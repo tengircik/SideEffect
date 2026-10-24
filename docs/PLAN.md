@@ -66,7 +66,7 @@ The parser and renderer must enforce the explicit budgets recorded in Milestone 
 
 Report generation must enforce the documented event/string/output budgets. Create completed reports atomically without following destination symlinks or replacing existing files; define cleanup behavior for failed or interrupted writes.
 
-**Exit criteria:** schema/round-trip tests pass; HTML tests prove trace-provided markup is inert and no remote assets are required; incomplete captures are conspicuous; export failures do not corrupt raw run evidence. Current renderer tests cover static markup safety; browser compatibility and broad accessibility review remain open.
+**Exit criteria:** schema/round-trip tests pass; HTML tests prove trace-provided markup is inert and no remote assets are required; incomplete captures are conspicuous; export failures do not corrupt raw run evidence. Current renderer tests cover static markup safety and a keyboard skip link/main landmark; browser compatibility and broad accessibility review remain open.
 
 Additional exit criteria: report generation respects documented event/string/output budgets; completed exports are published atomically without following destination symlinks or replacing existing files; interrupted or failed exports leave no partial final report and do not corrupt raw run evidence.
 

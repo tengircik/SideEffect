@@ -98,9 +98,9 @@ pub fn write_html_summary<W: Write>(
     writer: &mut W,
 ) -> io::Result<()> {
     writer.write_all(b"<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n")?;
-    writer.write_all(b"<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; connect-src 'none'; frame-src 'none'; media-src 'none'; script-src 'none'\">\n<title>SideEffect aggregate diff summary</title>\n<style>body{max-width:60rem;margin:2rem auto;padding:0 1rem;font:16px/1.5 system-ui,sans-serif}table{border-collapse:collapse;width:100%;margin:1rem 0}th,td{border:1px solid #888;padding:.5rem;text-align:left}.notice{border-left:.25rem solid #b87900;padding:.5rem 1rem}</style>\n</head>\n<body>\n<h1>SideEffect aggregate diff summary</h1>\n<p class=\"notice\">")?;
+    writer.write_all(b"<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; connect-src 'none'; frame-src 'none'; media-src 'none'; script-src 'none'\">\n<title>SideEffect aggregate diff summary</title>\n<style>body{max-width:60rem;margin:2rem auto;padding:0 1rem;font:16px/1.5 system-ui,sans-serif}table{border-collapse:collapse;width:100%;margin:1rem 0}th,td{border:1px solid #888;padding:.5rem;text-align:left}.notice{border-left:.25rem solid #b87900;padding:.5rem 1rem}.skip-link{position:absolute;left:1rem;top:0;z-index:1;transform:translateY(-150%);background:Canvas;color:CanvasText;padding:.5rem 1rem;border:2px solid currentColor}.skip-link:focus{transform:translateY(1rem)}</style>\n</head>\n<body>\n<a class=\"skip-link\" href=\"#report-content\">Skip to report content</a>\n<main id=\"report-content\" tabindex=\"-1\">\n<h1>SideEffect aggregate diff summary</h1>\n<p class=\"notice\">")?;
     writer.write_all(summary.disclosure.warning.as_bytes())?;
-    writer.write_all(b"</p>\n<p>Schema: sideeffect_redacted_diff_summary v1. Parse status: complete. Capture completeness: unknown; parsing cannot establish that every interaction was observed.</p>\n<p>This separate summary contains category-level counts only. It does not preserve event-level evidence.</p>\n<table><thead><tr><th>Category</th><th>Added groups</th><th>Changed groups</th><th>Removed groups</th></tr></thead><tbody>\n")?;
+    writer.write_all(b"</p>\n<p>Schema: sideeffect_redacted_diff_summary v1. Parse status: complete. Capture completeness: unknown; parsing cannot establish that every interaction was observed.</p>\n<p>This separate summary contains category-level counts only. It does not preserve event-level evidence.</p>\n<table><caption>Observed change groups by category</caption><thead><tr><th>Category</th><th>Added groups</th><th>Changed groups</th><th>Removed groups</th></tr></thead><tbody>\n")?;
     for row in &summary.changes_by_category {
         writeln!(
             writer,
@@ -111,7 +111,7 @@ pub fn write_html_summary<W: Write>(
             row.removed_groups
         )?;
     }
-    writer.write_all(b"</tbody></table>\n<p>Omitted from this export: syscall names, raw arguments and results, lexical path hints, source fingerprints, source evidence references, and local input paths. The command performs no upload.</p>\n</body>\n</html>\n")
+    writer.write_all(b"</tbody></table>\n<p>Omitted from this export: syscall names, raw arguments and results, lexical path hints, source fingerprints, source evidence references, and local input paths. The command performs no upload.</p>\n</main>\n</body>\n</html>\n")
 }
 
 fn category_name(category: EventCategory) -> &'static str {
@@ -211,6 +211,16 @@ mod tests {
         let mut output = Vec::new();
         write_html_summary(&summary, &mut output).unwrap();
         let html = String::from_utf8(output).unwrap();
+        assert!(html.contains(
+            r##"<a class="skip-link" href="#report-content">Skip to report content</a>"##
+        ));
+        assert!(html.contains(r#"<main id="report-content" tabindex="-1">"#));
+        assert!(html.contains("transform:translateY(-150%)"));
+        assert!(html.contains(".skip-link:focus{transform:translateY(1rem)}"));
+        assert!(html.contains("<caption>Observed change groups by category</caption>"));
+        assert!(html.contains("</main>\n</body>"));
+        assert_eq!(html.matches("href=").count(), 1);
+        assert!(!html.contains("href=\"http"));
         assert!(html.contains("Content-Security-Policy"));
         assert!(html.contains("default-src 'none'"));
         assert!(html.contains("script-src 'none'"));

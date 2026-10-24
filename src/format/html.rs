@@ -19,7 +19,7 @@ pub fn write_html_diff<W: Write>(diff: &TraceDiff<'_>, writer: &mut W) -> io::Re
     writer.write_all(b"<meta http-equiv=\"Content-Security-Policy\" content=\"")?;
     writer.write_all(CSP.as_bytes())?;
     writer.write_all(
-        b"\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>SideEffect trace comparison</title>\n<style>\n:root{color-scheme:light dark;font:16px/1.5 system-ui,sans-serif}body{max-width:72rem;margin:2rem auto;padding:0 1rem}h1,h2,h3{line-height:1.2}.context,.delta{border:1px solid #8886;border-radius:.5rem;padding:1rem;margin:1rem 0}dl{display:grid;grid-template-columns:minmax(10rem,15rem) minmax(0,1fr);gap:.35rem 1rem}dt{font-weight:600}.value{unicode-bidi:isolate;white-space:pre-wrap;overflow-wrap:anywhere}.evidence{margin:.25rem 0 1rem 1.25rem;padding:0}.evidence li{font-family:ui-monospace,monospace}code{font-family:ui-monospace,monospace}.notice{border-left:.25rem solid #b87900;padding:.5rem 1rem} @media(max-width:40rem){dl{grid-template-columns:1fr;gap:0}dt{margin-top:.5rem}}\n</style>\n</head>\n<body>\n<header><h1>SideEffect trace comparison</h1><p class=\"notice\">Trace values may contain sensitive data. Review this report before sharing it. Parsing does not establish complete capture coverage.</p></header>\n<p>Categories are syscall-name buckets. A recorded attempt or comparison does not establish a completed effect or causation.</p>\n<section class=\"context\"><h2>Comparison context</h2><dl>\n<dt>Schema version</dt><dd>",
+        b"\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>SideEffect trace comparison</title>\n<style>\n:root{color-scheme:light dark;font:16px/1.5 system-ui,sans-serif}body{max-width:72rem;margin:2rem auto;padding:0 1rem}h1,h2,h3{line-height:1.2}.context,.delta{border:1px solid #8886;border-radius:.5rem;padding:1rem;margin:1rem 0}dl{display:grid;grid-template-columns:minmax(10rem,15rem) minmax(0,1fr);gap:.35rem 1rem}dt{font-weight:600}.value{unicode-bidi:isolate;white-space:pre-wrap;overflow-wrap:anywhere}.evidence{margin:.25rem 0 1rem 1.25rem;padding:0}.evidence li{font-family:ui-monospace,monospace}code{font-family:ui-monospace,monospace}.notice{border-left:.25rem solid #b87900;padding:.5rem 1rem} @media(max-width:40rem){dl{grid-template-columns:1fr;gap:0}dt{margin-top:.5rem}}\n.skip-link{position:absolute;left:1rem;top:0;z-index:1;transform:translateY(-150%);background:Canvas;color:CanvasText;padding:.5rem 1rem;border:2px solid currentColor}.skip-link:focus{transform:translateY(1rem)}\n</style>\n</head>\n<body>\n<a class=\"skip-link\" href=\"#report-content\">Skip to report content</a>\n<main id=\"report-content\" tabindex=\"-1\">\n<header><h1>SideEffect trace comparison</h1><p class=\"notice\">Trace values may contain sensitive data. Review this report before sharing it. Parsing does not establish complete capture coverage.</p></header>\n<p>Categories are syscall-name buckets. A recorded attempt or comparison does not establish a completed effect or causation.</p>\n<section class=\"context\"><h2>Comparison context</h2><dl>\n<dt>Schema version</dt><dd>",
     )?;
     write!(writer, "{}", diff.schema_version)?;
     writer.write_all(b"</dd>\n<dt>Capture completeness</dt><dd>")?;
@@ -93,7 +93,7 @@ pub fn write_html_diff<W: Write>(diff: &TraceDiff<'_>, writer: &mut W) -> io::Re
         }
         writer.write_all(b"</ol>\n")?;
     }
-    writer.write_all(b"</section>\n</body>\n</html>\n")
+    writer.write_all(b"</section>\n</main>\n</body>\n</html>\n")
 }
 
 fn write_delta<W: Write>(writer: &mut W, change: &ObservedDelta<'_>) -> io::Result<()> {
@@ -330,6 +330,13 @@ mod tests {
     fn renders_diff_content_and_provenance_in_static_offline_document() {
         let output = render(&make_diff("AT_FDCWD, \"config.ini\", O_RDONLY"));
         assert!(output.starts_with("<!doctype html>\n<html lang=\"en\">"));
+        assert!(output.contains(
+            r##"<a class="skip-link" href="#report-content">Skip to report content</a>"##
+        ));
+        assert!(output.contains(r#"<main id="report-content" tabindex="-1">"#));
+        assert!(output.contains("</main>\n</body>"));
+        assert!(output.contains("transform:translateY(-150%)"));
+        assert!(output.contains(".skip-link:focus{transform:translateY(1rem)}"));
         assert!(output.contains("Content-Security-Policy"));
         assert!(output.contains("default-src 'none'; style-src 'unsafe-inline'"));
         assert!(output.contains("script-src 'none'"));
@@ -357,7 +364,8 @@ mod tests {
         ));
         assert!(!output.contains("<script"));
         assert!(!output.contains("src=\"http"));
-        assert!(!output.contains("href="));
+        assert_eq!(output.matches("href=").count(), 1);
+        assert!(!output.contains("href=\"http"));
     }
 
     #[test]
