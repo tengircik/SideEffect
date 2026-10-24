@@ -1,12 +1,12 @@
 # SideEffect Delivery Plan
 
-**Status:** implementation is underway; this is not a schedule or release claim. Bounded `inspect` and conservative `diff` commands with synthetic fixtures exist. Capture orchestration and HTML rendering remain future work.
+**Status:** implementation is underway; this is not a schedule or release claim. Bounded `inspect`, conservative `diff`, and a terminal-safe text view with synthetic fixtures exist. Capture orchestration and HTML rendering remain future work.
 
 ## Current implementation slice
 
-`sideeffect inspect TRACE` reads a regular local file, accepts a bounded subset of `strace` text, preserves raw lines and source byte offsets in a schema-v1 JSON document, and writes that document to stdout. `sideeffect diff LEFT RIGHT` compares completely parsed documents' syscall rows and writes schema-v1 JSON observed deltas with source offsets. Neither command executes the represented command, invokes `strace`, or writes report files. The parser and diff fixtures are synthetic, not real captures. Compatibility with real tracer output has not been integration-tested.
+`sideeffect inspect TRACE` reads a regular local file, accepts a bounded subset of `strace` text, preserves raw lines and source byte offsets in a schema-v1 JSON document, and writes that document to stdout. `sideeffect diff LEFT RIGHT` compares completely parsed documents' syscall rows and writes schema-v1 JSON observed deltas with source offsets; `sideeffect diff --format text LEFT RIGHT` writes a human-readable ASCII-only view with terminal controls escaped. Neither command executes the represented command, invokes `strace`, or writes report files. The parser and diff fixtures are synthetic, not real captures. Compatibility with real tracer output has not been integration-tested.
 
-Current hard limits are 32 MiB per input file (64 MiB combined for a diff), 64 KiB per physical record excluding LF, 100,000 records per input, 200,000 diff rows, and 64 MiB for JSON output. These initial values need review against real captures. `parse_status` describes syntax/continuation parsing only and cannot establish capture completeness. The diff fails closed on partial parses, ignores only parser-level PID/timestamp prefixes when matching, compares exact arguments/results, treats rows as a multiset, and reports excluded control-row counts. It emits a changed row only when exactly one unmatched same-signature record remains on each side; ambiguous result multiplicities remain additions/removals. Before/after references point to the first/second CLI input respectively. Unfinished and resumed rows remain separate observations.
+Current hard limits are 32 MiB per input file (64 MiB combined for a diff), 64 KiB per physical record excluding LF, 100,000 records per input, 200,000 diff rows, and 64 MiB for serialized JSON or text output. These initial values need review against real captures. `parse_status` describes syntax/continuation parsing only and cannot establish capture completeness. The diff fails closed on partial parses, ignores only parser-level PID/timestamp prefixes when matching, compares exact arguments/results, treats rows as a multiset, and reports excluded control-row counts. It emits a changed row only when exactly one unmatched same-signature record remains on each side; ambiguous result multiplicities remain additions/removals. Before/after references point to the first/second CLI input respectively. Unfinished and resumed rows remain separate observations.
 
 ## Milestone 0 — Repository and dependency decision
 
@@ -22,6 +22,8 @@ Current hard limits are 32 MiB per input file (64 MiB combined for a diff), 64 K
 The initial Rust/MSRV and parser limits are recorded in `Cargo.toml` and `src/limits.rs`; supported `strace` versions, real-capture compatibility, and final release budgets remain open.
 
 ## Milestone 1 — Capture a single run
+
+**Deferred by design.** The current `strace -o FILE` file sink has no enforced output-size ceiling. Do not implement recording until a bounded trace sink can stop or reject oversized captures without silently continuing an unobserved command, and the effects of stopping the tracer on tracees are explicit. `--kill-on-exit` requires strace 6.6 or newer but is only best-effort cleanup; descendants created with `CLONE_UNTRACED` can escape tracing. The project has not validated a supported minimum version or cleanup behavior. `--syscall-limit` detaches tracees after a call count and must not be treated as a complete run. Never pass a user-controlled `-o` value directly: strace treats output names beginning with `|` or `!` as commands. See the [`strace(1)` manual](https://man7.org/linux/man-pages/man1/strace.1.html).
 
 - Implement proposed command wrapping and external `strace` invocation.
 - Record raw trace, stdout/stderr, command exit status, tracer status/version/arguments, and capture diagnostics.
@@ -50,9 +52,10 @@ The parser and renderer must enforce the explicit budgets recorded in Milestone 
 
 **Exit criteria:** fixture pairs cover timestamp/PID-prefix changes, added/removed/changed observations, duplicate multiplicity, and unstable event ordering; incomplete input is rejected; every emitted delta links to source evidence; any future normalization is explicit and never destroys raw values. The current exact-argument matcher can still report changes caused by run-local values inside arguments or results; resolve those only through separately reviewed rules.
 
-## Milestone 4 — Export JSON and offline HTML
+## Milestone 4 — Export human-readable output and offline HTML
 
-- Serialize versioned JSON.
+- Versioned JSON diff output is implemented.
+- `diff --format text` is implemented as an ASCII-only terminal view; escape trace-derived controls, quotes, backslashes, and non-ASCII scalars and enforce the shared output cap.
 - Render a self-contained, offline HTML comparison report.
 - Escape all trace-derived content and keep raw evidence references accessible.
 - Show per-run capture status, diagnostics, observed changes, and uncertainty.

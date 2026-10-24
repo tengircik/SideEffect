@@ -1,10 +1,10 @@
 # Security Policy
 
-**Project status:** early implementation. `sideeffect inspect TRACE` reads one local regular file, parses bounded `strace`-style text, and writes JSON to stdout. `sideeffect diff LEFT RIGHT` parses two local trace files and writes a bounded JSON comparison only when both parses are complete. Neither command starts a command or invokes `strace`; HTML rendering is not implemented. The safeguards below distinguish current behavior from requirements for future features.
+**Project status:** early implementation. `sideeffect inspect TRACE` reads one local regular file, parses bounded `strace`-style text, and writes JSON to stdout. `sideeffect diff LEFT RIGHT` parses two local trace files and writes a bounded JSON comparison or ASCII-only terminal-safe text view only when both parses are complete. Neither command starts a command or invokes `strace`; HTML rendering is not implemented. The safeguards below distinguish current behavior from requirements for future features.
 
 ## System, scope, and threat model
 
-The current inspector reads user-selected trace text and emits a JSON document containing raw lines and parsed fields. The current diff reads two such files and emits event deltas with source offsets; it ignores only parsed PID/timestamp prefixes for matching, keeps arguments/results exact, reports control-row counts, and states capture completeness is unknown. Future capture may start a user-selected command under `strace`, retain a local evidence bundle, and render offline HTML. The main assets are the user's machine and files, input traces and their potentially sensitive data, and (for future capture) the command's execution context and raw trace/output bundles.
+The current inspector reads user-selected trace text and emits a JSON document containing raw lines and parsed fields. The current diff reads two such files and emits event deltas with source offsets; it ignores only parsed PID/timestamp prefixes for matching, keeps arguments/results exact, reports control-row counts, and states capture completeness is unknown. Its text formatter escapes controls and non-ASCII characters to prevent terminal-control injection, but does not redact secrets. Future capture may start a user-selected command under `strace`, retain a local evidence bundle, and render offline HTML. The main assets are the user's machine and files, input traces and their potentially sensitive data, and (for future capture) the command's execution context and raw trace/output bundles.
 
 The operator is trusted to select a trace file and, in a future capture mode, choose a command and decide whether to run it. The selected file's contents, trace strings, command arguments, future capture output, and report values are untrusted. The current inspector does not execute trace content or launch the traced command. For future capture, the external `strace` binary, the kernel, and selected syscall set form part of the observation boundary. Repository vulnerabilities are reportable when a realistic input or action crosses that boundary and causes impact beyond the documented behavior.
 
@@ -20,7 +20,7 @@ Temporal order and process ancestry can help a human investigate a behavior chan
 
 ## Data handling and privacy
 
-The current inspector has no telemetry, hosted service, or automatic report upload. It reads locally and writes JSON to stdout. Future capture and reporting are also planned to remain local by default. This does not make trace data safe to share:
+The current inspector and diff have no telemetry, hosted service, or automatic report upload. They read locally and write JSON or escaped terminal text to stdout. Future capture and reporting are also planned to remain local by default. This does not make trace data safe to share:
 
 - Raw traces can contain command-line arguments, file paths, IP addresses and ports, and other values passed to traced syscalls. Arguments can contain credentials or tokens. Paths and output can reveal usernames, project names, customer data, or internal infrastructure.
 - Command stdout and stderr may also contain sensitive information.
@@ -59,7 +59,7 @@ Severity depends on reachability and impact. The fact that the user intentionall
 
 SideEffect is not intended to prevent the chosen command from modifying files or accessing the network, identify malware, establish that a command is safe, capture every system interaction, or prove causation. These are product limitations, not vulnerabilities, provided the implementation does not make contrary claims or violate the invariants above. Sensitive values appearing in a local trace as a result of the selected capture are an acknowledged privacy risk; unexpected external disclosure or unsafe rendering is reportable.
 
-The current comparison is a conservative parser-row diff, not a capture-completeness check or logical syscall reconstruction. It has no real-tracer integration evidence. Rendering and capture risks have not been validated because those features do not exist yet. The parser/diff tests use synthetic input; real `strace` compatibility and capture completeness remain unverified. The Linux/`strace` scope, incomplete observation possibilities, local raw-data exposure, absence of automatic redaction, and non-causal nature of event comparison are known product limitations that must remain visible in user-facing documentation.
+The current comparison is a conservative parser-row diff, not a capture-completeness check or logical syscall reconstruction. It has no real-tracer integration evidence. HTML rendering and capture risks have not been validated because those features do not exist yet. The parser/diff tests use synthetic input; real `strace` compatibility and capture completeness remain unverified. The Linux/`strace` scope, incomplete observation possibilities, local raw-data exposure, absence of automatic redaction, and non-causal nature of event comparison are known product limitations that must remain visible in user-facing documentation.
 
 ## Reporting a vulnerability
 

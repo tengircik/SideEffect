@@ -9,11 +9,12 @@ use std::process::ExitCode;
 
 use serde::Serialize;
 use sideeffect::diff::compare_traces;
+use sideeffect::format::write_text_diff;
 use sideeffect::limits::{MAX_JSON_BYTES, MAX_TRACE_BYTES, ParseLimits};
-use sideeffect::model::ParseCompleteness;
+use sideeffect::model::{ParseCompleteness, TraceDiff};
 use sideeffect::trace::strace::parse_trace_bytes;
 
-const USAGE: &str = "Usage: sideeffect inspect <strace-trace-file>\n       sideeffect diff <baseline-trace> <candidate-trace>\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file and writes JSON evidence to stdout. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout. Neither command executes the represented command.";
+const USAGE: &str = "Usage: sideeffect inspect <strace-trace-file>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file and writes JSON evidence to stdout. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout (JSON by default). Neither command executes the represented command.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -37,6 +38,9 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         }
         [command, path] if command == "inspect" => inspect(path),
         [command, left, right] if command == "diff" => diff(left, right),
+        [command, flag, format, left, right] if command == "diff" && flag == "--format" => {
+            diff_with_format(format, left, right)
+        }
         _ => Err(USAGE.to_owned()),
     }
 }
@@ -54,11 +58,41 @@ fn inspect(path: &OsString) -> Result<ExitCode, String> {
 }
 
 fn diff(left_path: &OsString, right_path: &OsString) -> Result<ExitCode, String> {
+    diff_with_output_format(left_path, right_path, DiffOutputFormat::Json)
+}
+
+fn diff_with_format(
+    format: &OsString,
+    left_path: &OsString,
+    right_path: &OsString,
+) -> Result<ExitCode, String> {
+    let output_format = match format.to_str() {
+        Some("json") => DiffOutputFormat::Json,
+        Some("text") => DiffOutputFormat::Text,
+        _ => return Err("diff format must be either 'json' or 'text'".to_owned()),
+    };
+    diff_with_output_format(left_path, right_path, output_format)
+}
+
+#[derive(Clone, Copy)]
+enum DiffOutputFormat {
+    Json,
+    Text,
+}
+
+fn diff_with_output_format(
+    left_path: &OsString,
+    right_path: &OsString,
+    output_format: DiffOutputFormat,
+) -> Result<ExitCode, String> {
     let left = read_and_parse(left_path)?;
     let right = read_and_parse(right_path)?;
     let result = compare_traces(&left, &right)
         .map_err(|error| format!("could not compare traces: {error}"))?;
-    write_json(&result, "JSON comparison document")?;
+    match output_format {
+        DiffOutputFormat::Json => write_json(&result, "JSON comparison document")?,
+        DiffOutputFormat::Text => write_text(&result)?,
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -87,11 +121,29 @@ fn write_json<T: Serialize>(value: &T, description: &str) -> Result<(), String> 
         )
     })?;
 
+    write_buffer(&json, description)
+}
+
+fn write_text(diff: &TraceDiff<'_>) -> Result<(), String> {
+    let mut text = CappedBuffer::new(MAX_JSON_BYTES);
+    write_text_diff(diff, &mut text).map_err(|error| {
+        if text.exceeded {
+            format!("text comparison exceeds the {MAX_JSON_BYTES} byte output limit")
+        } else {
+            format!("could not render text comparison: {error}")
+        }
+    })?;
+    text.write_all(b"\n")
+        .map_err(|_| format!("text comparison exceeds the {MAX_JSON_BYTES} byte output limit"))?;
+    write_buffer(&text, "text comparison")
+}
+
+fn write_buffer(buffer: &CappedBuffer, description: &str) -> Result<(), String> {
     let mut stdout = io::stdout().lock();
     stdout
-        .write_all(&json.bytes)
+        .write_all(&buffer.bytes)
         .and_then(|()| stdout.flush())
-        .map_err(|error| format!("could not write JSON to stdout: {error}"))
+        .map_err(|error| format!("could not write {description} to stdout: {error}"))
 }
 
 fn read_bounded(path: &OsString) -> Result<Vec<u8>, String> {

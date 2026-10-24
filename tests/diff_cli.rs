@@ -83,3 +83,29 @@ fn diff_command_emits_no_document_for_a_partial_parse() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("not completely parsed"));
 }
+
+#[test]
+fn text_format_escapes_terminal_controls_and_non_ascii_trace_data() {
+    let trace =
+        "1 1700000000.000001 write(1, \"ansi-\u{1b}[31m-bidi-\u{202e}-é\", 16) = 16\n".to_owned();
+    let baseline = TempTrace::with_contents(trace.as_bytes());
+    let candidate = TempTrace::with_contents(b"");
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["diff", "--format", "text"])
+        .arg(&baseline.0)
+        .arg(&candidate.0)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_ascii());
+    assert!(!output.stdout.contains(&0x1b));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("\\u{1B}[31m"));
+    assert!(text.contains("\\u{202E}"));
+    assert!(text.contains("\\u{E9}"));
+}

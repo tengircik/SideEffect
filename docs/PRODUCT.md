@@ -1,6 +1,6 @@
 # SideEffect Product Brief
 
-**Status:** early implementation. The repository implements bounded `sideeffect inspect TRACE` parsing and a conservative `sideeffect diff LEFT RIGHT` JSON comparison. Capture and HTML report generation remain planned; no security guarantee is claimed.
+**Status:** early implementation. The repository implements bounded `sideeffect inspect TRACE` parsing and a conservative `sideeffect diff LEFT RIGHT` comparison with JSON or terminal-safe text output. Capture and HTML report generation remain planned; no security guarantee is claimed.
 
 ## Product summary
 
@@ -22,9 +22,9 @@ The first release should focus on one reproducible pair of command runs. It is n
 
 ## Current implementation
 
-`sideeffect inspect TRACE` reads a regular file without executing the traced command, invokes no external program, and writes schema-v1 JSON to stdout. `sideeffect diff LEFT RIGHT` compares complete parses and writes schema-v1 JSON deltas with raw source line/byte references. The diff fails closed on partial parses, compares syscall rows as a multiset, ignores only parsed timestamp and PID prefixes for matching, and compares raw syscall arguments/results exactly. A result change is shown as changed only when one unmatched same-signature row remains on each side; ambiguous residual multiplicities stay as additions/removals. It reports control-row counts outside the comparison. Paired unfinished/resumed records are treated as separate rows. Capture completeness remains unknown, and process/file/network labels are syscall-name buckets rather than claims of successful effects.
+`sideeffect inspect TRACE` reads a regular file without executing the traced command, invokes no external program, and writes schema-v1 JSON to stdout. `sideeffect diff LEFT RIGHT` compares complete parses and writes schema-v1 JSON deltas with raw source line/byte references; `--format text` renders the same differences as ASCII-only terminal-safe text. The diff fails closed on partial parses, compares syscall rows as a multiset, ignores only parsed timestamp and PID prefixes for matching, and compares raw syscall arguments/results exactly. A result change is shown as changed only when one unmatched same-signature row remains on each side; ambiguous residual multiplicities stay as additions/removals. It reports control-row counts outside the comparison. Paired unfinished/resumed records are treated as separate rows. Capture completeness remains unknown, and process/file/network labels are syscall-name buckets rather than claims of successful effects. Text escaping prevents terminal control injection; it does not redact sensitive content.
 
-The parser enforces a 32 MiB input limit, a 64 KiB physical-record limit, a 100,000-record limit, and a 64 MiB JSON output limit. Diff results are bounded to 200,000 rows. Invalid UTF-8 and hard limit violations fail without producing an evidence document. Included traces are synthetic, not real system captures. Real `strace` integration has not been tested because `strace` is not installed in the current WSL environment.
+The parser enforces a 32 MiB input limit, a 64 KiB physical-record limit, and a 100,000-record limit. Diff results are bounded to 200,000 rows, and both JSON and text output are capped at 64 MiB before stdout is written. Invalid UTF-8 and hard limit violations fail without producing an evidence document. Included traces are synthetic, not real system captures. Real `strace` integration has not been tested because `strace` is not installed in the current WSL environment.
 
 ## Planned capture and comparison workflow
 
@@ -33,7 +33,7 @@ The parser enforces a 32 MiB input limit, a 64 KiB physical-record limit, a 100,
 3. Inspect the source rows for each reported delta; the tool does not infer a cause or prove capture coverage.
 4. Future capture and offline HTML export will build on this evidence-linked JSON comparison.
 
-The command capture runner and HTML export are not implemented. The initial diff does not normalize file descriptors, paths, or PID-like values embedded in syscall arguments/results; those may appear as differences. Its fixture pair is synthetic and is not an integration test against real `strace` output.
+The command capture runner and HTML export are not implemented. Capture remains deferred until finite output handling and best-effort tracee cleanup are designed; it is not a sandbox. The initial diff does not normalize file descriptors, paths, or PID-like values embedded in syscall arguments/results; those may appear as differences. Its fixture pair is synthetic and is not an integration test against real `strace` output.
 
 ## Product principles
 

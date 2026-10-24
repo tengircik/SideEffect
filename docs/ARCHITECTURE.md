@@ -1,6 +1,6 @@
 # SideEffect Architecture Plan
 
-**Status:** early implementation. The source implements read-only `inspect` and conservative `diff` CLI paths over bounded line-oriented trace parsing. Capture orchestration, run bundles, and HTML rendering below remain planned, not implemented.
+**Status:** early implementation. The source implements read-only `inspect`, conservative `diff`, and an ASCII-only terminal text view over bounded line-oriented trace parsing. Capture orchestration, run bundles, and HTML rendering below remain planned, not implemented.
 
 The security requirements for future implementation are summarized in [SECURITY.md](../SECURITY.md); the input-budget and safe-output behavior below are release requirements, not implemented protections.
 
@@ -34,7 +34,7 @@ Versioned run record ───────► raw event references + capture met
                                versioned JSON          offline HTML
 ```
 
-The current paths are `inspect <trace-file>` → bounded regular-file read → strict UTF-8 and line parsing → versioned JSON, and `diff <left-trace> <right-trace>` → parse both inputs → conservative multiset comparison → versioned JSON. They do not start `strace` or execute the command represented by the trace.
+The current paths are `inspect <trace-file>` → bounded regular-file read → strict UTF-8 and line parsing → versioned JSON, and `diff <left-trace> <right-trace>` → parse both inputs → conservative multiset comparison → versioned JSON or ASCII-only escaped text. They do not start `strace` or execute the command represented by the trace.
 
 ## Current parser contract
 
@@ -50,7 +50,9 @@ The current hard budgets are 32 MiB total input bytes, 64 KiB per physical recor
 
 ### CLI and capture coordinator
 
-The CLI validates inputs, checks for the required external tracer, starts the wrapped command, manages trace/output files, records tool versions and invocation metadata, and returns a documented status. It must keep the wrapped command's exit code distinguishable from tracer, parser, and report-generation failures.
+The future CLI validates inputs, checks for the required external tracer, starts the wrapped command, manages trace/output files, records tool versions and invocation metadata, and returns a documented status. It must preserve the wrapped command's argument boundaries and run it with the invoking user's normal permissions; it is an observer, not a sandbox. No automatic privilege escalation or capture of arbitrary environment variables is planned. The command's stdout/stderr should remain inherited rather than being captured unless a separately reviewed feature changes that contract. Trace output may contain command arguments, paths, sockaddr values, and other sensitive data.
+
+Recording is deferred until a bounded trace-output sink and explicit stop behavior are designed. A regular `strace -o FILE` output can grow without an application-enforced ceiling. `--syscall-limit` detaches tracees after a call count, so it cannot silently stand in for a complete run. `--kill-on-exit` needs strace 6.6 or newer and is not a complete cleanup guarantee because descendants can escape tracing via `CLONE_UNTRACED`. The project has not selected a supported minimum strace version or validated cleanup behavior. Strace also treats output names beginning with `|` or `!` as commands, so future capture must use a generated internal output path and never pass a user-provided destination directly as `-o`. Strace normally returns the traced command's exit status; that status is not an independent proof that the tracer completed without warnings. See the [`strace(1)` manual](https://man7.org/linux/man-pages/man1/strace.1.html).
 
 The exact process supervision strategy and how stdout/stderr are forwarded while being recorded must be validated during implementation. The product must document any behavioral differences from direct command execution, including interactive terminal limitations if applicable.
 
@@ -68,7 +70,7 @@ Raw trace text is retained as the evidence source. The parser converts supported
 
 The parser must tolerate concurrent processes and unfinished/resumed syscall records according to supported `strace` output formats. Unsupported record forms are surfaced as unsupported or unparsed evidence rather than guessed into structured events.
 
-Each parser input is limited to 32 MiB, 64 KiB per physical record excluding LF, and 100,000 physical records. A diff therefore reads at most 64 MiB combined; output is bounded to at most 200,000 grouped rows and JSON serialization has an independent 64 MiB cap before stdout is written. The comparison borrows argument/result strings from parsed inputs and retains source offsets rather than copying full raw lines into deltas. The current diff compares parsed syscall rows as a multiset, ignores only parser-level PID/timestamp prefixes, and keeps syscall names, arguments, and results exact. It refuses partial parses, reports excluded control-row counts, and treats unfinished/resumed rows separately. Its category labels are syscall-name buckets. Capture completeness remains unknown. Future capture and HTML rendering still need their own budgets. Oversized input fails explicitly; malformed or unsupported lines remain raw evidence with diagnostics rather than implying they were understood.
+Each parser input is limited to 32 MiB, 64 KiB per physical record excluding LF, and 100,000 physical records. A diff therefore reads at most 64 MiB combined; output is bounded to at most 200,000 grouped rows and JSON or text serialization has a 64 MiB cap before stdout is written. The comparison borrows argument/result strings from parsed inputs and retains source offsets rather than copying full raw lines into deltas. The current diff compares parsed syscall rows as a multiset, ignores only parser-level PID/timestamp prefixes, and keeps syscall names, arguments, and results exact. It refuses partial parses, reports excluded control-row counts, and treats unfinished/resumed rows separately. Its category labels are syscall-name buckets. Capture completeness remains unknown. Future capture and HTML rendering still need their own budgets. Oversized input fails explicitly; malformed or unsupported lines remain raw evidence with diagnostics rather than implying they were understood.
 
 ### Versioned run record
 
@@ -101,7 +103,7 @@ Concurrency can change event order even when behavior is similar. The diff shoul
 
 ### Renderers
 
-JSON is the machine-readable output. HTML is a self-contained local report with no remote assets, network calls, or active content sourced from the trace. Every trace-derived string is escaped or inserted as text; scripts must not evaluate trace values. Reports should show capture status, run identity, observed differences, uncertainty, and direct raw-evidence references.
+JSON is the machine-readable output. The current text view escapes quotes, backslashes, control characters, and all non-ASCII scalars to ASCII, preventing trace input from emitting terminal control sequences. It is still sensitive and not redacted. Future HTML must be a self-contained local report with no remote assets, network calls, or active content sourced from the trace. Every trace-derived string must be escaped or inserted as text; scripts must not evaluate trace values. Reports should show capture status, run identity, observed differences, uncertainty, and direct raw-evidence references.
 
 An export must not be described as sanitized or safe to publish by default. Command arguments, paths, output, and syscall arguments may contain secrets or personal information. If a future redaction option is added, the report must distinguish redacted data from absent data and preserve the original local evidence separately according to an explicit policy.
 
