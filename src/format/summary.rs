@@ -132,7 +132,7 @@ mod tests {
     };
     use crate::trace::{LexicalPathBasis, LexicalPathHint};
 
-    fn summary_source_fixture<'a>(hint: &'a LexicalPathHint) -> TraceDiff<'a> {
+    fn summary_source_fixture(hint: &LexicalPathHint) -> TraceDiff<'_> {
         TraceDiff {
             schema_version: TRACE_DIFF_SCHEMA_VERSION,
             left_source_format: "strace_text",

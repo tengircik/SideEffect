@@ -437,13 +437,13 @@ fn verify_opened_stage(
 }
 
 fn remove_directory_if_same(parent_fd: i32, name: &OsStr, device: libc::dev_t, inode: libc::ino_t) {
-    if verify_named_directory(parent_fd, name, device, inode).is_ok()
-        && let Ok(name) = c_name(name.as_bytes())
-    {
-        // SAFETY: the entry was checked against the held directory inode and removal is
-        // restricted to an empty directory.
-        unsafe {
-            libc::unlinkat(parent_fd, name.as_ptr(), libc::AT_REMOVEDIR);
+    if verify_named_directory(parent_fd, name, device, inode).is_ok() {
+        if let Ok(name) = c_name(name.as_bytes()) {
+            // SAFETY: the entry was checked against the held directory inode and removal is
+            // restricted to an empty directory.
+            unsafe {
+                libc::unlinkat(parent_fd, name.as_ptr(), libc::AT_REMOVEDIR);
+            }
         }
     }
 }
@@ -712,7 +712,7 @@ mod tests {
             fs::rename(&stage_path, &moved_original).unwrap();
             fs::create_dir(&stage_path).unwrap();
             fs::set_permissions(&stage_path, fs::Permissions::from_mode(0o770)).unwrap();
-            fs::write(&stage_path.join("marker"), b"replacement data").unwrap();
+            fs::write(stage_path.join("marker"), b"replacement data").unwrap();
             replacement_path = Some(stage_path);
         });
 

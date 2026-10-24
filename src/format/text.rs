@@ -205,7 +205,7 @@ mod tests {
     use crate::trace::{LexicalPathBasis, LexicalPathHint};
     use std::io::{self, Write};
 
-    fn diff_with<'a>(changes: Vec<ObservedDelta<'a>>) -> TraceDiff<'a> {
+    fn diff_with(changes: Vec<ObservedDelta<'_>>) -> TraceDiff<'_> {
         TraceDiff {
             schema_version: TRACE_DIFF_SCHEMA_VERSION,
             left_source_format: "strace_text_v1",
