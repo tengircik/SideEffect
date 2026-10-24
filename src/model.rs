@@ -1,6 +1,8 @@
 use serde::Serialize;
 
-pub const TRACE_DOCUMENT_SCHEMA_VERSION: u32 = 1;
+use crate::trace::LexicalPathHint;
+
+pub const TRACE_DOCUMENT_SCHEMA_VERSION: u32 = 2;
 pub const TRACE_DIFF_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -44,6 +46,10 @@ pub struct TraceRecord {
     pub raw_arguments: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_result: Option<String>,
+    /// A conservative path spelling joined with an absolute `-yy` dirfd base.
+    /// This is lexical only; it is not canonical or filesystem-resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lexical_path_hint: Option<LexicalPathHint>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

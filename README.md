@@ -12,13 +12,17 @@ From the repository root, run:
 cargo run -- inspect tests/fixtures/strace/synthetic-minimal.trace
 ```
 
-This prints a schema-v1 JSON document containing parsed records, raw trace lines, source byte offsets, and diagnostics. The fixture is synthetic; it is not a real system capture. For a readable, terminal-safe view of every parsed and unparsed record, run:
+This prints a schema-v2 JSON document containing parsed records, raw trace lines, source byte offsets, diagnostics, and optional `lexical_path_hint` values. The fixture is synthetic; it is not a real system capture. For a readable, terminal-safe view of every parsed and unparsed record, run:
 
 ```sh
 cargo run -- inspect --format text tests/fixtures/strace/synthetic-minimal.trace
 ```
 
 Exit status `0` means every input record was classified and continuation records were reconciled; `2` means JSON or text was produced with a partial parse; `1` means the input or output could not be processed. Text output retains raw values and is not redacted. **Parse status says nothing about whether the original OS capture observed every event.**
+
+For `openat` and `openat2`, records may also include a `lexical_path_hint` when the path argument is unambiguously printable and either absolute or paired with an absolute `-yy` directory annotation. It preserves `.` and `..` segments and is not a canonical or filesystem-resolved path; symlinks, descriptor reuse, resolution flags, and trace truncation can make it differ from the path the kernel ultimately used. Raw arguments remain the evidence source.
+
+`inspect` and `diff` consume raw `strace` text, not previously exported SideEffect JSON documents. Schema-v1 JSON exports remain standalone; the current CLI does not import or migrate them.
 
 ## What the parser accepts
 

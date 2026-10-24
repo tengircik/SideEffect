@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 
+use super::derive_lexical_path_hint;
 use crate::limits::ParseLimits;
 use crate::model::{
     EvidenceReference, ParseCompleteness, TRACE_DOCUMENT_SCHEMA_VERSION, TraceDiagnostic,
@@ -595,6 +596,15 @@ fn record(
     byte_length: u64,
     fields: ParsedFields,
 ) -> TraceRecord {
+    let lexical_path_hint = if fields.kind == TraceRecordKind::Syscall {
+        fields
+            .syscall
+            .as_deref()
+            .zip(fields.raw_arguments.as_deref())
+            .and_then(|(syscall, arguments)| derive_lexical_path_hint(syscall, arguments))
+    } else {
+        None
+    };
     TraceRecord {
         kind: fields.kind,
         evidence: EvidenceReference {
@@ -608,6 +618,7 @@ fn record(
         syscall: fields.syscall,
         raw_arguments: fields.raw_arguments,
         raw_result: fields.raw_result,
+        lexical_path_hint,
     }
 }
 

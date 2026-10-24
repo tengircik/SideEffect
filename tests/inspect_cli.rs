@@ -35,7 +35,9 @@ impl Drop for TempTrace {
 
 #[test]
 fn inspect_defaults_to_versioned_json() {
-    let trace = TempTrace::with_contents(b"close(3) = 0\n");
+    let trace = TempTrace::with_contents(
+        b"123 1700000000.123456 openat(AT_FDCWD</tmp/work>, \"file.txt\", O_RDONLY) = 3\n",
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .arg("inspect")
         .arg(&trace.0)
@@ -48,9 +50,41 @@ fn inspect_defaults_to_versioned_json() {
         String::from_utf8_lossy(&output.stderr)
     );
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(document["schema_version"], 1);
+    assert_eq!(document["schema_version"], 2);
     assert_eq!(document["parse_status"], "complete");
-    assert_eq!(document["records"][0]["raw_line"], "close(3) = 0");
+    assert_eq!(
+        document["records"][0]["raw_arguments"],
+        "AT_FDCWD</tmp/work>, \"file.txt\", O_RDONLY"
+    );
+    assert_eq!(
+        document["records"][0]["lexical_path_hint"]["path"],
+        "/tmp/work/file.txt"
+    );
+    assert_eq!(
+        document["records"][0]["lexical_path_hint"]["basis"],
+        "at_fdcwd_annotation"
+    );
+}
+
+#[test]
+fn inspect_text_discloses_the_basis_of_a_lexical_path_hint() {
+    let trace = TempTrace::with_contents(
+        b"123 1700000000.123456 openat(AT_FDCWD</tmp/work>, \"assets/icon.svg\", O_RDONLY) = 4\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["inspect", "--format", "text"])
+        .arg(&trace.0)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Lexical path hint: \"/tmp/work/assets/icon.svg\""));
+    assert!(text.contains("Path hint basis: at_fdcwd_annotation"));
 }
 
 #[test]

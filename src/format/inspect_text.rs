@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use crate::model::{
     EvidenceReference, ParseCompleteness, TraceDiagnostic, TraceDocument, TraceRecordKind,
 };
+use crate::trace::LexicalPathBasis;
 
 /// Write a terminal-safe, ASCII-only view of every parsed trace record and diagnostic.
 ///
@@ -28,6 +29,12 @@ pub fn write_trace_text<W: Write>(document: &TraceDocument, writer: &mut W) -> i
         write_optional_quoted(writer, "  Syscall", record.syscall.as_deref())?;
         write_optional_quoted(writer, "  Arguments", record.raw_arguments.as_deref())?;
         write_optional_quoted(writer, "  Result", record.raw_result.as_deref())?;
+        if let Some(hint) = record.lexical_path_hint.as_ref() {
+            write_optional_quoted(writer, "  Lexical path hint", Some(&hint.path))?;
+            writer.write_all(b"  Path hint basis: ")?;
+            writer.write_all(path_hint_basis_name(hint.basis).as_bytes())?;
+            writer.write_all(b"\n")?;
+        }
         write_evidence(writer, &record.evidence)?;
         writer.write_all(b"  Raw line: ")?;
         write_quoted(writer, &record.raw_line)?;
@@ -121,6 +128,14 @@ fn record_kind_name(kind: TraceRecordKind) -> &'static str {
     }
 }
 
+fn path_hint_basis_name(basis: LexicalPathBasis) -> &'static str {
+    match basis {
+        LexicalPathBasis::AbsoluteArgument => "absolute_argument",
+        LexicalPathBasis::AtFdcwdAnnotation => "at_fdcwd_annotation",
+        LexicalPathBasis::DirectoryFdAnnotation => "directory_fd_annotation",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::write_trace_text;
@@ -128,6 +143,7 @@ mod tests {
         EvidenceReference, ParseCompleteness, TraceDiagnostic, TraceDocument, TraceRecord,
         TraceRecordKind,
     };
+    use crate::trace::{LexicalPathBasis, LexicalPathHint};
     use std::io::{self, Write};
 
     fn record(
@@ -149,13 +165,14 @@ mod tests {
             syscall: syscall.map(str::to_owned),
             raw_arguments: syscall.map(|_| "AT_FDCWD, \"path\"".to_owned()),
             raw_result: syscall.map(|_| "0".to_owned()),
+            lexical_path_hint: None,
         }
     }
 
     fn document() -> TraceDocument {
         TraceDocument {
-            schema_version: 1,
-            source_format: "strace_text_v1".to_owned(),
+            schema_version: 2,
+            source_format: "strace_text".to_owned(),
             input_bytes: 120,
             parse_status: ParseCompleteness::Partial,
             records: vec![
@@ -191,13 +208,18 @@ mod tests {
 
     #[test]
     fn prints_metadata_every_record_in_order_and_all_diagnostics() {
+        let mut document = document();
+        document.records[0].lexical_path_hint = Some(LexicalPathHint {
+            path: "/home/demo/file.txt".to_owned(),
+            basis: LexicalPathBasis::AtFdcwdAnnotation,
+        });
         let mut bytes = Vec::new();
-        write_trace_text(&document(), &mut bytes).unwrap();
+        write_trace_text(&document, &mut bytes).unwrap();
         assert!(bytes.is_ascii());
         let output = String::from_utf8(bytes).unwrap();
 
-        assert!(output.contains("Schema version: 1"));
-        assert!(output.contains("Source format: \"strace_text_v1\""));
+        assert!(output.contains("Schema version: 2"));
+        assert!(output.contains("Source format: \"strace_text\""));
         assert!(output.contains("Input bytes: 120"));
         assert!(output.contains("Parse status: partial"));
         assert!(output.contains("Records: 5"));
@@ -214,6 +236,8 @@ mod tests {
         assert!(output.contains("Syscall: \"openat\""));
         assert!(output.contains("Arguments: \"AT_FDCWD, \\\"path\\\"\""));
         assert!(output.contains("Result: \"0\""));
+        assert!(output.contains("Lexical path hint: \"/home/demo/file.txt\""));
+        assert!(output.contains("Path hint basis: at_fdcwd_annotation"));
         assert!(output.contains("Evidence: line=5 byte=80 length=19"));
         assert!(output.contains("Raw line: \"not a parsed record\""));
         assert!(output.contains("Diagnostics: 1"));

@@ -5,6 +5,7 @@ use sideeffect::model::{
     TraceDocument, TraceRecord, TraceRecordKind,
 };
 use sideeffect::trace::strace::parse_trace_bytes;
+use sideeffect::trace::{LexicalPathBasis, LexicalPathHint};
 
 const BASELINE: &[u8] = include_bytes!("fixtures/diff/baseline.synthetic.trace");
 const UPDATED: &[u8] = include_bytes!("fixtures/diff/updated.synthetic.trace");
@@ -103,6 +104,23 @@ fn timestamp_and_pid_prefix_changes_do_not_create_deltas() {
     assert_eq!(right.records[0].process_id, Some(9999));
     assert_ne!(left.records[0].timestamp, right.records[0].timestamp);
     assert_ne!(left.records[0].raw_line, right.records[0].raw_line);
+}
+
+#[test]
+fn diff_matching_ignores_derived_lexical_hints_and_keeps_raw_arguments_authoritative() {
+    let input = b"10 1700000000.000001 openat(AT_FDCWD</work>, \"file.txt\", O_RDONLY) = 3\n";
+    let left = parse(input);
+    let mut right = parse(input);
+    right.records[0].lexical_path_hint = Some(LexicalPathHint {
+        path: "/different/derived/value".to_owned(),
+        basis: LexicalPathBasis::AbsoluteArgument,
+    });
+
+    assert_eq!(
+        left.records[0].raw_arguments,
+        right.records[0].raw_arguments
+    );
+    assert!(compare_traces(&left, &right).unwrap().changes.is_empty());
 }
 
 #[test]
@@ -321,6 +339,7 @@ fn control_document(count: usize) -> TraceDocument {
             syscall: None,
             raw_arguments: None,
             raw_result: None,
+            lexical_path_hint: None,
         })
         .collect();
     TraceDocument {

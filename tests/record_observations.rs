@@ -64,15 +64,17 @@ fn require_tool(name: &str, version_args: &[&str]) {
 fn run_record(trace_path: &Path, file_path: &Path, connect_loopback: bool) -> Output {
     const SCRIPT: &str = r#"
 import socket
+import os
 import sys
 
 path = sys.argv[1]
+os.chdir(sys.argv[2])
 with open(path, "wb") as output:
     output.write(b"SideEffect loopback integration test")
 with open(path, "rb") as source:
     source.read()
 
-if sys.argv[2] == "connect":
+if sys.argv[3] == "connect":
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind(("127.0.0.1", 0))
     server.listen(1)
@@ -88,7 +90,8 @@ if sys.argv[2] == "connect":
         .args(["record", "--trace"])
         .arg(trace_path)
         .args(["--", "python3", "-c", SCRIPT])
-        .arg(file_path)
+        .arg(file_path.file_name().expect("test filename"))
+        .arg(file_path.parent().expect("test directory"))
         .arg(if connect_loopback {
             "connect"
         } else {
@@ -222,15 +225,35 @@ fn real_strace_capture_inspect_and_diff_observe_file_and_loopback_events() {
 
     let baseline = inspect_trace(&baseline_path);
     let candidate = inspect_trace(&candidate_path);
-    assert_successful_syscall(
+    let baseline_file_open = assert_successful_syscall(
         &baseline,
         "openat",
-        baseline_file.to_str().expect("UTF-8 test path"),
+        baseline_file
+            .file_name()
+            .unwrap()
+            .to_str()
+            .expect("UTF-8 test filename"),
     );
-    assert_successful_syscall(
+    assert_eq!(
+        baseline_file_open["lexical_path_hint"]["path"],
+        baseline_file.to_str().unwrap()
+    );
+    assert_eq!(
+        baseline_file_open["lexical_path_hint"]["basis"],
+        "at_fdcwd_annotation"
+    );
+    let candidate_file_open = assert_successful_syscall(
         &candidate,
         "openat",
-        candidate_file.to_str().expect("UTF-8 test path"),
+        candidate_file
+            .file_name()
+            .unwrap()
+            .to_str()
+            .expect("UTF-8 test filename"),
+    );
+    assert_eq!(
+        candidate_file_open["lexical_path_hint"]["path"],
+        candidate_file.to_str().unwrap()
     );
     let loopback_connect = assert_successful_syscall(&baseline, "connect", "127.0.0.1");
     assert_eq!(loopback_connect["raw_result"], "0");
@@ -258,6 +281,8 @@ fn real_strace_capture_inspect_and_diff_observe_file_and_loopback_events() {
     assert_success(&output, "diff real captures");
     let diff: Value = serde_json::from_slice(&output.stdout).expect("parse diff JSON");
     let changes = diff["changes"].as_array().expect("diff changes array");
+    let baseline_file_name = baseline_file.file_name().unwrap().to_str().unwrap();
+    let candidate_file_name = candidate_file.file_name().unwrap().to_str().unwrap();
     assert!(
         changes.iter().any(|change| {
             change["kind"] == "removed"
@@ -265,7 +290,7 @@ fn real_strace_capture_inspect_and_diff_observe_file_and_loopback_events() {
                 && change["syscall"] == "openat"
                 && change["raw_arguments"]
                     .as_str()
-                    .is_some_and(|args| args.contains(baseline_file.to_str().unwrap()))
+                    .is_some_and(|args| args.contains(baseline_file_name))
                 && change["before_result"]
                     .as_str()
                     .is_some_and(|result| !result.starts_with("-1"))
@@ -280,7 +305,7 @@ fn real_strace_capture_inspect_and_diff_observe_file_and_loopback_events() {
                 && change["syscall"] == "openat"
                 && change["raw_arguments"]
                     .as_str()
-                    .is_some_and(|args| args.contains(candidate_file.to_str().unwrap()))
+                    .is_some_and(|args| args.contains(candidate_file_name))
                 && change["before_result"].is_null()
                 && change["after_result"]
                     .as_str()

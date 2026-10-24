@@ -73,6 +73,20 @@ fn parses_tcp_peer_arrow_inside_strace_fd_annotation() {
 }
 
 #[test]
+fn legacy_openat_text_without_yy_annotations_remains_inspectable_in_schema_v2() {
+    let input = b"123 1700000000.123456 openat(AT_FDCWD, \"relative/file.txt\", O_RDONLY) = 3\n";
+
+    let document = parse_trace_bytes(input, ParseLimits::default()).unwrap();
+    assert_eq!(document.schema_version, 2);
+    assert_eq!(document.parse_status, ParseCompleteness::Complete);
+    assert_eq!(
+        document.records[0].raw_arguments.as_deref(),
+        Some("AT_FDCWD, \"relative/file.txt\", O_RDONLY")
+    );
+    assert!(document.records[0].lexical_path_hint.is_none());
+}
+
+#[test]
 fn tcp_peer_arrow_does_not_accept_a_missing_outer_annotation_close() {
     let input = b"123 1700000000.123456 getsockname(3<TCP:[127.0.0.1:41000->127.0.0.1:42000], {sa_family=AF_INET}, [16]) = 0\n";
 
