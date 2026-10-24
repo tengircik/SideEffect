@@ -39,7 +39,8 @@ The first bounded recorder slice is implemented as `sideeffect record --trace OU
 ## Milestone 2 — Parse and model evidence
 
 - The initial `inspect` parser is implemented for the documented bounded text subset. Continue validating it against real supported `strace` captures and add explicit format/version support before release.
-- Phase 1 of the versioned run record is implemented as the opt-in `record --bundle` writer. Its `sideeffect.run` v1 manifest references the exact raw trace by fixed bundle filename, byte length, and SHA-256; it does not reconstruct events or prove authenticity/completeness. Bundle input validation, trace import, comparison directly from bundles, and migration remain open.
+- Phase 1 of the versioned run record is implemented as the opt-in `record --bundle` writer. Its `sideeffect.run` v1 manifest references the exact raw trace by fixed bundle filename, byte length, and SHA-256; it does not reconstruct events or prove authenticity/completeness. Bundle migration remains open.
+- Direct comparison of two validated Linux v1 bundles is implemented as `diff --bundles LEFT_DIR RIGHT_DIR`; it reuses the strict bundle reader, then applies the existing parser and diff contract. Bundle migration and imported SideEffect JSON remain out of scope.
 - Represent process, file, and connection-related observations without overstating success or identity.
 - Track parse errors, unsupported records, and detectable incomplete/truncated input.
 

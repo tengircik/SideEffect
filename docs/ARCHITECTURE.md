@@ -38,6 +38,8 @@ The current paths are `inspect <trace-file>` → bounded regular-file read → s
 
 ## Current parser contract
 
+Linux `sideeffect diff --bundles LEFT_DIR RIGHT_DIR` reads both operands through the same strict v1 bundle validator used by `inspect --bundle`, then parses and compares the contained trace bytes. JSON and text output preserve raw-trace diff semantics and omit local bundle paths; HTML is also available through the existing bounded offline report writer. The manifest's status fields do not establish capture completeness or command success, and the diff engine still rejects partial parses before emitting output.
+
 The parser accepts a bounded subset of line-oriented `strace` output. Record uses `-f -ttt -yy -s 256 -e trace=%process,%file,%network --kill-on-exit -o <generated FIFO>`; `inspect` does not verify how an input was produced. For current `strace` option and output behavior, see the [`strace(1)` manual](https://man7.org/linux/man-pages/man1/strace.1.html). A smoke test used an extracted strace 6.19 package in WSL without installing it system-wide: `/usr/bin/true` and `/usr/bin/false` produced bounded traces which parsed completely. This does not validate broad syscall or file/network-event coverage.
 
 The parser recognizes PID and timestamp prefixes, syscall calls, common control records, and unfinished/resumed calls. It retains the original raw line and byte offset/length, plus raw syscall argument/result text. Unknown, malformed, or unpaired continuation lines remain in the JSON with diagnostics; invalid UTF-8 and hard budget violations return an error and no document. `parse_status` reports whether the parser classified and reconciled the supplied text; it never asserts capture completeness.

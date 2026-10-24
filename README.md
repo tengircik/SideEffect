@@ -22,7 +22,7 @@ Exit status `0` means every input record was classified and continuation records
 
 For `openat` and `openat2`, records may also include a `lexical_path_hint` when the path argument is unambiguously printable and either absolute or paired with an absolute `-yy` directory annotation. It preserves `.` and `..` segments and is not a canonical or filesystem-resolved path; symlinks, descriptor reuse, resolution flags, and trace truncation can make it differ from the path the kernel ultimately used. Raw arguments remain the evidence source.
 
-`inspect` and `diff` consume raw `strace` text; `inspect --bundle DIR` reads only a validated `sideeffect.run` v1 recording bundle. Earlier schema-v1 and schema-v2 trace and diff JSON exports remain standalone; the current CLI does not import or migrate them. Bundle inspection requires exactly `run.json` and `trace.strace`, owned by the current user with the recorded private modes; symlinks, extra entries, unsupported/unknown manifest fields, size violations, and trace length or hash mismatches are rejected before parsing. A SHA-256 fingerprint is identity metadata, not a signature, authenticity proof, redaction, or completeness signal. Because traces may be sensitive, fingerprints are sensitive metadata too; low-entropy traces may be guessed, and exact trace bytes never leave the local machine through these commands.
+`inspect` and ordinary `diff` consume raw `strace` text; `inspect --bundle DIR` reads only a validated `sideeffect.run` v1 recording bundle. `diff --bundles LEFT_DIR RIGHT_DIR` validates both bundles and compares their contained traces with the same JSON, text, or Linux HTML output as raw trace comparison. Bundle validation checks the fixed `run.json` and `trace.strace` entries, ownership and private modes, symlink and size rules, supported manifest fields, and exact trace length and SHA-256 before parsing; manifest status fields do not establish capture completeness or command success. Earlier schema-v1 and schema-v2 trace and diff JSON exports remain standalone; the current CLI does not import or migrate them. A SHA-256 fingerprint is identity metadata, not a signature, authenticity proof, redaction, or completeness signal. Because traces may be sensitive, fingerprints are sensitive metadata too; low-entropy traces may be guessed, and exact trace bytes never leave the local machine through these commands.
 
 ## What the parser accepts
 
@@ -83,6 +83,8 @@ cargo run -- diff --format text tests/fixtures/diff/baseline.synthetic.trace tes
 Text output is ASCII-only: quotes, control characters, terminal escapes, and non-ASCII scalars in trace values are escaped, so imported content cannot inject ANSI terminal control sequences. The output remains sensitive and is not sanitized for sharing.
 
 ## Record one command (Linux only)
+
+To compare two existing validated run bundles directly, use `sideeffect diff --bundles BASELINE_DIR CANDIDATE_DIR`. Add `--format text` for terminal-safe text or, on Linux, `--format html --output REPORT.html` for the bounded offline report. Bundle paths are not included in comparison output. The strict reader verifies each manifest and trace before parsing; manifest status fields do not prove successful execution or complete capture, and partial traces are rejected before diff output.
 
 ```sh
 sideeffect record --trace ./run.trace -- /usr/bin/printf 'hello\n'

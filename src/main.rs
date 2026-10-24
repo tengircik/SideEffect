@@ -32,7 +32,7 @@ use sideeffect::record::AnchoredOutput;
 use sideeffect::record::{record_bundle, record_trace};
 use sideeffect::trace::strace::parse_trace_bytes;
 
-const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect inspect [--format json|text] --bundle <run-bundle-directory>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. Record runs a command under external strace and writes either a bounded raw trace or an opt-in privacy-minimized run bundle; it is observation, not isolation or a safety check.";
+const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect inspect [--format json|text] --bundle <run-bundle-directory>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff --bundles [--format json|text] <baseline-bundle> <candidate-bundle>\n       sideeffect diff --bundles --format html --output <report.html> <baseline-bundle> <candidate-bundle>\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. Record runs a command under external strace and writes either a bounded raw trace or an opt-in privacy-minimized run bundle; it is observation, not isolation or a safety check.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -70,6 +70,11 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             evidence(path, digest, line, byte_offset, byte_length)
         }
         [command, left, right] if command == "diff" => diff(left, right),
+        [command, bundles_flag, left, right]
+            if command == "diff" && bundles_flag == "--bundles" =>
+        {
+            diff_bundles(left, right)
+        }
         [command, left, right] if command == "diff-summary" => diff_summary_json(left, right),
         [command, format_flag, format, left, right]
             if command == "diff-summary" && format_flag == "--format" && format == "json" =>
@@ -94,6 +99,11 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         [command, flag, format, left, right] if command == "diff" && flag == "--format" => {
             diff_with_format(format, left, right)
         }
+        [command, bundles_flag, flag, format, left, right]
+            if command == "diff" && bundles_flag == "--bundles" && flag == "--format" =>
+        {
+            diff_bundles_with_format(format, left, right)
+        }
         [
             command,
             format_flag,
@@ -108,6 +118,23 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             && output_flag == "--output" =>
         {
             diff_html(output, left, right)
+        }
+        [
+            command,
+            bundles_flag,
+            format_flag,
+            format,
+            output_flag,
+            output,
+            left,
+            right,
+        ] if command == "diff"
+            && bundles_flag == "--bundles"
+            && format_flag == "--format"
+            && format == "html"
+            && output_flag == "--output" =>
+        {
+            diff_bundles_html(output, left, right)
         }
         [
             command,
@@ -507,6 +534,86 @@ fn diff_with_format(
         _ => return Err("diff format must be either 'json' or 'text'".to_owned()),
     };
     diff_with_output_format(left_path, right_path, output_format)
+}
+
+fn diff_bundles(left_path: &OsString, right_path: &OsString) -> Result<ExitCode, String> {
+    diff_bundles_with_output_format(left_path, right_path, DiffOutputFormat::Json)
+}
+
+fn diff_bundles_with_format(
+    format: &OsString,
+    left_path: &OsString,
+    right_path: &OsString,
+) -> Result<ExitCode, String> {
+    let output_format = match format.to_str() {
+        Some("json") => DiffOutputFormat::Json,
+        Some("text") => DiffOutputFormat::Text,
+        _ => return Err("diff format must be either 'json' or 'text'".to_owned()),
+    };
+    diff_bundles_with_output_format(left_path, right_path, output_format)
+}
+
+fn diff_bundles_with_output_format(
+    left_path: &OsString,
+    right_path: &OsString,
+    output_format: DiffOutputFormat,
+) -> Result<ExitCode, String> {
+    let (left, right) = read_and_parse_bundles(left_path, right_path)?;
+    let result = compare_traces(&left, &right)
+        .map_err(|error| format!("could not compare traces: {error}"))?;
+    match output_format {
+        DiffOutputFormat::Json => write_json(&result, "JSON comparison document")?,
+        DiffOutputFormat::Text => write_text(&result)?,
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn read_and_parse_bundles(
+    left_path: &OsString,
+    right_path: &OsString,
+) -> Result<
+    (
+        sideeffect::model::TraceDocument,
+        sideeffect::model::TraceDocument,
+    ),
+    String,
+> {
+    let left_bytes = read_run_bundle(Path::new(left_path))?;
+    let right_bytes = read_run_bundle(Path::new(right_path))?;
+    let left = parse_trace_bytes(&left_bytes, ParseLimits::default())
+        .map_err(|error| format!("trace inspection failed: {error}"))?;
+    let right = parse_trace_bytes(&right_bytes, ParseLimits::default())
+        .map_err(|error| format!("trace inspection failed: {error}"))?;
+    Ok((left, right))
+}
+
+fn diff_bundles_html(
+    output_path: &OsString,
+    left_path: &OsString,
+    right_path: &OsString,
+) -> Result<ExitCode, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut output = AnchoredOutput::prepare(Path::new(output_path))
+            .map_err(|error| format!("could not prepare safe HTML report output: {error}"))?;
+        let (left, right) = read_and_parse_bundles(left_path, right_path)?;
+        let diff = compare_traces(&left, &right)
+            .map_err(|error| format!("could not compare traces: {error}"))?;
+        let report_path = publish_html_report(&mut output, &diff, MAX_REPORT_BYTES)?;
+        eprintln!(
+            "Offline HTML report written to {}. It may contain sensitive paths, arguments, or endpoint data; review before sharing.",
+            terminal_safe_path(&report_path)
+        );
+        Ok(ExitCode::SUCCESS)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (output_path, left_path, right_path);
+        Err(
+            "bundle comparison and HTML report export are currently supported on Linux only"
+                .to_owned(),
+        )
+    }
 }
 
 fn diff_html(
