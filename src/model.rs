@@ -1,6 +1,7 @@
 use serde::Serialize;
 
 pub const TRACE_DOCUMENT_SCHEMA_VERSION: u32 = 1;
+pub const TRACE_DIFF_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -62,4 +63,63 @@ pub struct TraceDocument {
     pub parse_status: ParseCompleteness,
     pub records: Vec<TraceRecord>,
     pub diagnostics: Vec<TraceDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureCompleteness {
+    /// Parsing a trace cannot establish whether the capture observed all activity.
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventCategory {
+    File,
+    Network,
+    Other,
+    Process,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeltaKind {
+    Added,
+    Changed,
+    Removed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MatchingPolicy {
+    /// Parser-level run metadata omitted only from matching; raw records retain it.
+    pub ignored_prefix_fields: Vec<String>,
+    pub multiplicity: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ObservedDelta<'a> {
+    pub kind: DeltaKind,
+    pub category: EventCategory,
+    pub record_kind: TraceRecordKind,
+    pub syscall: &'a str,
+    pub raw_arguments: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_result: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_result: Option<&'a str>,
+    pub before: Vec<EvidenceReference>,
+    pub after: Vec<EvidenceReference>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TraceDiff<'a> {
+    pub schema_version: u32,
+    pub left_source_format: &'a str,
+    pub right_source_format: &'a str,
+    pub capture_completeness: CaptureCompleteness,
+    pub matching_policy: MatchingPolicy,
+    /// Control rows are visible as counts but are outside the initial syscall comparison.
+    pub left_excluded_control_records: u64,
+    pub right_excluded_control_records: u64,
+    pub changes: Vec<ObservedDelta<'a>>,
 }

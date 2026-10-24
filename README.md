@@ -2,7 +2,7 @@
 
 SideEffect is a local-first Rust CLI for inspecting `strace` text and preserving event-level evidence in JSON.
 
-> **Status: early implementation.** The current `inspect` command reads one local trace file and writes a versioned JSON document to stdout. It does not run `strace`, execute a command, compare runs, or generate HTML reports.
+> **Status: early implementation.** `inspect` reads one local trace file and writes a versioned JSON document. `diff` compares two fully parsed traces and writes a versioned JSON comparison. Neither command runs `strace` or executes a command; HTML reports and capture orchestration are not implemented.
 
 ## Try the current command
 
@@ -20,9 +20,19 @@ The parser handles a bounded subset of line-oriented `strace` text, including sy
 
 Input is limited to 32 MiB, each physical record to 64 KiB, and the document to 100,000 records. JSON output is limited to 64 MiB. Oversized or invalid UTF-8 input fails without emitting JSON. Unrecognized, malformed, or unpaired continuation lines remain visible as raw records with diagnostics.
 
+## Compare two traces
+
+```sh
+cargo run -- diff tests/fixtures/diff/baseline.trace tests/fixtures/diff/candidate.trace
+```
+
+`diff` emits schema-v1 observed syscall-row additions, removals, and uniquely paired result changes with source line/byte references. References use the baseline input for `before` and candidate input for `after`, in command argument order. The fixture pair is synthetic and is not a real capture. A comparison requires both inputs to parse completely; parser status still cannot prove capture completeness. The initial matcher treats records as a multiset, ignores only the parsed PID and timestamp prefixes for matching, and keeps exact arguments/results (including path and file-descriptor text). When multiple same-signature result records remain and no pairing is justified, they remain separate additions/removals instead of an invented changed-event pair. Paired unfinished/resumed rows are compared as separate trace rows, not merged into a reconstructed call. Control rows are outside the initial comparison and their counts are reported. The process/file/network labels are syscall-name buckets; they do not claim that an operation succeeded or caused another event.
+
+Each input remains bounded by the parser limits above (64 MiB combined maximum); a diff has at most 200,000 grouped delta rows and uses the 64 MiB JSON output cap. The comparison keeps argument/result strings borrowed from parsed input and emits source references rather than copies of entire raw lines. Review reports before sharing: they may contain sensitive paths, arguments, and endpoint details.
+
 ## Planned product
 
-The broader goal is to capture selected process, file, and network-related events from a command, compare two runs, and produce an evidence-linked offline report. Those capture, comparison, and HTML-report features are not implemented yet. The initial target is Linux x86_64 with an externally installed `strace`; WSL2 may be used if already installed, but native Windows tracing is not in scope.
+The broader goal is to capture selected process, file, and network-related events from a command and produce an evidence-linked offline report. Capture and HTML reporting are not implemented. The initial target is Linux x86_64 with an externally installed `strace`; WSL2 may be used if already installed, but native Windows tracing is not in scope.
 
 ## Limits and privacy
 

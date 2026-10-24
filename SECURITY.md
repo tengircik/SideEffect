@@ -1,10 +1,10 @@
 # Security Policy
 
-**Project status:** early implementation. `sideeffect inspect TRACE` reads one local regular file, parses bounded `strace`-style text, and writes JSON to stdout. It does not start a command, invoke `strace`, compare runs, or render HTML. The safeguards below distinguish current behavior from requirements for those future features.
+**Project status:** early implementation. `sideeffect inspect TRACE` reads one local regular file, parses bounded `strace`-style text, and writes JSON to stdout. `sideeffect diff LEFT RIGHT` parses two local trace files and writes a bounded JSON comparison only when both parses are complete. Neither command starts a command or invokes `strace`; HTML rendering is not implemented. The safeguards below distinguish current behavior from requirements for future features.
 
 ## System, scope, and threat model
 
-The current inspector reads user-selected trace text and emits a JSON document containing raw lines and parsed fields. The future capture CLI may start a user-selected command under `strace`, retain a local evidence bundle, compare two runs, and render JSON and offline HTML. The main assets are the user's machine and files, the input trace and its potentially sensitive data, and (for future capture) the command's execution context and raw trace/output bundles.
+The current inspector reads user-selected trace text and emits a JSON document containing raw lines and parsed fields. The current diff reads two such files and emits event deltas with source offsets; it ignores only parsed PID/timestamp prefixes for matching, keeps arguments/results exact, reports control-row counts, and states capture completeness is unknown. Future capture may start a user-selected command under `strace`, retain a local evidence bundle, and render offline HTML. The main assets are the user's machine and files, input traces and their potentially sensitive data, and (for future capture) the command's execution context and raw trace/output bundles.
 
 The operator is trusted to select a trace file and, in a future capture mode, choose a command and decide whether to run it. The selected file's contents, trace strings, command arguments, future capture output, and report values are untrusted. The current inspector does not execute trace content or launch the traced command. For future capture, the external `strace` binary, the kernel, and selected syscall set form part of the observation boundary. Repository vulnerabilities are reportable when a realistic input or action crosses that boundary and causes impact beyond the documented behavior.
 
@@ -31,16 +31,16 @@ Keep evidence bundles in a directory whose access you control. Do not attach rea
 
 ## Planned implementation safeguards
 
-The following safeguards are partly implemented for `inspect` and remain requirements for future capture, comparison, and rendering:
+The following safeguards are partly implemented for `inspect` and `diff` and remain requirements for future capture and rendering:
 
 - Treat the current input trace, future command arguments/capture output, and report values as untrusted input.
 - Preserve argument boundaries when starting a command; never construct a shell command by interpolating user-supplied text.
-- The current parser enforces 32 MiB input, 64 KiB per physical record, and 100,000 records; JSON serialization is capped at 64 MiB before stdout is written. Keep limits explicit for future capture/comparison/rendering, and reject or clearly flag malformed, oversized, truncated, and unsupported input rather than silently treating it as complete.
+- Each diff input is limited to 32 MiB (64 MiB combined); each parser limits physical records to 64 KiB and total records to 100,000. Diff rows are limited to 200,000, and JSON serialization is capped at 64 MiB before stdout is written. The diff holds parsed inputs and bounded references/keys rather than copying raw lines into every delta. Keep limits explicit for future capture/rendering, and reject or clearly flag malformed, oversized, truncated, and unsupported input rather than silently treating it as complete.
 - Handle output paths conservatively. Avoid following attacker-controlled symlinks or overwriting unrelated files when creating evidence bundles.
 - Render every trace-derived value as inert text in offline HTML. Escape it in the correct output context, do not evaluate it as markup or script, and do not load remote assets or make network requests from a report.
 - Keep raw evidence local and distinguish exact evidence from normalized or derived comparison fields.
 
-These requirements should be covered by implementation tests before the related features ship: process arguments must retain their boundaries without shell parsing; malformed and oversized trace fixtures must hit explicit parser limits; report fixtures containing HTML/script-like strings must display as inert text; report generation must work without network access; and capture must not elevate privileges or write outside its selected evidence location through path or symlink confusion.
+These requirements should be covered by implementation tests before the related features ship: process arguments must retain their boundaries without shell parsing; malformed and oversized trace fixtures must hit explicit parser limits; diff tests must preserve source references and reject partial inputs; report fixtures containing HTML/script-like strings must display as inert text; report generation must work without network access; and capture must not elevate privileges or write outside its selected evidence location through path or symlink confusion.
 
 Trace text is already an untrusted input to `inspect`. Any new import format, such as structured JSON bundles, requires a separate security review before release.
 
@@ -59,7 +59,7 @@ Severity depends on reachability and impact. The fact that the user intentionall
 
 SideEffect is not intended to prevent the chosen command from modifying files or accessing the network, identify malware, establish that a command is safe, capture every system interaction, or prove causation. These are product limitations, not vulnerabilities, provided the implementation does not make contrary claims or violate the invariants above. Sensitive values appearing in a local trace as a result of the selected capture are an acknowledged privacy risk; unexpected external disclosure or unsafe rendering is reportable.
 
-The capture, comparison, and rendering risks have not been validated because those features do not exist yet. The parser-only CLI has bounded input/output tests, but real `strace` compatibility and capture completeness remain unverified. The Linux/`strace` scope, incomplete observation possibilities, local raw-data exposure, absence of automatic redaction, and non-causal nature of event correlation are known product limitations that must remain visible in user-facing documentation.
+The current comparison is a conservative parser-row diff, not a capture-completeness check or logical syscall reconstruction. It has no real-tracer integration evidence. Rendering and capture risks have not been validated because those features do not exist yet. The parser/diff tests use synthetic input; real `strace` compatibility and capture completeness remain unverified. The Linux/`strace` scope, incomplete observation possibilities, local raw-data exposure, absence of automatic redaction, and non-causal nature of event comparison are known product limitations that must remain visible in user-facing documentation.
 
 ## Reporting a vulnerability
 

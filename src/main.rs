@@ -7,11 +7,13 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
+use serde::Serialize;
+use sideeffect::diff::compare_traces;
 use sideeffect::limits::{MAX_JSON_BYTES, MAX_TRACE_BYTES, ParseLimits};
 use sideeffect::model::ParseCompleteness;
 use sideeffect::trace::strace::parse_trace_bytes;
 
-const USAGE: &str = "Usage: sideeffect inspect <strace-trace-file>\n       sideeffect --help\n       sideeffect --version\n\nReads a bounded strace text capture and writes a versioned JSON evidence document to stdout. It does not execute the traced command.";
+const USAGE: &str = "Usage: sideeffect inspect <strace-trace-file>\n       sideeffect diff <baseline-trace> <candidate-trace>\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file and writes JSON evidence to stdout. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout. Neither command executes the represented command.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -34,30 +36,53 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         [command, path] if command == "inspect" => inspect(path),
+        [command, left, right] if command == "diff" => diff(left, right),
         _ => Err(USAGE.to_owned()),
     }
 }
 
 fn inspect(path: &OsString) -> Result<ExitCode, String> {
-    let bytes = read_bounded(path)?;
-    let document = parse_trace_bytes(&bytes, ParseLimits::default())
-        .map_err(|error| format!("trace inspection failed: {error}"))?;
+    let document = read_and_parse(path)?;
     let partial = document.parse_status == ParseCompleteness::Partial;
+    write_json(&document, "JSON evidence document")?;
 
+    if partial {
+        Ok(ExitCode::from(2))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+fn diff(left_path: &OsString, right_path: &OsString) -> Result<ExitCode, String> {
+    let left = read_and_parse(left_path)?;
+    let right = read_and_parse(right_path)?;
+    let result = compare_traces(&left, &right)
+        .map_err(|error| format!("could not compare traces: {error}"))?;
+    write_json(&result, "JSON comparison document")?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn read_and_parse(path: &OsString) -> Result<sideeffect::model::TraceDocument, String> {
+    let bytes = read_bounded(path)?;
+    parse_trace_bytes(&bytes, ParseLimits::default())
+        .map_err(|error| format!("trace inspection failed: {error}"))
+}
+
+fn write_json<T: Serialize>(value: &T, description: &str) -> Result<(), String> {
     let mut json = CappedBuffer::new(MAX_JSON_BYTES);
-    serde_json::to_writer_pretty(&mut json, &document).map_err(|error| {
+    serde_json::to_writer_pretty(&mut json, value).map_err(|error| {
         if json.exceeded {
             format!(
-                "JSON evidence document exceeds the {} byte output limit",
+                "{description} exceeds the {} byte output limit",
                 MAX_JSON_BYTES
             )
         } else {
-            format!("could not serialize JSON evidence document: {error}")
+            format!("could not serialize {description}: {error}")
         }
     })?;
     json.write_all(b"\n").map_err(|_| {
         format!(
-            "JSON evidence document exceeds the {} byte output limit",
+            "{description} exceeds the {} byte output limit",
             MAX_JSON_BYTES
         )
     })?;
@@ -66,13 +91,7 @@ fn inspect(path: &OsString) -> Result<ExitCode, String> {
     stdout
         .write_all(&json.bytes)
         .and_then(|()| stdout.flush())
-        .map_err(|error| format!("could not write JSON to stdout: {error}"))?;
-
-    if partial {
-        Ok(ExitCode::from(2))
-    } else {
-        Ok(ExitCode::SUCCESS)
-    }
+        .map_err(|error| format!("could not write JSON to stdout: {error}"))
 }
 
 fn read_bounded(path: &OsString) -> Result<Vec<u8>, String> {

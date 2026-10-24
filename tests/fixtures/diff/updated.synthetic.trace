@@ -1,0 +1,5 @@
+201 1700000100.000001 execve("/usr/bin/demo", ["demo"], 0x0) = 0
+201 1700000100.000002 openat(AT_FDCWD, "/tmp/config.json", O_RDONLY) = -1 EACCES (Permission denied)
+201 1700000100.000003 execve("/usr/bin/helper", ["helper"], 0x0) = 0
+201 1700000100.000004 connect(4, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("203.0.113.8")}, 16) = -1 ECONNREFUSED (Connection refused)
+201 1700000100.000005 +++ exited with 0 +++

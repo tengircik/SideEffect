@@ -1,6 +1,6 @@
 # SideEffect Architecture Plan
 
-**Status:** early implementation. The current source implements a read-only `inspect` CLI path and bounded line-oriented parser that emits a schema-v1 JSON document. Capture orchestration, comparison, run bundles, and HTML rendering below are planned, not implemented.
+**Status:** early implementation. The source implements read-only `inspect` and conservative `diff` CLI paths over bounded line-oriented trace parsing. Capture orchestration, run bundles, and HTML rendering below remain planned, not implemented.
 
 The security requirements for future implementation are summarized in [SECURITY.md](../SECURITY.md); the input-budget and safe-output behavior below are release requirements, not implemented protections.
 
@@ -34,7 +34,7 @@ Versioned run record ───────► raw event references + capture met
                                versioned JSON          offline HTML
 ```
 
-The current parser-only path is `inspect <trace-file>` → bounded regular-file read → strict UTF-8 and line parsing → versioned JSON to stdout. It does not start `strace` or execute the command represented by the trace.
+The current paths are `inspect <trace-file>` → bounded regular-file read → strict UTF-8 and line parsing → versioned JSON, and `diff <left-trace> <right-trace>` → parse both inputs → conservative multiset comparison → versioned JSON. They do not start `strace` or execute the command represented by the trace.
 
 ## Current parser contract
 
@@ -68,7 +68,7 @@ Raw trace text is retained as the evidence source. The parser converts supported
 
 The parser must tolerate concurrent processes and unfinished/resumed syscall records according to supported `strace` output formats. Unsupported record forms are surfaced as unsupported or unparsed evidence rather than guessed into structured events.
 
-The current parser enforces 32 MiB total input, 64 KiB per physical record excluding LF, and 100,000 physical records. JSON serialization has an independent 64 MiB output cap and completes in a bounded buffer before stdout is written. Parser fields duplicate bounded portions of raw records; record-size, input-size, record-count, and output-size caps constrain those copies. These initial limits need validation with real traces before release. Future capture, comparison, and HTML rendering must define additional budgets for event collections, comparison growth, and rendered output before implementation. Oversized input fails explicitly; malformed or unsupported lines remain raw evidence with diagnostics rather than implying they were understood.
+Each parser input is limited to 32 MiB, 64 KiB per physical record excluding LF, and 100,000 physical records. A diff therefore reads at most 64 MiB combined; output is bounded to at most 200,000 grouped rows and JSON serialization has an independent 64 MiB cap before stdout is written. The comparison borrows argument/result strings from parsed inputs and retains source offsets rather than copying full raw lines into deltas. The current diff compares parsed syscall rows as a multiset, ignores only parser-level PID/timestamp prefixes, and keeps syscall names, arguments, and results exact. It refuses partial parses, reports excluded control-row counts, and treats unfinished/resumed rows separately. Its category labels are syscall-name buckets. Capture completeness remains unknown. Future capture and HTML rendering still need their own budgets. Oversized input fails explicitly; malformed or unsupported lines remain raw evidence with diagnostics rather than implying they were understood.
 
 ### Versioned run record
 
@@ -93,9 +93,9 @@ Every derived field and rendered finding should link to the source event(s). Thi
 
 ### Comparison engine
 
-The comparison engine operates on a documented canonical comparison key while the run record retains exact values. It classifies matched, added, removed, and changed events/groups, and preserves references to the events on both sides.
+The initial comparison engine keys observed rows by record kind, category, syscall, and exact raw arguments, then compares raw result values with multiset semantics. It classifies added, removed, and uniquely paired changed rows and preserves source references on both sides. It emits a changed row only if exactly one unmatched same-signature row remains on each side after exact matches; ambiguous residual multiplicities stay as additions/removals. `before` references the first CLI input and `after` the second. Parsed PID and timestamp prefixes are ignored only for matching and remain in the original input records. The comparison output does not claim to merge continuation rows into logical calls or prove that a capture observed every event.
 
-Only stable identifiers are eligible for normalization, such as run-local PID renaming and trace timestamps when used solely for run alignment. File descriptor numbers are run-local and should be mapped through observed descriptor lifecycle where feasible; otherwise comparisons must show ambiguity rather than equating descriptors by number. Path normalization must be narrow and explicit. There is no blanket rule that removes temporary directories or treats all paths with similar suffixes as equivalent.
+The initial rule omits only the parser's top-level PID and timestamp prefixes; values inside syscall arguments or results are not normalized. This can produce differences from run-local identifiers embedded in arguments/results. Future normalization requires explicit evidence and tests. File descriptor numbers and paths are currently compared exactly; there is no blanket rule that removes temporary directories or equates paths by suffix.
 
 Concurrency can change event order even when behavior is similar. The diff should avoid presenting raw sequence order as semantic equivalence. A matching algorithm may group equivalent events, but must surface ambiguous matches and retain original ordering/timestamps in evidence. Unstable matching or normalization must be visible in the output.
 

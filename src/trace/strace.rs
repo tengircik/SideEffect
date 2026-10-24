@@ -276,12 +276,14 @@ fn parse_line(
             line_number,
             byte_offset,
             byte_length,
-            TraceRecordKind::ResumedSyscall,
-            process_id,
-            timestamp,
-            Some(name.to_owned()),
-            Some(raw_arguments.to_owned()),
-            Some(raw_result.to_owned()),
+            ParsedFields {
+                kind: TraceRecordKind::ResumedSyscall,
+                process_id,
+                timestamp,
+                syscall: Some(name.to_owned()),
+                raw_arguments: Some(raw_arguments.to_owned()),
+                raw_result: Some(raw_result.to_owned()),
+            },
         ));
     }
 
@@ -292,12 +294,14 @@ fn parse_line(
             line_number,
             byte_offset,
             byte_length,
-            TraceRecordKind::UnfinishedSyscall,
-            process_id,
-            timestamp,
-            Some(name.to_owned()),
-            Some(prefix[open_paren + 1..].to_owned()),
-            None,
+            ParsedFields {
+                kind: TraceRecordKind::UnfinishedSyscall,
+                process_id,
+                timestamp,
+                syscall: Some(name.to_owned()),
+                raw_arguments: Some(prefix[open_paren + 1..].to_owned()),
+                raw_result: None,
+            },
         ));
     }
 
@@ -320,12 +324,14 @@ fn parse_line(
         line_number,
         byte_offset,
         byte_length,
-        TraceRecordKind::Syscall,
-        process_id,
-        timestamp,
-        Some(name.to_owned()),
-        Some(raw_arguments.to_owned()),
-        Some(raw_result.to_owned()),
+        ParsedFields {
+            kind: TraceRecordKind::Syscall,
+            process_id,
+            timestamp,
+            syscall: Some(name.to_owned()),
+            raw_arguments: Some(raw_arguments.to_owned()),
+            raw_result: Some(raw_result.to_owned()),
+        },
     ))
 }
 
@@ -554,31 +560,35 @@ fn scan_angle_annotation(bytes: &[u8], open: usize) -> (Option<usize>, usize) {
     (None, bytes.len().saturating_sub(content_start))
 }
 
-fn record(
-    raw_line: &str,
-    line_number: u64,
-    byte_offset: u64,
-    byte_length: u64,
+struct ParsedFields {
     kind: TraceRecordKind,
     process_id: Option<u32>,
     timestamp: Option<String>,
     syscall: Option<String>,
     raw_arguments: Option<String>,
     raw_result: Option<String>,
+}
+
+fn record(
+    raw_line: &str,
+    line_number: u64,
+    byte_offset: u64,
+    byte_length: u64,
+    fields: ParsedFields,
 ) -> TraceRecord {
     TraceRecord {
-        kind,
+        kind: fields.kind,
         evidence: EvidenceReference {
             line_number,
             byte_offset,
             byte_length,
         },
         raw_line: raw_line.to_owned(),
-        process_id,
-        timestamp,
-        syscall,
-        raw_arguments,
-        raw_result,
+        process_id: fields.process_id,
+        timestamp: fields.timestamp,
+        syscall: fields.syscall,
+        raw_arguments: fields.raw_arguments,
+        raw_result: fields.raw_result,
     }
 }
 
@@ -595,12 +605,14 @@ fn control_record(
         line_number,
         byte_offset,
         byte_length,
-        TraceRecordKind::Control,
-        process_id,
-        timestamp,
-        None,
-        None,
-        None,
+        ParsedFields {
+            kind: TraceRecordKind::Control,
+            process_id,
+            timestamp,
+            syscall: None,
+            raw_arguments: None,
+            raw_result: None,
+        },
     )
 }
 
@@ -615,12 +627,14 @@ fn unparsed_record(
         line_number,
         byte_offset,
         byte_length,
-        TraceRecordKind::Unparsed,
-        None,
-        None,
-        None,
-        None,
-        None,
+        ParsedFields {
+            kind: TraceRecordKind::Unparsed,
+            process_id: None,
+            timestamp: None,
+            syscall: None,
+            raw_arguments: None,
+            raw_result: None,
+        },
     )
 }
 

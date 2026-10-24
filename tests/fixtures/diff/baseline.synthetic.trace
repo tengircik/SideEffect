@@ -1,0 +1,4 @@
+101 1700000000.000001 execve("/usr/bin/demo", ["demo"], 0x0) = 0
+101 1700000000.000002 openat(AT_FDCWD, "/tmp/config.json", O_RDONLY) = 3
+101 1700000000.000003 connect(4, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("203.0.113.7")}, 16) = 0
+101 1700000000.000004 +++ exited with 0 +++

@@ -1,19 +1,19 @@
 # SideEffect Delivery Plan
 
-**Status:** implementation is underway; this is not a schedule or release claim. A bounded parser-only `inspect` command and synthetic parser fixtures now exist. The capture runner, comparison engine, and HTML renderer remain future work.
+**Status:** implementation is underway; this is not a schedule or release claim. Bounded `inspect` and conservative `diff` commands with synthetic fixtures exist. Capture orchestration and HTML rendering remain future work.
 
 ## Current implementation slice
 
-`sideeffect inspect TRACE` reads a regular local file, accepts a bounded subset of `strace` text, preserves raw lines and source byte offsets in a schema-v1 JSON document, and writes that document to stdout. It does not execute the represented command, invoke `strace`, compare runs, or write report files. The synthetic fixture is not a real capture. Compatibility with a real tracer output has not been integration-tested.
+`sideeffect inspect TRACE` reads a regular local file, accepts a bounded subset of `strace` text, preserves raw lines and source byte offsets in a schema-v1 JSON document, and writes that document to stdout. `sideeffect diff LEFT RIGHT` compares completely parsed documents' syscall rows and writes schema-v1 JSON observed deltas with source offsets. Neither command executes the represented command, invokes `strace`, or writes report files. The parser and diff fixtures are synthetic, not real captures. Compatibility with real tracer output has not been integration-tested.
 
-Current hard limits are 32 MiB per input file, 64 KiB per physical record excluding LF, 100,000 records, and 64 MiB for JSON output. These initial values need review against real captures. `parse_status` describes syntax/continuation parsing only and cannot establish capture completeness.
+Current hard limits are 32 MiB per input file (64 MiB combined for a diff), 64 KiB per physical record excluding LF, 100,000 records per input, 200,000 diff rows, and 64 MiB for JSON output. These initial values need review against real captures. `parse_status` describes syntax/continuation parsing only and cannot establish capture completeness. The diff fails closed on partial parses, ignores only parser-level PID/timestamp prefixes when matching, compares exact arguments/results, treats rows as a multiset, and reports excluded control-row counts. It emits a changed row only when exactly one unmatched same-signature record remains on each side; ambiguous result multiplicities remain additions/removals. Before/after references point to the first/second CLI input respectively. Unfinished and resumed rows remain separate observations.
 
 ## Milestone 0 — Repository and dependency decision
 
 - Review repository guidance and existing project state before implementation.
 - Confirm available Rust toolchain and Linux x86_64 development/test environment; do not install a toolchain without explicit authorization.
 - Define the supported `strace` range, exact initial syscall set, command/exit-status contract, capture storage layout, and JSON schema policy. The parser's current v1 JSON document is not the planned run-bundle schema.
-- Record explicit resource budgets before parser/report implementation. `inspect` currently uses 32 MiB input, 64 KiB physical records, 100,000 records, and 64 MiB JSON output; validate these values against real captures before release. Define additional budgets for capture bundles and comparison before those features are implemented.
+- Record explicit resource budgets before parser/report implementation. `inspect` currently uses 32 MiB input, 64 KiB physical records, 100,000 records, and 64 MiB JSON output; validate these values against real captures before release. The initial diff is bounded to 200,000 rows and the same JSON output cap; define further budgets for capture bundles and future report features.
 - Decide the Linux filesystem operations needed to create evidence bundles and atomically publish reports without following attacker-controlled symlinks or replacing existing user files. See [SECURITY.md](../SECURITY.md).
 - Resolve licensing and packaging implications of depending on an external `strace` executable before distribution.
 
@@ -43,12 +43,12 @@ The parser and renderer must enforce the explicit budgets recorded in Milestone 
 
 ## Milestone 3 — Compare two runs
 
-- Define and document canonical event keys separately from exact captured values.
-- Implement added/removed/changed event grouping with links to both runs' source evidence.
-- Add only justified normalization for run-local identities and timing; keep descriptor/path uncertainty visible.
-- Preserve and explain ambiguous matches instead of hiding them.
+- The first `diff` slice is implemented for completely parsed trace documents. It groups raw syscall rows as a multiset, ignores only parsed PID/timestamp prefixes for matching, compares exact syscall names, arguments, and results, and links deltas to source offsets.
+- Control rows are excluded from the initial event comparison, with per-input counts in the JSON output. Unfinished and resumed rows are retained and compared as separate observations rather than reconstructed into logical calls.
+- Process/file/network labels are transparent syscall-name buckets, not claims about completed effects. The report says capture completeness is unknown; parser completeness does not establish absence of events.
+- Extend matching only with independently justified rules for run-local identities. Keep descriptor/path uncertainty visible and preserve original values in source evidence. Never apply blanket path or file-descriptor normalization.
 
-**Exit criteria:** fixtures show that timestamp/PID-only changes do not create spurious differences when a justified mapping exists; meaningful process/file/network changes are reported; unstable event ordering and ambiguous matches are represented; normalization never destroys raw values.
+**Exit criteria:** fixture pairs cover timestamp/PID-prefix changes, added/removed/changed observations, duplicate multiplicity, and unstable event ordering; incomplete input is rejected; every emitted delta links to source evidence; any future normalization is explicit and never destroys raw values. The current exact-argument matcher can still report changes caused by run-local values inside arguments or results; resolve those only through separately reviewed rules.
 
 ## Milestone 4 — Export JSON and offline HTML
 
