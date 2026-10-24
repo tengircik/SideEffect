@@ -61,10 +61,16 @@ fn require_tool(name: &str, version_args: &[&str]) {
     );
 }
 
-fn run_record(trace_path: &Path, file_path: &Path, connect_loopback: bool) -> Output {
+fn run_record(
+    trace_path: &Path,
+    file_path: &Path,
+    connect_loopback: bool,
+    spawn_child: bool,
+) -> Output {
     const SCRIPT: &str = r#"
 import socket
 import os
+import subprocess
 import sys
 
 path = sys.argv[1]
@@ -84,6 +90,12 @@ if sys.argv[3] == "connect":
     accepted.close()
     client.close()
     server.close()
+
+if sys.argv[4] == "spawn-child":
+    subprocess.run(
+        [sys.executable, "-c", "pass", "sideeffect-child-process-marker"],
+        check=True,
+    )
 "#;
 
     Command::new(env!("CARGO_BIN_EXE_sideeffect"))
@@ -97,8 +109,33 @@ if sys.argv[3] == "connect":
         } else {
             "file-only"
         })
+        .arg(if spawn_child {
+            "spawn-child"
+        } else {
+            "no-child"
+        })
+        .arg("sideeffect-parent-process-marker")
         .output()
         .expect("launch SideEffect record command")
+}
+
+fn assert_record_output_does_not_leak_capture(output: &Output) {
+    assert!(
+        output.stdout.is_empty(),
+        "record target unexpectedly wrote stdout"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for sentinel in [
+        "SideEffect loopback integration test",
+        "sideeffect-parent-process-marker",
+        "sideeffect-child-process-marker",
+        "\"records\"",
+        "\"schema_version\"",
+    ] {
+        assert!(!stdout.contains(sentinel), "stdout leaked {sentinel}");
+        assert!(!stderr.contains(sentinel), "stderr leaked {sentinel}");
+    }
 }
 
 fn assert_success(output: &Output, operation: &str) {
@@ -169,7 +206,7 @@ fn assert_successful_syscall<'a>(
         })
         .unwrap_or_else(|| {
             panic!(
-                "inspect output lacks successful {syscall_name} evidence matching the expected argument"
+                "inspect output lacks successful {syscall_name} evidence matching argument marker {argument_fragment}"
             )
         });
     assert!(
@@ -192,6 +229,7 @@ fn real_strace_capture_inspect_and_diff_observe_file_and_loopback_events() {
     require_tool("python3", &["--version"]);
 
     let directory = PrivateTempDirectory::new();
+    let temporary_root = directory.path().to_path_buf();
     let baseline_path = directory.path().join("baseline.trace");
     let candidate_path = directory.path().join("candidate.trace");
     let baseline_file = directory.path().join(format!(
@@ -205,11 +243,22 @@ fn real_strace_capture_inspect_and_diff_observe_file_and_loopback_events() {
         NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
     ));
 
-    for (trace, file, connect_loopback) in [
-        (baseline_path.as_path(), baseline_file.as_path(), true),
-        (candidate_path.as_path(), candidate_file.as_path(), false),
+    for (trace, file, connect_loopback, spawn_child) in [
+        (
+            baseline_path.as_path(),
+            baseline_file.as_path(),
+            true,
+            false,
+        ),
+        (
+            candidate_path.as_path(),
+            candidate_file.as_path(),
+            false,
+            true,
+        ),
     ] {
-        let output = run_record(trace, file, connect_loopback);
+        let output = run_record(trace, file, connect_loopback, spawn_child);
+        assert_record_output_does_not_leak_capture(&output);
         assert_success(&output, "record real strace capture");
         assert!(trace.is_file(), "record should publish its trace file");
         assert_eq!(
@@ -257,6 +306,80 @@ fn real_strace_capture_inspect_and_diff_observe_file_and_loopback_events() {
     );
     let loopback_connect = assert_successful_syscall(&baseline, "connect", "127.0.0.1");
     assert_eq!(loopback_connect["raw_result"], "0");
+    let parent_exec =
+        assert_successful_syscall(&candidate, "execve", "sideeffect-parent-process-marker");
+    let child_exec = candidate["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| {
+            (record["kind"] == "syscall" || record["kind"] == "unfinished_syscall")
+                && record["syscall"] == "execve"
+                && record["raw_arguments"]
+                    .as_str()
+                    .is_some_and(|args| args.contains("sideeffect-child-process-marker"))
+        })
+        .expect("candidate trace should preserve the child's execve evidence row");
+    let child_pid = child_exec["process_id"]
+        .as_u64()
+        .expect("child execve row PID");
+    let child_exec_resume = match child_exec["kind"].as_str() {
+        Some("syscall") => {
+            assert_eq!(child_exec["raw_result"], "0");
+            None
+        }
+        Some("unfinished_syscall") => Some(
+            candidate["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|record| {
+                    record["kind"] == "resumed_syscall"
+                        && record["syscall"] == "execve"
+                        && record["process_id"] == child_pid
+                        && record["raw_result"] == "0"
+                })
+                .expect("split child execve should have a matching successful resume"),
+        ),
+        _ => panic!("child execve should be a complete or unfinished syscall record"),
+    };
+    assert_ne!(
+        parent_exec["process_id"], child_exec["process_id"],
+        "child execve evidence must identify a PID distinct from the target process"
+    );
+    assert!(child_exec["evidence"]["line_number"].as_u64().is_some());
+    assert!(child_exec["evidence"]["byte_offset"].as_u64().is_some());
+    assert!(child_exec["evidence"]["byte_length"].as_u64().is_some());
+    if let Some(child_exec_resume) = child_exec_resume {
+        assert!(
+            child_exec_resume["evidence"]["line_number"]
+                .as_u64()
+                .is_some()
+        );
+        assert!(
+            child_exec_resume["evidence"]["byte_offset"]
+                .as_u64()
+                .is_some()
+        );
+        assert!(
+            child_exec_resume["evidence"]["byte_length"]
+                .as_u64()
+                .is_some()
+        );
+    }
+    assert!(
+        !baseline["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| {
+                record["syscall"] == "execve"
+                    && record["raw_arguments"]
+                        .as_str()
+                        .is_some_and(|args| args.contains("sideeffect-child-process-marker"))
+            }),
+        "baseline target should not spawn the child"
+    );
     assert!(
         !candidate["records"]
             .as_array()
@@ -325,5 +448,31 @@ fn real_strace_capture_inspect_and_diff_observe_file_and_loopback_events() {
                     .is_some_and(|args| args.contains("127.0.0.1"))
         }),
         "diff should contain a loopback connect delta"
+    );
+    assert!(
+        changes.iter().any(|change| {
+            change["kind"] == "added"
+                && change["category"] == "process"
+                && change["record_kind"] == child_exec["kind"]
+                && change["syscall"] == "execve"
+                && change["raw_arguments"]
+                    .as_str()
+                    .is_some_and(|args| args.contains("sideeffect-child-process-marker"))
+                && change["before"].as_array().is_some_and(Vec::is_empty)
+                && change["after"].as_array().is_some_and(|references| {
+                    references.iter().any(|reference| {
+                        reference["line_number"] == child_exec["evidence"]["line_number"]
+                            && reference["byte_offset"] == child_exec["evidence"]["byte_offset"]
+                            && reference["byte_length"] == child_exec["evidence"]["byte_length"]
+                    })
+                })
+        }),
+        "diff should report the child's observed execve row as an added process observation with evidence"
+    );
+
+    drop(directory);
+    assert!(
+        !temporary_root.exists(),
+        "temporary traces and target files must be removed after the test"
     );
 }

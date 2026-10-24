@@ -34,7 +34,7 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
-      - name: Run tests, including real file and loopback capture
+      - name: Run tests, including real child, file, and loopback capture
         run: cargo test --locked --all-targets
 
       - name: Build CLI
