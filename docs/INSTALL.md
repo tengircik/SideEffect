@@ -4,7 +4,7 @@
 
 The current supported product target is Linux x86_64. This repository provides source code; it does not currently publish prebuilt binaries or a package repository. Windows builds cover parser/comparison workflows, but command recording and HTML file export are Linux-only. SideEffect does not provide native Windows tracing.
 
-Builds use Rust and Cargo. `Cargo.toml` declares Rust 1.85 as its minimum version; CI currently tests its configured stable toolchain rather than separately proving that minimum. Install Rust and Cargo using the [official Rust installation instructions](https://rust-lang.org/tools/install/). The Linux system also needs a C toolchain/linker for Rust targets; install one with your distribution's package manager if it is not already present.
+Builds use Rust and Cargo. `Cargo.toml` declares Rust 1.85 as its minimum version, and CI now has a dedicated Linux job configured to run formatting, Clippy, tests, and a build with Rust 1.85. Its hosted result has not yet been confirmed. Install Rust and Cargo using the [official Rust installation instructions](https://rust-lang.org/tools/install/). The Linux system also needs a C toolchain/linker for Rust targets; install one with your distribution's package manager if it is not already present.
 
 The `record` command requires an external `strace` version 6.6 or newer. Check the installed version before recording:
 
