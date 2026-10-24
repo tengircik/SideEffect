@@ -12,7 +12,7 @@ The `record` command requires an external `strace` version 6.6 or newer. Check t
 strace --version
 ```
 
-For example, Ubuntu 24.04's `strace` package is version 6.8 in the Ubuntu package archive ([package details](https://packages.ubuntu.com/noble/strace)). Package versions in other distributions and repositories differ; if `strace --version` reports a version below 6.6, do not use `record` with it. Parser, diff, and evidence commands consume an existing trace and do not launch `strace`.
+For example, Ubuntu 24.04's `strace` package is version 6.8 in the Ubuntu package archive ([package details](https://packages.ubuntu.com/noble/strace)). Package versions in other distributions and repositories differ; if `strace --version` reports a version below 6.6, do not use `record` with it. The Linux real-tracer integration test has passed in WSL with extracted Ubuntu packages for strace 6.8 and 6.19, without installing them system-wide; this does not verify every 6.6 build or kernel combination. Parser, diff, and evidence commands consume an existing trace and do not launch `strace`.
 
 ## Build from source
 
