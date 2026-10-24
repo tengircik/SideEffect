@@ -304,11 +304,11 @@ fn hash_exact_trace(
             "staged trace length changed before hashing; bundle was discarded",
         ));
     }
-    let encoded = digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let mut encoded = String::with_capacity(64);
+    for byte in digest.finalize() {
+        encoded.push(b"0123456789abcdef"[(byte >> 4) as usize] as char);
+        encoded.push(b"0123456789abcdef"[(byte & 0x0f) as usize] as char);
+    }
     Ok((encoded, total))
 }
 
