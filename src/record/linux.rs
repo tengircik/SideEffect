@@ -696,7 +696,10 @@ mod tests {
 
         let over = TestDirectory::new();
         let error = run_fake(&over, &write_trace_script("123456789"), "over.trace", 8).unwrap_err();
-        assert!(error.to_string().contains("exceeded the 8 byte limit"));
+        assert!(
+            error.to_string().contains("exceeded the 8 byte limit"),
+            "unexpected recorder error: {error}"
+        );
         assert!(!over.0.join("over.trace").exists());
         assert_eq!(
             std::fs::read_dir(&over.0).unwrap().count(),
@@ -846,9 +849,13 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("could not recognize `strace -V` output")
+                .contains("could not recognize `strace -V` output"),
+            "unexpected recorder error: {error}"
         );
-        assert!(error.to_string().contains("the command was not started"));
+        assert!(
+            error.to_string().contains("the command was not started"),
+            "unexpected recorder error: {error}"
+        );
         assert!(!target_marker.exists());
         assert!(!directory.0.join("unknown.trace").exists());
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
