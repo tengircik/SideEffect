@@ -3,6 +3,7 @@
 use serde_json::Value;
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -144,6 +145,80 @@ fn assert_success(output: &Output, operation: &str) {
         "{operation} failed (status: {:?}; stderr: {})",
         output.status.code(),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn run_record_target_status(trace_path: &Path, script: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["record", "--trace"])
+        .arg(trace_path)
+        .args(["--", "python3", "-c", script])
+        .output()
+        .expect("launch SideEffect record status target")
+}
+
+fn assert_published_nonempty_trace(path: &Path) {
+    let metadata = fs::metadata(path).expect("record should publish the trace");
+    assert!(metadata.is_file());
+    assert!(metadata.len() > 0, "published trace must be nonempty");
+}
+
+#[test]
+fn record_propagates_nonzero_target_exit_after_publishing_trace() {
+    require_tool("strace", &["--version"]);
+    require_tool("python3", &["--version"]);
+
+    let directory = PrivateTempDirectory::new();
+    let trace_path = directory.path().join("exit-37.trace");
+    let output = run_record_target_status(&trace_path, "import os; os._exit(37)");
+
+    assert_eq!(
+        output.status.code(),
+        Some(37),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_published_nonempty_trace(&trace_path);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Recorded "), "stderr: {stderr}");
+    assert!(
+        stderr.contains("strace-reported and propagated exit status: 37"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("does not prove tracer success or capture completeness"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn record_propagates_target_signal_after_publishing_trace() {
+    require_tool("strace", &["--version"]);
+    require_tool("python3", &["--version"]);
+
+    let directory = PrivateTempDirectory::new();
+    let trace_path = directory.path().join("sigterm.trace");
+    let output = run_record_target_status(
+        &trace_path,
+        "import os, signal; os.kill(os.getpid(), signal.SIGTERM)",
+    );
+
+    assert_eq!(
+        output.status.signal(),
+        Some(libc::SIGTERM),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_published_nonempty_trace(&trace_path);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Recorded "), "stderr: {stderr}");
+    assert!(
+        stderr.contains("strace-reported termination by signal 15 is being propagated"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("does not prove tracer success or capture completeness"),
+        "stderr: {stderr}"
     );
 }
 

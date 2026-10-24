@@ -4,6 +4,8 @@ use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -113,24 +115,63 @@ fn record(output: &OsString, program: &OsString, args: &[OsString]) -> Result<Ex
     {
         let outcome =
             record_trace(Path::new(output), program, args).map_err(|error| error.to_string())?;
-        let status = outcome
-            .strace_status
-            .code()
-            .map(|code| code.to_string())
-            .unwrap_or_else(|| "terminated by signal or unavailable".to_owned());
-        eprintln!(
-            "Recorded {} bytes to {}. strace exit status: {} (not an independent command or tracer success result).",
-            outcome.trace_bytes,
-            terminal_safe_path(&outcome.trace_path),
-            status
-        );
-        Ok(ExitCode::SUCCESS)
+        let status = outcome.strace_status;
+        if let Some(code) = status.code() {
+            eprintln!(
+                "Recorded {} bytes to {}. strace-reported and propagated exit status: {} (strace normally mirrors the wrapped command; this does not prove tracer success or capture completeness).",
+                outcome.trace_bytes,
+                terminal_safe_path(&outcome.trace_path),
+                code
+            );
+            Ok(ExitCode::from(code as u8))
+        } else if let Some(signal) = status.signal() {
+            eprintln!(
+                "Recorded {} bytes to {}. strace-reported termination by signal {} is being propagated (strace normally mirrors the wrapped command; this does not prove tracer success or capture completeness).",
+                outcome.trace_bytes,
+                terminal_safe_path(&outcome.trace_path),
+                signal
+            );
+            Ok(propagate_signal(signal))
+        } else {
+            eprintln!(
+                "Recorded {} bytes to {}. strace returned an unavailable exit status; using failure status 1.",
+                outcome.trace_bytes,
+                terminal_safe_path(&outcome.trace_path)
+            );
+            Ok(ExitCode::from(1))
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (output, program, args);
         Err("record is available only on Linux with an external strace executable".to_owned())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn propagate_signal(signal: i32) -> ExitCode {
+    // `record_trace` has returned, so its cancellation handlers have been restored and
+    // the trace has already been published. Re-raise with the default disposition to
+    // preserve the wrapped command's signal outcome at the process boundary.
+    // SAFETY: signal is supplied by ExitStatusExt from wait status. The calls only
+    // update this process's signal disposition/mask and raise that signal in this process.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut action.sa_mask);
+        let reset = libc::sigaction(signal, &action, std::ptr::null_mut()) == 0;
+        // SIGKILL cannot have its disposition changed, but its disposition is already
+        // unconditionally terminating, so it can still be raised below.
+        if reset || signal == libc::SIGKILL {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, signal);
+            if libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) == 0 {
+                libc::raise(signal);
+            }
+        }
+    }
+    ExitCode::from(128u8.saturating_add(signal.clamp(0, 127) as u8))
 }
 
 #[cfg(target_os = "linux")]

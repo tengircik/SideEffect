@@ -52,7 +52,7 @@ Then record a command by passing the program and its arguments after `--`:
 ./target/release/sideeffect inspect ./run.trace
 ```
 
-SideEffect runs the selected program with your permissions; it is not a sandbox. The program can modify files, access the network, and perform actions otherwise available to your account. Recording is bounded, but if the trace exceeds its limit the direct `strace` process is terminated and the partial trace is discarded. `strace`'s reported status is not proof of the target's exit status or successful, complete tracing.
+SideEffect runs the selected program with your permissions; it is not a sandbox. The program can modify files, access the network, and perform actions otherwise available to your account. Recording is bounded, but if the trace exceeds its limit the direct `strace` process is terminated and the partial trace is discarded. After a nonempty trace is finalized and published, SideEffect propagates `strace`'s reported exit code or signal. The `strace(1)` manual says it normally mirrors the wrapped command's outcome. Capture errors take precedence; a propagated status does not prove tracer success or capture completeness.
 
 Raw traces may contain command arguments, file paths, socket addresses, and other sensitive values. Keep them local unless you have reviewed them. Detailed diff reports retain event-level values. `diff-summary` omits event strings and source references but still exposes category/count patterns, which may also be sensitive; it is not a safe-to-share verdict. These commands do not upload data.
 
