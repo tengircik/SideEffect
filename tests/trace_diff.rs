@@ -20,7 +20,10 @@ fn synthetic_pair_reports_observed_file_network_and_process_deltas_with_evidence
     let right = parse(UPDATED);
     let diff = compare_traces(&left, &right).unwrap();
 
-    assert_eq!(diff.schema_version, 2);
+    assert_eq!(
+        diff.schema_version,
+        sideeffect::model::TRACE_DIFF_SCHEMA_VERSION
+    );
     assert_eq!(diff.capture_completeness, CaptureCompleteness::Unknown);
     assert_eq!(
         diff.matching_policy.ignored_prefix_fields,
@@ -440,6 +443,7 @@ fn control_document(count: usize) -> TraceDocument {
     TraceDocument {
         schema_version: sideeffect::model::TRACE_DOCUMENT_SCHEMA_VERSION,
         source_format: "synthetic_fixture".to_owned(),
+        source_sha256: "00".repeat(32),
         input_bytes: 0,
         parse_status: ParseCompleteness::Complete,
         records,

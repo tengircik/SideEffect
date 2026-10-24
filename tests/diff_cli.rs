@@ -55,7 +55,15 @@ fn diff_command_emits_versioned_json_with_evidence_references() {
         String::from_utf8_lossy(&output.stderr)
     );
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(document["schema_version"], 2);
+    assert_eq!(document["schema_version"], 3);
+    assert_eq!(
+        document["left_source_sha256"],
+        "d75a97b3058387a94ca085ed28ab08826671f305be8c70e947df902de553ca9d"
+    );
+    assert_eq!(
+        document["right_source_sha256"],
+        "e75d32bc48eaa3577db14bbe3dc7f5e75bc83f28d575af8c0592e420aa866a91"
+    );
     assert_eq!(document["capture_completeness"], "unknown");
     assert_eq!(document["matching_policy"]["multiplicity"], "multiset");
     assert_eq!(

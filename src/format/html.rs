@@ -32,7 +32,11 @@ pub fn write_html_diff<W: Write>(diff: &TraceDiff<'_>, writer: &mut W) -> io::Re
     write_value(writer, diff.left_source_format)?;
     writer.write_all(b"</dd>\n<dt>After (CLI argument 2) source format</dt><dd>")?;
     write_value(writer, diff.right_source_format)?;
-    writer.write_all(b"</dd>\n<dt>Matching multiplicity</dt><dd>")?;
+    writer.write_all(b"</dd>\n<dt>Before (CLI argument 1) source SHA-256</dt><dd>")?;
+    write_value(writer, diff.left_source_sha256)?;
+    writer.write_all(b"</dd>\n<dt>After (CLI argument 2) source SHA-256</dt><dd>")?;
+    write_value(writer, diff.right_source_sha256)?;
+    writer.write_all(b"</dd>\n<dt>Fingerprint note</dt><dd>Identity metadata only; not authentication, redaction, or capture completeness.</dd>\n<dt>Matching multiplicity</dt><dd>")?;
     write_value(writer, &diff.matching_policy.multiplicity)?;
     writer.write_all(b"</dd>\n<dt>Ignored prefix fields</dt><dd>")?;
     if diff.matching_policy.ignored_prefix_fields.is_empty() {
@@ -275,6 +279,8 @@ mod tests {
             schema_version: TRACE_DIFF_SCHEMA_VERSION,
             left_source_format: "strace_text_v1",
             right_source_format: "strace_text_v1",
+            left_source_sha256: "1111111111111111111111111111111111111111111111111111111111111111",
+            right_source_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
             capture_completeness: CaptureCompleteness::Unknown,
             matching_policy: MatchingPolicy {
                 ignored_prefix_fields: vec!["process_id".to_owned(), "timestamp".to_owned()],
@@ -328,6 +334,11 @@ mod tests {
         assert!(output.contains("default-src 'none'; style-src 'unsafe-inline'"));
         assert!(output.contains("script-src 'none'"));
         assert!(output.contains("Capture completeness</dt><dd>unknown"));
+        assert!(output.contains("Before (CLI argument 1) source SHA-256</dt><dd><span class=\"value\">1111111111111111111111111111111111111111111111111111111111111111"));
+        assert!(output.contains("After (CLI argument 2) source SHA-256</dt><dd><span class=\"value\">2222222222222222222222222222222222222222222222222222222222222222"));
+        assert!(output.contains(
+            "Identity metadata only; not authentication, redaction, or capture completeness."
+        ));
         assert!(output.contains("Excluded control records</dt><dd>Baseline: 1; candidate: 2"));
         assert!(output.contains("<h3>Changed</h3>"));
         assert!(output.contains("Before evidence (CLI argument 1)"));

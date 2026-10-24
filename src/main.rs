@@ -20,7 +20,7 @@ use sideeffect::record::AnchoredOutput;
 use sideeffect::record::record_trace;
 use sideeffect::trace::strace::parse_trace_bytes;
 
-const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect evidence <strace-trace-file> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file and writes JSON evidence by default, or terminal-safe text with --format text. Evidence checks an exact line/byte/length tuple against one parsed row in the supplied trace; it is positional and does not verify a content hash. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Record runs a command under external strace and writes a bounded raw trace; it is observation, not isolation or a safety check.";
+const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Record runs a command under external strace and writes a bounded raw trace; it is observation, not isolation or a safety check.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -46,8 +46,8 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         [command, flag, format, path] if command == "inspect" && flag == "--format" => {
             inspect_with_format(format, path)
         }
-        [command, path, line, byte_offset, byte_length] if command == "evidence" => {
-            evidence(path, line, byte_offset, byte_length)
+        [command, path, digest, line, byte_offset, byte_length] if command == "evidence" => {
+            evidence(path, digest, line, byte_offset, byte_length)
         }
         [command, left, right] if command == "diff" => diff(left, right),
         [command, flag, format, left, right] if command == "diff" && flag == "--format" => {
@@ -132,10 +132,12 @@ fn inspect(path: &OsString) -> Result<ExitCode, String> {
 
 fn evidence(
     path: &OsString,
+    digest: &OsString,
     line: &OsString,
     byte_offset: &OsString,
     byte_length: &OsString,
 ) -> Result<ExitCode, String> {
+    let expected_digest = parse_sha256_digest(digest)?;
     let line_number = parse_reference_number(line, "line number")?;
     let expected_offset = parse_reference_number(byte_offset, "byte offset")?;
     let expected_length = parse_reference_number(byte_length, "byte length")?;
@@ -144,6 +146,12 @@ fn evidence(
     }
 
     let document = read_and_parse(path)?;
+    if document.source_sha256 != expected_digest {
+        return Err(format!(
+            "source SHA-256 mismatch: supplied {}, file is {}",
+            expected_digest, document.source_sha256
+        ));
+    }
     let record = document
         .records
         .iter()
@@ -181,7 +189,13 @@ fn evidence(
 
     let partial = document.parse_status == ParseCompleteness::Partial;
     let mut text = CappedBuffer::new(MAX_REPORT_BYTES);
-    write_trace_evidence_text(record, document.parse_status, &mut text).map_err(|error| {
+    write_trace_evidence_text(
+        record,
+        document.parse_status,
+        &document.source_sha256,
+        &mut text,
+    )
+    .map_err(|error| {
         if text.exceeded {
             format!("evidence output exceeds the {MAX_REPORT_BYTES} byte output limit")
         } else {
@@ -194,6 +208,20 @@ fn evidence(
     } else {
         Ok(ExitCode::SUCCESS)
     }
+}
+
+fn parse_sha256_digest(value: &OsString) -> Result<String, String> {
+    let Some(text) = value.to_str() else {
+        return Err("SHA-256 must be 64 lowercase hexadecimal characters".to_owned());
+    };
+    if text.len() != 64
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("SHA-256 must be 64 lowercase hexadecimal characters".to_owned());
+    }
+    Ok(text.to_owned())
 }
 
 fn parse_reference_number(value: &OsString, label: &str) -> Result<u64, String> {

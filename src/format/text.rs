@@ -24,6 +24,11 @@ pub fn write_text_diff<W: Write>(diff: &TraceDiff<'_>, writer: &mut W) -> io::Re
     write_quoted(writer, diff.left_source_format)?;
     writer.write_all(b"\nCandidate source format: ")?;
     write_quoted(writer, diff.right_source_format)?;
+    writer.write_all(b"\nBaseline source SHA-256: ")?;
+    write_fingerprint(writer, diff.left_source_sha256)?;
+    writer.write_all(b"\nCandidate source SHA-256: ")?;
+    write_fingerprint(writer, diff.right_source_sha256)?;
+    writer.write_all(b"\n")?;
     writer.write_all(b"\nMatching policy: multiplicity=")?;
     write_quoted(writer, &diff.matching_policy.multiplicity)?;
     writer.write_all(b"; exact fields: ")?;
@@ -122,6 +127,18 @@ fn write_optional_quoted<W: Write>(writer: &mut W, value: Option<&str>) -> io::R
     }
 }
 
+fn write_fingerprint<W: Write>(writer: &mut W, value: &str) -> io::Result<()> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        writer.write_all(value.as_bytes())
+    } else {
+        write_quoted(writer, value)
+    }
+}
+
 fn write_quoted_list<W: Write>(writer: &mut W, values: &[String]) -> io::Result<()> {
     if values.is_empty() {
         return writer.write_all(b"(none)");
@@ -193,6 +210,8 @@ mod tests {
             schema_version: TRACE_DIFF_SCHEMA_VERSION,
             left_source_format: "strace_text_v1",
             right_source_format: "strace_text_v1",
+            left_source_sha256: "1111111111111111111111111111111111111111111111111111111111111111",
+            right_source_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
             capture_completeness: CaptureCompleteness::Unknown,
             matching_policy: MatchingPolicy {
                 ignored_prefix_fields: vec!["process_id".to_owned(), "timestamp".to_owned()],
@@ -274,7 +293,9 @@ mod tests {
         let mut output = Vec::new();
         write_text_diff(&diff, &mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(output.starts_with("SideEffect trace comparison\nSchema version: 2\n"));
+        assert!(output.starts_with("SideEffect trace comparison\nSchema version: 3\n"));
+        assert!(output.contains("Baseline source SHA-256: 1111111111111111111111111111111111111111111111111111111111111111"));
+        assert!(output.contains("Candidate source SHA-256: 2222222222222222222222222222222222222222222222222222222222222222"));
         assert!(output.contains("Capture completeness: unknown (not established by parsing)"));
         assert!(output.contains("Excluded control records: baseline=2, candidate=3"));
         assert!(output.contains("1. Added\n"));
@@ -346,7 +367,7 @@ mod tests {
 
     #[test]
     fn escapes_terminal_controls_quotes_backslashes_bidi_and_non_ascii() {
-        let diff = diff_with(vec![delta(
+        let mut diff = diff_with(vec![delta(
             DeltaKind::Added,
             EventCategory::Other,
             "write\u{1B}[31m\u{202E}é",
@@ -354,12 +375,14 @@ mod tests {
             (None, Some("\u{1B}]0;title\u{7}״")),
             (vec![], vec![reference(1, 0, 4)]),
         )]);
+        diff.left_source_sha256 = "\u{1B}[31m";
         let mut output = Vec::new();
         write_text_diff(&diff, &mut output).unwrap();
         let bytes = output;
         assert!(bytes.is_ascii());
         let output = String::from_utf8(bytes).unwrap();
         assert!(output.contains("write\\u{1B}[31m\\u{202E}\\u{E9}"));
+        assert!(output.contains("Baseline source SHA-256: \"\\u{1B}[31m\""));
         assert!(output.contains("line1\\u{D}\\u{A}line2\\u{9}\\u{7F}"));
         assert!(output.contains("\\\"quoted\\\" \\\\"));
         assert!(output.contains("\\u{1B}]0;title\\u{7}\\u{5F4}"));

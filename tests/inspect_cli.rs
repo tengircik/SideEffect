@@ -50,7 +50,8 @@ fn inspect_defaults_to_versioned_json() {
         String::from_utf8_lossy(&output.stderr)
     );
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(document["schema_version"], 2);
+    assert_eq!(document["schema_version"], 3);
+    assert_eq!(document["source_sha256"].as_str().unwrap().len(), 64);
     assert_eq!(document["parse_status"], "complete");
     assert_eq!(
         document["records"][0]["raw_arguments"],

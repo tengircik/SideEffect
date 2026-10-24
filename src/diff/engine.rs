@@ -232,6 +232,8 @@ pub fn compare_traces<'a>(
         schema_version: TRACE_DIFF_SCHEMA_VERSION,
         left_source_format: &left.source_format,
         right_source_format: &right.source_format,
+        left_source_sha256: &left.source_sha256,
+        right_source_sha256: &right.source_sha256,
         capture_completeness: CaptureCompleteness::Unknown,
         matching_policy: MatchingPolicy {
             ignored_prefix_fields: vec!["process_id".to_owned(), "timestamp".to_owned()],

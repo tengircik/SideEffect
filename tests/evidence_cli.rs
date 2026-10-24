@@ -56,6 +56,7 @@ impl Drop for TempTrace {
 
 fn run_evidence(
     path: &std::path::Path,
+    digest: &str,
     line: &str,
     byte_offset: &str,
     byte_length: &str,
@@ -63,7 +64,7 @@ fn run_evidence(
     Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .args(["evidence"])
         .arg(path)
-        .args([line, byte_offset, byte_length])
+        .args([digest, line, byte_offset, byte_length])
         .output()
         .unwrap()
 }
@@ -76,13 +77,21 @@ fn first_reference(contents: &[u8]) -> sideeffect::model::EvidenceReference {
         .clone()
 }
 
+fn source_digest(contents: &[u8]) -> String {
+    parse_trace_bytes(contents, ParseLimits::default())
+        .unwrap()
+        .source_sha256
+}
+
 #[test]
 fn resolves_a_diff_reference_to_one_parsed_row() {
     let contents = b"7 1700000000.000001 openat(AT_FDCWD</tmp>, \"item.txt\", O_RDONLY) = 3\n";
     let trace = TempTrace::with_contents(contents);
     let reference = first_reference(contents);
+    let digest = source_digest(contents);
     let output = run_evidence(
         &trace.0,
+        &digest,
         &reference.line_number.to_string(),
         &reference.byte_offset.to_string(),
         &reference.byte_length.to_string(),
@@ -103,7 +112,7 @@ fn resolves_a_diff_reference_to_one_parsed_row() {
     assert!(text.contains("Kind: syscall"));
     assert!(text.contains("Syscall: \"openat\""));
     assert!(text.contains("Raw line: \"7 1700000000.000001 openat("));
-    assert!(text.contains("no content hash or capture completeness is established"));
+    assert!(text.contains("Reference scope: exact bytes matched the supplied SHA-256 fingerprint"));
 }
 
 #[test]
@@ -111,8 +120,10 @@ fn rejects_a_reference_whose_offset_or_length_does_not_match() {
     let contents = b"1 1700000000.000001 close(3) = 0\n";
     let trace = TempTrace::with_contents(contents);
     let reference = first_reference(contents);
+    let digest = source_digest(contents);
     let output = run_evidence(
         &trace.0,
+        &digest,
         &reference.line_number.to_string(),
         &(reference.byte_offset + 1).to_string(),
         &reference.byte_length.to_string(),
@@ -124,6 +135,30 @@ fn rejects_a_reference_whose_offset_or_length_does_not_match() {
 }
 
 #[test]
+fn verifies_source_fingerprint_before_looking_up_a_reference() {
+    let contents = b"1 1700000000.000001 close(3) = 0\n";
+    let trace = TempTrace::with_contents(contents);
+    let output = run_evidence(&trace.0, &"0".repeat(64), "99", "0", "1");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("source SHA-256 mismatch"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("line 99"));
+}
+
+#[test]
+fn rejects_malformed_sha256_fingerprints() {
+    let trace = TempTrace::with_contents(b"close(3) = 0\n");
+    let invalid_hex = "G".repeat(64);
+    for digest in ["abc", invalid_hex.as_str()] {
+        let output = run_evidence(&trace.0, digest, "1", "0", "1");
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("64 lowercase hexadecimal"));
+    }
+}
+
+#[test]
 fn rejects_out_of_range_control_and_unparsed_references() {
     let trace = TempTrace::with_contents(b"+++ exited with 0 +++\nnot a syscall record\n");
     let document = parse_trace_bytes(
@@ -132,8 +167,10 @@ fn rejects_out_of_range_control_and_unparsed_references() {
     )
     .unwrap();
     let control = &document.records[0].evidence;
+    let digest = source_digest(b"+++ exited with 0 +++\nnot a syscall record\n");
     let output = run_evidence(
         &trace.0,
+        &digest,
         &control.line_number.to_string(),
         &control.byte_offset.to_string(),
         &control.byte_length.to_string(),
@@ -144,6 +181,7 @@ fn rejects_out_of_range_control_and_unparsed_references() {
     let unparsed = &document.records[1].evidence;
     let output = run_evidence(
         &trace.0,
+        &digest,
         &unparsed.line_number.to_string(),
         &unparsed.byte_offset.to_string(),
         &unparsed.byte_length.to_string(),
@@ -151,7 +189,7 @@ fn rejects_out_of_range_control_and_unparsed_references() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("is unparsed"));
 
-    let output = run_evidence(&trace.0, "99", "0", "1");
+    let output = run_evidence(&trace.0, &digest, "99", "0", "1");
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("no trace record exists at line 99"));
 }
@@ -162,8 +200,10 @@ fn partial_input_labels_the_lookup_and_escapes_terminal_controls() {
         b"1 1700000000.000001 write(1, \"ansi-\x1b[31m\", 8) = 8\nnot a syscall record\n";
     let trace = TempTrace::with_contents(contents);
     let reference = first_reference(contents);
+    let digest = source_digest(contents);
     let output = run_evidence(
         &trace.0,
+        &digest,
         &reference.line_number.to_string(),
         &reference.byte_offset.to_string(),
         &reference.byte_length.to_string(),
@@ -174,14 +214,14 @@ fn partial_input_labels_the_lookup_and_escapes_terminal_controls() {
     assert!(!output.stdout.contains(&0x1b));
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("Parse status: partial"));
-    assert!(text.contains("positional match in the supplied file"));
+    assert!(text.contains("identity metadata, not authenticity"));
     assert!(text.contains("\\u{1B}[31m"));
 }
 
 #[test]
 fn rejects_oversized_trace_before_producing_output() {
     let trace = TempTrace::oversized();
-    let output = run_evidence(&trace.0, "1", "0", "1");
+    let output = run_evidence(&trace.0, &"0".repeat(64), "1", "0", "1");
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("trace input exceeds"));
@@ -190,7 +230,8 @@ fn rejects_oversized_trace_before_producing_output() {
 #[test]
 fn rejects_non_decimal_reference_fields() {
     let trace = TempTrace::with_contents(b"1 1700000000.000001 close(3) = 0\n");
-    let output = run_evidence(&trace.0, "1", "0", "1x");
+    let digest = source_digest(b"1 1700000000.000001 close(3) = 0\n");
+    let output = run_evidence(&trace.0, &digest, "1", "0", "1x");
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     assert!(

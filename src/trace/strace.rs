@@ -174,6 +174,7 @@ pub fn parse_trace_bytes(input: &[u8], limits: ParseLimits) -> Result<TraceDocum
     Ok(TraceDocument {
         schema_version: TRACE_DOCUMENT_SCHEMA_VERSION,
         source_format: SOURCE_FORMAT.to_owned(),
+        source_sha256: crate::fingerprint::sha256_hex(input),
         input_bytes: input.len() as u64,
         parse_status,
         records,

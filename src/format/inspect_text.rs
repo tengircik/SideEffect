@@ -14,7 +14,10 @@ pub fn write_trace_text<W: Write>(document: &TraceDocument, writer: &mut W) -> i
     writeln!(writer, "Schema version: {}", document.schema_version)?;
     writer.write_all(b"Source format: ")?;
     write_quoted(writer, &document.source_format)?;
-    writeln!(writer, "\nInput bytes: {}", document.input_bytes)?;
+    writer.write_all(b"\nSource SHA-256: ")?;
+    write_fingerprint(writer, &document.source_sha256)?;
+    writer.write_all(b"\n")?;
+    writeln!(writer, "Input bytes: {}", document.input_bytes)?;
     writer.write_all(b"Parse status: ")?;
     writer.write_all(parse_status_name(document.parse_status).as_bytes())?;
     writeln!(writer, "\nRecords: {}", document.records.len())?;
@@ -33,19 +36,23 @@ pub fn write_trace_text<W: Write>(document: &TraceDocument, writer: &mut W) -> i
 
 /// Write one parsed source record after the CLI has matched its line/offset/length reference.
 ///
-/// A partial input is labeled explicitly; this view does not certify the trace as complete or
-/// bind the reference to a content hash.
+/// A partial input is labeled explicitly; the caller has verified the content fingerprint, but
+/// this view does not certify authenticity or capture completeness.
 pub fn write_trace_evidence_text<W: Write>(
     record: &crate::model::TraceRecord,
     parse_status: ParseCompleteness,
+    source_sha256: &str,
     writer: &mut W,
 ) -> io::Result<()> {
     writer.write_all(b"SideEffect evidence lookup\n")?;
     writer.write_all(b"Parse status: ")?;
     writer.write_all(parse_status_name(parse_status).as_bytes())?;
     writer.write_all(b"\n")?;
+    writer.write_all(b"Source SHA-256: ")?;
+    write_fingerprint(writer, source_sha256)?;
+    writer.write_all(b"\n")?;
     if parse_status == ParseCompleteness::Partial {
-        writer.write_all(b"Warning: the input parse is partial; this is only a positional match in the supplied file, not a complete comparison or capture-coverage claim.\n")?;
+        writer.write_all(b"Warning: the input parse is partial; the fingerprint identifies these bytes, but this is not a complete comparison or capture-coverage claim.\n")?;
     }
     writer.write_all(b"Reference: ")?;
     writeln!(
@@ -53,7 +60,7 @@ pub fn write_trace_evidence_text<W: Write>(
         "line={} byte={} length={}",
         record.evidence.line_number, record.evidence.byte_offset, record.evidence.byte_length
     )?;
-    writer.write_all(b"Reference scope: position in the supplied file; no content hash or capture completeness is established.\n\n")?;
+    writer.write_all(b"Reference scope: exact bytes matched the supplied SHA-256 fingerprint; this is identity metadata, not authenticity or capture completeness.\n\n")?;
     write_record_details(writer, record)
 }
 
@@ -86,6 +93,18 @@ fn write_optional_u32<W: Write>(writer: &mut W, label: &str, value: Option<u32>)
         writeln!(writer, "{label}: {value}")?;
     }
     Ok(())
+}
+
+fn write_fingerprint<W: Write>(writer: &mut W, value: &str) -> io::Result<()> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        writer.write_all(value.as_bytes())
+    } else {
+        write_quoted(writer, value)
+    }
 }
 
 fn write_optional_quoted<W: Write>(
@@ -204,8 +223,9 @@ mod tests {
 
     fn document() -> TraceDocument {
         TraceDocument {
-            schema_version: 2,
+            schema_version: crate::model::TRACE_DOCUMENT_SCHEMA_VERSION,
             source_format: "strace_text".to_owned(),
+            source_sha256: "00".repeat(32),
             input_bytes: 120,
             parse_status: ParseCompleteness::Partial,
             records: vec![
@@ -251,8 +271,9 @@ mod tests {
         assert!(bytes.is_ascii());
         let output = String::from_utf8(bytes).unwrap();
 
-        assert!(output.contains("Schema version: 2"));
+        assert!(output.contains("Schema version: 3"));
         assert!(output.contains("Source format: \"strace_text\""));
+        assert!(output.contains(&format!("Source SHA-256: {}", "00".repeat(32))));
         assert!(output.contains("Input bytes: 120"));
         assert!(output.contains("Parse status: partial"));
         assert!(output.contains("Records: 5"));
@@ -283,6 +304,7 @@ mod tests {
     fn escapes_terminal_controls_bidi_and_non_ascii_as_visible_ascii() {
         let mut trace = document();
         trace.source_format = "strace\u{1B}[31m\u{202E}é".to_owned();
+        trace.source_sha256 = "\u{1B}[31m".to_owned();
         trace.records[0].raw_arguments = Some("first\r\nsecond\t\u{7F} \"q\" \\".to_owned());
         trace.records[0].raw_line = "data\u{1B}]0;title\u{7} and café".to_owned();
         trace.diagnostics[0].message = "invisible\u{200B} bidi\u{2066}".to_owned();
@@ -293,6 +315,7 @@ mod tests {
         assert!(!bytes.contains(&0x1b));
         let output = String::from_utf8(bytes).unwrap();
         assert!(output.contains("strace\\u{1B}[31m\\u{202E}\\u{E9}"));
+        assert!(output.contains("Source SHA-256: \"\\u{1B}[31m\""));
         assert!(output.contains("first\\u{D}\\u{A}second\\u{9}\\u{7F}"));
         assert!(output.contains("data\\u{1B}]0;title\\u{7} and caf\\u{E9}"));
         assert!(output.contains("invisible\\u{200B} bidi\\u{2066}"));

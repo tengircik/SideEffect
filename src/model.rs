@@ -2,8 +2,8 @@ use serde::Serialize;
 
 use crate::trace::LexicalPathHint;
 
-pub const TRACE_DOCUMENT_SCHEMA_VERSION: u32 = 2;
-pub const TRACE_DIFF_SCHEMA_VERSION: u32 = 2;
+pub const TRACE_DOCUMENT_SCHEMA_VERSION: u32 = 3;
+pub const TRACE_DIFF_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +64,8 @@ pub struct TraceDiagnostic {
 pub struct TraceDocument {
     pub schema_version: u32,
     pub source_format: String,
+    /// SHA-256 identity fingerprint of the exact bounded bytes parsed.
+    pub source_sha256: String,
     pub input_bytes: u64,
     /// Parse status only; it does not describe whether an OS capture was complete.
     pub parse_status: ParseCompleteness,
@@ -132,6 +134,9 @@ pub struct TraceDiff<'a> {
     pub schema_version: u32,
     pub left_source_format: &'a str,
     pub right_source_format: &'a str,
+    /// SHA-256 identity fingerprints of the first and second parsed input bytes.
+    pub left_source_sha256: &'a str,
+    pub right_source_sha256: &'a str,
     pub capture_completeness: CaptureCompleteness,
     pub matching_policy: MatchingPolicy,
     /// Control rows are visible as counts but are outside the initial syscall comparison.

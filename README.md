@@ -12,7 +12,7 @@ From the repository root, run:
 cargo run -- inspect tests/fixtures/strace/synthetic-minimal.trace
 ```
 
-This prints a schema-v2 JSON document containing parsed records, raw trace lines, source byte offsets, diagnostics, and optional `lexical_path_hint` values. The fixture is synthetic; it is not a real system capture. For a readable, terminal-safe view of every parsed and unparsed record, run:
+This prints a schema-v3 JSON document containing parsed records, raw trace lines, source byte offsets, diagnostics, optional `lexical_path_hint` values, and the SHA-256 fingerprint of the exact bytes parsed. The fixture is synthetic; it is not a real system capture. A fingerprint identifies bytes but does not authenticate them or establish capture completeness. For a readable, terminal-safe view of every parsed and unparsed record, run:
 
 ```sh
 cargo run -- inspect --format text tests/fixtures/strace/synthetic-minimal.trace
@@ -22,7 +22,7 @@ Exit status `0` means every input record was classified and continuation records
 
 For `openat` and `openat2`, records may also include a `lexical_path_hint` when the path argument is unambiguously printable and either absolute or paired with an absolute `-yy` directory annotation. It preserves `.` and `..` segments and is not a canonical or filesystem-resolved path; symlinks, descriptor reuse, resolution flags, and trace truncation can make it differ from the path the kernel ultimately used. Raw arguments remain the evidence source.
 
-`inspect` and `diff` consume raw `strace` text, not previously exported SideEffect JSON documents. Earlier schema-v1 trace and diff JSON exports remain standalone; the current CLI does not import or migrate them.
+`inspect` and `diff` consume raw `strace` text, not previously exported SideEffect JSON documents. Earlier schema-v1 and schema-v2 trace and diff JSON exports remain standalone; the current CLI does not import or migrate them. A SHA-256 fingerprint is identity metadata, not a signature, authenticity proof, redaction, or completeness signal. Because traces may be sensitive, fingerprints are sensitive metadata too; low-entropy traces may be guessed, and exact trace bytes never leave the local machine through these commands.
 
 ## What the parser accepts
 
@@ -36,15 +36,15 @@ Input is limited to 32 MiB, each physical record to 64 KiB, and the document to 
 cargo run -- diff tests/fixtures/diff/baseline.synthetic.trace tests/fixtures/diff/updated.synthetic.trace
 ```
 
-`diff` emits schema-v2 observed syscall-row additions, removals, and uniquely paired result changes with source line/byte references. `matching_policy.exact_fields` names the compared row/result fields, while `matching_policy.display_only_fields` identifies lexical hints that never participate in matching. References use the baseline input for `before` and candidate input for `after`, in command argument order. Optional side-specific lexical path hints are display-only; matching uses exact raw arguments and results, never the hints. The fixture pair is synthetic and is not a real capture. A comparison requires both inputs to parse completely; parser status still cannot prove capture completeness. The initial matcher treats records as a multiset, ignores only the parsed PID and timestamp prefixes for matching, and keeps exact arguments/results (including path and file-descriptor text). When multiple same-signature result records remain and no pairing is justified, they remain separate additions/removals instead of an invented changed-event pair. Paired unfinished/resumed rows are compared as separate trace rows, not merged into a reconstructed call. Control rows are outside the initial comparison and their counts are reported. The process/file/network labels are syscall-name buckets; they do not claim that an operation succeeded or caused another event.
+`diff` emits schema-v3 observed syscall-row additions, removals, and uniquely paired result changes with source line/byte references and separate SHA-256 fingerprints for the exact baseline and candidate bytes. `matching_policy.exact_fields` names the compared row/result fields, while `matching_policy.display_only_fields` identifies lexical hints that never participate in matching. References use the baseline input for `before` and candidate input for `after`, in command argument order. Optional side-specific lexical path hints are display-only; matching uses exact raw arguments and results, never the hints. Fingerprints identify each input but do not authenticate it or establish capture completeness. The fixture pair is synthetic and is not a real capture. A comparison requires both inputs to parse completely; parser status still cannot prove capture completeness. The initial matcher treats records as a multiset, ignores only the parsed PID and timestamp prefixes for matching, and keeps exact arguments/results (including path and file-descriptor text). When multiple same-signature result records remain and no pairing is justified, they remain separate additions/removals instead of an invented changed-event pair. Paired unfinished/resumed rows are compared as separate trace rows, not merged into a reconstructed call. Control rows are outside the initial comparison and their counts are reported. The process/file/network labels are syscall-name buckets; they do not claim that an operation succeeded or caused another event.
 
-To look up a diff reference from the baseline fixture, use its `before` tuple (`line=2 byte=65 length=72`):
+To look up a diff reference from the baseline fixture, use its `before` tuple (`line=2 byte=65 length=72`) and source hash:
 
 ```sh
-sideeffect evidence tests/fixtures/diff/baseline.synthetic.trace 2 65 72
+sideeffect evidence tests/fixtures/diff/baseline.synthetic.trace d75a97b3058387a94ca085ed28ab08826671f305be8c70e947df902de553ca9d 2 65 72
 ```
 
-The command requires an exact line, byte-offset, and byte-length match to one parsed syscall row; it rejects control, unparsed, out-of-range, and mismatched references. If the trace has a partial parse, it prints a warning and exits with status `2`. A successful lookup only establishes a positional match in the currently supplied file; it does not bind the reference to a content hash or establish capture completeness.
+The command first verifies that the supplied lowercase SHA-256 fingerprint matches the exact bounded bytes parsed, then requires an exact line, byte-offset, and byte-length match to one parsed syscall row. It rejects malformed or mismatched fingerprints and control, unparsed, out-of-range, or mismatched references. If the trace has a partial parse, it prints a warning and exits with status `2`. A successful lookup establishes byte identity relative to the supplied fingerprint and a positional match within those bytes; it does not establish authenticity or capture completeness. Fingerprints are not redaction and can reveal equality or be guessed for low-entropy inputs.
 
 Each input remains bounded by the parser limits above (64 MiB combined maximum); a diff has at most 200,000 grouped delta rows and JSON/text output is capped at 64 MiB before stdout is written. The comparison keeps argument/result strings borrowed from parsed input and emits source references rather than copies of entire raw lines. Review reports before sharing: they may contain sensitive paths, arguments, and endpoint details.
 
