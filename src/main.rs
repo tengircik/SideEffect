@@ -9,14 +9,18 @@ use std::process::ExitCode;
 
 use serde::Serialize;
 use sideeffect::diff::compare_traces;
+#[cfg(target_os = "linux")]
+use sideeffect::format::write_html_diff;
 use sideeffect::format::write_text_diff;
-use sideeffect::limits::{MAX_JSON_BYTES, MAX_TRACE_BYTES, ParseLimits};
+use sideeffect::limits::{MAX_REPORT_BYTES, MAX_TRACE_BYTES, ParseLimits};
 use sideeffect::model::{ParseCompleteness, TraceDiff};
+#[cfg(target_os = "linux")]
+use sideeffect::record::AnchoredOutput;
 #[cfg(target_os = "linux")]
 use sideeffect::record::record_trace;
 use sideeffect::trace::strace::parse_trace_bytes;
 
-const USAGE: &str = "Usage: sideeffect inspect <strace-trace-file>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file and writes JSON evidence to stdout. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout (JSON by default). Record runs a command under external strace and writes a bounded raw trace; it is observation, not isolation or a safety check.";
+const USAGE: &str = "Usage: sideeffect inspect <strace-trace-file>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file and writes JSON evidence to stdout. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Record runs a command under external strace and writes a bounded raw trace; it is observation, not isolation or a safety check.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -42,6 +46,21 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         [command, left, right] if command == "diff" => diff(left, right),
         [command, flag, format, left, right] if command == "diff" && flag == "--format" => {
             diff_with_format(format, left, right)
+        }
+        [
+            command,
+            format_flag,
+            format,
+            output_flag,
+            output,
+            left,
+            right,
+        ] if command == "diff"
+            && format_flag == "--format"
+            && format == "html"
+            && output_flag == "--output" =>
+        {
+            diff_html(output, left, right)
         }
         [
             command,
@@ -130,6 +149,60 @@ fn diff_with_format(
     diff_with_output_format(left_path, right_path, output_format)
 }
 
+fn diff_html(
+    output_path: &OsString,
+    left_path: &OsString,
+    right_path: &OsString,
+) -> Result<ExitCode, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut output = AnchoredOutput::prepare(Path::new(output_path))
+            .map_err(|error| format!("could not prepare safe HTML report output: {error}"))?;
+        let left = read_and_parse(left_path)?;
+        let right = read_and_parse(right_path)?;
+        let diff = compare_traces(&left, &right)
+            .map_err(|error| format!("could not compare traces: {error}"))?;
+        let report_path = publish_html_report(&mut output, &diff, MAX_REPORT_BYTES)?;
+        eprintln!(
+            "Offline HTML report written to {}. It may contain sensitive paths, arguments, or endpoint data; review before sharing.",
+            terminal_safe_path(&report_path)
+        );
+        Ok(ExitCode::SUCCESS)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (output_path, left_path, right_path);
+        Err("HTML report file export is currently supported on Linux only".to_owned())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn publish_html_report(
+    output: &mut AnchoredOutput,
+    diff: &TraceDiff<'_>,
+    output_limit: usize,
+) -> Result<std::path::PathBuf, String> {
+    let mut html = CappedBuffer::new(output_limit);
+    write_html_diff(diff, &mut html).map_err(|error| {
+        if html.exceeded {
+            format!("HTML report exceeds the {output_limit} byte output limit")
+        } else {
+            format!("could not render HTML report: {error}")
+        }
+    })?;
+    let mut report = output
+        .create_report_file()
+        .map_err(|error| format!("could not create private HTML staging file: {error}"))?;
+    report
+        .write_all(&html.bytes)
+        .and_then(|()| report.flush())
+        .and_then(|()| report.sync_all())
+        .map_err(|error| format!("could not write complete HTML report: {error}"))?;
+    output
+        .publish_report()
+        .map_err(|error| format!("could not publish HTML report without replacing a file: {error}"))
+}
+
 #[derive(Clone, Copy)]
 enum DiffOutputFormat {
     Json,
@@ -159,12 +232,12 @@ fn read_and_parse(path: &OsString) -> Result<sideeffect::model::TraceDocument, S
 }
 
 fn write_json<T: Serialize>(value: &T, description: &str) -> Result<(), String> {
-    let mut json = CappedBuffer::new(MAX_JSON_BYTES);
+    let mut json = CappedBuffer::new(MAX_REPORT_BYTES);
     serde_json::to_writer_pretty(&mut json, value).map_err(|error| {
         if json.exceeded {
             format!(
                 "{description} exceeds the {} byte output limit",
-                MAX_JSON_BYTES
+                MAX_REPORT_BYTES
             )
         } else {
             format!("could not serialize {description}: {error}")
@@ -173,7 +246,7 @@ fn write_json<T: Serialize>(value: &T, description: &str) -> Result<(), String> 
     json.write_all(b"\n").map_err(|_| {
         format!(
             "{description} exceeds the {} byte output limit",
-            MAX_JSON_BYTES
+            MAX_REPORT_BYTES
         )
     })?;
 
@@ -181,16 +254,16 @@ fn write_json<T: Serialize>(value: &T, description: &str) -> Result<(), String> 
 }
 
 fn write_text(diff: &TraceDiff<'_>) -> Result<(), String> {
-    let mut text = CappedBuffer::new(MAX_JSON_BYTES);
+    let mut text = CappedBuffer::new(MAX_REPORT_BYTES);
     write_text_diff(diff, &mut text).map_err(|error| {
         if text.exceeded {
-            format!("text comparison exceeds the {MAX_JSON_BYTES} byte output limit")
+            format!("text comparison exceeds the {MAX_REPORT_BYTES} byte output limit")
         } else {
             format!("could not render text comparison: {error}")
         }
     })?;
     text.write_all(b"\n")
-        .map_err(|_| format!("text comparison exceeds the {MAX_JSON_BYTES} byte output limit"))?;
+        .map_err(|_| format!("text comparison exceeds the {MAX_REPORT_BYTES} byte output limit"))?;
     write_buffer(&text, "text comparison")
 }
 
@@ -303,6 +376,10 @@ impl Write for CappedBuffer {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::{
+        AnchoredOutput, ParseLimits, compare_traces, parse_trace_bytes, publish_html_report,
+    };
     use super::{CappedBuffer, read_limited, read_trace_file};
     use std::fs::{self, OpenOptions};
     use std::io::{self, Cursor, Write};
@@ -382,6 +459,29 @@ mod tests {
     fn production_path_reader_rejects_non_regular_input() {
         let error = read_trace_file(&std::env::temp_dir(), 4).unwrap_err();
         assert!(error.contains("regular file"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oversized_html_render_does_not_create_a_report_or_leave_staging() {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "sideeffect-html-cap-test-{}-{id}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let report_path = directory.join("too-large.html");
+        let mut output = AnchoredOutput::prepare(&report_path).unwrap();
+        let baseline = parse_trace_bytes(b"close(1) = 0\n", ParseLimits::default()).unwrap();
+        let candidate = parse_trace_bytes(b"", ParseLimits::default()).unwrap();
+        let diff = compare_traces(&baseline, &candidate).unwrap();
+
+        let error = publish_html_report(&mut output, &diff, 16).unwrap_err();
+        assert!(error.contains("HTML report exceeds the 16 byte output limit"));
+        assert!(!report_path.exists());
+        drop(output);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        fs::remove_dir(&directory).unwrap();
     }
 
     #[cfg(target_os = "linux")]

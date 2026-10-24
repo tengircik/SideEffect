@@ -2,7 +2,7 @@
 
 SideEffect is a local-first Rust CLI for inspecting `strace` text and preserving event-level evidence in JSON.
 
-> **Status: early implementation.** `inspect` reads a local trace file and writes versioned JSON. `diff` compares two complete parses as JSON or terminal-safe text. On Linux, `record` can run a command under external `strace` and publish one bounded raw trace. A smoke test with extracted strace 6.19 captured `/usr/bin/true` and `/usr/bin/false` under WSL; broad trace coverage and compatibility are still unvalidated. Recording is not a sandbox. HTML reports are not implemented.
+> **Status: early implementation.** `inspect` reads a local trace file and writes versioned JSON. `diff` compares two complete parses as JSON or terminal-safe text; Linux can also write a bounded, offline HTML report. On Linux, `record` can run a command under external `strace` and publish one bounded raw trace. A smoke test with extracted strace 6.19 captured `/usr/bin/true` and `/usr/bin/false` under WSL; broad trace coverage and compatibility are still unvalidated. Recording is not a sandbox.
 
 ## Try the current command
 
@@ -30,6 +30,14 @@ cargo run -- diff tests/fixtures/diff/baseline.synthetic.trace tests/fixtures/di
 
 Each input remains bounded by the parser limits above (64 MiB combined maximum); a diff has at most 200,000 grouped delta rows and JSON/text output is capped at 64 MiB before stdout is written. The comparison keeps argument/result strings borrowed from parsed input and emits source references rather than copies of entire raw lines. Review reports before sharing: they may contain sensitive paths, arguments, and endpoint details.
 
+On Linux, create a self-contained static report with:
+
+```sh
+sideeffect diff --format html --output REPORT.html BASELINE CANDIDATE
+```
+
+The report is capped at 64 MiB, mode 0600, and never replaces an existing destination. It uses no scripts, external assets, or network requests; trace-derived markup is escaped, and control/bidi formatting characters are shown as visible spellings. Local input paths are omitted, but raw arguments, paths, and endpoint details may remain. HTML file export is not available in the native Windows build; Windows users with WSL2 can run the Linux build there. Review the report before sharing it.
+
 For a readable terminal view of the same comparison, use:
 
 ```sh
@@ -50,7 +58,7 @@ If the trace exceeds the limit, SideEffect terminates its `strace` process and d
 
 ## Planned product
 
-The broader goal is to compare selected process, file, and network-related observations from two command runs and produce an evidence-linked offline report. The initial target is Linux x86_64; an existing WSL2 installation may be used, but native Windows tracing is not in scope. HTML reporting is not implemented.
+The broader goal is to compare selected process, file, and network-related observations from two command runs and produce an evidence-linked offline report. The initial target is Linux x86_64; an existing WSL2 installation may be used, but native Windows tracing is not in scope. Static HTML export exists on Linux; browser compatibility beyond renderer tests remains unverified.
 
 ## Limits and privacy
 

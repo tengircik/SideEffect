@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const FIFO_NAME: &[u8] = b"trace.fifo";
 const TRACE_NAME: &[u8] = b"trace.raw";
+const REPORT_NAME: &[u8] = b"report.html";
 const STAGE_PREFIX: &[u8] = b".sideeffect-capture-";
 static NEXT_STAGE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -28,6 +29,7 @@ pub struct AnchoredOutput {
     stage_inode: libc::ino_t,
     fifo_identity: Option<(libc::dev_t, libc::ino_t)>,
     trace_identity: Option<(libc::dev_t, libc::ino_t)>,
+    report_identity: Option<(libc::dev_t, libc::ino_t)>,
     published: bool,
 }
 
@@ -61,6 +63,7 @@ impl AnchoredOutput {
             stage_inode: stage_stat.st_ino,
             fifo_identity: None,
             trace_identity: None,
+            report_identity: None,
             published: false,
         })
     }
@@ -158,6 +161,72 @@ impl AnchoredOutput {
         Ok(current_parent.join(&self.destination_name))
     }
 
+    /// Create a new private HTML report staging file relative to the held directory descriptor.
+    pub fn create_report_file(&mut self) -> io::Result<File> {
+        let file = self.create_private_staged_file(REPORT_NAME)?;
+        let stat = stat_fd(file.as_raw_fd())?;
+        if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(io::Error::other(
+                "created HTML report staging entry is not a regular file",
+            ));
+        }
+        self.report_identity = Some((stat.st_dev, stat.st_ino));
+        Ok(file)
+    }
+
+    /// Publish the staged report without replacing an existing destination.
+    pub fn publish_report(&mut self) -> io::Result<PathBuf> {
+        if self.report_identity.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "HTML report staging file has not been created",
+            ));
+        }
+        if self.published {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "output has already been published",
+            ));
+        }
+        let source = c_name(REPORT_NAME)?;
+        let destination = c_name(self.destination_name.as_os_str().as_bytes())?;
+        // SAFETY: both dirfds are held open; names are NUL-terminated single components.
+        if unsafe {
+            libc::linkat(
+                self.stage_dir.as_raw_fd(),
+                source.as_ptr(),
+                self.parent_dir.as_raw_fd(),
+                destination.as_ptr(),
+                0,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        self.published = true;
+        let current_parent = read_fd_path(self.parent_dir.as_raw_fd())
+            .unwrap_or_else(|_| self.parent_path_at_prepare.clone());
+        Ok(current_parent.join(&self.destination_name))
+    }
+
+    fn create_private_staged_file(&self, filename: &[u8]) -> io::Result<File> {
+        let name = c_name(filename)?;
+        // SAFETY: stage_dir is a held directory; flags reject symlinks and existing entries.
+        let fd = unsafe {
+            libc::openat(
+                self.stage_dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a new owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
     #[cfg(test)]
     fn stage_path_for_test(&self) -> PathBuf {
         self.parent_path_at_prepare.join(&self.stage_name)
@@ -183,6 +252,15 @@ impl Drop for AnchoredOutput {
                 // entry itself and never follows a replacement symlink.
                 unsafe {
                     libc::unlinkat(self.stage_dir.as_raw_fd(), trace.as_ptr(), 0);
+                }
+            }
+        }
+        if let Some((device, inode)) = self.report_identity {
+            let report = c_name(REPORT_NAME).expect("fixed report name contains no NUL");
+            if named_entry_matches(self.stage_dir.as_raw_fd(), REPORT_NAME, device, inode) {
+                // SAFETY: fixed name is relative to held stage dirfd; unlink doesn't follow it.
+                unsafe {
+                    libc::unlinkat(self.stage_dir.as_raw_fd(), report.as_ptr(), 0);
                 }
             }
         }
@@ -565,6 +643,25 @@ mod tests {
             io::ErrorKind::AlreadyExists
         );
         assert_eq!(fs::read(&raced).unwrap(), b"concurrent writer");
+    }
+
+    #[test]
+    fn html_report_uses_private_staging_and_no_clobber_publication() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("report.html");
+        let mut output = directory.prepare("report.html");
+        let mut report = output.create_report_file().unwrap();
+        assert_eq!(report.metadata().unwrap().permissions().mode() & 0o077, 0);
+        report.write_all(b"<!doctype html><p>safe</p>").unwrap();
+        report.sync_all().unwrap();
+        fs::write(&destination, b"concurrent writer").unwrap();
+        assert_eq!(
+            output.publish_report().unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"concurrent writer");
+        drop(report);
+        drop(output);
     }
 
     #[test]

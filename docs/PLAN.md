@@ -1,12 +1,12 @@
 # SideEffect Delivery Plan
 
-**Status:** implementation is underway; this is not a schedule or release claim. Bounded `inspect`, conservative `diff`, terminal-safe text output, and a Linux `record` path with fake-tracer lifecycle tests exist. A limited WSL smoke test used extracted strace 6.19 with `/usr/bin/true` and `/usr/bin/false`; broad real-tracer integration and HTML rendering remain future work.
+**Status:** implementation is underway; this is not a schedule or release claim. Bounded `inspect`, conservative `diff`, terminal-safe text output, Linux-only static HTML export, and a Linux `record` path with fake-tracer lifecycle tests exist. A limited WSL smoke test used extracted strace 6.19 with `/usr/bin/true` and `/usr/bin/false`; broad real-tracer integration and browser compatibility remain unverified.
 
 ## Current implementation slice
 
-`sideeffect inspect TRACE` reads a regular local file, accepts a bounded subset of `strace` text, preserves raw lines and source byte offsets in a schema-v1 JSON document, and writes that document to stdout. `sideeffect diff LEFT RIGHT` compares completely parsed documents' syscall rows and writes schema-v1 JSON observed deltas with source offsets; `sideeffect diff --format text LEFT RIGHT` writes a human-readable ASCII-only view with terminal controls escaped. Neither command executes the represented command, invokes `strace`, or writes report files. The parser and diff fixtures are synthetic, not real captures. Compatibility with real tracer output has not been integration-tested.
+`sideeffect inspect TRACE` reads a regular local file, accepts a bounded subset of `strace` text, preserves raw lines and source byte offsets in a schema-v1 JSON document, and writes that document to stdout. `sideeffect diff LEFT RIGHT` compares completely parsed documents' syscall rows and writes schema-v1 JSON observed deltas with source offsets; `sideeffect diff --format text LEFT RIGHT` writes a human-readable ASCII-only view with terminal controls escaped. Linux `sideeffect diff --format html --output REPORT LEFT RIGHT` writes a bounded static offline report, with no scripts or remote assets, mode 0600, and no-clobber publication. It omits local input paths but can contain sensitive trace values. The parser and diff fixtures are synthetic, not real captures. Compatibility with real tracer output has not been integration-tested.
 
-Current hard limits are 32 MiB per input file (64 MiB combined for a diff), 64 KiB per physical record excluding LF, 100,000 records per input, 200,000 diff rows, and 64 MiB for serialized JSON or text output. These initial values need review against real captures. `parse_status` describes syntax/continuation parsing only and cannot establish capture completeness. The diff fails closed on partial parses, ignores only parser-level PID/timestamp prefixes when matching, compares exact arguments/results, treats rows as a multiset, and reports excluded control-row counts. It emits a changed row only when exactly one unmatched same-signature record remains on each side; ambiguous result multiplicities remain additions/removals. Before/after references point to the first/second CLI input respectively. Unfinished and resumed rows remain separate observations.
+Current hard limits are 32 MiB per input file (64 MiB combined for a diff), 64 KiB per physical record excluding LF, 100,000 records per input, 200,000 diff rows, and 64 MiB for serialized JSON, text, or HTML output. These initial values need review against real captures. `parse_status` describes syntax/continuation parsing only and cannot establish capture completeness. The diff fails closed on partial parses, ignores only parser-level PID/timestamp prefixes when matching, compares exact arguments/results, treats rows as a multiset, and reports excluded control-row counts. It emits a changed row only when exactly one unmatched same-signature record remains on each side; ambiguous result multiplicities remain additions/removals. Before/after references point to the first/second CLI input respectively. Unfinished and resumed rows remain separate observations.
 
 ## Milestone 0 — Repository and dependency decision
 
@@ -58,14 +58,13 @@ The parser and renderer must enforce the explicit budgets recorded in Milestone 
 
 - Versioned JSON diff output is implemented.
 - `diff --format text` is implemented as an ASCII-only terminal view; escape trace-derived controls, quotes, backslashes, and non-ASCII scalars and enforce the shared output cap.
-- Render a self-contained, offline HTML comparison report.
-- Escape all trace-derived content and keep raw evidence references accessible.
-- Show per-run capture status, diagnostics, observed changes, and uncertainty.
-- State clearly that reports may contain secrets and are not automatically sanitized.
+- Linux `diff --format html --output REPORT LEFT RIGHT` renders a self-contained offline report with static CSS, no scripts or remote assets, escaped trace-derived content, and evidence references.
+- The HTML report shows comparison context, observed changes, and uncertainty; rendering is capped before no-clobber publication.
+- State clearly that reports may contain secrets and are not automatically sanitized; HTML file export is currently Linux-only.
 
 Report generation must enforce the documented event/string/output budgets. Create completed reports atomically without following destination symlinks or replacing existing files; define cleanup behavior for failed or interrupted writes.
 
-**Exit criteria:** schema/round-trip tests pass; HTML tests prove trace-provided markup is inert and no remote assets are required; incomplete captures are conspicuous; export failures do not corrupt raw run evidence.
+**Exit criteria:** schema/round-trip tests pass; HTML tests prove trace-provided markup is inert and no remote assets are required; incomplete captures are conspicuous; export failures do not corrupt raw run evidence. Current renderer tests cover static markup safety; browser compatibility and broad accessibility review remain open.
 
 Additional exit criteria: report generation respects documented event/string/output budgets; completed exports are published atomically without following destination symlinks or replacing existing files; interrupted or failed exports leave no partial final report and do not corrupt raw run evidence.
 

@@ -1,6 +1,6 @@
 # SideEffect Architecture Plan
 
-**Status:** early implementation. The source implements bounded `inspect`, conservative `diff`, an ASCII-only terminal text view, and Linux `record` using an external `strace` process with a bounded FIFO sink. Versioned run bundles and HTML rendering remain planned. The real `strace` path has not been integration-tested in this environment.
+**Status:** early implementation. The source implements bounded `inspect`, conservative `diff`, an ASCII-only terminal text view, Linux static HTML export, and Linux `record` using an external `strace` process with a bounded FIFO sink. Versioned run bundles remain planned. A limited real `strace` smoke test is recorded below; broader integration remains unverified.
 
 The security requirements and current safeguards are summarized in [SECURITY.md](../SECURITY.md); requirements marked future remain release gates.
 
@@ -34,7 +34,7 @@ Versioned run record ───────► raw event references + capture met
                                versioned JSON          offline HTML
 ```
 
-The current paths are `inspect <trace-file>` → bounded regular-file read → strict UTF-8 and line parsing → versioned JSON; `diff <left-trace> <right-trace>` → parse both inputs → conservative multiset comparison → versioned JSON or ASCII-only escaped text; and Linux `record --trace OUTPUT -- PROGRAM [ARGS...]` → private FIFO → bounded raw trace → no-clobber publication. The record command executes the selected program under strace with the user's normal permissions.
+The current paths are `inspect <trace-file>` → bounded regular-file read → strict UTF-8 and line parsing → versioned JSON; `diff <left-trace> <right-trace>` → parse both inputs → conservative multiset comparison → versioned JSON or ASCII-only escaped text; Linux `diff --format html --output REPORT LEFT RIGHT` → bounded HTML buffer → mode-0600 no-clobber report publication; and Linux `record --trace OUTPUT -- PROGRAM [ARGS...]` → private FIFO → bounded raw trace → no-clobber publication. The record command executes the selected program under strace with the user's normal permissions.
 
 ## Current parser contract
 
@@ -56,7 +56,7 @@ Recording uses a generated FIFO instead of `strace -o FILE`, allowing the parent
 
 The FIFO anchor is opened with `O_CLOEXEC`, so the traced command cannot keep it open. Parent supervision polls the FIFO and strace child; there is no separate reader process or shell command string. A hard kill or system crash can leave a private staging directory behind. Command execution remains unrestricted and tracing may alter timing or behavior.
 
-Evidence bundles and report exports must use conservative output-path handling. Creating a new run must not follow attacker-controlled symlinks or overwrite an existing unrelated bundle. Report publication must use a temporary file created exclusively in the destination directory, then publish it atomically without replacing an existing destination; failures must remove partial temporary output where possible and leave existing user data unchanged. The implementation must select Linux filesystem operations that preserve these semantics under path races, not rely only on a preflight `exists` check. Tests must cover existing destinations, symlink targets, and interrupted/failed writes. Any deliberate overwrite option requires separate product/security review.
+Evidence bundles and report exports use conservative output-path handling. The HTML exporter is Linux-only, buffers rendered output up to the shared 64 MiB cap before creating a staged report, writes it with mode 0600, and publishes without replacing an existing destination. It uses a static HTML/CSS template, restrictive CSP, no script or remote assets, and inserts trace values only as escaped text; local input paths are omitted. Reports can still contain sensitive raw arguments, paths, and endpoints. Tests cover injection strings, controls/bidi formatting, output limits, existing destinations, symlink targets, and staged cleanup. Any deliberate overwrite option requires separate product/security review.
 
 ### `strace` integration
 
@@ -70,7 +70,7 @@ Raw trace text is retained as the evidence source. The parser converts supported
 
 The parser must tolerate concurrent processes and unfinished/resumed syscall records according to supported `strace` output formats. Unsupported record forms are surfaced as unsupported or unparsed evidence rather than guessed into structured events.
 
-Each parser input is limited to 32 MiB, 64 KiB per physical record excluding LF, and 100,000 physical records. A diff therefore reads at most 64 MiB combined; output is bounded to at most 200,000 grouped rows and JSON or text serialization has a 64 MiB cap before stdout is written. The comparison borrows argument/result strings from parsed inputs and retains source offsets rather than copying full raw lines into deltas. The current diff compares parsed syscall rows as a multiset, ignores only parser-level PID/timestamp prefixes, and keeps syscall names, arguments, and results exact. It refuses partial parses, reports excluded control-row counts, and treats unfinished/resumed rows separately. Its category labels are syscall-name buckets. Capture completeness remains unknown. Future capture and HTML rendering still need their own budgets. Oversized input fails explicitly; malformed or unsupported lines remain raw evidence with diagnostics rather than implying they were understood.
+Each parser input is limited to 32 MiB, 64 KiB per physical record excluding LF, and 100,000 physical records. A diff therefore reads at most 64 MiB combined; output is bounded to at most 200,000 grouped rows and JSON, text, or HTML serialization has a 64 MiB cap. Console formats are buffered before stdout is written; HTML is buffered before file publication. The comparison borrows argument/result strings from parsed inputs and retains source offsets rather than copying full raw lines into deltas. The current diff compares parsed syscall rows as a multiset, ignores only parser-level PID/timestamp prefixes, and keeps syscall names, arguments, and results exact. It refuses partial parses, reports excluded control-row counts, and treats unfinished/resumed rows separately. Its category labels are syscall-name buckets. Capture completeness remains unknown. Oversized input fails explicitly; malformed or unsupported lines remain raw evidence with diagnostics rather than implying they were understood.
 
 ### Versioned run record
 
@@ -103,7 +103,7 @@ Concurrency can change event order even when behavior is similar. The diff shoul
 
 ### Renderers
 
-JSON is the machine-readable output. The current text view escapes quotes, backslashes, control characters, and all non-ASCII scalars to ASCII, preventing trace input from emitting terminal control sequences. It is still sensitive and not redacted. Future HTML must be a self-contained local report with no remote assets, network calls, or active content sourced from the trace. Every trace-derived string must be escaped or inserted as text; scripts must not evaluate trace values. Reports should show capture status, run identity, observed differences, uncertainty, and direct raw-evidence references.
+JSON is the machine-readable output. The current text view escapes quotes, backslashes, control characters, and all non-ASCII scalars to ASCII, preventing trace input from emitting terminal control sequences. It is still sensitive and not redacted. The Linux HTML exporter creates a self-contained local report with static CSS, restrictive CSP, no scripts, remote assets, or active content sourced from the trace. Every trace-derived value is escaped into a text node; controls and known bidi/default-ignorable characters are presented as literal visible spellings. The report shows comparison context, observed differences, uncertainty, and direct raw-evidence references, but does not include local input file paths.
 
 An export must not be described as sanitized or safe to publish by default. Command arguments, paths, output, and syscall arguments may contain secrets or personal information. If a future redaction option is added, the report must distinguish redacted data from absent data and preserve the original local evidence separately according to an explicit policy.
 
