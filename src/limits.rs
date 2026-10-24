@@ -1,4 +1,5 @@
 pub const MAX_TRACE_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_BUNDLE_MANIFEST_BYTES: usize = 16 * 1024;
 pub const MAX_DIFF_INPUT_BYTES: usize = MAX_TRACE_BYTES * 2;
 pub const MAX_RECORD_BYTES: usize = 64 * 1024;
 pub const MAX_RECORDS: usize = 100_000;

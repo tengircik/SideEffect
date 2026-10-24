@@ -9,7 +9,11 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::ExitCode;
 
+#[cfg(target_os = "linux")]
+use serde::Deserialize;
 use serde::Serialize;
+#[cfg(target_os = "linux")]
+use sha2::{Digest, Sha256};
 use sideeffect::diff::compare_traces;
 #[cfg(target_os = "linux")]
 use sideeffect::format::write_html_diff;
@@ -18,6 +22,8 @@ use sideeffect::format::write_html_summary;
 use sideeffect::format::{
     RedactedDiffSummary, summarize_diff, write_text_diff, write_trace_evidence_text,
 };
+#[cfg(target_os = "linux")]
+use sideeffect::limits::MAX_BUNDLE_MANIFEST_BYTES;
 use sideeffect::limits::{MAX_REPORT_BYTES, MAX_TRACE_BYTES, ParseLimits};
 use sideeffect::model::{ParseCompleteness, TraceDiff, TraceRecordKind};
 #[cfg(target_os = "linux")]
@@ -26,7 +32,7 @@ use sideeffect::record::AnchoredOutput;
 use sideeffect::record::{record_bundle, record_trace};
 use sideeffect::trace::strace::parse_trace_bytes;
 
-const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. Record runs a command under external strace and writes either a bounded raw trace or an opt-in privacy-minimized run bundle; it is observation, not isolation or a safety check.";
+const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect inspect [--format json|text] --bundle <run-bundle-directory>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. Record runs a command under external strace and writes either a bounded raw trace or an opt-in privacy-minimized run bundle; it is observation, not isolation or a safety check.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -49,8 +55,16 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         [command, path] if command == "inspect" => inspect(path),
+        [command, flag, path] if command == "inspect" && flag == "--bundle" => {
+            inspect_bundle_with_format(&OsString::from("json"), path)
+        }
         [command, flag, format, path] if command == "inspect" && flag == "--format" => {
             inspect_with_format(format, path)
+        }
+        [command, format_flag, format, bundle_flag, path]
+            if command == "inspect" && format_flag == "--format" && bundle_flag == "--bundle" =>
+        {
+            inspect_bundle_with_format(format, path)
         }
         [command, path, digest, line, byte_offset, byte_length] if command == "evidence" => {
             evidence(path, digest, line, byte_offset, byte_length)
@@ -363,12 +377,28 @@ fn parse_reference_number(value: &OsString, label: &str) -> Result<u64, String> 
 }
 
 fn inspect_with_format(format: &OsString, path: &OsString) -> Result<ExitCode, String> {
+    if !matches!(format.to_str(), Some("json" | "text")) {
+        return Err("inspect format must be either 'json' or 'text'".to_owned());
+    }
+    inspect_bytes_with_format(format, read_bounded(path)?)
+}
+
+fn inspect_bundle_with_format(format: &OsString, path: &OsString) -> Result<ExitCode, String> {
+    if !matches!(format.to_str(), Some("json" | "text")) {
+        return Err("inspect format must be either 'json' or 'text'".to_owned());
+    }
+    let bytes = read_run_bundle(Path::new(path))?;
+    inspect_bytes_with_format(format, bytes)
+}
+
+fn inspect_bytes_with_format(format: &OsString, bytes: Vec<u8>) -> Result<ExitCode, String> {
     let format = match format.to_str() {
         Some("json") => DiffOutputFormat::Json,
         Some("text") => DiffOutputFormat::Text,
         _ => return Err("inspect format must be either 'json' or 'text'".to_owned()),
     };
-    let document = read_and_parse(path)?;
+    let document = parse_trace_bytes(&bytes, ParseLimits::default())
+        .map_err(|error| format!("trace inspection failed: {error}"))?;
     let partial = document.parse_status == ParseCompleteness::Partial;
     match format {
         DiffOutputFormat::Json => write_json(&document, "JSON evidence document")?,
@@ -559,6 +589,255 @@ fn read_and_parse(path: &OsString) -> Result<sideeffect::model::TraceDocument, S
     let bytes = read_bounded(path)?;
     parse_trace_bytes(&bytes, ParseLimits::default())
         .map_err(|error| format!("trace inspection failed: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct RunManifest {
+    schema: String,
+    schema_version: u32,
+    producer: BundleProducer,
+    capture: BundleCapture,
+    trace: BundleTrace,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct BundleProducer {
+    sideeffect_version: String,
+    operating_system: String,
+    architecture: String,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct BundleCapture {
+    tracer: BundleTracer,
+    capture_profile: String,
+    strace_reported_status: BundleStatus,
+    command_outcome: String,
+    completeness: String,
+    command_stdout: String,
+    command_stderr: String,
+    tracer_diagnostics: String,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct BundleTracer {
+    name: String,
+    major: u64,
+    minor: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(dead_code)]
+enum BundleStatus {
+    ExitCode { value: i32 },
+    Signal { value: i32 },
+    Unavailable,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct BundleTrace {
+    name: String,
+    format: String,
+    byte_length: u64,
+    sha256: String,
+}
+
+fn read_run_bundle(path: &Path) -> Result<Vec<u8>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        read_run_bundle_linux(path)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Err("bundle inspection is currently supported on Linux only".to_owned())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_run_bundle_linux(path: &Path) -> Result<Vec<u8>, String> {
+    use std::ffi::CStr;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| "bundle path contains a NUL byte".to_owned())?;
+    // O_NOFOLLOW ensures the selected bundle directory itself is not a symlink.
+    // SAFETY: c_path is NUL-terminated and the returned descriptor is owned below.
+    let dir_fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if dir_fd < 0 {
+        return Err("could not open bundle directory without following symlinks".to_owned());
+    }
+    // SAFETY: open returned a new owned descriptor.
+    let dir = unsafe { File::from_raw_fd(dir_fd) };
+    let metadata = dir
+        .metadata()
+        .map_err(|_| "could not inspect bundle directory".to_owned())?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o700
+    {
+        return Err(
+            "bundle directory must be owned by the current user and inaccessible to group/other"
+                .to_owned(),
+        );
+    }
+
+    // Enumerate through a duplicated descriptor so a replaced path cannot redirect the read.
+    // SAFETY: dup creates an owned descriptor; fdopendir takes ownership on success.
+    let duplicate = unsafe { libc::dup(dir.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err("could not enumerate bundle directory".to_owned());
+    }
+    let directory = unsafe { libc::fdopendir(duplicate) };
+    if directory.is_null() {
+        unsafe { libc::close(duplicate) };
+        return Err("could not enumerate bundle directory".to_owned());
+    }
+    let mut names = Vec::new();
+    let mut enumeration_failed = false;
+    loop {
+        // SAFETY: this Linux thread-local errno pointer is valid for the current thread.
+        unsafe { *libc::__errno_location() = 0 };
+        // SAFETY: directory remains open until closed below; readdir returns storage owned by it.
+        let entry = unsafe { libc::readdir(directory) };
+        if entry.is_null() {
+            // SAFETY: errno is thread-local and valid for this thread.
+            enumeration_failed = unsafe { *libc::__errno_location() != 0 };
+            break;
+        }
+        // SAFETY: d_name is a NUL-terminated byte array supplied by readdir.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            names.push(name.to_vec());
+            if names.len() > 2 {
+                break;
+            }
+        }
+    }
+    // SAFETY: directory was returned by fdopendir and has not been closed.
+    unsafe { libc::closedir(directory) };
+    if enumeration_failed {
+        return Err("could not enumerate bundle directory".to_owned());
+    }
+    names.sort();
+    if names != [b"run.json".to_vec(), b"trace.strace".to_vec()] {
+        return Err("bundle must contain exactly run.json and trace.strace".to_owned());
+    }
+
+    let manifest_bytes = read_bundle_file(dir.as_raw_fd(), b"run.json", MAX_BUNDLE_MANIFEST_BYTES)?;
+    let manifest: RunManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|_| "bundle manifest is invalid JSON or has an unsupported schema".to_owned())?;
+    validate_bundle_manifest(&manifest)?;
+    let trace_len = usize::try_from(manifest.trace.byte_length)
+        .map_err(|_| "bundle trace length exceeds the supported range".to_owned())?;
+    if trace_len > MAX_TRACE_BYTES {
+        return Err(format!(
+            "bundle trace exceeds the {MAX_TRACE_BYTES} byte limit"
+        ));
+    }
+    let trace = read_bundle_file(dir.as_raw_fd(), b"trace.strace", MAX_TRACE_BYTES)?;
+    if trace.len() != trace_len {
+        return Err("bundle trace length does not match the manifest".to_owned());
+    }
+    let actual_hash = format!("{:x}", Sha256::digest(&trace));
+    if actual_hash != manifest.trace.sha256 {
+        return Err("bundle trace SHA-256 does not match the manifest".to_owned());
+    }
+    Ok(trace)
+}
+
+#[cfg(target_os = "linux")]
+fn read_bundle_file(dir_fd: i32, name: &[u8], limit: usize) -> Result<Vec<u8>, String> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let name_c = std::ffi::CString::new(name).expect("fixed file name has no NUL");
+    // SAFETY: dir_fd is an open directory and name_c is a fixed single path component.
+    let fd = unsafe {
+        libc::openat(
+            dir_fd,
+            name_c.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err("bundle entries must be regular files without symlinks".to_owned());
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file
+        .metadata()
+        .map_err(|_| "could not inspect bundle file".to_owned())?;
+    let expected_uid = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || metadata.uid() != expected_uid
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o777 != 0o600
+    {
+        return Err("bundle entries must be current-user-owned private regular files".to_owned());
+    }
+    read_limited(file, limit)
+        .map_err(|error| format!("could not read bounded bundle entry: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn validate_bundle_manifest(manifest: &RunManifest) -> Result<(), String> {
+    let valid_reported_status = match manifest.capture.strace_reported_status {
+        BundleStatus::ExitCode { value } => value >= 0,
+        BundleStatus::Signal { value } => (1..=64).contains(&value),
+        BundleStatus::Unavailable => true,
+    };
+    if manifest.schema != "sideeffect.run" || manifest.schema_version != 1 {
+        return Err("unsupported bundle schema or schema version".to_owned());
+    }
+    if manifest.producer.operating_system != "linux"
+        || manifest.producer.architecture != "x86_64"
+        || manifest.capture.tracer.name != "strace"
+        || manifest.capture.capture_profile != "linux_process_file_network_v1"
+        || manifest.capture.command_outcome != "not_independently_verified"
+        || manifest.capture.completeness != "unknown"
+        || manifest.capture.command_stdout != "inherited_not_captured"
+        || manifest.capture.command_stderr != "inherited_not_captured"
+        || manifest.capture.tracer_diagnostics != "inherited_not_captured"
+        || !valid_reported_status
+        || manifest.trace.name != "trace.strace"
+        || manifest.trace.format != "strace_text"
+        || manifest.trace.byte_length == 0
+        || manifest.trace.sha256.len() != 64
+        || !manifest
+            .trace
+            .sha256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || manifest.producer.sideeffect_version.is_empty()
+        || manifest.capture.tracer.major == 0
+    {
+        return Err("bundle manifest contains invalid or unsupported fields".to_owned());
+    }
+    Ok(())
 }
 
 fn write_json<T: Serialize>(value: &T, description: &str) -> Result<(), String> {
