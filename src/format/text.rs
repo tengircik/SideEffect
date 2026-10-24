@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use crate::model::{
     CaptureCompleteness, DeltaKind, EventCategory, EvidenceReference, TraceDiff, TraceRecordKind,
 };
+use crate::trace::{LexicalPathBasis, LexicalPathHint};
 
 /// Write a terminal-safe, ASCII-only rendering of a paired trace comparison.
 ///
@@ -25,9 +26,11 @@ pub fn write_text_diff<W: Write>(diff: &TraceDiff<'_>, writer: &mut W) -> io::Re
     write_quoted(writer, diff.right_source_format)?;
     writer.write_all(b"\nMatching policy: multiplicity=")?;
     write_quoted(writer, &diff.matching_policy.multiplicity)?;
+    writer.write_all(b"; exact fields: ")?;
+    write_quoted_list(writer, &diff.matching_policy.exact_fields)?;
     writer.write_all(b"; ignored prefix fields: ")?;
     write_quoted_list(writer, &diff.matching_policy.ignored_prefix_fields)?;
-    writer.write_all(b"; syscall names, arguments, and results are exact.\n")?;
+    writer.write_all(b"; matching uses exact syscall names, raw arguments, and results; lexical_path_hint is display-only.\n")?;
     writeln!(
         writer,
         "Excluded control records: baseline={}, candidate={}",
@@ -50,6 +53,14 @@ pub fn write_text_diff<W: Write>(diff: &TraceDiff<'_>, writer: &mut W) -> io::Re
         write_quoted(writer, change.syscall)?;
         writer.write_all(b"\n   Arguments: ")?;
         write_quoted(writer, change.raw_arguments)?;
+        writer.write_all(
+            b"\n   Baseline lexical path hint (display only; not used for matching): ",
+        )?;
+        write_optional_path_hint(writer, change.before_lexical_path_hint)?;
+        writer.write_all(
+            b"\n   Candidate lexical path hint (display only; not used for matching): ",
+        )?;
+        write_optional_path_hint(writer, change.after_lexical_path_hint)?;
         writer.write_all(b"\n   Baseline result: ")?;
         write_optional_quoted(writer, change.before_result)?;
         writer.write_all(b"\n   Candidate result: ")?;
@@ -59,6 +70,29 @@ pub fn write_text_diff<W: Write>(diff: &TraceDiff<'_>, writer: &mut W) -> io::Re
         write_evidence_section(writer, "Candidate evidence", &change.after)?;
     }
     Ok(())
+}
+
+fn write_optional_path_hint<W: Write>(
+    writer: &mut W,
+    hint: Option<&LexicalPathHint>,
+) -> io::Result<()> {
+    match hint {
+        Some(hint) => {
+            write_quoted(writer, &hint.path)?;
+            writer.write_all(b" (basis=")?;
+            writer.write_all(path_basis_name(hint.basis).as_bytes())?;
+            writer.write_all(b")")
+        }
+        None => writer.write_all(b"(not available)"),
+    }
+}
+
+fn path_basis_name(basis: LexicalPathBasis) -> &'static str {
+    match basis {
+        LexicalPathBasis::AbsoluteArgument => "absolute_argument",
+        LexicalPathBasis::AtFdcwdAnnotation => "at_fdcwd_annotation",
+        LexicalPathBasis::DirectoryFdAnnotation => "directory_fd_annotation",
+    }
 }
 
 fn write_evidence_section<W: Write>(
@@ -151,9 +185,10 @@ mod tests {
         CaptureCompleteness, DeltaKind, EventCategory, EvidenceReference, MatchingPolicy,
         ObservedDelta, TRACE_DIFF_SCHEMA_VERSION, TraceDiff, TraceRecordKind,
     };
+    use crate::trace::{LexicalPathBasis, LexicalPathHint};
     use std::io::{self, Write};
 
-    fn diff_with(changes: Vec<ObservedDelta<'static>>) -> TraceDiff<'static> {
+    fn diff_with<'a>(changes: Vec<ObservedDelta<'a>>) -> TraceDiff<'a> {
         TraceDiff {
             schema_version: TRACE_DIFF_SCHEMA_VERSION,
             left_source_format: "strace_text_v1",
@@ -162,6 +197,14 @@ mod tests {
             matching_policy: MatchingPolicy {
                 ignored_prefix_fields: vec!["process_id".to_owned(), "timestamp".to_owned()],
                 multiplicity: "multiset".to_owned(),
+                exact_fields: vec![
+                    "record_kind".to_owned(),
+                    "category".to_owned(),
+                    "syscall".to_owned(),
+                    "raw_arguments".to_owned(),
+                    "raw_result".to_owned(),
+                ],
+                display_only_fields: vec!["lexical_path_hint".to_owned()],
             },
             left_excluded_control_records: 2,
             right_excluded_control_records: 3,
@@ -169,20 +212,22 @@ mod tests {
         }
     }
 
-    fn delta(
+    fn delta<'a>(
         kind: DeltaKind,
         category: EventCategory,
-        syscall: &'static str,
-        args: &'static str,
-        results: (Option<&'static str>, Option<&'static str>),
+        syscall: &'a str,
+        args: &'a str,
+        results: (Option<&'a str>, Option<&'a str>),
         evidence: (Vec<EvidenceReference>, Vec<EvidenceReference>),
-    ) -> ObservedDelta<'static> {
+    ) -> ObservedDelta<'a> {
         ObservedDelta {
             kind,
             category,
             record_kind: TraceRecordKind::Syscall,
             syscall,
             raw_arguments: args,
+            before_lexical_path_hint: None,
+            after_lexical_path_hint: None,
             before_result: results.0,
             after_result: results.1,
             before: evidence.0,
@@ -229,7 +274,7 @@ mod tests {
         let mut output = Vec::new();
         write_text_diff(&diff, &mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(output.starts_with("SideEffect trace comparison\nSchema version: 1\n"));
+        assert!(output.starts_with("SideEffect trace comparison\nSchema version: 2\n"));
         assert!(output.contains("Capture completeness: unknown (not established by parsing)"));
         assert!(output.contains("Excluded control records: baseline=2, candidate=3"));
         assert!(output.contains("1. Added\n"));
@@ -267,6 +312,36 @@ mod tests {
         write_text_diff(&diff, &mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("line=3 byte=20 length=16\n     line=7 byte=99 length=16"));
+    }
+
+    #[test]
+    fn renders_side_specific_lexical_hints_as_display_only() {
+        let before_hint = LexicalPathHint {
+            path: "/before/relative.txt".to_owned(),
+            basis: LexicalPathBasis::DirectoryFdAnnotation,
+        };
+        let after_hint = LexicalPathHint {
+            path: "/after/relative.txt".to_owned(),
+            basis: LexicalPathBasis::AtFdcwdAnnotation,
+        };
+        let mut changed = delta(
+            DeltaKind::Changed,
+            EventCategory::File,
+            "openat",
+            "AT_FDCWD, \"relative.txt\", O_RDONLY",
+            (Some("3"), Some("4")),
+            (vec![reference(1, 0, 25)], vec![reference(1, 0, 25)]),
+        );
+        changed.before_lexical_path_hint = Some(&before_hint);
+        changed.after_lexical_path_hint = Some(&after_hint);
+        let diff = diff_with(vec![changed]);
+        let mut output = Vec::new();
+        write_text_diff(&diff, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("exact fields: \"record_kind\", \"category\", \"syscall\", \"raw_arguments\", \"raw_result\""));
+        assert!(output.contains("matching uses exact syscall names, raw arguments, and results; lexical_path_hint is display-only."));
+        assert!(output.contains("Baseline lexical path hint (display only; not used for matching): \"/before/relative.txt\" (basis=directory_fd_annotation)"));
+        assert!(output.contains("Candidate lexical path hint (display only; not used for matching): \"/after/relative.txt\" (basis=at_fdcwd_annotation)"));
     }
 
     #[test]

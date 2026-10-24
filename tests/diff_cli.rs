@@ -55,9 +55,31 @@ fn diff_command_emits_versioned_json_with_evidence_references() {
         String::from_utf8_lossy(&output.stderr)
     );
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(document["schema_version"], 1);
+    assert_eq!(document["schema_version"], 2);
     assert_eq!(document["capture_completeness"], "unknown");
     assert_eq!(document["matching_policy"]["multiplicity"], "multiset");
+    assert_eq!(
+        document["matching_policy"]["exact_fields"][3],
+        "raw_arguments"
+    );
+    assert_eq!(
+        document["matching_policy"]["display_only_fields"][0],
+        "lexical_path_hint"
+    );
+    let changed_open = document["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["syscall"] == "openat" && change["kind"] == "changed")
+        .unwrap();
+    assert_eq!(
+        changed_open["before_lexical_path_hint"]["path"],
+        "/tmp/config.json"
+    );
+    assert_eq!(
+        changed_open["after_lexical_path_hint"]["path"],
+        "/tmp/config.json"
+    );
     assert_eq!(document["changes"].as_array().unwrap().len(), 4);
     let changed_open = document["changes"]
         .as_array()

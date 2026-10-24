@@ -20,13 +20,27 @@ fn synthetic_pair_reports_observed_file_network_and_process_deltas_with_evidence
     let right = parse(UPDATED);
     let diff = compare_traces(&left, &right).unwrap();
 
-    assert_eq!(diff.schema_version, 1);
+    assert_eq!(diff.schema_version, 2);
     assert_eq!(diff.capture_completeness, CaptureCompleteness::Unknown);
     assert_eq!(
         diff.matching_policy.ignored_prefix_fields,
         ["process_id", "timestamp"]
     );
     assert_eq!(diff.matching_policy.multiplicity, "multiset");
+    assert_eq!(
+        diff.matching_policy.exact_fields,
+        [
+            "record_kind",
+            "category",
+            "syscall",
+            "raw_arguments",
+            "raw_result"
+        ]
+    );
+    assert_eq!(
+        diff.matching_policy.display_only_fields,
+        ["lexical_path_hint"]
+    );
     assert_eq!(diff.left_excluded_control_records, 1);
     assert_eq!(diff.right_excluded_control_records, 1);
     assert_eq!(diff.changes.len(), 4);
@@ -108,11 +122,13 @@ fn timestamp_and_pid_prefix_changes_do_not_create_deltas() {
 
 #[test]
 fn diff_matching_ignores_derived_lexical_hints_and_keeps_raw_arguments_authoritative() {
-    let input = b"10 1700000000.000001 openat(AT_FDCWD</work>, \"file.txt\", O_RDONLY) = 3\n";
-    let left = parse(input);
-    let mut right = parse(input);
+    let left =
+        parse(b"10 1700000000.000001 openat(AT_FDCWD</work>, \"/work/file.txt\", O_RDONLY) = 3\n");
+    let mut right = parse(
+        b"20 1800000000.000001 openat(AT_FDCWD</work>, \"/work/file.txt\", O_RDONLY) = -1 EACCES (Permission denied)\n",
+    );
     right.records[0].lexical_path_hint = Some(LexicalPathHint {
-        path: "/different/derived/value".to_owned(),
+        path: "/intentionally/different/display/hint".to_owned(),
         basis: LexicalPathBasis::AbsoluteArgument,
     });
 
@@ -120,7 +136,86 @@ fn diff_matching_ignores_derived_lexical_hints_and_keeps_raw_arguments_authorita
         left.records[0].raw_arguments,
         right.records[0].raw_arguments
     );
-    assert!(compare_traces(&left, &right).unwrap().changes.is_empty());
+    let diff = compare_traces(&left, &right).unwrap();
+    assert_eq!(diff.changes.len(), 1);
+    let change = &diff.changes[0];
+    assert_eq!(change.kind, DeltaKind::Changed);
+    assert_eq!(
+        change.before_lexical_path_hint.unwrap().path,
+        "/work/file.txt"
+    );
+    assert_eq!(
+        change.after_lexical_path_hint.unwrap().path,
+        "/intentionally/different/display/hint"
+    );
+}
+
+#[test]
+fn derived_hints_do_not_pair_ambiguous_duplicate_raw_argument_rows() {
+    let mut left =
+        parse(b"10 1700000000.000001 getpid() = 101\n10 1700000000.000002 getpid() = 102\n");
+    let mut right =
+        parse(b"20 1800000000.000001 getpid() = 201\n20 1800000000.000002 getpid() = 202\n");
+    left.records[0].lexical_path_hint = Some(LexicalPathHint {
+        path: "before-one".to_owned(),
+        basis: LexicalPathBasis::AbsoluteArgument,
+    });
+    left.records[1].lexical_path_hint = Some(LexicalPathHint {
+        path: "before-two".to_owned(),
+        basis: LexicalPathBasis::AbsoluteArgument,
+    });
+    right.records[0].lexical_path_hint = Some(LexicalPathHint {
+        path: "after-two".to_owned(),
+        basis: LexicalPathBasis::AbsoluteArgument,
+    });
+    right.records[1].lexical_path_hint = Some(LexicalPathHint {
+        path: "after-one".to_owned(),
+        basis: LexicalPathBasis::AbsoluteArgument,
+    });
+
+    let diff = compare_traces(&left, &right).unwrap();
+    assert_eq!(diff.changes.len(), 4);
+    assert!(
+        diff.changes
+            .iter()
+            .all(|change| change.kind != DeltaKind::Changed)
+    );
+    let removed_hints: Vec<_> = diff
+        .changes
+        .iter()
+        .filter(|change| change.kind == DeltaKind::Removed)
+        .map(|change| change.before_lexical_path_hint.unwrap().path.as_str())
+        .collect();
+    let added_hints: Vec<_> = diff
+        .changes
+        .iter()
+        .filter(|change| change.kind == DeltaKind::Added)
+        .map(|change| change.after_lexical_path_hint.unwrap().path.as_str())
+        .collect();
+    assert_eq!(removed_hints, ["before-one", "before-two"]);
+    assert_eq!(added_hints, ["after-two", "after-one"]);
+}
+
+#[test]
+fn grouped_evidence_omits_inconsistent_display_hints() {
+    let mut left =
+        parse(b"10 1700000000.000001 getpid() = 101\n10 1700000000.000002 getpid() = 101\n");
+    left.records[0].lexical_path_hint = Some(LexicalPathHint {
+        path: "first-hint".to_owned(),
+        basis: LexicalPathBasis::AbsoluteArgument,
+    });
+    left.records[1].lexical_path_hint = Some(LexicalPathHint {
+        path: "second-hint".to_owned(),
+        basis: LexicalPathBasis::AbsoluteArgument,
+    });
+
+    let right = parse(b"");
+    let diff = compare_traces(&left, &right).unwrap();
+    assert_eq!(diff.changes.len(), 1);
+    let removed = &diff.changes[0];
+    assert_eq!(removed.kind, DeltaKind::Removed);
+    assert_eq!(removed.before.len(), 2);
+    assert!(removed.before_lexical_path_hint.is_none());
 }
 
 #[test]
@@ -343,7 +438,7 @@ fn control_document(count: usize) -> TraceDocument {
         })
         .collect();
     TraceDocument {
-        schema_version: 1,
+        schema_version: sideeffect::model::TRACE_DOCUMENT_SCHEMA_VERSION,
         source_format: "synthetic_fixture".to_owned(),
         input_bytes: 0,
         parse_status: ParseCompleteness::Complete,

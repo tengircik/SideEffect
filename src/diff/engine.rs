@@ -7,6 +7,7 @@ use crate::model::{
     CaptureCompleteness, DeltaKind, EventCategory, MatchingPolicy, ObservedDelta,
     ParseCompleteness, TRACE_DIFF_SCHEMA_VERSION, TraceDiff, TraceDocument, TraceRecordKind,
 };
+use crate::trace::LexicalPathHint;
 
 /// Which side of a pair failed validation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,6 +82,7 @@ struct Row<'a> {
     syscall: &'a str,
     raw_arguments: &'a str,
     raw_result: Option<&'a str>,
+    lexical_path_hint: Option<&'a LexicalPathHint>,
     evidence: &'a crate::model::EvidenceReference,
 }
 
@@ -234,6 +236,14 @@ pub fn compare_traces<'a>(
         matching_policy: MatchingPolicy {
             ignored_prefix_fields: vec!["process_id".to_owned(), "timestamp".to_owned()],
             multiplicity: "multiset".to_owned(),
+            exact_fields: vec![
+                "record_kind".to_owned(),
+                "category".to_owned(),
+                "syscall".to_owned(),
+                "raw_arguments".to_owned(),
+                "raw_result".to_owned(),
+            ],
+            display_only_fields: vec!["lexical_path_hint".to_owned()],
         },
         left_excluded_control_records,
         right_excluded_control_records,
@@ -317,6 +327,7 @@ fn collect_rows<'a>(document: &'a TraceDocument, rows: &mut Vec<Row<'a>>) -> u64
                     syscall,
                     raw_arguments,
                     raw_result: record.raw_result.as_deref(),
+                    lexical_path_hint: record.lexical_path_hint.as_ref(),
                     evidence: &record.evidence,
                 });
             }
@@ -481,6 +492,8 @@ fn emit_unmatched_changes<'a>(
             record_kind: before.record_kind,
             syscall: before.syscall,
             raw_arguments: before.raw_arguments,
+            before_lexical_path_hint: before.lexical_path_hint,
+            after_lexical_path_hint: after.lexical_path_hint,
             before_result: before.raw_result,
             after_result: after.raw_result,
             before: std::mem::take(&mut before_refs),
@@ -540,6 +553,16 @@ fn emit_residuals<'a>(
             record_kind: first.record_kind,
             syscall: first.syscall,
             raw_arguments: first.raw_arguments,
+            before_lexical_path_hint: match kind {
+                DeltaKind::Removed => consistent_group_hint(rows, &residual_indices[start..end]),
+                DeltaKind::Added => None,
+                DeltaKind::Changed => unreachable!("changed rows are emitted as pairs"),
+            },
+            after_lexical_path_hint: match kind {
+                DeltaKind::Added => consistent_group_hint(rows, &residual_indices[start..end]),
+                DeltaKind::Removed => None,
+                DeltaKind::Changed => unreachable!("changed rows are emitted as pairs"),
+            },
             before_result,
             after_result,
             before,
@@ -548,6 +571,15 @@ fn emit_residuals<'a>(
         start = end;
     }
     Ok(())
+}
+
+fn consistent_group_hint<'a>(rows: &[Row<'a>], indices: &[usize]) -> Option<&'a LexicalPathHint> {
+    let first = rows[indices.first().copied()?].lexical_path_hint;
+    indices
+        .iter()
+        .all(|index| rows[*index].lexical_path_hint == first)
+        .then_some(first)
+        .flatten()
 }
 
 fn compare_deltas(left: &ObservedDelta<'_>, right: &ObservedDelta<'_>) -> Ordering {

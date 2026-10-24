@@ -4,6 +4,7 @@ use crate::model::{
     CaptureCompleteness, DeltaKind, EventCategory, EvidenceReference, ObservedDelta, TraceDiff,
     TraceRecordKind,
 };
+use crate::trace::{LexicalPathBasis, LexicalPathHint};
 
 const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; connect-src 'none'; frame-src 'none'; media-src 'none'; script-src 'none'";
 
@@ -49,7 +50,29 @@ pub fn write_html_diff<W: Write>(diff: &TraceDiff<'_>, writer: &mut W) -> io::Re
             write_value(writer, field)?;
         }
     }
-    writer.write_all(b"</dd>\n<dt>Compared fields</dt><dd>Syscall names, arguments, and results are exact.</dd>\n<dt>Excluded control records</dt><dd>Baseline: ")?;
+    writer.write_all(b"</dd>\n<dt>Exact matching fields</dt><dd>")?;
+    if diff.matching_policy.exact_fields.is_empty() {
+        writer.write_all(b"(none)")?;
+    } else {
+        for (index, field) in diff.matching_policy.exact_fields.iter().enumerate() {
+            if index != 0 {
+                writer.write_all(b", ")?;
+            }
+            write_value(writer, field)?;
+        }
+    }
+    writer.write_all(b"</dd>\n<dt>Display-only fields</dt><dd>")?;
+    if diff.matching_policy.display_only_fields.is_empty() {
+        writer.write_all(b"(none)")?;
+    } else {
+        for (index, field) in diff.matching_policy.display_only_fields.iter().enumerate() {
+            if index != 0 {
+                writer.write_all(b", ")?;
+            }
+            write_value(writer, field)?;
+        }
+    }
+    writer.write_all(b"</dd>\n<dt>Excluded control records</dt><dd>Baseline: ")?;
     write!(writer, "{}", diff.left_excluded_control_records)?;
     writer.write_all(b"; candidate: ")?;
     write!(writer, "{}", diff.right_excluded_control_records)?;
@@ -80,6 +103,14 @@ fn write_delta<W: Write>(writer: &mut W, change: &ObservedDelta<'_>) -> io::Resu
     write_value(writer, change.syscall)?;
     writer.write_all(b"</dd>\n<dt>Arguments</dt><dd>")?;
     write_value(writer, change.raw_arguments)?;
+    writer.write_all(
+        b"</dd>\n<dt>Before lexical path hint (display only; not used for matching)</dt><dd>",
+    )?;
+    write_optional_path_hint(writer, change.before_lexical_path_hint)?;
+    writer.write_all(
+        b"</dd>\n<dt>After lexical path hint (display only; not used for matching)</dt><dd>",
+    )?;
+    write_optional_path_hint(writer, change.after_lexical_path_hint)?;
     writer.write_all(b"</dd>\n<dt>Before result (CLI argument 1)</dt><dd>")?;
     write_optional_value(writer, change.before_result)?;
     writer.write_all(b"</dd>\n<dt>After result (CLI argument 2)</dt><dd>")?;
@@ -88,6 +119,29 @@ fn write_delta<W: Write>(writer: &mut W, change: &ObservedDelta<'_>) -> io::Resu
     write_evidence(writer, "Before evidence (CLI argument 1)", &change.before)?;
     write_evidence(writer, "After evidence (CLI argument 2)", &change.after)?;
     writer.write_all(b"</li>\n")
+}
+
+fn write_optional_path_hint<W: Write>(
+    writer: &mut W,
+    hint: Option<&LexicalPathHint>,
+) -> io::Result<()> {
+    match hint {
+        Some(hint) => {
+            write_value(writer, &hint.path)?;
+            writer.write_all(b" (basis=")?;
+            writer.write_all(path_basis_name(hint.basis).as_bytes())?;
+            writer.write_all(b")")
+        }
+        None => writer.write_all(b"(not available)"),
+    }
+}
+
+fn path_basis_name(basis: LexicalPathBasis) -> &'static str {
+    match basis {
+        LexicalPathBasis::AbsoluteArgument => "absolute_argument",
+        LexicalPathBasis::AtFdcwdAnnotation => "at_fdcwd_annotation",
+        LexicalPathBasis::DirectoryFdAnnotation => "directory_fd_annotation",
+    }
 }
 
 fn write_evidence<W: Write>(
@@ -213,9 +267,10 @@ mod tests {
         CaptureCompleteness, DeltaKind, EventCategory, EvidenceReference, MatchingPolicy,
         ObservedDelta, TRACE_DIFF_SCHEMA_VERSION, TraceDiff, TraceRecordKind,
     };
+    use crate::trace::{LexicalPathBasis, LexicalPathHint};
     use std::io::{self, Write};
 
-    fn make_diff(args: &'static str) -> TraceDiff<'static> {
+    fn make_diff(args: &str) -> TraceDiff<'_> {
         TraceDiff {
             schema_version: TRACE_DIFF_SCHEMA_VERSION,
             left_source_format: "strace_text_v1",
@@ -224,6 +279,14 @@ mod tests {
             matching_policy: MatchingPolicy {
                 ignored_prefix_fields: vec!["process_id".to_owned(), "timestamp".to_owned()],
                 multiplicity: "multiset".to_owned(),
+                exact_fields: vec![
+                    "record_kind".to_owned(),
+                    "category".to_owned(),
+                    "syscall".to_owned(),
+                    "raw_arguments".to_owned(),
+                    "raw_result".to_owned(),
+                ],
+                display_only_fields: vec!["lexical_path_hint".to_owned()],
             },
             left_excluded_control_records: 1,
             right_excluded_control_records: 2,
@@ -233,6 +296,8 @@ mod tests {
                 record_kind: TraceRecordKind::Syscall,
                 syscall: "openat",
                 raw_arguments: args,
+                before_lexical_path_hint: None,
+                after_lexical_path_hint: None,
                 before_result: Some("-1 ENOENT"),
                 after_result: Some("3"),
                 before: vec![EvidenceReference {
@@ -275,9 +340,34 @@ mod tests {
         );
         assert!(output.contains("After result (CLI argument 2)</dt><dd><span class=\"value\">3"));
         assert!(output.contains("config.ini"));
+        assert!(output.contains("Exact matching fields</dt><dd><span class=\"value\">record_kind</span>, <span class=\"value\">category</span>, <span class=\"value\">syscall</span>, <span class=\"value\">raw_arguments</span>, <span class=\"value\">raw_result</span>"));
+        assert!(output.contains(
+            "Display-only fields</dt><dd><span class=\"value\">lexical_path_hint</span>"
+        ));
         assert!(!output.contains("<script"));
         assert!(!output.contains("src=\"http"));
         assert!(!output.contains("href="));
+    }
+
+    #[test]
+    fn renders_side_hints_as_escaped_text_without_making_them_match_keys() {
+        let before_hint = LexicalPathHint {
+            path: "/before/<img src=x onerror=alert(1)>".to_owned(),
+            basis: LexicalPathBasis::DirectoryFdAnnotation,
+        };
+        let after_hint = LexicalPathHint {
+            path: "/after/relative.txt".to_owned(),
+            basis: LexicalPathBasis::AtFdcwdAnnotation,
+        };
+        let mut diff = make_diff("AT_FDCWD, \"relative.txt\", O_RDONLY");
+        diff.changes[0].before_lexical_path_hint = Some(&before_hint);
+        diff.changes[0].after_lexical_path_hint = Some(&after_hint);
+        let output = render(&diff);
+        assert!(output.contains("Before lexical path hint (display only; not used for matching)"));
+        assert!(output.contains("&lt;img src=x onerror=alert(1)&gt;"));
+        assert!(output.contains("basis=directory_fd_annotation"));
+        assert!(output.contains("After lexical path hint (display only; not used for matching)"));
+        assert!(!output.contains("<img"));
     }
 
     #[test]

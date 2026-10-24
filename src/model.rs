@@ -3,7 +3,7 @@ use serde::Serialize;
 use crate::trace::LexicalPathHint;
 
 pub const TRACE_DOCUMENT_SCHEMA_VERSION: u32 = 2;
-pub const TRACE_DIFF_SCHEMA_VERSION: u32 = 1;
+pub const TRACE_DIFF_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -100,6 +100,10 @@ pub struct MatchingPolicy {
     /// Parser-level run metadata omitted only from matching; raw records retain it.
     pub ignored_prefix_fields: Vec<String>,
     pub multiplicity: String,
+    /// Exact row identity fields and result value used by the comparison.
+    pub exact_fields: Vec<String>,
+    /// Derived display hints are exposed but never used as comparison keys.
+    pub display_only_fields: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -109,6 +113,12 @@ pub struct ObservedDelta<'a> {
     pub record_kind: TraceRecordKind,
     pub syscall: &'a str,
     pub raw_arguments: &'a str,
+    /// Optional derived path hint from the before-side evidence. Display only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_lexical_path_hint: Option<&'a LexicalPathHint>,
+    /// Optional derived path hint from the after-side evidence. Display only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_lexical_path_hint: Option<&'a LexicalPathHint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub before_result: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
