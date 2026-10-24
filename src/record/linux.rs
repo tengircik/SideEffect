@@ -5,14 +5,18 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ExitStatus};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use crate::limits::MAX_TRACE_BYTES;
 
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 const POLL_INTERVAL_MS: i32 = 50;
+const MIN_STRACE_VERSION: (u64, u64) = (6, 6);
+const MAX_VERSION_OUTPUT_BYTES: usize = 4096;
+const VERSION_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 static CANCELLATION_SIGNAL: AtomicI32 = AtomicI32::new(0);
 static SIGNAL_GUARD_LOCK: Mutex<()> = Mutex::new(());
 
@@ -85,6 +89,7 @@ fn record_trace_bounded(
     args: &[OsString],
     max_trace_bytes: usize,
 ) -> Result<RecordOutcome, RecordError> {
+    verify_strace_version(tracer)?;
     let mut output = super::AnchoredOutput::prepare(destination).map_err(|error| {
         RecordError::before_launch(format!("could not prepare safe trace output: {error}"))
     })?;
@@ -251,6 +256,160 @@ fn record_trace_bounded(
     })
 }
 
+fn verify_strace_version(tracer: &OsStr) -> Result<(), RecordError> {
+    verify_strace_version_with_timeout(tracer, VERSION_QUERY_TIMEOUT)
+}
+
+fn verify_strace_version_with_timeout(
+    tracer: &OsStr,
+    query_timeout: Duration,
+) -> Result<(), RecordError> {
+    let parent_pid = std::process::id() as libc::pid_t;
+    let mut version_command = Command::new(tracer);
+    version_command
+        .arg("-V")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // SAFETY: use the same narrow parent-death guard as the tracing process;
+    // the version query does not launch the user's target.
+    unsafe {
+        version_command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::getppid() != parent_pid {
+                return Err(io::Error::from_raw_os_error(libc::ECHILD));
+            }
+            Ok(())
+        });
+    }
+    let mut child = version_command.spawn().map_err(|error| {
+        RecordError::before_launch(format!(
+            "could not query strace version: {error}; the command was not started"
+        ))
+    })?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(RecordError::before_launch(
+            "could not read strace version output; the command was not started",
+        ));
+    };
+    let deadline = Instant::now() + query_timeout;
+    let mut output = Vec::with_capacity(128);
+    let mut buffer = [0u8; 512];
+    let mut eof = false;
+    let mut status = None;
+
+    while !eof || status.is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RecordError::before_launch(format!(
+                "strace version check timed out after {query_timeout:?}; the command was not started"
+            )));
+        }
+
+        let poll_result = if eof {
+            std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS as u64));
+            0
+        } else {
+            let mut descriptor = libc::pollfd {
+                fd: stdout.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: descriptor points to one initialized pollfd for the duration of poll.
+            unsafe { libc::poll(&mut descriptor, 1, POLL_INTERVAL_MS) }
+        };
+        if poll_result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RecordError::before_launch(format!(
+                "could not read strace version output: {error}"
+            )));
+        }
+
+        if poll_result > 0 {
+            let remaining = MAX_VERSION_OUTPUT_BYTES
+                .saturating_add(1)
+                .saturating_sub(output.len());
+            let read_len = buffer.len().min(remaining.max(1));
+            let count =
+                std::io::Read::read(&mut stdout, &mut buffer[..read_len]).map_err(|error| {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    RecordError::before_launch(format!(
+                        "could not read strace version output: {error}; the command was not started"
+                    ))
+                })?;
+            if count == 0 {
+                eof = true;
+            } else {
+                output.extend_from_slice(&buffer[..count]);
+                if output.len() > MAX_VERSION_OUTPUT_BYTES {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(RecordError::before_launch(format!(
+                        "strace version output exceeds {MAX_VERSION_OUTPUT_BYTES} bytes; the command was not started"
+                    )));
+                }
+            }
+        }
+
+        if status.is_none() {
+            status = child.try_wait().map_err(|error| {
+                let _ = child.kill();
+                let _ = child.wait();
+                RecordError::before_launch(format!(
+                    "could not inspect strace version-check status: {error}"
+                ))
+            })?;
+        }
+    }
+
+    let status = status.expect("loop exits only after the version process exits");
+    if !status.success() {
+        return Err(RecordError::before_launch(format!(
+            "strace version check failed with status {}; the command was not started",
+            status
+                .code()
+                .map_or_else(|| "signal".to_owned(), |code| code.to_string())
+        )));
+    }
+
+    let version = parse_strace_version(&output).ok_or_else(|| {
+        RecordError::before_launch(
+            "could not recognize `strace -V` output; the command was not started",
+        )
+    })?;
+    if version < MIN_STRACE_VERSION {
+        return Err(RecordError::before_launch(format!(
+            "strace {}.{} or newer is required for --kill-on-exit; found {}.{}; the command was not started",
+            MIN_STRACE_VERSION.0, MIN_STRACE_VERSION.1, version.0, version.1
+        )));
+    }
+    Ok(())
+}
+
+fn parse_strace_version(output: &[u8]) -> Option<(u64, u64)> {
+    let text = std::str::from_utf8(output).ok()?;
+    let version = text
+        .lines()
+        .find_map(|line| line.strip_prefix("strace -- version "))?;
+    let mut components = version.trim().split('.');
+    let major = components.next()?.parse().ok()?;
+    let minor = components.next()?.parse().ok()?;
+    if components.any(|component| component.parse::<u64>().is_err()) {
+        return None;
+    }
+    Some((major, minor))
+}
+
 enum DrainResult {
     Idle,
     Overflow,
@@ -406,7 +565,10 @@ impl Drop for SignalGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{RecordError, record_trace_bounded};
+    use super::{
+        MAX_VERSION_OUTPUT_BYTES, RecordError, record_trace_bounded,
+        verify_strace_version_with_timeout,
+    };
     use std::ffi::{OsStr, OsString};
     use std::fs::{self, OpenOptions};
     use std::io::Write;
@@ -414,6 +576,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -436,6 +599,16 @@ mod tests {
         }
 
         fn fake_tracer(&self, script_body: &str) -> PathBuf {
+            self.fake_tracer_version(script_body, "6.6")
+        }
+
+        fn fake_tracer_version(&self, script_body: &str, version: &str) -> PathBuf {
+            self.fake_tracer_script(&format!(
+                "#!/bin/sh\nif [ \"$1\" = \"-V\" ]; then printf '%s\\n' 'strace -- version {version}'; exit 0; fi\n{script_body}\n"
+            ))
+        }
+
+        fn fake_tracer_script(&self, script: &str) -> PathBuf {
             let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
             let path = self.0.join(format!("fake-strace-{id}"));
             let mut file = OpenOptions::new()
@@ -443,7 +616,7 @@ mod tests {
                 .create_new(true)
                 .open(&path)
                 .expect("create fake tracer");
-            file.write_all(format!("#!/bin/sh\n{script_body}\n").as_bytes())
+            file.write_all(script.as_bytes())
                 .expect("write fake tracer");
             let mut permissions = file.metadata().unwrap().permissions();
             permissions.set_mode(0o700);
@@ -465,7 +638,17 @@ mod tests {
         output_name: &str,
         limit: usize,
     ) -> Result<super::RecordOutcome, RecordError> {
-        let tracer = directory.fake_tracer(script_body);
+        run_fake_with_version(directory, script_body, output_name, limit, "6.6")
+    }
+
+    fn run_fake_with_version(
+        directory: &TestDirectory,
+        script_body: &str,
+        output_name: &str,
+        limit: usize,
+        version: &str,
+    ) -> Result<super::RecordOutcome, RecordError> {
+        let tracer = directory.fake_tracer_version(script_body, version);
         record_trace_bounded(
             &directory.0.join(output_name),
             tracer.as_os_str(),
@@ -591,9 +774,126 @@ mod tests {
             64,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("could not start strace"));
+        assert!(error.to_string().contains("could not query strace version"));
+        assert!(error.to_string().contains("the command was not started"));
         assert!(!directory.0.join("missing.trace").exists());
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn older_strace_is_rejected_before_output_staging_or_target_launch() {
+        let directory = TestDirectory::new();
+        let target_marker = directory.0.join("target-was-started");
+        let escaped_marker = target_marker.to_string_lossy().replace('\'', "'\\''");
+        let error = run_fake_with_version(
+            &directory,
+            &format!("touch '{escaped_marker}'"),
+            "old.trace",
+            64,
+            "6.5",
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("strace 6.6 or newer is required")
+        );
+        assert!(error.to_string().contains("the command was not started"));
+        assert!(!directory.0.join("old.trace").exists());
+        assert!(!directory.0.join("target-was-started").exists());
+        assert_eq!(
+            fs::read_dir(&directory.0).unwrap().count(),
+            1,
+            "only the fake tracer remains; output staging was not created"
+        );
+    }
+
+    #[test]
+    fn strace_version_parser_rejects_unknown_and_accepts_numeric_versions() {
+        assert_eq!(
+            super::parse_strace_version(b"strace -- version 6.6\n"),
+            Some((6, 6))
+        );
+        assert_eq!(
+            super::parse_strace_version(b"strace -- version 7.0.1\n"),
+            Some((7, 0))
+        );
+        assert_eq!(
+            super::parse_strace_version(b"strace version unknown\n"),
+            None
+        );
+        assert_eq!(
+            super::parse_strace_version(b"strace -- version 6.x\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn unrecognized_successful_version_is_rejected_before_target_launch() {
+        let directory = TestDirectory::new();
+        let target_marker = directory.0.join("target-was-started");
+        let escaped_marker = target_marker.to_string_lossy().replace('\'', "'\\''");
+        let error = run_fake_with_version(
+            &directory,
+            &format!("touch '{escaped_marker}'"),
+            "unknown.trace",
+            64,
+            "unknown",
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("could not recognize `strace -V` output")
+        );
+        assert!(error.to_string().contains("the command was not started"));
+        assert!(!target_marker.exists());
+        assert!(!directory.0.join("unknown.trace").exists());
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn oversized_version_output_is_rejected_before_target_launch() {
+        let directory = TestDirectory::new();
+        let target_marker = directory.0.join("target-was-started");
+        let escaped_marker = target_marker.to_string_lossy().replace('\'', "'\\''");
+        let oversized = format!("6.6.{}", "0".repeat(MAX_VERSION_OUTPUT_BYTES));
+        let error = run_fake_with_version(
+            &directory,
+            &format!("touch '{escaped_marker}'"),
+            "oversized.trace",
+            64,
+            &oversized,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("strace version output exceeds 4096 bytes")
+        );
+        assert!(error.to_string().contains("the command was not started"));
+        assert!(!target_marker.exists());
+        assert!(!directory.0.join("oversized.trace").exists());
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn version_query_eof_waits_until_bounded_timeout() {
+        let directory = TestDirectory::new();
+        let tracer = directory.fake_tracer_script(
+            "#!/bin/sh\nif [ \"$1\" = \"-V\" ]; then exec 1>&-; exec /bin/sleep 10; fi\nexit 1\n",
+        );
+        let started = Instant::now();
+        let error =
+            verify_strace_version_with_timeout(tracer.as_os_str(), Duration::from_millis(150))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("version check timed out"));
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]
