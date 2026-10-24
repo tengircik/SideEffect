@@ -138,22 +138,13 @@ impl AnchoredOutput {
             ));
         }
 
-        let source = c_name(TRACE_NAME)?;
-        let destination = c_name(self.destination_name.as_os_str().as_bytes())?;
-        // SAFETY: both dirfds are held open directories; names are NUL-terminated single
-        // components; linkat without AT_SYMLINK_FOLLOW does not follow a source symlink.
-        if unsafe {
-            libc::linkat(
-                self.stage_dir.as_raw_fd(),
-                source.as_ptr(),
-                self.parent_dir.as_raw_fd(),
-                destination.as_ptr(),
-                0,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
+        publish_entry(
+            self.stage_dir.as_raw_fd(),
+            TRACE_NAME,
+            self.parent_dir.as_raw_fd(),
+            self.destination_name.as_os_str().as_bytes(),
+            link_entry,
+        )?;
         self.published = true;
 
         let current_parent = read_fd_path(self.parent_dir.as_raw_fd())
@@ -188,21 +179,13 @@ impl AnchoredOutput {
                 "output has already been published",
             ));
         }
-        let source = c_name(REPORT_NAME)?;
-        let destination = c_name(self.destination_name.as_os_str().as_bytes())?;
-        // SAFETY: both dirfds are held open; names are NUL-terminated single components.
-        if unsafe {
-            libc::linkat(
-                self.stage_dir.as_raw_fd(),
-                source.as_ptr(),
-                self.parent_dir.as_raw_fd(),
-                destination.as_ptr(),
-                0,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
+        publish_entry(
+            self.stage_dir.as_raw_fd(),
+            REPORT_NAME,
+            self.parent_dir.as_raw_fd(),
+            self.destination_name.as_os_str().as_bytes(),
+            link_entry,
+        )?;
         self.published = true;
         let current_parent = read_fd_path(self.parent_dir.as_raw_fd())
             .unwrap_or_else(|_| self.parent_path_at_prepare.clone());
@@ -230,6 +213,82 @@ impl AnchoredOutput {
     #[cfg(test)]
     fn stage_path_for_test(&self) -> PathBuf {
         self.parent_path_at_prepare.join(&self.stage_name)
+    }
+}
+
+fn publish_entry<F>(
+    source_dir_fd: i32,
+    source_name: &[u8],
+    destination_dir_fd: i32,
+    destination_name: &[u8],
+    link: F,
+) -> io::Result<()>
+where
+    F: FnOnce(i32, &CString, i32, &CString) -> io::Result<()>,
+{
+    let source = c_name(source_name)?;
+    let destination = c_name(destination_name)?;
+    match link(source_dir_fd, &source, destination_dir_fd, &destination) {
+        Ok(()) => Ok(()),
+        Err(error) if hard_links_unsupported(&error) => {
+            rename_no_replace(source_dir_fd, &source, destination_dir_fd, &destination)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn link_entry(
+    source_dir_fd: i32,
+    source: &CString,
+    destination_dir_fd: i32,
+    destination: &CString,
+) -> io::Result<()> {
+    // SAFETY: both dirfds are held open directories; names are single components. linkat does
+    // not follow a source symlink, and atomically fails if the destination name is occupied.
+    if unsafe {
+        libc::linkat(
+            source_dir_fd,
+            source.as_ptr(),
+            destination_dir_fd,
+            destination.as_ptr(),
+            0,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn hard_links_unsupported(error: &io::Error) -> bool {
+    error.raw_os_error().is_some_and(|code| {
+        code == libc::EOPNOTSUPP || code == libc::ENOTSUP || code == libc::ENOSYS
+    })
+}
+
+fn rename_no_replace(
+    source_dir_fd: i32,
+    source: &CString,
+    destination_dir_fd: i32,
+    destination: &CString,
+) -> io::Result<()> {
+    // RENAME_NOREPLACE keeps the destination collision check atomic. A plain rename would
+    // overwrite an existing file, so filesystems/kernels without this operation fail closed.
+    // SAFETY: both dirfds are held directory descriptors and both names are single components.
+    if unsafe {
+        libc::renameat2(
+            source_dir_fd,
+            source.as_ptr(),
+            destination_dir_fd,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -549,9 +608,11 @@ fn c_name(name: &[u8]) -> io::Result<CString> {
 
 #[cfg(test)]
 mod tests {
-    use super::AnchoredOutput;
+    use super::{AnchoredOutput, REPORT_NAME, TRACE_NAME, publish_entry};
     use std::fs;
     use std::io::{self, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -589,6 +650,119 @@ mod tests {
         let mut trace = output.create_trace_file().expect("create trace file");
         trace.write_all(contents).expect("write staged trace");
         trace.sync_all().expect("sync staged trace");
+    }
+
+    fn force_unsupported_link(
+        _: i32,
+        _: &std::ffi::CString,
+        _: i32,
+        _: &std::ffi::CString,
+    ) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+    }
+
+    fn publish_via_forced_fallback(output: &mut AnchoredOutput, source: &[u8]) -> PathBuf {
+        publish_entry(
+            output.stage_dir.as_raw_fd(),
+            source,
+            output.parent_dir.as_raw_fd(),
+            output.destination_name.as_os_str().as_bytes(),
+            force_unsupported_link,
+        )
+        .expect("rename no-replace fallback");
+        output.published = true;
+        let parent = super::read_fd_path(output.parent_dir.as_raw_fd())
+            .unwrap_or_else(|_| output.parent_path_at_prepare.clone());
+        parent.join(&output.destination_name)
+    }
+
+    #[test]
+    fn hard_link_and_rename_routes_preserve_private_file_contents_and_mode_and_clean_stage() {
+        let directory = TestDirectory::new();
+
+        let hard_link_path = directory.0.join("hard-link.trace");
+        let mut hard_link = directory.prepare("hard-link.trace");
+        write_staged(&mut hard_link, b"hard link bytes");
+        let staged_hard_link = hard_link.stage_path_for_test();
+        hard_link.publish_trace().unwrap();
+        assert_eq!(fs::read(&hard_link_path).unwrap(), b"hard link bytes");
+        assert_eq!(
+            fs::metadata(&hard_link_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(hard_link);
+        assert!(!staged_hard_link.exists());
+
+        let report_path = directory.0.join("rename.html");
+        let mut report_output = directory.prepare("rename.html");
+        let mut report = report_output.create_report_file().unwrap();
+        report.write_all(b"fallback report").unwrap();
+        report.sync_all().unwrap();
+        let staged_report = report_output.stage_path_for_test();
+        drop(report);
+        let published = publish_via_forced_fallback(&mut report_output, REPORT_NAME);
+        assert_eq!(published, report_path);
+        assert_eq!(fs::read(&report_path).unwrap(), b"fallback report");
+        assert_eq!(
+            fs::metadata(&report_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(report_output);
+        assert!(!staged_report.exists());
+    }
+
+    #[test]
+    fn fallback_never_replaces_a_racing_file_or_symlink_and_other_link_errors_do_not_fallback() {
+        let directory = TestDirectory::new();
+        let mut output = directory.prepare("collision.trace");
+        write_staged(&mut output, b"staged bytes");
+        let destination = directory.0.join("collision.trace");
+        fs::write(&destination, b"racing bytes").unwrap();
+        let error = publish_entry(
+            output.stage_dir.as_raw_fd(),
+            TRACE_NAME,
+            output.parent_dir.as_raw_fd(),
+            b"collision.trace",
+            |_, _, _, _| Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&destination).unwrap(), b"racing bytes");
+
+        let mut symlink_output = directory.prepare("symlink.trace");
+        write_staged(&mut symlink_output, b"must not replace link");
+        let target = directory.0.join("target");
+        fs::write(&target, b"target bytes").unwrap();
+        let symlink = directory.0.join("symlink.trace");
+        std::os::unix::fs::symlink(&target, &symlink).unwrap();
+        let error = publish_entry(
+            symlink_output.stage_dir.as_raw_fd(),
+            TRACE_NAME,
+            symlink_output.parent_dir.as_raw_fd(),
+            b"symlink.trace",
+            force_unsupported_link,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&target).unwrap(), b"target bytes");
+        assert!(
+            fs::symlink_metadata(&symlink)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let permission_output = directory.prepare("permission.trace");
+        let error = publish_entry(
+            permission_output.stage_dir.as_raw_fd(),
+            TRACE_NAME,
+            permission_output.parent_dir.as_raw_fd(),
+            b"permission.trace",
+            |_, _, _, _| Err(io::Error::from_raw_os_error(libc::EACCES)),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        assert!(!directory.0.join("permission.trace").exists());
     }
 
     #[test]
