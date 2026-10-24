@@ -1,17 +1,25 @@
 # SideEffect Delivery Plan
 
-**Status:** proposed sequence for future implementation. This is not a schedule, a claim of completed work, or permission to change scope. All commands/features below remain proposed until implemented and verified.
+**Status:** implementation is underway; this is not a schedule or release claim. A bounded parser-only `inspect` command and synthetic parser fixtures now exist. The capture runner, comparison engine, and HTML renderer remain future work.
+
+## Current implementation slice
+
+`sideeffect inspect TRACE` reads a regular local file, accepts a bounded subset of `strace` text, preserves raw lines and source byte offsets in a schema-v1 JSON document, and writes that document to stdout. It does not execute the represented command, invoke `strace`, compare runs, or write report files. The synthetic fixture is not a real capture. Compatibility with a real tracer output has not been integration-tested.
+
+Current hard limits are 32 MiB per input file, 64 KiB per physical record excluding LF, 100,000 records, and 64 MiB for JSON output. These initial values need review against real captures. `parse_status` describes syntax/continuation parsing only and cannot establish capture completeness.
 
 ## Milestone 0 — Repository and dependency decision
 
 - Review repository guidance and existing project state before implementation.
-- Confirm available Rust toolchain and Linux x86_64 development/test environment; do not install a toolchain as part of documentation work.
-- Define the supported `strace` range, exact initial syscall set, command/exit-status contract, storage layout, and JSON schema policy.
-- Record explicit resource budgets before parser/report implementation: input bytes, record and string length, event/collection counts, comparison growth, and rendered-output size. The budgets must be reviewed and documented; no numeric threshold is assumed by this plan.
+- Confirm available Rust toolchain and Linux x86_64 development/test environment; do not install a toolchain without explicit authorization.
+- Define the supported `strace` range, exact initial syscall set, command/exit-status contract, capture storage layout, and JSON schema policy. The parser's current v1 JSON document is not the planned run-bundle schema.
+- Record explicit resource budgets before parser/report implementation. `inspect` currently uses 32 MiB input, 64 KiB physical records, 100,000 records, and 64 MiB JSON output; validate these values against real captures before release. Define additional budgets for capture bundles and comparison before those features are implemented.
 - Decide the Linux filesystem operations needed to create evidence bundles and atomically publish reports without following attacker-controlled symlinks or replacing existing user files. See [SECURITY.md](../SECURITY.md).
 - Resolve licensing and packaging implications of depending on an external `strace` executable before distribution.
 
 **Exit criteria:** written implementation decisions identify supported platform/tool versions, known observation limits, status/error semantics, documented resource budgets, safe no-follow/no-clobber output semantics, and unresolved items. No unsupported native Windows promise.
+
+The initial Rust/MSRV and parser limits are recorded in `Cargo.toml` and `src/limits.rs`; supported `strace` versions, real-capture compatibility, and final release budgets remain open.
 
 ## Milestone 1 — Capture a single run
 
@@ -24,7 +32,7 @@
 
 ## Milestone 2 — Parse and model evidence
 
-- Implement a bounded parser for the supported `strace` version/output mode.
+- The initial `inspect` parser is implemented for the documented bounded text subset. Continue validating it against real supported `strace` captures and add explicit format/version support before release.
 - Add a versioned run record and event schema with raw-evidence references.
 - Represent process, file, and connection-related observations without overstating success or identity.
 - Track parse errors, unsupported records, and detectable incomplete/truncated input.

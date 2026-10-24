@@ -4,16 +4,30 @@ Thank you for your interest in SideEffect.
 
 ## Current project state
 
-The repository is currently at the planning and documentation stage. There is no implemented CLI, build command, automated test suite, or CI workflow yet. The command examples in the planning documents are sketches, not executable commands. Please do not report a build or test as passing unless that check exists and you actually ran it.
+The repository has an early Rust implementation of `sideeffect inspect TRACE`: it reads one bounded local trace file and writes a schema-v1 JSON evidence document to stdout. Capture, paired-run comparison, HTML reporting, and CI are not implemented yet. A synthetic fixture exercises the parser but is not a real `strace` capture. Please do not report a real-tracer integration as passing unless it was run with `strace` installed.
 
-For now, useful contributions include correcting or clarifying the product brief, architecture plan, delivery plan, and security guidance. Before proposing implementation work, read:
+Before proposing implementation work, read:
 
 - [`docs/PRODUCT.md`](docs/PRODUCT.md)
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - [`docs/PLAN.md`](docs/PLAN.md)
 - [`SECURITY.md`](SECURITY.md)
 
-The current target is a Rust CLI for Linux x86_64 using an external `strace` executable. Use through an already installed WSL2 environment may be possible, but native Windows tracing is not in the initial scope. The product is local-first and does not require an LLM or hosted service.
+The intended capture target is a Rust CLI for Linux x86_64 using an external `strace` executable. Existing WSL2 may be used as a Linux environment, but native Windows tracing is not in the initial scope. The current parser-only command does not invoke `strace`; no LLM or hosted service is required.
+
+## Local checks
+
+From the repository root, the current checks are:
+
+```sh
+cargo fmt --all --check
+cargo test --all-targets
+cargo run -- inspect tests/fixtures/strace/synthetic-minimal.trace
+```
+
+The included trace is synthetic. Parser and CLI tests do not validate compatibility with a real `strace` release. A real capture integration test remains future work and requires an installed supported tracer.
+
+`cargo fmt --all --check` requires the `rustfmt` component; no toolchain components are installed automatically by this repository.
 
 ## How to propose a change
 
@@ -26,11 +40,11 @@ There is no contribution agreement, DCO sign-off, or code style tool configured 
 
 ## Documentation changes
 
-There is no configured documentation build or link checker yet. Review Markdown rendering and links manually when practical, and identify that review in the pull request. Do not claim automated validation that has not been set up and run.
+There is no configured documentation build or link checker. Review Markdown rendering and links manually when practical, and identify that review in the pull request. Do not claim automated validation that has not been set up and run.
 
 ## Future implementation contributions
 
-When implementation begins, new behavior should include automated tests. The planning documents describe acceptance targets for capture, parsing, comparison, incomplete traces, JSON, and offline HTML; those targets are not tests that currently exist. The project should add and document real build and test commands before asking contributors to run them.
+New behavior should include automated tests. The planning documents describe remaining acceptance targets for capture, comparison, incomplete traces, JSON compatibility, and offline HTML; those targets are not tests that currently exist. Keep synthetic fixtures clearly labeled and add real-tracer tests only when the external prerequisite is available.
 
 Use synthetic or deliberately generated fixtures. Do not commit traces, command output, screenshots, or reports from real systems unless they have been carefully reviewed and sanitized. SideEffect traces may contain sensitive command arguments, paths, network endpoints, or output, and there is no automatic secret-removal guarantee.
 

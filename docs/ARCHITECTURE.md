@@ -1,6 +1,6 @@
 # SideEffect Architecture Plan
 
-**Status:** planning draft. The architecture below is proposed and may change after repository and toolchain review. No component described here is implied to exist yet.
+**Status:** early implementation. The current source implements a read-only `inspect` CLI path and bounded line-oriented parser that emits a schema-v1 JSON document. Capture orchestration, comparison, run bundles, and HTML rendering below are planned, not implemented.
 
 The security requirements for future implementation are summarized in [SECURITY.md](../SECURITY.md); the input-budget and safe-output behavior below are release requirements, not implemented protections.
 
@@ -34,6 +34,18 @@ Versioned run record ───────► raw event references + capture met
                                versioned JSON          offline HTML
 ```
 
+The current parser-only path is `inspect <trace-file>` → bounded regular-file read → strict UTF-8 and line parsing → versioned JSON to stdout. It does not start `strace` or execute the command represented by the trace.
+
+## Current parser contract
+
+The parser accepts a bounded subset of line-oriented `strace` output. A proposed profile for a future capture command is `-f -ttt -yy -s 256 -e trace=%process,%file,%network -o FILE`; `inspect` does not verify how its input was produced. For current `strace` option and output behavior, see the [`strace(1)` manual](https://man7.org/linux/man-pages/man1/strace.1.html). No real-tracer integration test has been run yet because `strace` is not installed in the available WSL Ubuntu environment.
+
+The parser recognizes PID and timestamp prefixes, syscall calls, common control records, and unfinished/resumed calls. It retains the original raw line and byte offset/length, plus raw syscall argument/result text. Unknown, malformed, or unpaired continuation lines remain in the JSON with diagnostics; invalid UTF-8 and hard budget violations return an error and no document. `parse_status` reports whether the parser classified and reconciled the supplied text; it never asserts capture completeness.
+
+For `-yy` output, an unquoted `<` begins a file-descriptor annotation and the parser skips through its next `>`. An unterminated annotation makes that line malformed. Other valid strace representations may be reported as partial until fixtures demonstrate support.
+
+The current hard budgets are 32 MiB total input bytes, 64 KiB per physical record (excluding LF), 100,000 physical records, and 64 MiB for the serialized JSON document. Records include control and unparsed lines. The event fields duplicate portions of raw text and have bounded string lengths because every source record and the overall input are bounded; the serialized document is independently capped before it is written to stdout. These initial values need review against real captures before release.
+
 ## Component responsibilities
 
 ### CLI and capture coordinator
@@ -56,7 +68,7 @@ Raw trace text is retained as the evidence source. The parser converts supported
 
 The parser must tolerate concurrent processes and unfinished/resumed syscall records according to supported `strace` output formats. Unsupported record forms are surfaced as unsupported or unparsed evidence rather than guessed into structured events.
 
-Before implementation, record explicit resource budgets for input trace size, record and string length, event and collection counts, comparison growth, and rendered output size. Do not choose undocumented or implicit limits. Oversized, malformed, and truncated inputs must produce a bounded, explicit failure or partial/incomplete result rather than unbounded allocation, silent truncation, or a report that implies complete observation. Boundary tests must exercise each chosen limit at the accepted boundary and just beyond it, including large strings and event/record counts.
+The current parser enforces 32 MiB total input, 64 KiB per physical record excluding LF, and 100,000 physical records. JSON serialization has an independent 64 MiB output cap and completes in a bounded buffer before stdout is written. Parser fields duplicate bounded portions of raw records; record-size, input-size, record-count, and output-size caps constrain those copies. These initial limits need validation with real traces before release. Future capture, comparison, and HTML rendering must define additional budgets for event collections, comparison growth, and rendered output before implementation. Oversized input fails explicitly; malformed or unsupported lines remain raw evidence with diagnostics rather than implying they were understood.
 
 ### Versioned run record
 

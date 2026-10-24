@@ -1,42 +1,39 @@
 # SideEffect
 
-SideEffect is a proposed local-first CLI for capturing selected process, file, and network-related operating-system events from a command, comparing two runs, and producing an evidence-linked report.
+SideEffect is a local-first Rust CLI for inspecting `strace` text and preserving event-level evidence in JSON.
 
-> **Project status: planning only.** This repository currently contains documentation, not an executable implementation. No capture command, installer, report generator, or security guarantee is available yet. The workflow below describes the intended product.
+> **Status: early implementation.** The current `inspect` command reads one local trace file and writes a versioned JSON document to stdout. It does not run `strace`, execute a command, compare runs, or generate HTML reports.
 
-## Why it exists
+## Try the current command
 
-When a command behaves differently after a dependency, build, or environment change, raw system-call traces are difficult to compare. SideEffect is intended to turn a pair of captures into a compact review: what was observed in each run, what differs, and which raw trace records support each difference.
+From the repository root, run:
 
-For example, a maintainer could compare the same CLI before and after an update and inspect whether the newer run attempted an extra child-process launch, file operation, or connection. A report describes observations; it does not infer root cause or decide whether software is safe.
+```sh
+cargo run -- inspect tests/fixtures/strace/synthetic-minimal.trace
+```
 
-## Proposed demo
+This prints a schema-v1 JSON document containing parsed records, raw trace lines, source byte offsets, and diagnostics. The fixture is synthetic; it is not a real system capture. Exit status `0` means every input record was classified and continuation records were reconciled; `2` means JSON was produced with a partial parse; `1` means the input or output could not be processed. **Parse status says nothing about whether the original OS capture observed every event.**
 
-The intended short demo uses a fixed, harmless sample command and two prepared captures. A local HTML report highlights one added event group and links it to the source records from both runs. This demo does not exist yet; no sample report is presented as real tool output.
+## What the parser accepts
 
-## Planned v0
+The parser handles a bounded subset of line-oriented `strace` text, including syscall records, common control lines, and `-yy` file-descriptor annotations. A recommended input profile for future capture support is `-f -ttt -yy -s 256 -e trace=%process,%file,%network -o FILE`; `inspect` does not verify that a file was generated with those exact options. See the [`strace(1)` manual](https://man7.org/linux/man-pages/man1/strace.1.html). Compatibility with a real `strace` capture has not yet been integration-tested in this environment.
 
-- Linux x86_64, using an externally installed `strace` executable.
-- Record a command run and its capture metadata, then compare it with a second run.
-- Preserve raw trace evidence and link each parsed or compared event back to that evidence.
-- Export versioned JSON and a self-contained, offline HTML report.
-- Keep captures and reports on the user's machine by default; no hosted service or telemetry is planned for v0.
+Input is limited to 32 MiB, each physical record to 64 KiB, and the document to 100,000 records. JSON output is limited to 64 MiB. Oversized or invalid UTF-8 input fails without emitting JSON. Unrecognized, malformed, or unpaired continuation lines remain visible as raw records with diagnostics.
 
-Windows is not a native v0 target. A user who already has WSL2 installed may use its Linux environment; SideEffect will not install WSL2 or promise identical Windows behavior.
+## Planned product
+
+The broader goal is to capture selected process, file, and network-related events from a command, compare two runs, and produce an evidence-linked offline report. Those capture, comparison, and HTML-report features are not implemented yet. The initial target is Linux x86_64 with an externally installed `strace`; WSL2 may be used if already installed, but native Windows tracing is not in scope.
 
 ## Limits and privacy
 
-SideEffect is an observation and comparison aid, not a sandbox, malware detector, complete audit, or proof that a command is safe. Tracer, kernel, permissions, and parser limitations may leave behavior unobserved. An attempted syscall does not necessarily mean the operation succeeded, and event proximity does not prove causation.
+The current command only reads a regular input file and writes JSON to stdout; it does not execute the traced command or upload data. JSON retains raw trace lines and may expose command arguments, paths, network endpoints, or other sensitive values. Review it before sharing.
 
-Raw traces, command output, paths, and arguments can contain secrets or personal data. Local storage does not make them safe to share. Reports are not automatically sanitized; inspect exports before sharing them.
+The planned capture product will be an observation aid, not a sandbox, malware detector, complete audit, or safety verdict. A syscall attempt does not necessarily mean it succeeded, and event proximity does not prove causation. See [SECURITY.md](SECURITY.md).
 
 ## Documentation
 
 - [Product brief](docs/PRODUCT.md)
 - [Architecture plan](docs/ARCHITECTURE.md)
 - [Delivery plan](docs/PLAN.md)
-- [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
 - [License](LICENSE)
-
-The product, architecture, and delivery documents are proposals. The security and contribution documents describe requirements for future work; they do not imply that those safeguards or any executable features are implemented.

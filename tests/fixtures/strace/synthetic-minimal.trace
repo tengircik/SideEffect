@@ -1,0 +1,6 @@
+[pid 417] 1700000000.000001 execve("/usr/bin/sideeffect-demo", ["sideeffect-demo", "--check"], 0x7ffc0000 /* 2 vars */) = 0
+[pid 417] 1700000000.000045 openat(AT_FDCWD</home/demo>, "/home/demo/.config/sample.toml", O_RDONLY|O_CLOEXEC) = 3</home/demo/.config/sample.toml>
+[pid 417] 1700000000.000078 socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC, IPPROTO_TCP) = 4<TCP:[12345]>
+[pid 417] 1700000000.000091 connect(4<TCP:[12345]>, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("203.0.113.8")}, 16) = -1 ECONNREFUSED (Connection refused)
+[pid 417] 1700000000.000101 close(3</home/demo/.config/sample.toml>) = 0
+[pid 417] 1700000000.000120 +++ exited with 0 +++

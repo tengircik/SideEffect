@@ -1,10 +1,10 @@
 # SideEffect Product Brief
 
-**Status:** planning draft. This document describes a proposed product; it does not claim that commands, features, or guarantees are implemented.
+**Status:** early implementation. The repository currently implements bounded `sideeffect inspect TRACE` parsing and JSON output. Capture, paired-run comparison, and HTML report generation remain planned; no security guarantee is claimed.
 
 ## Product summary
 
-SideEffect is a local command-line tool for observing selected operating-system interactions made while a command runs, comparing two runs, and exporting an evidence-backed report. Its central result is a paired behavior delta: a reader can see which observed process, file, and network events differ between the runs and inspect the underlying trace evidence.
+The planned product is a local command-line tool for observing selected operating-system interactions made while a command runs, comparing two runs, and exporting an evidence-backed report. Its central result is a paired behavior delta: a reader can see which observed process, file, and network events differ between the runs and inspect the underlying trace evidence. The current implementation is only the bounded `inspect` slice: it parses one user-selected local `strace` text file and emits a versioned JSON evidence document to stdout.
 
 The initial implementation is planned for Linux x86_64 and uses an external `strace` executable. Windows users may develop or run it through an existing WSL2 installation, but native Windows support is not part of v0. Rust is the planned implementation language for the CLI, parser, event schema, comparison engine, and local report renderer. No LLM or hosted service is required.
 
@@ -20,14 +20,20 @@ Developers often know that two executions behaved differently but cannot quickly
 
 The first release should focus on one reproducible pair of command runs. It is not a continuously running endpoint monitor or a general tracing platform.
 
-## Core workflow
+## Current implementation
+
+`sideeffect inspect TRACE` reads a regular file without executing the traced command, invokes no external program, and writes schema-v1 JSON to stdout. It retains raw lines and byte offsets; recognized syscalls include raw argument and result text, while unsupported or malformed lines remain in the document with diagnostics. The parser reports parse status only; it does not know whether the original capture was complete.
+
+The parser enforces a 32 MiB input limit, a 64 KiB physical-record limit, a 100,000-record limit, and a 64 MiB JSON output limit. Invalid UTF-8 and hard limit violations fail without producing an evidence document. The included test trace is synthetic, not a real system capture. Real `strace` integration has not been tested because `strace` is not installed in the current WSL environment.
+
+## Planned capture and comparison workflow
 
 1. Record a command run and retain its exit status, stdout, stderr, raw trace, and capture metadata.
 2. Record a second run, usually with a different version or environment.
 3. Compare normalized event keys while retaining exact raw evidence for each event.
 4. Export a local, offline HTML report and versioned JSON data. A reader can follow each reported difference to its source event or events.
 
-Command names and flags shown in examples elsewhere are proposed interface sketches until implemented.
+The capture runner, run comparison, and HTML export are not implemented. Command names and flags shown in examples elsewhere are proposed interface sketches.
 
 ## Product principles
 
@@ -43,7 +49,7 @@ Each run must record capture status and relevant limitations, including tracer s
 
 ### Local by default, sensitive by design
 
-Traces, reports, and command output are stored locally. There is no telemetry or remote report hosting in v0. A syscall trace can contain sensitive strings, including command arguments, paths, and data passed to some calls; the absence of deliberate environment-variable collection does not make raw traces secret-free. Exports are not automatically sanitized. Users must inspect material before sharing it.
+The current `inspect` command reads the selected local input and writes JSON to stdout; it has no upload or telemetry path. The resulting JSON retains raw trace text and can contain sensitive command arguments, paths, endpoint details, and other syscall values. The absent capture runner means it does not currently collect stdout/stderr or start a command. Future capture output will need separate retention, privacy, and sanitization decisions. Users must inspect JSON before sharing it.
 
 ### Honest network representation
 
@@ -51,6 +57,9 @@ The first release may observe connection-related syscalls. It must distinguish a
 
 ## Proposed v0 scope
 
+- Inspect one selected local, regular `strace` text file and emit a versioned JSON evidence document to stdout.
+- Preserve raw records and source byte offsets; report malformed, unsupported, or unpaired continuation lines as diagnostics.
+- Enforce the current parser budgets: 32 MiB per input, 64 KiB per physical record, 100,000 records, and 64 MiB serialized JSON output. These initial limits require review against real captures before release.
 - Linux x86_64 with a separately installed `strace` executable.
 - Run one command under tracing and save a local evidence bundle.
 - Capture process execution/lifecycle, selected file-related calls, and connection-related calls supported by the chosen trace configuration.
@@ -88,7 +97,7 @@ These are acceptance targets for future implementation and tests, not claims abo
 
 - Exact `strace` version range, supported distributions, and behavior when a requested event class is unavailable.
 - Trace storage layout, retention/deletion behavior, and whether raw traces are compressed.
-- Exact proposed command syntax and exit-code contract.
+- Capture command syntax and capture/tracer/command exit-code contract. The parser-only `inspect TRACE` syntax and its partial-parse/error statuses are implemented.
 - Safe handling of command output when stdout/stderr are streamed or captured.
 - JSON schema versioning and compatibility policy.
 - License compatibility, packaging, and whether/how an external `strace` dependency is pinned or installed. No licensing or redistribution conclusion is made here.
