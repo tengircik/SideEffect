@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
@@ -220,6 +221,82 @@ fn record_propagates_target_signal_after_publishing_trace() {
         stderr.contains("does not prove tracer success or capture completeness"),
         "stderr: {stderr}"
     );
+}
+
+#[test]
+fn record_bundle_publishes_manifest_and_exact_trace_for_nonzero_target() {
+    require_tool("strace", &["--version"]);
+    require_tool("python3", &["--version"]);
+
+    let directory = PrivateTempDirectory::new();
+    let bundle = directory.path().join("exit-37.run");
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["record", "--bundle"])
+        .arg(&bundle)
+        .args([
+            "--",
+            "python3",
+            "-c",
+            "import os,sys; os._exit(37)",
+            "private-bundle-argv-marker",
+        ])
+        .output()
+        .expect("launch SideEffect record bundle command");
+
+    assert_eq!(
+        output.status.code(),
+        Some(37),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    let entries = fs::read_dir(&bundle)
+        .expect("bundle directory should be published")
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().any(|name| name == "run.json"));
+    assert!(entries.iter().any(|name| name == "trace.strace"));
+    assert_eq!(
+        fs::metadata(&bundle).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    for name in ["run.json", "trace.strace"] {
+        assert_eq!(
+            fs::metadata(bundle.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "bundle file {name} must be private"
+        );
+    }
+
+    let trace = fs::read(bundle.join("trace.strace")).unwrap();
+    let manifest_bytes = fs::read(bundle.join("run.json")).unwrap();
+    let manifest: Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    assert_eq!(manifest["schema"], "sideeffect.run");
+    assert_eq!(manifest["schema_version"], 1);
+    assert_eq!(
+        manifest["capture"]["strace_reported_status"]["kind"],
+        "exit_code"
+    );
+    assert_eq!(manifest["capture"]["strace_reported_status"]["value"], 37);
+    assert_eq!(
+        manifest["capture"]["command_outcome"],
+        "not_independently_verified"
+    );
+    assert_eq!(manifest["capture"]["completeness"], "unknown");
+    assert_eq!(manifest["trace"]["name"], "trace.strace");
+    assert_eq!(manifest["trace"]["byte_length"], trace.len());
+    let expected_hash = format!("{:x}", Sha256::digest(&trace));
+    assert_eq!(manifest["trace"]["sha256"], expected_hash);
+    let manifest_text = String::from_utf8(manifest_bytes).unwrap();
+    assert!(!manifest_text.contains("private-bundle-argv-marker"));
+    assert!(!manifest_text.contains("python3"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("strace-reported and propagated exit status: 37"));
 }
 
 fn inspect_trace(path: &Path) -> Value {

@@ -12,4 +12,4 @@ pub(crate) use command::build_strace_command_for;
 pub use paths::AnchoredOutput;
 
 #[cfg(target_os = "linux")]
-pub use linux::{RecordError, RecordOutcome, record_trace};
+pub use linux::{RecordError, RecordOutcome, RunBundleOutcome, record_bundle, record_trace};

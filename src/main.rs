@@ -23,10 +23,10 @@ use sideeffect::model::{ParseCompleteness, TraceDiff, TraceRecordKind};
 #[cfg(target_os = "linux")]
 use sideeffect::record::AnchoredOutput;
 #[cfg(target_os = "linux")]
-use sideeffect::record::record_trace;
+use sideeffect::record::{record_bundle, record_trace};
 use sideeffect::trace::strace::parse_trace_bytes;
 
-const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. Record runs a command under external strace and writes a bounded raw trace; it is observation, not isolation or a safety check.";
+const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. Record runs a command under external strace and writes either a bounded raw trace or an opt-in privacy-minimized run bundle; it is observation, not isolation or a safety check.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -105,6 +105,16 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         ] if command == "record" && option == "--trace" && separator == "--" => {
             record(output, program, target_args)
         }
+        [
+            command,
+            option,
+            output,
+            separator,
+            program,
+            target_args @ ..,
+        ] if command == "record" && option == "--bundle" && separator == "--" => {
+            record_bundle_command(output, program, target_args)
+        }
         [command, ..] if command == "record" => Err(USAGE.to_owned()),
         _ => Err(USAGE.to_owned()),
     }
@@ -145,6 +155,57 @@ fn record(output: &OsString, program: &OsString, args: &[OsString]) -> Result<Ex
     {
         let _ = (output, program, args);
         Err("record is available only on Linux with an external strace executable".to_owned())
+    }
+}
+
+fn record_bundle_command(
+    output: &OsString,
+    program: &OsString,
+    args: &[OsString],
+) -> Result<ExitCode, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let outcome =
+            record_bundle(Path::new(output), program, args).map_err(|error| error.to_string())?;
+        if !outcome.parent_directory_sync_confirmed {
+            eprintln!(
+                "Warning: bundle {} was atomically published, but syncing its parent directory failed; persistence across sudden power loss is uncertain.",
+                terminal_safe_path(&outcome.bundle_path)
+            );
+        }
+        let status = outcome.strace_status;
+        if let Some(code) = status.code() {
+            eprintln!(
+                "Recorded {} bytes in bundle {}. strace-reported and propagated exit status: {} (command outcome is not independently verified; capture completeness is unknown).",
+                outcome.trace_bytes,
+                terminal_safe_path(&outcome.bundle_path),
+                code
+            );
+            Ok(ExitCode::from(code as u8))
+        } else if let Some(signal) = status.signal() {
+            eprintln!(
+                "Recorded {} bytes in bundle {}. strace-reported termination by signal {} is being propagated (command outcome is not independently verified; capture completeness is unknown).",
+                outcome.trace_bytes,
+                terminal_safe_path(&outcome.bundle_path),
+                signal
+            );
+            Ok(propagate_signal(signal))
+        } else {
+            eprintln!(
+                "Recorded {} bytes in bundle {}. strace returned an unavailable exit status; using failure status 1.",
+                outcome.trace_bytes,
+                terminal_safe_path(&outcome.bundle_path)
+            );
+            Ok(ExitCode::from(1))
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (output, program, args);
+        Err(
+            "record --bundle is available only on Linux with an external strace executable"
+                .to_owned(),
+        )
     }
 }
 

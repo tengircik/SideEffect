@@ -1,9 +1,12 @@
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -27,6 +30,79 @@ pub struct RecordOutcome {
     pub strace_status: ExitStatus,
     pub trace_path: PathBuf,
     pub trace_bytes: usize,
+}
+
+#[derive(Debug)]
+pub struct RunBundleOutcome {
+    pub strace_status: ExitStatus,
+    pub bundle_path: PathBuf,
+    pub trace_bytes: usize,
+    pub parent_directory_sync_confirmed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StraceVersion {
+    major: u64,
+    minor: u64,
+}
+
+#[derive(Serialize)]
+struct RunManifest<'a> {
+    schema: &'static str,
+    schema_version: u32,
+    producer: Producer,
+    capture: Capture,
+    trace: TraceFile<'a>,
+}
+
+#[derive(Serialize)]
+struct Producer {
+    sideeffect_version: &'static str,
+    operating_system: &'static str,
+    architecture: &'static str,
+}
+
+#[derive(Serialize)]
+struct Capture {
+    tracer: Tracer,
+    capture_profile: &'static str,
+    strace_reported_status: ReportedStatus,
+    command_outcome: &'static str,
+    completeness: &'static str,
+    command_stdout: &'static str,
+    command_stderr: &'static str,
+    tracer_diagnostics: &'static str,
+}
+
+#[derive(Serialize)]
+struct Tracer {
+    name: &'static str,
+    major: u64,
+    minor: u64,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ReportedStatus {
+    ExitCode { value: i32 },
+    Signal { value: i32 },
+    Unavailable,
+}
+
+#[derive(Serialize)]
+struct TraceFile<'a> {
+    name: &'static str,
+    format: &'static str,
+    byte_length: usize,
+    sha256: &'a str,
+}
+
+struct CaptureStage {
+    output: super::AnchoredOutput,
+    status: ExitStatus,
+    bytes: usize,
+    version: StraceVersion,
+    trace_file: File,
 }
 
 #[derive(Debug)]
@@ -73,7 +149,33 @@ pub fn record_trace(
     program: &OsStr,
     args: &[OsString],
 ) -> Result<RecordOutcome, RecordError> {
-    record_trace_bounded(
+    let mut captured = record_capture_bounded(
+        destination,
+        OsStr::new("strace"),
+        program,
+        args,
+        MAX_TRACE_BYTES,
+        false,
+    )?;
+    let final_path = captured.output.publish_trace().map_err(|error| {
+        RecordError::after_launch(format!(
+            "could not publish trace without replacing an existing path: {error}"
+        ))
+    })?;
+    Ok(RecordOutcome {
+        strace_status: captured.status,
+        trace_path: final_path,
+        trace_bytes: captured.bytes,
+    })
+}
+
+/// Record a bounded run and atomically publish a privacy-minimized versioned bundle.
+pub fn record_bundle(
+    destination: &Path,
+    program: &OsStr,
+    args: &[OsString],
+) -> Result<RunBundleOutcome, RecordError> {
+    record_bundle_bounded(
         destination,
         OsStr::new("strace"),
         program,
@@ -82,6 +184,135 @@ pub fn record_trace(
     )
 }
 
+fn record_bundle_bounded(
+    destination: &Path,
+    tracer: &OsStr,
+    program: &OsStr,
+    args: &[OsString],
+    max_trace_bytes: usize,
+) -> Result<RunBundleOutcome, RecordError> {
+    if !cfg!(target_arch = "x86_64") {
+        return Err(RecordError::before_launch(
+            "versioned run bundles currently require Linux x86_64; the command was not started",
+        ));
+    }
+    let mut capture =
+        record_capture_bounded(destination, tracer, program, args, max_trace_bytes, true)?;
+    let (sha256, byte_length) = hash_exact_trace(&mut capture.trace_file, capture.bytes)?;
+    let manifest = RunManifest {
+        schema: "sideeffect.run",
+        schema_version: 1,
+        producer: Producer {
+            sideeffect_version: env!("CARGO_PKG_VERSION"),
+            operating_system: "linux",
+            architecture: "x86_64",
+        },
+        capture: Capture {
+            tracer: Tracer {
+                name: "strace",
+                major: capture.version.major,
+                minor: capture.version.minor,
+            },
+            capture_profile: "linux_process_file_network_v1",
+            strace_reported_status: reported_status(capture.status),
+            command_outcome: "not_independently_verified",
+            completeness: "unknown",
+            command_stdout: "inherited_not_captured",
+            command_stderr: "inherited_not_captured",
+            tracer_diagnostics: "inherited_not_captured",
+        },
+        trace: TraceFile {
+            name: "trace.strace",
+            format: "strace_text",
+            byte_length,
+            sha256: &sha256,
+        },
+    };
+    let mut manifest_file = capture.output.create_manifest_file().map_err(|error| {
+        RecordError::after_launch(format!("could not create bundle manifest: {error}"))
+    })?;
+    serde_json::to_writer(&mut manifest_file, &manifest).map_err(|error| {
+        RecordError::after_launch(format!("could not serialize bundle manifest: {error}"))
+    })?;
+    manifest_file
+        .write_all(b"\n")
+        .and_then(|()| manifest_file.flush())
+        .and_then(|()| manifest_file.sync_all())
+        .map_err(|error| {
+            RecordError::after_launch(format!("could not finalize bundle manifest: {error}"))
+        })?;
+    drop(manifest_file);
+    drop(capture.trace_file);
+    capture.output.remove_fifo().map_err(|error| {
+        RecordError::after_launch(format!(
+            "could not remove staging FIFO before bundle publication: {error}"
+        ))
+    })?;
+    let (bundle_path, parent_directory_sync_confirmed) =
+        capture.output.publish_bundle().map_err(|error| {
+            RecordError::after_launch(format!(
+                "could not atomically publish bundle without replacing an existing path: {error}"
+            ))
+        })?;
+    Ok(RunBundleOutcome {
+        strace_status: capture.status,
+        bundle_path,
+        trace_bytes: capture.bytes,
+        parent_directory_sync_confirmed,
+    })
+}
+
+fn reported_status(status: ExitStatus) -> ReportedStatus {
+    if let Some(code) = status.code() {
+        ReportedStatus::ExitCode { value: code }
+    } else if let Some(signal) = status.signal() {
+        ReportedStatus::Signal { value: signal }
+    } else {
+        ReportedStatus::Unavailable
+    }
+}
+
+fn hash_exact_trace(
+    file: &mut File,
+    expected_bytes: usize,
+) -> Result<(String, usize), RecordError> {
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        RecordError::after_launch(format!("could not seek staged trace for hashing: {error}"))
+    })?;
+    let mut digest = Sha256::new();
+    let mut total = 0usize;
+    let mut buffer = [0u8; 32 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|error| {
+            RecordError::after_launch(format!("could not read staged trace for hashing: {error}"))
+        })?;
+        if count == 0 {
+            break;
+        }
+        total = total
+            .checked_add(count)
+            .ok_or_else(|| RecordError::after_launch("trace byte count overflow while hashing"))?;
+        if total > expected_bytes {
+            return Err(RecordError::after_launch(
+                "staged trace grew while hashing; bundle was discarded",
+            ));
+        }
+        digest.update(&buffer[..count]);
+    }
+    if total != expected_bytes {
+        return Err(RecordError::after_launch(
+            "staged trace length changed before hashing; bundle was discarded",
+        ));
+    }
+    let encoded = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok((encoded, total))
+}
+
+#[cfg(test)]
 fn record_trace_bounded(
     destination: &Path,
     tracer: &OsStr,
@@ -89,8 +320,35 @@ fn record_trace_bounded(
     args: &[OsString],
     max_trace_bytes: usize,
 ) -> Result<RecordOutcome, RecordError> {
-    verify_strace_version(tracer)?;
-    let mut output = super::AnchoredOutput::prepare(destination).map_err(|error| {
+    let mut capture =
+        record_capture_bounded(destination, tracer, program, args, max_trace_bytes, false)?;
+    let final_path = capture.output.publish_trace().map_err(|error| {
+        RecordError::after_launch(format!(
+            "could not publish trace without replacing an existing path: {error}"
+        ))
+    })?;
+    Ok(RecordOutcome {
+        strace_status: capture.status,
+        trace_path: final_path,
+        trace_bytes: capture.bytes,
+    })
+}
+
+fn record_capture_bounded(
+    destination: &Path,
+    tracer: &OsStr,
+    program: &OsStr,
+    args: &[OsString],
+    max_trace_bytes: usize,
+    bundle: bool,
+) -> Result<CaptureStage, RecordError> {
+    let version = verify_strace_version(tracer)?;
+    let mut output = (if bundle {
+        super::AnchoredOutput::prepare_bundle(destination)
+    } else {
+        super::AnchoredOutput::prepare(destination)
+    })
+    .map_err(|error| {
         RecordError::before_launch(format!("could not prepare safe trace output: {error}"))
     })?;
     output.create_fifo().map_err(|error| {
@@ -243,27 +501,23 @@ fn record_trace_bounded(
         .map_err(|error| {
             RecordError::after_launch(format!("could not finalize staged trace: {error}"))
         })?;
-    let final_path = output.publish_trace().map_err(|error| {
-        RecordError::after_launch(format!(
-            "could not publish trace without replacing an existing path: {error}"
-        ))
-    })?;
-
-    Ok(RecordOutcome {
-        strace_status: status,
-        trace_path: final_path,
-        trace_bytes: total,
+    Ok(CaptureStage {
+        output,
+        status,
+        bytes: total,
+        version,
+        trace_file: staged_trace,
     })
 }
 
-fn verify_strace_version(tracer: &OsStr) -> Result<(), RecordError> {
+fn verify_strace_version(tracer: &OsStr) -> Result<StraceVersion, RecordError> {
     verify_strace_version_with_timeout(tracer, VERSION_QUERY_TIMEOUT)
 }
 
 fn verify_strace_version_with_timeout(
     tracer: &OsStr,
     query_timeout: Duration,
-) -> Result<(), RecordError> {
+) -> Result<StraceVersion, RecordError> {
     let parent_pid = std::process::id() as libc::pid_t;
     let mut version_command = Command::new(tracer);
     version_command
@@ -393,7 +647,10 @@ fn verify_strace_version_with_timeout(
             MIN_STRACE_VERSION.0, MIN_STRACE_VERSION.1, version.0, version.1
         )));
     }
-    Ok(())
+    Ok(StraceVersion {
+        major: version.0,
+        minor: version.1,
+    })
 }
 
 fn parse_strace_version(output: &[u8]) -> Option<(u64, u64)> {
@@ -566,13 +823,14 @@ impl Drop for SignalGuard {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_VERSION_OUTPUT_BYTES, RecordError, record_trace_bounded,
+        MAX_VERSION_OUTPUT_BYTES, RecordError, record_bundle_bounded, record_trace_bounded,
         verify_strace_version_with_timeout,
     };
     use std::ffi::{OsStr, OsString};
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -658,6 +916,22 @@ mod tests {
         )
     }
 
+    fn run_fake_bundle(
+        directory: &TestDirectory,
+        script_body: &str,
+        output_name: &str,
+        limit: usize,
+    ) -> Result<super::RunBundleOutcome, RecordError> {
+        let tracer = directory.fake_tracer(script_body);
+        record_bundle_bounded(
+            &directory.0.join(output_name),
+            tracer.as_os_str(),
+            OsStr::new("private-program-name"),
+            &[OsString::from("private-argument-value")],
+            limit,
+        )
+    }
+
     fn write_trace_script(bytes: &str) -> String {
         format!(
             "while [ \"$1\" != \"-o\" ]; do shift; done\nfifo=$2\nprintf '%b' '{}' > \"$fifo\"",
@@ -686,6 +960,141 @@ mod tests {
             0o600
         );
         assert!(outcome.strace_status.success());
+    }
+
+    #[test]
+    fn bundle_manifest_records_fixed_privacy_minimized_schema_hash_size_and_exit_code() {
+        let directory = TestDirectory::new();
+        let trace = b"close(1) = 0\n";
+        let outcome = run_fake_bundle(
+            &directory,
+            &format!("{}\nexit 37", write_trace_script("close(1) = 0\\n")),
+            "bundle.run",
+            64,
+        )
+        .unwrap();
+        assert_eq!(outcome.strace_status.code(), Some(37));
+        let bundle = outcome.bundle_path;
+        assert_eq!(fs::read_dir(&bundle).unwrap().count(), 2);
+        assert_eq!(fs::read(bundle.join("trace.strace")).unwrap(), trace);
+        let manifest_bytes = fs::read(bundle.join("run.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(manifest["schema"], "sideeffect.run");
+        assert_eq!(manifest["schema_version"], 1);
+        assert_eq!(
+            manifest["producer"]["sideeffect_version"],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(manifest["producer"]["operating_system"], "linux");
+        assert_eq!(manifest["producer"]["architecture"], "x86_64");
+        assert_eq!(manifest["capture"]["tracer"]["name"], "strace");
+        assert_eq!(manifest["capture"]["tracer"]["major"], 6);
+        assert_eq!(manifest["capture"]["tracer"]["minor"], 6);
+        assert_eq!(
+            manifest["capture"]["capture_profile"],
+            "linux_process_file_network_v1"
+        );
+        assert_eq!(
+            manifest["capture"]["strace_reported_status"]["kind"],
+            "exit_code"
+        );
+        assert_eq!(manifest["capture"]["strace_reported_status"]["value"], 37);
+        assert_eq!(
+            manifest["capture"]["command_outcome"],
+            "not_independently_verified"
+        );
+        assert_eq!(manifest["capture"]["completeness"], "unknown");
+        assert_eq!(
+            manifest["capture"]["command_stdout"],
+            "inherited_not_captured"
+        );
+        assert_eq!(
+            manifest["capture"]["command_stderr"],
+            "inherited_not_captured"
+        );
+        assert_eq!(
+            manifest["capture"]["tracer_diagnostics"],
+            "inherited_not_captured"
+        );
+        assert_eq!(manifest["trace"]["name"], "trace.strace");
+        assert_eq!(manifest["trace"]["format"], "strace_text");
+        assert_eq!(manifest["trace"]["byte_length"], trace.len());
+        assert_eq!(
+            manifest["trace"]["sha256"],
+            crate::fingerprint::sha256_hex(trace)
+        );
+        let text = String::from_utf8(manifest_bytes).unwrap();
+        for forbidden in [
+            "private-program-name",
+            "private-argument-value",
+            "argv",
+            "environment",
+            "cwd",
+            "username",
+            "trace.raw",
+        ] {
+            assert!(!text.contains(forbidden), "manifest leaked {forbidden}");
+        }
+        assert_eq!(
+            fs::metadata(&bundle).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(bundle.join("run.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(bundle.join("trace.strace"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn bundle_manifest_records_signal_status_and_overflow_discards_staging() {
+        let directory = TestDirectory::new();
+        let signal_script = format!("{}\nkill -TERM $$", write_trace_script("close(1) = 0\\n"));
+        let outcome = run_fake_bundle(&directory, &signal_script, "signal.run", 64).unwrap();
+        assert_eq!(outcome.strace_status.signal(), Some(libc::SIGTERM));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(outcome.bundle_path.join("run.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest["capture"]["strace_reported_status"]["kind"],
+            "signal"
+        );
+        assert_eq!(
+            manifest["capture"]["strace_reported_status"]["value"],
+            libc::SIGTERM
+        );
+
+        let error = run_fake_bundle(
+            &directory,
+            &write_trace_script("0123456789"),
+            "overflow.run",
+            4,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeded the 4 byte limit"));
+        assert!(!directory.0.join("overflow.run").exists());
+        assert_eq!(
+            fs::read_dir(&directory.0)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".sideeffect-capture-"))
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -943,7 +1352,7 @@ mod tests {
             -1,
             "fake tracer survived cancellation"
         );
-        assert!(!directory.0.join("cancel.trace").exists());
+        assert!(!directory.0.join("cancel.run").exists());
         assert_eq!(
             fs::read_dir(&directory.0).unwrap().count(),
             2,
@@ -959,8 +1368,8 @@ mod tests {
         ) else {
             return;
         };
-        let error = record_trace_bounded(
-            &Path::new(&directory).join("cancel.trace"),
+        let error = record_bundle_bounded(
+            &Path::new(&directory).join("cancel.run"),
             OsStr::new(&tracer),
             OsStr::new("must-not-be-run-by-fake-tracer"),
             &[],

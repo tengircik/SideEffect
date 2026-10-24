@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const FIFO_NAME: &[u8] = b"trace.fifo";
 const TRACE_NAME: &[u8] = b"trace.raw";
+const BUNDLE_TRACE_NAME: &[u8] = b"trace.strace";
+const MANIFEST_NAME: &[u8] = b"run.json";
 const REPORT_NAME: &[u8] = b"report.html";
 const STAGE_PREFIX: &[u8] = b".sideeffect-capture-";
 static NEXT_STAGE_ID: AtomicU64 = AtomicU64::new(0);
@@ -30,12 +32,24 @@ pub struct AnchoredOutput {
     fifo_identity: Option<(libc::dev_t, libc::ino_t)>,
     trace_identity: Option<(libc::dev_t, libc::ino_t)>,
     report_identity: Option<(libc::dev_t, libc::ino_t)>,
+    manifest_identity: Option<(libc::dev_t, libc::ino_t)>,
+    bundle: bool,
+    bundle_published: bool,
     published: bool,
 }
 
 impl AnchoredOutput {
     /// Resolve and hold the destination parent, then create a private staging directory in it.
     pub fn prepare(destination: &Path) -> io::Result<Self> {
+        Self::prepare_kind(destination, false)
+    }
+
+    /// Create a private sibling staging directory for an atomically published run bundle.
+    pub fn prepare_bundle(destination: &Path) -> io::Result<Self> {
+        Self::prepare_kind(destination, true)
+    }
+
+    fn prepare_kind(destination: &Path, bundle: bool) -> io::Result<Self> {
         let destination_name = destination
             .file_name()
             .filter(|name| !name.is_empty())
@@ -49,6 +63,9 @@ impl AnchoredOutput {
             .unwrap_or_else(|| Path::new("."));
         let parent_path = fs::canonicalize(parent_request)?;
         let parent_dir = open_directory(&parent_path)?;
+        if bundle {
+            ensure_bundle_parent_trusted(&parent_dir)?;
+        }
         ensure_destination_absent(parent_dir.as_raw_fd(), &destination_name)?;
 
         let (stage_name, stage_dir, stage_stat) = create_stage_directory(&parent_dir)?;
@@ -64,6 +81,9 @@ impl AnchoredOutput {
             fifo_identity: None,
             trace_identity: None,
             report_identity: None,
+            manifest_identity: None,
+            bundle,
+            bundle_published: false,
             published: false,
         })
     }
@@ -95,16 +115,51 @@ impl AnchoredOutput {
         Ok(())
     }
 
+    /// Remove the private FIFO by its recorded inode before publishing a bundle.
+    pub fn remove_fifo(&mut self) -> io::Result<()> {
+        let Some((device, inode)) = self.fifo_identity else {
+            return match stat_named_entry(self.stage_dir.as_raw_fd(), FIFO_NAME) {
+                Ok(_) => Err(io::Error::other(
+                    "unexpected FIFO entry appeared in bundle staging",
+                )),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            };
+        };
+        match stat_named_entry(self.stage_dir.as_raw_fd(), FIFO_NAME) {
+            Ok(stat) if stat.st_dev == device && stat.st_ino == inode => {
+                let name = c_name(FIFO_NAME)?;
+                if unsafe { libc::unlinkat(self.stage_dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "staged FIFO identity changed before bundle finalization",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+        self.fifo_identity = None;
+        Ok(())
+    }
+
     /// Create a new private regular trace file relative to the held staging directory descriptor.
     pub fn create_trace_file(&mut self) -> io::Result<File> {
-        let name = c_name(TRACE_NAME)?;
+        let trace_name = if self.bundle {
+            BUNDLE_TRACE_NAME
+        } else {
+            TRACE_NAME
+        };
+        let name = c_name(trace_name)?;
         // SAFETY: stage_dir is an open directory; name is fixed and flags prevent following or
         // replacing an existing entry. The returned descriptor is owned by `from_raw_fd`.
         let fd = unsafe {
             libc::openat(
                 self.stage_dir.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 0o600,
             )
         };
@@ -121,6 +176,89 @@ impl AnchoredOutput {
         }
         self.trace_identity = Some((stat.st_dev, stat.st_ino));
         Ok(file)
+    }
+
+    /// Create the fixed-name private manifest file for a run bundle.
+    pub fn create_manifest_file(&mut self) -> io::Result<File> {
+        if !self.bundle {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a bundle output",
+            ));
+        }
+        let file = self.create_private_staged_file(MANIFEST_NAME)?;
+        let stat = stat_fd(file.as_raw_fd())?;
+        if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(io::Error::other("created manifest is not a regular file"));
+        }
+        self.manifest_identity = Some((stat.st_dev, stat.st_ino));
+        Ok(file)
+    }
+
+    /// Atomically publish the complete staged directory without replacing a destination.
+    pub fn publish_bundle(&mut self) -> io::Result<(PathBuf, bool)> {
+        if !self.bundle || self.trace_identity.is_none() || self.manifest_identity.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bundle is not complete",
+            ));
+        }
+        if self.published || self.bundle_published {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "output has already been published",
+            ));
+        }
+        verify_named_directory(
+            self.parent_dir.as_raw_fd(),
+            &self.stage_name,
+            self.stage_device,
+            self.stage_inode,
+        )?;
+        let stage_name = c_name(self.stage_name.as_os_str().as_bytes())?;
+        let destination_name = c_name(self.destination_name.as_os_str().as_bytes())?;
+        // Ensure staged files still have the exact identities created by this object.
+        if !named_entry_matches(
+            self.stage_dir.as_raw_fd(),
+            BUNDLE_TRACE_NAME,
+            self.trace_identity.unwrap().0,
+            self.trace_identity.unwrap().1,
+        ) || !named_entry_matches(
+            self.stage_dir.as_raw_fd(),
+            MANIFEST_NAME,
+            self.manifest_identity.unwrap().0,
+            self.manifest_identity.unwrap().1,
+        ) || self.fifo_identity.is_some()
+            || !has_exact_bundle_entries(self.stage_dir.as_raw_fd())
+        {
+            return Err(io::Error::other(
+                "staging directory contains unexpected entries or identities",
+            ));
+        }
+        self.stage_dir.sync_all()?;
+        // RENAME_NOREPLACE atomically publishes the complete sibling directory and refuses any
+        // racing destination. Both names are single components relative to held directory fds.
+        if unsafe {
+            libc::renameat2(
+                self.parent_dir.as_raw_fd(),
+                stage_name.as_ptr(),
+                self.parent_dir.as_raw_fd(),
+                destination_name.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        self.bundle_published = true;
+        self.published = true;
+        let parent_sync_confirmed = self.parent_dir.sync_all().is_ok();
+        let current_parent = read_fd_path(self.parent_dir.as_raw_fd())
+            .unwrap_or_else(|_| self.parent_path_at_prepare.clone());
+        Ok((
+            current_parent.join(&self.destination_name),
+            parent_sync_confirmed,
+        ))
     }
 
     /// Publish the staged trace as a new destination entry without replacing anything.
@@ -199,7 +337,7 @@ impl AnchoredOutput {
             libc::openat(
                 self.stage_dir.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 0o600,
             )
         };
@@ -294,6 +432,9 @@ fn rename_no_replace(
 
 impl Drop for AnchoredOutput {
     fn drop(&mut self) {
+        if self.bundle_published {
+            return;
+        }
         if let Some((device, inode)) = self.fifo_identity {
             let fifo = c_name(FIFO_NAME).expect("fixed FIFO name contains no NUL");
             if named_entry_matches(self.stage_dir.as_raw_fd(), FIFO_NAME, device, inode) {
@@ -305,12 +446,25 @@ impl Drop for AnchoredOutput {
             }
         }
         if let Some((device, inode)) = self.trace_identity {
-            let trace = c_name(TRACE_NAME).expect("fixed trace name contains no NUL");
-            if named_entry_matches(self.stage_dir.as_raw_fd(), TRACE_NAME, device, inode) {
+            let trace_name = if self.bundle {
+                BUNDLE_TRACE_NAME
+            } else {
+                TRACE_NAME
+            };
+            let trace = c_name(trace_name).expect("fixed trace name contains no NUL");
+            if named_entry_matches(self.stage_dir.as_raw_fd(), trace_name, device, inode) {
                 // SAFETY: fixed name is relative to the held stage dirfd; unlink removes the
                 // entry itself and never follows a replacement symlink.
                 unsafe {
                     libc::unlinkat(self.stage_dir.as_raw_fd(), trace.as_ptr(), 0);
+                }
+            }
+        }
+        if let Some((device, inode)) = self.manifest_identity {
+            let manifest = c_name(MANIFEST_NAME).expect("fixed manifest name contains no NUL");
+            if named_entry_matches(self.stage_dir.as_raw_fd(), MANIFEST_NAME, device, inode) {
+                unsafe {
+                    libc::unlinkat(self.stage_dir.as_raw_fd(), manifest.as_ptr(), 0);
                 }
             }
         }
@@ -354,6 +508,19 @@ fn open_directory(path: &Path) -> io::Result<File> {
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)
+}
+
+fn ensure_bundle_parent_trusted(parent: &File) -> io::Result<()> {
+    let stat = stat_fd(parent.as_raw_fd())?;
+    let writable_by_others = stat.st_mode & (libc::S_IWGRP | libc::S_IWOTH) != 0;
+    let sticky = stat.st_mode & libc::S_ISVTX != 0;
+    if writable_by_others && !sticky {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "bundle destination parent is writable by other users without sticky-bit protection",
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_destination_absent(parent_fd: i32, destination_name: &OsStr) -> io::Result<()> {
@@ -419,13 +586,13 @@ where
         after_create(parent, &name);
 
         // SAFETY: parent is an open directory; the just-created entry is opened without following
-        // symlinks and with close-on-exec. O_PATH keeps the directory usable as a dirfd even under
-        // a restrictive umask without granting read access to the staged contents.
+        // symlinks and with close-on-exec. The mode-0700 directory is owned by this process, and
+        // a readable directory descriptor is needed for fsync before bundle publication.
         let fd = unsafe {
             libc::openat(
                 parent.as_raw_fd(),
                 c_name.as_ptr(),
-                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             )
         };
         if fd < 0 {
@@ -581,6 +748,48 @@ fn stat_named_entry(dir_fd: i32, name: &[u8]) -> io::Result<libc::stat> {
         return Err(io::Error::last_os_error());
     }
     Ok(stat)
+}
+
+fn has_exact_bundle_entries(directory_fd: i32) -> bool {
+    // Duplicate the held descriptor because fdopendir takes ownership of its argument.
+    let duplicate = unsafe { libc::fcntl(directory_fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return false;
+    }
+    let directory = unsafe { libc::fdopendir(duplicate) };
+    if directory.is_null() {
+        unsafe { libc::close(duplicate) };
+        return false;
+    }
+    let mut saw_trace = false;
+    let mut saw_manifest = false;
+    let mut count = 0usize;
+    loop {
+        unsafe { *libc::__errno_location() = 0 };
+        let entry = unsafe { libc::readdir(directory) };
+        if entry.is_null() {
+            let read_error = unsafe { *libc::__errno_location() };
+            unsafe { libc::closedir(directory) };
+            return read_error == 0 && count == 2 && saw_trace && saw_manifest;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        count += 1;
+        if count > 2 {
+            unsafe { libc::closedir(directory) };
+            return false;
+        }
+        match name {
+            BUNDLE_TRACE_NAME => saw_trace = true,
+            MANIFEST_NAME => saw_manifest = true,
+            _ => {
+                unsafe { libc::closedir(directory) };
+                return false;
+            }
+        }
+    }
 }
 
 fn named_entry_matches(dir_fd: i32, name: &[u8], device: libc::dev_t, inode: libc::ino_t) -> bool {
@@ -910,5 +1119,160 @@ mod tests {
         let metadata = fs::metadata(&path).unwrap();
         assert!(metadata.file_type().is_fifo());
         assert!(metadata.ino() > 0);
+    }
+
+    #[test]
+    fn bundle_publishes_exact_private_layout_and_refuses_file_or_symlink_collision() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("baseline.run");
+        let mut output = AnchoredOutput::prepare_bundle(&destination).unwrap();
+        output.create_fifo().unwrap();
+        let mut trace = output.create_trace_file().unwrap();
+        trace.write_all(b"trace bytes\n").unwrap();
+        trace.sync_all().unwrap();
+        assert_eq!(
+            trace.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let mut manifest = output.create_manifest_file().unwrap();
+        manifest.write_all(b"{}\n").unwrap();
+        manifest.sync_all().unwrap();
+        assert_eq!(
+            manifest.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(trace);
+        drop(manifest);
+        output.remove_fifo().unwrap();
+        let (published, parent_sync_confirmed) = output.publish_bundle().unwrap();
+        assert!(parent_sync_confirmed);
+        assert_eq!(published, destination);
+        assert_eq!(
+            fs::read(published.join("trace.strace")).unwrap(),
+            b"trace bytes\n"
+        );
+        assert_eq!(fs::read(published.join("run.json")).unwrap(), b"{}\n");
+        assert_eq!(fs::read_dir(&published).unwrap().count(), 2);
+        assert_eq!(
+            fs::metadata(&published).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(published.join("trace.strace"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(published.join("run.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(output);
+        assert_eq!(fs::read_dir(&published).unwrap().count(), 2);
+
+        let existing = directory.0.join("existing.run");
+        fs::create_dir(&existing).unwrap();
+        assert_eq!(
+            AnchoredOutput::prepare_bundle(&existing)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        let target = directory.0.join("target");
+        fs::write(&target, b"keep target").unwrap();
+        let link = directory.0.join("linked.run");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(
+            AnchoredOutput::prepare_bundle(&link).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"keep target");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn bundle_rejects_parent_writable_by_other_users_without_sticky_bit() {
+        let directory = TestDirectory::new();
+        fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o777)).unwrap();
+        let error = AnchoredOutput::prepare_bundle(&directory.0.join("shared.run")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("writable by other users"));
+        fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn bundle_staging_is_removed_when_manifest_or_publication_fails() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("failed.run");
+        let mut output = AnchoredOutput::prepare_bundle(&destination).unwrap();
+        output.create_fifo().unwrap();
+        let stage = output.stage_path_for_test();
+        let mut trace = output.create_trace_file().unwrap();
+        trace.write_all(b"partial").unwrap();
+        trace.sync_all().unwrap();
+        drop(trace);
+        drop(output);
+        assert!(!stage.exists());
+        assert!(!destination.exists());
+
+        let mut output = AnchoredOutput::prepare_bundle(&destination).unwrap();
+        let stage = output.stage_path_for_test();
+        let mut trace = output.create_trace_file().unwrap();
+        trace.write_all(b"trace").unwrap();
+        trace.sync_all().unwrap();
+        let mut manifest = output.create_manifest_file().unwrap();
+        manifest.write_all(b"manifest").unwrap();
+        manifest.sync_all().unwrap();
+        drop(trace);
+        drop(manifest);
+        fs::create_dir(&destination).unwrap();
+        assert_eq!(
+            output.publish_bundle().unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        drop(output);
+        assert!(!stage.exists());
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn bundle_refuses_unexpected_staging_entries_and_preserves_them() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("unexpected.run");
+        let mut output = AnchoredOutput::prepare_bundle(&destination).unwrap();
+        let stage = output.stage_path_for_test();
+        let mut trace = output.create_trace_file().unwrap();
+        trace.write_all(b"trace").unwrap();
+        trace.sync_all().unwrap();
+        let mut manifest = output.create_manifest_file().unwrap();
+        manifest.write_all(b"manifest").unwrap();
+        manifest.sync_all().unwrap();
+        drop(trace);
+        drop(manifest);
+        let marker = stage.join("unexpected-entry");
+        fs::write(&marker, b"preserve").unwrap();
+        assert!(
+            output
+                .publish_bundle()
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected entries")
+        );
+        assert_eq!(fs::read(&marker).unwrap(), b"preserve");
+        assert!(!destination.exists());
+        fs::remove_file(marker).unwrap();
+        drop(output);
+        assert!(!stage.exists());
     }
 }

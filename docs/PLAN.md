@@ -1,6 +1,6 @@
 # SideEffect Delivery Plan
 
-**Status:** implementation is underway; this is not a schedule or release claim. Bounded `inspect`, conservative `diff`, exact-reference `evidence` lookup, terminal-safe text output, Linux-only static HTML export, and Linux `record` are implemented. A Linux integration test exercises real strace captures of a child's successful `execve`, represented as one complete row or separate continuation rows depending on tracer output, a temporary file operation, and loopback-only TCP activity through record, inspect, and diff; WSL runs used task-local extracted Ubuntu strace packages 6.8 and 6.19, without system installation. It checks for selected trace sentinels in captured command output and removes its private temporary directory; CI has no artifact-upload step. These runs do not validate every 6.6 build or kernel combination. Broad syscall coverage, other tracer/kernel combinations, and browser compatibility remain unverified.
+**Status:** implementation is underway; this is not a schedule or release claim. Bounded `inspect`, conservative `diff`, exact-reference `evidence` lookup, terminal-safe text output, Linux-only static HTML export, Linux `record --trace`, and opt-in `record --bundle` are implemented. Bundle writing publishes `run.json` and `trace.strace` atomically as one private sibling directory using a no-clobber rename; bundle reading/import remains unimplemented. A Linux integration test exercises real strace captures of a child's successful `execve`, represented as one complete row or separate continuation rows depending on tracer output, a temporary file operation, and loopback-only TCP activity through record, inspect, and diff; WSL runs used task-local extracted Ubuntu strace packages 6.8 and 6.19, without system installation. These runs do not validate every 6.6 build or kernel combination. Broad syscall coverage, other tracer/kernel combinations, and browser compatibility remain unverified.
 
 ## Current implementation slice
 
@@ -30,6 +30,7 @@ The first bounded recorder slice is implemented as `sideeffect record --trace OU
 - Decide whether to capture tracer diagnostics/version metadata and how to distinguish tracer failure from target exit. The current CLI inherits strace stderr, propagates its reported status only after publishing a nonempty trace, and does not independently verify command status or tracer success.
 - Validate cleanup behavior and document that this is not a sandbox and may not terminate descendants that escape tracing.
 - Test output caps, no-clobber publication, symlink safety, and cleanup on real tracer startup and termination failures.
+- `record --bundle DIR` writes the initial `sideeffect.run` v1 manifest and the exact bounded raw trace as one directory containing only `run.json` and `trace.strace`. The manifest omits command/program/argv, environment, cwd, username, absolute paths, output streams, tracer diagnostics, and event copies. It records the SideEffect and parsed strace major/minor versions, fixed capture profile, raw strace status, explicit unverified/unknown outcome markers, and exact trace length/SHA-256. Bundle files are mode 0600 in a mode-0700 directory; files and staging directory are synced before atomic sibling `renameat2(RENAME_NOREPLACE)`. Prepublication failure, overflow, and cancellation discard staging. If the post-rename parent-directory sync fails, the complete bundle is already visible and the CLI warns that persistence across sudden power loss is uncertain while propagating the recorded strace status. The bundle command is Linux-only; no bundle reader/import or schema migration exists.
 - Follow child processes where the chosen trace mode supports it.
 - Keep command status distinct from tracer/parser/report failures.
 
@@ -38,7 +39,7 @@ The first bounded recorder slice is implemented as `sideeffect record --trace OU
 ## Milestone 2 — Parse and model evidence
 
 - The initial `inspect` parser is implemented for the documented bounded text subset. Continue validating it against real supported `strace` captures and add explicit format/version support before release.
-- Add a versioned run record and event schema with raw-evidence references.
+- Phase 1 of the versioned run record is implemented as the opt-in `record --bundle` writer. Its `sideeffect.run` v1 manifest references the exact raw trace by fixed bundle filename, byte length, and SHA-256; it does not reconstruct events or prove authenticity/completeness. Bundle input validation, trace import, comparison directly from bundles, and migration remain open.
 - Represent process, file, and connection-related observations without overstating success or identity.
 - Track parse errors, unsupported records, and detectable incomplete/truncated input.
 
