@@ -62,7 +62,7 @@ Evidence bundles and report exports use conservative output-path handling. The H
 
 ### `strace` integration
 
-The initial capture backend invokes external `strace` on Linux x86_64 with child-following enabled and a scoped set of process, file, and network-related syscalls. The exact syscall selection is an implementation decision and should be tested against the acceptance fixtures. The capture bundle records tracer version, arguments, start/finish status, and relevant warnings.
+The initial capture backend invokes external `strace` on Linux x86_64 with child-following enabled and a scoped set of process, file, and network-related syscalls. The exact syscall selection is an implementation decision and should be tested against the acceptance fixtures. The current recorder publishes only the bounded raw trace and reports the raw `strace` exit status; it does not retain tracer version, arguments, diagnostics, or a structured run bundle. A future run-bundle format should record this metadata while keeping tracer status distinct from command exit status.
 
 The backend does not claim complete coverage. Kernel/version support, permissions, tracing restrictions, untraced code paths, tracer failures, and event loss or truncation can limit observation. When detectable, those conditions are represented as capture diagnostics. A successful tracer exit is not equivalent to a proof that every relevant OS interaction was captured.
 
