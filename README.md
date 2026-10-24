@@ -2,7 +2,7 @@
 
 SideEffect is a local-first Rust CLI for inspecting `strace` text and preserving event-level evidence in JSON.
 
-> **Status: early implementation.** `inspect` reads a local trace file and writes versioned JSON. `diff` compares two complete parses as JSON or terminal-safe text; Linux can also write a bounded, offline HTML report. On Linux, `record` can run a command under external `strace` and publish one bounded raw trace. A smoke test with extracted strace 6.19 captured `/usr/bin/true` and `/usr/bin/false` under WSL; broad trace coverage and compatibility are still unvalidated. Recording is not a sandbox.
+> **Status: early implementation.** `inspect` reads a local trace file and writes versioned JSON. `diff` compares two complete parses as JSON or terminal-safe text; Linux can also write a bounded, offline HTML report. On Linux, `record` can run a command under external `strace` and publish one bounded raw trace. A Linux integration test now records temporary file and loopback TCP activity, then verifies the resulting inspect and diff evidence; it has passed against extracted strace 6.19 in WSL. This narrow case does not validate broad trace coverage or other tracer/kernel combinations. Recording is not a sandbox.
 
 ## Try the current command
 

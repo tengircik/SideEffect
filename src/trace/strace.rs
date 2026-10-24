@@ -552,8 +552,27 @@ fn matching_closer(byte: u8) -> Option<u8> {
 
 fn scan_angle_annotation(bytes: &[u8], open: usize) -> (Option<usize>, usize) {
     let content_start = open.saturating_add(1).min(bytes.len());
-    for (relative_end, byte) in bytes[content_start..].iter().enumerate() {
+    let content = &bytes[content_start..];
+    let is_tcp_endpoint = content.starts_with(b"TCP:[") || content.starts_with(b"TCP6:[");
+    let mut endpoint_bracket_depth = 0usize;
+    for (relative_end, byte) in content.iter().enumerate() {
+        if is_tcp_endpoint {
+            if *byte == b'[' {
+                endpoint_bracket_depth += 1;
+            } else if *byte == b']' {
+                endpoint_bracket_depth = endpoint_bracket_depth.saturating_sub(1);
+            }
+        }
         if *byte == b'>' {
+            // TCP endpoint annotations use `->` to separate the local and peer
+            // addresses. That greater-than sign is data, not the annotation terminator.
+            if is_tcp_endpoint && endpoint_bracket_depth > 0 {
+                let is_peer_separator = relative_end > 0 && content[relative_end - 1] == b'-';
+                if is_peer_separator {
+                    continue;
+                }
+                return (None, relative_end + 1);
+            }
             return (Some(content_start + relative_end + 1), relative_end + 1);
         }
     }
@@ -728,5 +747,32 @@ mod scanner_tests {
         assert_eq!(end, None);
         assert_eq!(inspected, bytes.len() - 1);
         assert!(inspected <= bytes.len());
+    }
+
+    #[test]
+    fn tcp_peer_separator_does_not_end_the_fd_annotation() {
+        let annotation = b"<TCP:[127.0.0.1:41000->127.0.0.1:42000]>";
+        let (end, inspected) = scan_angle_annotation(annotation, 0);
+
+        assert_eq!(end, Some(annotation.len()));
+        assert_eq!(inspected, annotation.len() - 1);
+    }
+
+    #[test]
+    fn tcp_peer_separator_does_not_hide_a_missing_annotation_terminator() {
+        let annotation = b"<TCP:[127.0.0.1:41000->127.0.0.1:42000]";
+        let (end, inspected) = scan_angle_annotation(annotation, 0);
+
+        assert_eq!(end, None);
+        assert_eq!(inspected, annotation.len() - 1);
+    }
+
+    #[test]
+    fn tcp_annotation_terminator_is_not_accepted_before_its_inner_bracket_closes() {
+        let annotation = b"<TCP:[127.0.0.1:41000->127.0.0.1:42000>";
+        let (end, inspected) = scan_angle_annotation(annotation, 0);
+
+        assert_eq!(end, None);
+        assert!(inspected < annotation.len());
     }
 }

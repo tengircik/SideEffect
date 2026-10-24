@@ -4,7 +4,7 @@ Thank you for your interest in SideEffect.
 
 ## Current project state
 
-The repository has an early Rust implementation of `sideeffect inspect TRACE`, paired `diff`, Linux `record`, and Linux-only offline HTML export. GitHub Actions CI checks Linux and Windows builds; its Linux job installs the distribution `strace` package and runs only fixed `/usr/bin/true` and `/usr/bin/false` smoke commands. Capture files remain in the runner's temporary directory and are deleted without artifact upload. Synthetic fixtures exercise parser/diff behavior but are not real captures. Please do not report broader real-tracer integration as passing based on this smoke test.
+The repository has an early Rust implementation of `sideeffect inspect TRACE`, paired `diff`, Linux `record`, and Linux-only offline HTML export. GitHub Actions CI checks Linux and Windows builds; its Linux job installs the distribution `strace` and `python3` packages and runs a real-tracer integration test that observes temporary file operations and loopback-only TCP activity. Captures remain in a private temporary directory and are deleted without artifact upload. Synthetic fixtures exercise parser/diff behavior but are not real captures. This test does not establish broader syscall coverage or external-network behavior.
 
 Before proposing implementation work, read:
 
@@ -26,9 +26,9 @@ cargo test --locked --all-targets
 cargo run -- inspect tests/fixtures/strace/synthetic-minimal.trace
 ```
 
-The included trace is synthetic. Parser and CLI tests do not validate compatibility with a real `strace` release. CI runs a narrow real-capture smoke test with fixed harmless commands; broader real-tracer integration remains future work and requires an installed supported tracer.
+The included trace is synthetic. Parser and CLI tests do not validate compatibility with a real `strace` release. The Linux integration test requires both `strace` 6.6 or newer and `python3`; it fails when either tool is missing rather than skipping. It uses only a local TCP listener/client and temporary files. Its narrow observations do not establish broad real-tracer integration.
 
-`cargo fmt --all --check` and Clippy require the `rustfmt` and `clippy` components; install them in your local Rust toolchain with `rustup component add rustfmt clippy`. The CI workflow installs these components on its runners. The real-tracer smoke test runs only on Linux CI and requires the system `strace` package; do not use it as a substitute for broader integration validation.
+`cargo fmt --all --check` and Clippy require the `rustfmt` and `clippy` components; install them in your local Rust toolchain with `rustup component add rustfmt clippy`. The CI workflow installs these components on its runners. The real-tracer test runs on Linux and requires installed `strace` and `python3`; do not use it as a substitute for broader integration validation.
 
 ## How to propose a change
 

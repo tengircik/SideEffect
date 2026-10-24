@@ -1,6 +1,6 @@
 # SideEffect Architecture Plan
 
-**Status:** early implementation. The source implements bounded `inspect`, conservative `diff`, an ASCII-only terminal text view, Linux static HTML export, and Linux `record` using an external `strace` process with a bounded FIFO sink. Versioned run bundles remain planned. A limited real `strace` smoke test is recorded below; broader integration remains unverified.
+**Status:** early implementation. The source implements bounded `inspect`, conservative `diff`, an ASCII-only terminal text view, Linux static HTML export, and Linux `record` using an external `strace` process with a bounded FIFO sink. Versioned run bundles remain planned. A real-tracer integration test covers temporary file and loopback TCP observations through inspect/diff; broader coverage remains unverified.
 
 The security requirements and current safeguards are summarized in [SECURITY.md](../SECURITY.md); requirements marked future remain release gates.
 

@@ -55,6 +55,44 @@ fn parses_pid_timestamp_nested_arguments_and_fd_annotations() {
 }
 
 #[test]
+fn parses_tcp_peer_arrow_inside_strace_fd_annotation() {
+    let input = b"123 1700000000.123456 getsockname(3<TCP:[127.0.0.1:41000->127.0.0.1:42000]>, {sa_family=AF_INET, sin_port=htons(42000), sin_addr=inet_addr(\"127.0.0.1\")}, [16]) = 0\n";
+
+    let document = parse_trace_bytes(input, ParseLimits::default()).unwrap();
+    assert_eq!(document.parse_status, ParseCompleteness::Complete);
+    assert_eq!(document.records.len(), 1);
+    let record = &document.records[0];
+    assert_eq!(record.syscall.as_deref(), Some("getsockname"));
+    assert_eq!(
+        record.raw_arguments.as_deref(),
+        Some(
+            "3<TCP:[127.0.0.1:41000->127.0.0.1:42000]>, {sa_family=AF_INET, sin_port=htons(42000), sin_addr=inet_addr(\"127.0.0.1\")}, [16]"
+        )
+    );
+    assert_eq!(record.raw_result.as_deref(), Some("0"));
+}
+
+#[test]
+fn tcp_peer_arrow_does_not_accept_a_missing_outer_annotation_close() {
+    let input = b"123 1700000000.123456 getsockname(3<TCP:[127.0.0.1:41000->127.0.0.1:42000], {sa_family=AF_INET}, [16]) = 0\n";
+
+    let document = parse_trace_bytes(input, ParseLimits::default()).unwrap();
+    assert_eq!(document.parse_status, ParseCompleteness::Partial);
+    assert_eq!(document.records[0].kind, TraceRecordKind::Unparsed);
+    assert!(document.diagnostics[0].message.contains("unterminated"));
+}
+
+#[test]
+fn tcp_annotation_outer_close_does_not_hide_a_missing_inner_bracket() {
+    let input = b"123 1700000000.123456 getsockname(3<TCP:[127.0.0.1:41000->127.0.0.1:42000>, {sa_family=AF_INET}, [16]) = 0\n";
+
+    let document = parse_trace_bytes(input, ParseLimits::default()).unwrap();
+    assert_eq!(document.parse_status, ParseCompleteness::Partial);
+    assert_eq!(document.records[0].kind, TraceRecordKind::Unparsed);
+    assert!(document.diagnostics[0].message.contains("unterminated"));
+}
+
+#[test]
 fn accepts_bracketed_pid_and_failed_syscall_result() {
     let input = b"[pid 44] 1700000001.000002 openat(AT_FDCWD, \"/tmp/missing\", O_RDONLY) = -1 ENOENT (No such file or directory)\n";
 
