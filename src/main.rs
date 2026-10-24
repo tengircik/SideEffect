@@ -11,7 +11,11 @@ use serde::Serialize;
 use sideeffect::diff::compare_traces;
 #[cfg(target_os = "linux")]
 use sideeffect::format::write_html_diff;
-use sideeffect::format::{write_text_diff, write_trace_evidence_text};
+#[cfg(target_os = "linux")]
+use sideeffect::format::write_html_summary;
+use sideeffect::format::{
+    RedactedDiffSummary, summarize_diff, write_text_diff, write_trace_evidence_text,
+};
 use sideeffect::limits::{MAX_REPORT_BYTES, MAX_TRACE_BYTES, ParseLimits};
 use sideeffect::model::{ParseCompleteness, TraceDiff, TraceRecordKind};
 #[cfg(target_os = "linux")]
@@ -20,7 +24,7 @@ use sideeffect::record::AnchoredOutput;
 use sideeffect::record::record_trace;
 use sideeffect::trace::strace::parse_trace_bytes;
 
-const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Record runs a command under external strace and writes a bounded raw trace; it is observation, not isolation or a safety check.";
+const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. Record runs a command under external strace and writes a bounded raw trace; it is observation, not isolation or a safety check.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -50,6 +54,27 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             evidence(path, digest, line, byte_offset, byte_length)
         }
         [command, left, right] if command == "diff" => diff(left, right),
+        [command, left, right] if command == "diff-summary" => diff_summary_json(left, right),
+        [command, format_flag, format, left, right]
+            if command == "diff-summary" && format_flag == "--format" && format == "json" =>
+        {
+            diff_summary_json(left, right)
+        }
+        [
+            command,
+            format_flag,
+            format,
+            output_flag,
+            output,
+            left,
+            right,
+        ] if command == "diff-summary"
+            && format_flag == "--format"
+            && format == "html"
+            && output_flag == "--output" =>
+        {
+            diff_summary_html(output, left, right)
+        }
         [command, flag, format, left, right] if command == "diff" && flag == "--format" => {
             diff_with_format(format, left, right)
         }
@@ -269,6 +294,74 @@ fn write_trace_text_bounded(document: &sideeffect::model::TraceDocument) -> Resu
 
 fn diff(left_path: &OsString, right_path: &OsString) -> Result<ExitCode, String> {
     diff_with_output_format(left_path, right_path, DiffOutputFormat::Json)
+}
+
+fn diff_summary_json(left_path: &OsString, right_path: &OsString) -> Result<ExitCode, String> {
+    let summary = read_summary(left_path, right_path)?;
+    write_json(&summary, "JSON redacted diff summary")?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn diff_summary_html(
+    output_path: &OsString,
+    left_path: &OsString,
+    right_path: &OsString,
+) -> Result<ExitCode, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut output = AnchoredOutput::prepare(Path::new(output_path))
+            .map_err(|error| format!("could not prepare safe summary output: {error}"))?;
+        let summary = read_summary(left_path, right_path)?;
+        let report_path = publish_summary_html(&mut output, &summary, MAX_REPORT_BYTES)?;
+        eprintln!(
+            "Aggregate diff summary written to {}. Remaining category/count metadata may be sensitive; this export is not a safe-to-share verdict.",
+            terminal_safe_path(&report_path)
+        );
+        Ok(ExitCode::SUCCESS)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (output_path, left_path, right_path);
+        Err("HTML summary file export is currently supported on Linux only".to_owned())
+    }
+}
+
+fn read_summary(
+    left_path: &OsString,
+    right_path: &OsString,
+) -> Result<RedactedDiffSummary, String> {
+    let left = read_and_parse(left_path)?;
+    let right = read_and_parse(right_path)?;
+    let diff = compare_traces(&left, &right)
+        .map_err(|error| format!("could not compare traces: {error}"))?;
+    Ok(summarize_diff(&diff))
+}
+
+#[cfg(target_os = "linux")]
+fn publish_summary_html(
+    output: &mut AnchoredOutput,
+    summary: &RedactedDiffSummary,
+    output_limit: usize,
+) -> Result<std::path::PathBuf, String> {
+    let mut html = CappedBuffer::new(output_limit);
+    write_html_summary(summary, &mut html).map_err(|error| {
+        if html.exceeded {
+            format!("HTML summary exceeds the {output_limit} byte output limit")
+        } else {
+            format!("could not render HTML summary: {error}")
+        }
+    })?;
+    let mut report = output
+        .create_report_file()
+        .map_err(|error| format!("could not create private summary staging file: {error}"))?;
+    report
+        .write_all(&html.bytes)
+        .and_then(|()| report.flush())
+        .and_then(|()| report.sync_all())
+        .map_err(|error| format!("could not write complete HTML summary: {error}"))?;
+    output
+        .publish_report()
+        .map_err(|error| format!("could not publish summary without replacing a file: {error}"))
 }
 
 fn diff_with_format(

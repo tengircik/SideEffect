@@ -38,6 +38,24 @@ cargo run -- diff tests/fixtures/diff/baseline.synthetic.trace tests/fixtures/di
 
 `diff` emits schema-v3 observed syscall-row additions, removals, and uniquely paired result changes with source line/byte references and separate SHA-256 fingerprints for the exact baseline and candidate bytes. `matching_policy.exact_fields` names the compared row/result fields, while `matching_policy.display_only_fields` identifies lexical hints that never participate in matching. References use the baseline input for `before` and candidate input for `after`, in command argument order. Optional side-specific lexical path hints are display-only; matching uses exact raw arguments and results, never the hints. Fingerprints identify each input but do not authenticate it or establish capture completeness. The fixture pair is synthetic and is not a real capture. A comparison requires both inputs to parse completely; parser status still cannot prove capture completeness. The initial matcher treats records as a multiset, ignores only the parsed PID and timestamp prefixes for matching, and keeps exact arguments/results (including path and file-descriptor text). When multiple same-signature result records remain and no pairing is justified, they remain separate additions/removals instead of an invented changed-event pair. Paired unfinished/resumed rows are compared as separate trace rows, not merged into a reconstructed call. Control rows are outside the initial comparison and their counts are reported. The process/file/network labels are syscall-name buckets; they do not claim that an operation succeeded or caused another event.
 
+## Create an aggregate diff summary
+
+For an export that omits event-level values, run:
+
+```sh
+sideeffect diff-summary BASELINE CANDIDATE
+```
+
+This emits a separate `sideeffect_redacted_diff_summary` schema containing only added/changed/removed diff-group counts by fixed category. It omits syscall names, raw arguments/results, lexical path hints, source hashes, evidence references, and local input paths. This is field omission, not secret detection: categories and counts may still be sensitive, so the summary is not a safe-to-share verdict.
+
+On Linux, write the same aggregate as a local static HTML report with:
+
+```sh
+sideeffect diff-summary --format html --output SUMMARY.html BASELINE CANDIDATE
+```
+
+The HTML output is bounded, mode `0600`, no-clobber, offline, and contains no scripts or remote assets. JSON goes to stdout; neither command uploads data. This summary is a distinct aggregate export, not a redacted detailed diff, and it contains no event-level references.
+
 To look up a diff reference from the baseline fixture, use its `before` tuple (`line=2 byte=65 length=72`) and source hash:
 
 ```sh
