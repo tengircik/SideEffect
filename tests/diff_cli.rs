@@ -62,10 +62,11 @@ impl TempBundle {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(path.join("trace.strace"), contents).unwrap();
         fs::set_permissions(path.join("trace.strace"), fs::Permissions::from_mode(0o600)).unwrap();
+        let hash = format!("{:x}", Sha256::digest(contents));
         let manifest = format!(
             r#"{{"schema":"sideeffect.run","schema_version":1,"producer":{{"sideeffect_version":"0.1.0","operating_system":"linux","architecture":"x86_64"}},"capture":{{"tracer":{{"name":"strace","major":6,"minor":6}},"capture_profile":"linux_process_file_network_v1","strace_reported_status":{{"kind":"exit_code","value":0}},"command_outcome":"not_independently_verified","completeness":"unknown","command_stdout":"inherited_not_captured","command_stderr":"inherited_not_captured","tracer_diagnostics":"inherited_not_captured"}},"trace":{{"name":"trace.strace","format":"strace_text","byte_length":{},"sha256":"{}"}}}}"#,
             contents.len(),
-            format!("{:x}", Sha256::digest(contents))
+            hash
         );
         fs::write(path.join("run.json"), manifest).unwrap();
         fs::set_permissions(path.join("run.json"), fs::Permissions::from_mode(0o600)).unwrap();
