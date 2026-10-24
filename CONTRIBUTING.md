@@ -4,7 +4,7 @@ Thank you for your interest in SideEffect.
 
 ## Current project state
 
-The repository has an early Rust implementation of `sideeffect inspect TRACE`, paired `diff`, Linux `record`, and Linux-only offline HTML export. GitHub Actions CI checks Linux and Windows builds; its Linux job installs the distribution `strace` and `python3` packages and runs a real-tracer integration test that observes temporary file operations and loopback-only TCP activity. Captures remain in a private temporary directory and are deleted without artifact upload. Synthetic fixtures exercise parser/diff behavior but are not real captures. This test does not establish broader syscall coverage or external-network behavior.
+The repository has an early Rust implementation of `sideeffect inspect TRACE` (JSON by default, terminal-safe text with `--format text`), paired `diff`, Linux `record`, and Linux-only offline HTML export. GitHub Actions CI checks Linux and Windows builds; its Linux job installs the distribution `strace` and `python3` packages and runs a real-tracer integration test that observes temporary file operations and loopback-only TCP activity. Captures remain in a private temporary directory and are deleted without artifact upload. Synthetic fixtures exercise parser/diff behavior but are not real captures. This test does not establish broader syscall coverage or external-network behavior.
 
 Before proposing implementation work, read:
 

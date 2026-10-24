@@ -2,7 +2,7 @@
 
 SideEffect is a local-first Rust CLI for inspecting `strace` text and preserving event-level evidence in JSON.
 
-> **Status: early implementation.** `inspect` reads a local trace file and writes versioned JSON. `diff` compares two complete parses as JSON or terminal-safe text; Linux can also write a bounded, offline HTML report. On Linux, `record` can run a command under external `strace` and publish one bounded raw trace. A Linux integration test now records temporary file and loopback TCP activity, then verifies the resulting inspect and diff evidence; it has passed against extracted strace 6.19 in WSL. This narrow case does not validate broad trace coverage or other tracer/kernel combinations. Recording is not a sandbox.
+> **Status: early implementation.** `inspect` reads a local trace file and writes versioned JSON by default, or terminal-safe text with `--format text`. `diff` compares two complete parses as JSON or terminal-safe text; Linux can also write a bounded, offline HTML report. On Linux, `record` can run a command under external `strace` and publish one bounded raw trace. A Linux integration test now records temporary file and loopback TCP activity, then verifies the resulting inspect and diff evidence; it has passed against extracted strace 6.19 in WSL. This narrow case does not validate broad trace coverage or other tracer/kernel combinations. Recording is not a sandbox.
 
 ## Try the current command
 
@@ -12,13 +12,19 @@ From the repository root, run:
 cargo run -- inspect tests/fixtures/strace/synthetic-minimal.trace
 ```
 
-This prints a schema-v1 JSON document containing parsed records, raw trace lines, source byte offsets, and diagnostics. The fixture is synthetic; it is not a real system capture. Exit status `0` means every input record was classified and continuation records were reconciled; `2` means JSON was produced with a partial parse; `1` means the input or output could not be processed. **Parse status says nothing about whether the original OS capture observed every event.**
+This prints a schema-v1 JSON document containing parsed records, raw trace lines, source byte offsets, and diagnostics. The fixture is synthetic; it is not a real system capture. For a readable, terminal-safe view of every parsed and unparsed record, run:
+
+```sh
+cargo run -- inspect --format text tests/fixtures/strace/synthetic-minimal.trace
+```
+
+Exit status `0` means every input record was classified and continuation records were reconciled; `2` means JSON or text was produced with a partial parse; `1` means the input or output could not be processed. Text output retains raw values and is not redacted. **Parse status says nothing about whether the original OS capture observed every event.**
 
 ## What the parser accepts
 
 The parser handles a bounded subset of line-oriented `strace` text, including syscall records, common control lines, and `-yy` file-descriptor annotations. `record` uses `-f -ttt -yy -s 256 -e trace=%process,%file,%network --kill-on-exit` and a generated FIFO output path; `inspect` does not verify how an input was produced. See the [`strace(1)` manual](https://man7.org/linux/man-pages/man1/strace.1.html). Smoke testing used extracted strace 6.19 in WSL, not a system installation, and does not validate all supported records or events.
 
-Input is limited to 32 MiB, each physical record to 64 KiB, and the document to 100,000 records. JSON output is limited to 64 MiB. Oversized or invalid UTF-8 input fails without emitting JSON. Unrecognized, malformed, or unpaired continuation lines remain visible as raw records with diagnostics.
+Input is limited to 32 MiB, each physical record to 64 KiB, and the document to 100,000 records. JSON and text output are limited to 64 MiB. Oversized or invalid UTF-8 input fails without emitting an inspection document. Unrecognized, malformed, or unpaired continuation lines remain visible as raw records with diagnostics.
 
 ## Compare two traces
 

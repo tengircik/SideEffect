@@ -34,7 +34,7 @@ Versioned run record ───────► raw event references + capture met
                                versioned JSON          offline HTML
 ```
 
-The current paths are `inspect <trace-file>` → bounded regular-file read → strict UTF-8 and line parsing → versioned JSON; `diff <left-trace> <right-trace>` → parse both inputs → conservative multiset comparison → versioned JSON or ASCII-only escaped text; Linux `diff --format html --output REPORT LEFT RIGHT` → bounded HTML buffer → mode-0600 no-clobber report publication; and Linux `record --trace OUTPUT -- PROGRAM [ARGS...]` → private FIFO → bounded raw trace → no-clobber publication. The record command executes the selected program under strace with the user's normal permissions.
+The current paths are `inspect <trace-file>` → bounded regular-file read → strict UTF-8 and line parsing → versioned JSON by default or ASCII-only escaped text with `--format text`; `diff <left-trace> <right-trace>` → parse both inputs → conservative multiset comparison → versioned JSON or ASCII-only escaped text; Linux `diff --format html --output REPORT LEFT RIGHT` → bounded HTML buffer → mode-0600 no-clobber report publication; and Linux `record --trace OUTPUT -- PROGRAM [ARGS...]` → private FIFO → bounded raw trace → no-clobber publication. The record command executes the selected program under strace with the user's normal permissions.
 
 ## Current parser contract
 

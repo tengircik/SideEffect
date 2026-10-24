@@ -20,7 +20,7 @@ use sideeffect::record::AnchoredOutput;
 use sideeffect::record::record_trace;
 use sideeffect::trace::strace::parse_trace_bytes;
 
-const USAGE: &str = "Usage: sideeffect inspect <strace-trace-file>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file and writes JSON evidence to stdout. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Record runs a command under external strace and writes a bounded raw trace; it is observation, not isolation or a safety check.";
+const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file and writes JSON evidence by default, or terminal-safe text with --format text. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Record runs a command under external strace and writes a bounded raw trace; it is observation, not isolation or a safety check.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -43,6 +43,9 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         [command, path] if command == "inspect" => inspect(path),
+        [command, flag, format, path] if command == "inspect" && flag == "--format" => {
+            inspect_with_format(format, path)
+        }
         [command, left, right] if command == "diff" => diff(left, right),
         [command, flag, format, left, right] if command == "diff" && flag == "--format" => {
             diff_with_format(format, left, right)
@@ -121,15 +124,39 @@ fn terminal_safe_path(path: &Path) -> String {
 }
 
 fn inspect(path: &OsString) -> Result<ExitCode, String> {
+    inspect_with_format(&OsString::from("json"), path)
+}
+
+fn inspect_with_format(format: &OsString, path: &OsString) -> Result<ExitCode, String> {
+    let format = match format.to_str() {
+        Some("json") => DiffOutputFormat::Json,
+        Some("text") => DiffOutputFormat::Text,
+        _ => return Err("inspect format must be either 'json' or 'text'".to_owned()),
+    };
     let document = read_and_parse(path)?;
     let partial = document.parse_status == ParseCompleteness::Partial;
-    write_json(&document, "JSON evidence document")?;
+    match format {
+        DiffOutputFormat::Json => write_json(&document, "JSON evidence document")?,
+        DiffOutputFormat::Text => write_trace_text_bounded(&document)?,
+    }
 
     if partial {
         Ok(ExitCode::from(2))
     } else {
         Ok(ExitCode::SUCCESS)
     }
+}
+
+fn write_trace_text_bounded(document: &sideeffect::model::TraceDocument) -> Result<(), String> {
+    let mut text = CappedBuffer::new(MAX_REPORT_BYTES);
+    sideeffect::format::write_trace_text(document, &mut text).map_err(|error| {
+        if text.exceeded {
+            format!("text evidence exceeds the {MAX_REPORT_BYTES} byte output limit")
+        } else {
+            format!("could not render text evidence: {error}")
+        }
+    })?;
+    write_buffer(&text, "text evidence")
 }
 
 fn diff(left_path: &OsString, right_path: &OsString) -> Result<ExitCode, String> {
