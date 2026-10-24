@@ -1,0 +1,26 @@
+# Rust build output
+/target/
+
+# Local capture bundles and generated reports
+/captures/
+/runs/
+/reports/
+/output/
+/out/
+/.sideeffect/
+
+# Local secrets (keep the checked-in sample files explicit)
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Editor and operating-system noise
+.idea/
+.vscode/*.user
+.vscode/*.code-workspace
+*.swp
+*.tmp
+*.bak
+Thumbs.db
+Desktop.ini
