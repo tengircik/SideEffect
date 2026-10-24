@@ -80,7 +80,7 @@ pub fn write_html_diff<W: Write>(diff: &TraceDiff<'_>, writer: &mut W) -> io::Re
     write!(writer, "{}", diff.left_excluded_control_records)?;
     writer.write_all(b"; candidate: ")?;
     write!(writer, "{}", diff.right_excluded_control_records)?;
-    writer.write_all(b"</dd>\n</dl></section>\n<section><h2>Observed differences (")?;
+    writer.write_all(b"</dd>\n</dl></section>\n<p>To verify a cited row locally, run <code>sideeffect evidence TRACE SHA256 LINE BYTE_OFFSET BYTE_LENGTH</code>. For Before evidence, substitute the first input path and Before source SHA-256 shown above; for After, use the second input and After source SHA-256. Use that reference's line, byte, and length values. Input paths are omitted from this report.</p>\n<section><h2>Observed differences (")?;
     write!(writer, "{}", diff.changes.len())?;
     writer.write_all(b")</h2>")?;
 
@@ -350,6 +350,8 @@ mod tests {
         assert!(output.contains("<h3>Changed</h3>"));
         assert!(output.contains("Before evidence (CLI argument 1)"));
         assert!(output.contains("After evidence (CLI argument 2)"));
+        assert!(output.contains("sideeffect evidence TRACE SHA256 LINE BYTE_OFFSET BYTE_LENGTH"));
+        assert!(output.contains("Input paths are omitted from this report."));
         assert!(output.contains("line=4 byte=32 length=25"));
         assert!(output.contains("line=7 byte=77 length=25"));
         assert!(

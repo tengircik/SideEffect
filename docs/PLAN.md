@@ -60,7 +60,7 @@ The parser and renderer must enforce the explicit budgets recorded in Milestone 
 - Versioned JSON diff output is implemented.
 - `inspect --format text` is implemented as an ASCII-only listing of every parsed/control/unparsed record and diagnostic. It may show the narrowly scoped lexical path hint; it does not canonicalize paths or infer syscall effects.
 - `diff --format text` is implemented as an ASCII-only terminal view; escape trace-derived controls, quotes, backslashes, and non-ASCII scalars and enforce the shared output cap.
-- Linux `diff --format html --output REPORT LEFT RIGHT` renders a self-contained offline report with static CSS, no scripts or remote assets, escaped trace-derived content, and evidence references.
+- Linux `diff --format html --output REPORT LEFT RIGHT` renders a self-contained offline report with static CSS, no scripts or remote assets, escaped trace-derived content, evidence references, and instructions for checking a cited row with `sideeffect evidence`. Input paths remain omitted; before/after evidence maps to the first/second CLI inputs.
 - The HTML report shows comparison context, observed changes, and uncertainty; rendering is capped before no-clobber publication.
 - State clearly that reports may contain secrets and are not automatically sanitized; HTML file export is currently Linux-only.
 
