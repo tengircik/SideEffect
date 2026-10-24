@@ -104,6 +104,7 @@ The planned capture product will be an observation aid, not a sandbox, malware d
 
 ## Documentation
 
+- [Build and install from source](docs/INSTALL.md)
 - [Product brief](docs/PRODUCT.md)
 - [Architecture plan](docs/ARCHITECTURE.md)
 - [Delivery plan](docs/PLAN.md)

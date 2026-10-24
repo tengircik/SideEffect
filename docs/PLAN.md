@@ -72,7 +72,7 @@ Additional exit criteria: report generation respects documented event/string/out
 
 ## Milestone 5 — Release readiness
 
-- Finalize installation and `strace` prerequisite instructions for supported Linux distributions.
+- A source-build guide now records the Linux x86_64 scope, Rust/Cargo and `strace` prerequisites, a verified Ubuntu 24.04 `strace` example, existing-WSL2 usage, trace sensitivity, and the no-prebuilt-binary status. Remaining distribution/package coverage is not established.
 - Document optional use through an already installed WSL2 environment, without promising native Windows capture.
 - Review data retention/deletion behavior, output redaction decisions, supported syscall set, and known limitations.
 - Verify dependency versions and the committed lockfile, check dependency licenses and advisories, and document the separately installed `strace` dependency. Resolve any compatibility or redistribution question before packaging.
