@@ -21,24 +21,7 @@ pub fn write_trace_text<W: Write>(document: &TraceDocument, writer: &mut W) -> i
 
     for (index, record) in document.records.iter().enumerate() {
         writeln!(writer, "\nRecord {}", index + 1)?;
-        writer.write_all(b"  Kind: ")?;
-        writer.write_all(record_kind_name(record.kind).as_bytes())?;
-        writer.write_all(b"\n")?;
-        write_optional_u32(writer, "  Process ID", record.process_id)?;
-        write_optional_quoted(writer, "  Timestamp", record.timestamp.as_deref())?;
-        write_optional_quoted(writer, "  Syscall", record.syscall.as_deref())?;
-        write_optional_quoted(writer, "  Arguments", record.raw_arguments.as_deref())?;
-        write_optional_quoted(writer, "  Result", record.raw_result.as_deref())?;
-        if let Some(hint) = record.lexical_path_hint.as_ref() {
-            write_optional_quoted(writer, "  Lexical path hint", Some(&hint.path))?;
-            writer.write_all(b"  Path hint basis: ")?;
-            writer.write_all(path_hint_basis_name(hint.basis).as_bytes())?;
-            writer.write_all(b"\n")?;
-        }
-        write_evidence(writer, &record.evidence)?;
-        writer.write_all(b"  Raw line: ")?;
-        write_quoted(writer, &record.raw_line)?;
-        writer.write_all(b"\n")?;
+        write_record_details(writer, record)?;
     }
 
     writeln!(writer, "\nDiagnostics: {}", document.diagnostics.len())?;
@@ -46,6 +29,56 @@ pub fn write_trace_text<W: Write>(document: &TraceDocument, writer: &mut W) -> i
         write_diagnostic(writer, index + 1, diagnostic)?;
     }
     Ok(())
+}
+
+/// Write one parsed source record after the CLI has matched its line/offset/length reference.
+///
+/// A partial input is labeled explicitly; this view does not certify the trace as complete or
+/// bind the reference to a content hash.
+pub fn write_trace_evidence_text<W: Write>(
+    record: &crate::model::TraceRecord,
+    parse_status: ParseCompleteness,
+    writer: &mut W,
+) -> io::Result<()> {
+    writer.write_all(b"SideEffect evidence lookup\n")?;
+    writer.write_all(b"Parse status: ")?;
+    writer.write_all(parse_status_name(parse_status).as_bytes())?;
+    writer.write_all(b"\n")?;
+    if parse_status == ParseCompleteness::Partial {
+        writer.write_all(b"Warning: the input parse is partial; this is only a positional match in the supplied file, not a complete comparison or capture-coverage claim.\n")?;
+    }
+    writer.write_all(b"Reference: ")?;
+    writeln!(
+        writer,
+        "line={} byte={} length={}",
+        record.evidence.line_number, record.evidence.byte_offset, record.evidence.byte_length
+    )?;
+    writer.write_all(b"Reference scope: position in the supplied file; no content hash or capture completeness is established.\n\n")?;
+    write_record_details(writer, record)
+}
+
+fn write_record_details<W: Write>(
+    writer: &mut W,
+    record: &crate::model::TraceRecord,
+) -> io::Result<()> {
+    writer.write_all(b"  Kind: ")?;
+    writer.write_all(record_kind_name(record.kind).as_bytes())?;
+    writer.write_all(b"\n")?;
+    write_optional_u32(writer, "  Process ID", record.process_id)?;
+    write_optional_quoted(writer, "  Timestamp", record.timestamp.as_deref())?;
+    write_optional_quoted(writer, "  Syscall", record.syscall.as_deref())?;
+    write_optional_quoted(writer, "  Arguments", record.raw_arguments.as_deref())?;
+    write_optional_quoted(writer, "  Result", record.raw_result.as_deref())?;
+    if let Some(hint) = record.lexical_path_hint.as_ref() {
+        write_optional_quoted(writer, "  Lexical path hint", Some(&hint.path))?;
+        writer.write_all(b"  Path hint basis: ")?;
+        writer.write_all(path_hint_basis_name(hint.basis).as_bytes())?;
+        writer.write_all(b"\n")?;
+    }
+    write_evidence(writer, &record.evidence)?;
+    writer.write_all(b"  Raw line: ")?;
+    write_quoted(writer, &record.raw_line)?;
+    writer.write_all(b"\n")
 }
 
 fn write_optional_u32<W: Write>(writer: &mut W, label: &str, value: Option<u32>) -> io::Result<()> {

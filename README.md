@@ -2,7 +2,7 @@
 
 SideEffect is a local-first Rust CLI for inspecting `strace` text and preserving event-level evidence in JSON.
 
-> **Status: early implementation.** `inspect` reads a local trace file and writes versioned JSON by default, or terminal-safe text with `--format text`. `diff` compares two complete parses as JSON or terminal-safe text; Linux can also write a bounded, offline HTML report. On Linux, `record` can run a command under external `strace` and publish one bounded raw trace. A Linux integration test now records temporary file and loopback TCP activity, then verifies the resulting inspect and diff evidence; it has passed against extracted strace 6.19 in WSL. This narrow case does not validate broad trace coverage or other tracer/kernel combinations. Recording is not a sandbox.
+> **Status: early implementation.** `inspect` reads a local trace file and writes versioned JSON by default, or terminal-safe text with `--format text`. `diff` compares two complete parses as JSON or terminal-safe text; Linux can also write a bounded, offline HTML report. `evidence` resolves an exact diff line/byte/length reference to a parsed row in the selected trace file. On Linux, `record` can run a command under external `strace` and publish one bounded raw trace. A Linux integration test now records temporary file and loopback TCP activity, then verifies the resulting inspect and diff evidence; it has passed against extracted strace 6.19 in WSL. This narrow case does not validate broad trace coverage or other tracer/kernel combinations. Recording is not a sandbox.
 
 ## Try the current command
 
@@ -37,6 +37,14 @@ cargo run -- diff tests/fixtures/diff/baseline.synthetic.trace tests/fixtures/di
 ```
 
 `diff` emits schema-v2 observed syscall-row additions, removals, and uniquely paired result changes with source line/byte references. `matching_policy.exact_fields` names the compared row/result fields, while `matching_policy.display_only_fields` identifies lexical hints that never participate in matching. References use the baseline input for `before` and candidate input for `after`, in command argument order. Optional side-specific lexical path hints are display-only; matching uses exact raw arguments and results, never the hints. The fixture pair is synthetic and is not a real capture. A comparison requires both inputs to parse completely; parser status still cannot prove capture completeness. The initial matcher treats records as a multiset, ignores only the parsed PID and timestamp prefixes for matching, and keeps exact arguments/results (including path and file-descriptor text). When multiple same-signature result records remain and no pairing is justified, they remain separate additions/removals instead of an invented changed-event pair. Paired unfinished/resumed rows are compared as separate trace rows, not merged into a reconstructed call. Control rows are outside the initial comparison and their counts are reported. The process/file/network labels are syscall-name buckets; they do not claim that an operation succeeded or caused another event.
+
+To look up a diff reference from the baseline fixture, use its `before` tuple (`line=2 byte=65 length=72`):
+
+```sh
+sideeffect evidence tests/fixtures/diff/baseline.synthetic.trace 2 65 72
+```
+
+The command requires an exact line, byte-offset, and byte-length match to one parsed syscall row; it rejects control, unparsed, out-of-range, and mismatched references. If the trace has a partial parse, it prints a warning and exits with status `2`. A successful lookup only establishes a positional match in the currently supplied file; it does not bind the reference to a content hash or establish capture completeness.
 
 Each input remains bounded by the parser limits above (64 MiB combined maximum); a diff has at most 200,000 grouped delta rows and JSON/text output is capped at 64 MiB before stdout is written. The comparison keeps argument/result strings borrowed from parsed input and emits source references rather than copies of entire raw lines. Review reports before sharing: they may contain sensitive paths, arguments, and endpoint details.
 

@@ -11,16 +11,16 @@ use serde::Serialize;
 use sideeffect::diff::compare_traces;
 #[cfg(target_os = "linux")]
 use sideeffect::format::write_html_diff;
-use sideeffect::format::write_text_diff;
+use sideeffect::format::{write_text_diff, write_trace_evidence_text};
 use sideeffect::limits::{MAX_REPORT_BYTES, MAX_TRACE_BYTES, ParseLimits};
-use sideeffect::model::{ParseCompleteness, TraceDiff};
+use sideeffect::model::{ParseCompleteness, TraceDiff, TraceRecordKind};
 #[cfg(target_os = "linux")]
 use sideeffect::record::AnchoredOutput;
 #[cfg(target_os = "linux")]
 use sideeffect::record::record_trace;
 use sideeffect::trace::strace::parse_trace_bytes;
 
-const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file and writes JSON evidence by default, or terminal-safe text with --format text. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Record runs a command under external strace and writes a bounded raw trace; it is observation, not isolation or a safety check.";
+const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect evidence <strace-trace-file> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file and writes JSON evidence by default, or terminal-safe text with --format text. Evidence checks an exact line/byte/length tuple against one parsed row in the supplied trace; it is positional and does not verify a content hash. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Record runs a command under external strace and writes a bounded raw trace; it is observation, not isolation or a safety check.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -45,6 +45,9 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         [command, path] if command == "inspect" => inspect(path),
         [command, flag, format, path] if command == "inspect" && flag == "--format" => {
             inspect_with_format(format, path)
+        }
+        [command, path, line, byte_offset, byte_length] if command == "evidence" => {
+            evidence(path, line, byte_offset, byte_length)
         }
         [command, left, right] if command == "diff" => diff(left, right),
         [command, flag, format, left, right] if command == "diff" && flag == "--format" => {
@@ -125,6 +128,83 @@ fn terminal_safe_path(path: &Path) -> String {
 
 fn inspect(path: &OsString) -> Result<ExitCode, String> {
     inspect_with_format(&OsString::from("json"), path)
+}
+
+fn evidence(
+    path: &OsString,
+    line: &OsString,
+    byte_offset: &OsString,
+    byte_length: &OsString,
+) -> Result<ExitCode, String> {
+    let line_number = parse_reference_number(line, "line number")?;
+    let expected_offset = parse_reference_number(byte_offset, "byte offset")?;
+    let expected_length = parse_reference_number(byte_length, "byte length")?;
+    if line_number == 0 || expected_length == 0 {
+        return Err("line number and byte length must be greater than zero".to_owned());
+    }
+
+    let document = read_and_parse(path)?;
+    let record = document
+        .records
+        .iter()
+        .find(|record| record.evidence.line_number == line_number)
+        .ok_or_else(|| format!("no trace record exists at line {line_number}"))?;
+
+    match record.kind {
+        TraceRecordKind::Syscall
+        | TraceRecordKind::UnfinishedSyscall
+        | TraceRecordKind::ResumedSyscall => {}
+        TraceRecordKind::Control => {
+            return Err(format!(
+                "line {line_number} is a control record, not syscall evidence"
+            ));
+        }
+        TraceRecordKind::Unparsed => {
+            return Err(format!(
+                "line {line_number} is unparsed; no unambiguous syscall evidence is available"
+            ));
+        }
+    }
+    if record.syscall.is_none() || record.raw_arguments.is_none() {
+        return Err(format!(
+            "line {line_number} has incomplete parsed fields; no unambiguous syscall evidence is available"
+        ));
+    }
+    if record.evidence.byte_offset != expected_offset
+        || record.evidence.byte_length != expected_length
+    {
+        return Err(format!(
+            "reference mismatch at line {line_number}: supplied byte={expected_offset} length={expected_length}, file has byte={} length={}",
+            record.evidence.byte_offset, record.evidence.byte_length
+        ));
+    }
+
+    let partial = document.parse_status == ParseCompleteness::Partial;
+    let mut text = CappedBuffer::new(MAX_REPORT_BYTES);
+    write_trace_evidence_text(record, document.parse_status, &mut text).map_err(|error| {
+        if text.exceeded {
+            format!("evidence output exceeds the {MAX_REPORT_BYTES} byte output limit")
+        } else {
+            format!("could not render evidence: {error}")
+        }
+    })?;
+    write_buffer(&text, "evidence output")?;
+    if partial {
+        Ok(ExitCode::from(2))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+fn parse_reference_number(value: &OsString, label: &str) -> Result<u64, String> {
+    let Some(text) = value.to_str() else {
+        return Err(format!("{label} must be an ASCII decimal number"));
+    };
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("{label} must be an ASCII decimal number"));
+    }
+    text.parse::<u64>()
+        .map_err(|_| format!("{label} exceeds the supported numeric range"))
 }
 
 fn inspect_with_format(format: &OsString, path: &OsString) -> Result<ExitCode, String> {
