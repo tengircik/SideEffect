@@ -12,9 +12,11 @@ use sideeffect::diff::compare_traces;
 use sideeffect::format::write_text_diff;
 use sideeffect::limits::{MAX_JSON_BYTES, MAX_TRACE_BYTES, ParseLimits};
 use sideeffect::model::{ParseCompleteness, TraceDiff};
+#[cfg(target_os = "linux")]
+use sideeffect::record::record_trace;
 use sideeffect::trace::strace::parse_trace_bytes;
 
-const USAGE: &str = "Usage: sideeffect inspect <strace-trace-file>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file and writes JSON evidence to stdout. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout (JSON by default). Neither command executes the represented command.";
+const USAGE: &str = "Usage: sideeffect inspect <strace-trace-file>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file and writes JSON evidence to stdout. Diff compares two complete parsed traces and writes observed syscall-row differences to stdout (JSON by default). Record runs a command under external strace and writes a bounded raw trace; it is observation, not isolation or a safety check.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -41,8 +43,62 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         [command, flag, format, left, right] if command == "diff" && flag == "--format" => {
             diff_with_format(format, left, right)
         }
+        [
+            command,
+            option,
+            output,
+            separator,
+            program,
+            target_args @ ..,
+        ] if command == "record" && option == "--trace" && separator == "--" => {
+            record(output, program, target_args)
+        }
+        [command, ..] if command == "record" => Err(USAGE.to_owned()),
         _ => Err(USAGE.to_owned()),
     }
+}
+
+fn record(output: &OsString, program: &OsString, args: &[OsString]) -> Result<ExitCode, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let outcome =
+            record_trace(Path::new(output), program, args).map_err(|error| error.to_string())?;
+        let status = outcome
+            .strace_status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "terminated by signal or unavailable".to_owned());
+        eprintln!(
+            "Recorded {} bytes to {}. strace exit status: {} (not an independent command or tracer success result).",
+            outcome.trace_bytes,
+            terminal_safe_path(&outcome.trace_path),
+            status
+        );
+        Ok(ExitCode::SUCCESS)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (output, program, args);
+        Err("record is available only on Linux with an external strace executable".to_owned())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminal_safe_path(path: &Path) -> String {
+    use std::fmt::Write as _;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut escaped = String::new();
+    for byte in path.as_os_str().as_bytes() {
+        if (0x20..=0x7e).contains(byte) && *byte != b'\\' {
+            escaped.push(char::from(*byte));
+        } else if *byte == b'\\' {
+            escaped.push_str("\\\\");
+        } else {
+            let _ = write!(escaped, "\\x{byte:02x}");
+        }
+    }
+    escaped
 }
 
 fn inspect(path: &OsString) -> Result<ExitCode, String> {
@@ -326,5 +382,12 @@ mod tests {
     fn production_path_reader_rejects_non_regular_input() {
         let error = read_trace_file(&std::env::temp_dir(), 4).unwrap_err();
         assert!(error.contains("regular file"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn record_output_paths_escape_terminal_control_bytes() {
+        let path = std::path::Path::new("safe\n\u{1b}[31m");
+        assert_eq!(super::terminal_safe_path(path), "safe\\x0a\\x1b[31m");
     }
 }

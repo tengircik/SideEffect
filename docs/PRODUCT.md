@@ -1,10 +1,10 @@
 # SideEffect Product Brief
 
-**Status:** early implementation. The repository implements bounded `sideeffect inspect TRACE` parsing and a conservative `sideeffect diff LEFT RIGHT` comparison with JSON or terminal-safe text output. Capture and HTML report generation remain planned; no security guarantee is claimed.
+**Status:** early implementation. The repository implements bounded `inspect`, conservative `diff` with JSON or terminal-safe text output, and a Linux `record` command that sends strace output through a bounded FIFO. Real-tracer integration and HTML report generation remain unvalidated or planned; no security guarantee is claimed.
 
 ## Product summary
 
-The planned product is a local command-line tool for observing selected operating-system interactions made while a command runs, comparing two runs, and exporting an evidence-backed report. Its central result is a paired behavior delta: a reader can see which observed process, file, and network-related syscall rows differ and inspect their source evidence. The current implementation parses one user-selected local `strace` text file or compares two fully parsed traces; it does not capture a command.
+The product is a local command-line tool for observing selected operating-system interactions made while a command runs, comparing two runs, and exporting an evidence-backed report. Its central result is a paired behavior delta: a reader can see which observed process, file, and network-related syscall rows differ and inspect their source evidence. The current implementation can parse local traces, compare two fully parsed traces, and record a command under external strace on Linux. A smoke test of extracted strace 6.19 captured `/usr/bin/true` and `/usr/bin/false` in WSL; broad compatibility and selected file/network-event coverage remain unverified.
 
 The initial implementation is planned for Linux x86_64 and uses an external `strace` executable. Windows users may develop or run it through an existing WSL2 installation, but native Windows support is not part of v0. Rust is the planned implementation language for the CLI, parser, event schema, comparison engine, and local report renderer. No LLM or hosted service is required.
 
@@ -22,18 +22,18 @@ The first release should focus on one reproducible pair of command runs. It is n
 
 ## Current implementation
 
-`sideeffect inspect TRACE` reads a regular file without executing the traced command, invokes no external program, and writes schema-v1 JSON to stdout. `sideeffect diff LEFT RIGHT` compares complete parses and writes schema-v1 JSON deltas with raw source line/byte references; `--format text` renders the same differences as ASCII-only terminal-safe text. The diff fails closed on partial parses, compares syscall rows as a multiset, ignores only parsed timestamp and PID prefixes for matching, and compares raw syscall arguments/results exactly. A result change is shown as changed only when one unmatched same-signature row remains on each side; ambiguous residual multiplicities stay as additions/removals. It reports control-row counts outside the comparison. Paired unfinished/resumed records are treated as separate rows. Capture completeness remains unknown, and process/file/network labels are syscall-name buckets rather than claims of successful effects. Text escaping prevents terminal control injection; it does not redact sensitive content.
+`sideeffect inspect TRACE` reads a regular file without executing the represented command and writes schema-v1 JSON to stdout. `sideeffect diff LEFT RIGHT` compares complete parses and writes schema-v1 JSON deltas with raw source line/byte references; `--format text` renders the same differences as ASCII-only terminal-safe text. Linux `sideeffect record --trace OUTPUT -- PROGRAM [ARGS...]` runs the selected program under external strace, inheriting its stdout/stderr, and writes a bounded raw trace. The diff fails closed on partial parses, compares syscall rows as a multiset, ignores only parsed timestamp and PID prefixes for matching, and compares raw syscall arguments/results exactly. A result change is shown as changed only when one unmatched same-signature row remains on each side; ambiguous residual multiplicities stay as additions/removals. It reports control-row counts outside the comparison. Paired unfinished/resumed records are treated as separate rows. Capture completeness remains unknown, and process/file/network labels are syscall-name buckets rather than claims of successful effects. Text escaping prevents terminal control injection; it does not redact sensitive content.
 
-The parser enforces a 32 MiB input limit, a 64 KiB physical-record limit, and a 100,000-record limit. Diff results are bounded to 200,000 rows, and both JSON and text output are capped at 64 MiB before stdout is written. Invalid UTF-8 and hard limit violations fail without producing an evidence document. Included traces are synthetic, not real system captures. Real `strace` integration has not been tested because `strace` is not installed in the current WSL environment.
+The parser and recorder enforce a 32 MiB trace limit; the parser also enforces a 64 KiB physical-record limit and a 100,000-record limit. Diff results are bounded to 200,000 rows, and both JSON and text output are capped at 64 MiB before stdout is written. Invalid UTF-8 and hard limit violations fail without producing an inspect document. Included trace fixtures and fake-tracer tests are synthetic. A limited real capture smoke test exists but does not validate broad syscall output or file/network event coverage; strace remains uninstalled system-wide in the WSL environment.
 
 ## Planned capture and comparison workflow
 
-1. Obtain two `strace` text files from runs of interest (manual capture is currently required).
+1. Record two command runs with `sideeffect record` or obtain external `strace` text files.
 2. Run `sideeffect diff LEFT RIGHT` to compare parsed syscall rows and receive exact source references.
 3. Inspect the source rows for each reported delta; the tool does not infer a cause or prove capture coverage.
 4. Future capture and offline HTML export will build on this evidence-linked JSON comparison.
 
-The command capture runner and HTML export are not implemented. Capture remains deferred until finite output handling and best-effort tracee cleanup are designed; it is not a sandbox. The initial diff does not normalize file descriptors, paths, or PID-like values embedded in syscall arguments/results; those may appear as differences. Its fixture pair is synthetic and is not an integration test against real `strace` output.
+The recorder uses a private FIFO sink with a 32 MiB ceiling and publishes a bounded nonempty raw trace without replacing an existing file or symlink. If the limit is exceeded, it terminates only the direct strace process and discards staging. Strace 6.6 or newer is required for `--kill-on-exit`; it is best-effort cleanup, and descendants using `CLONE_UNTRACED` may escape. The command runs without a shell under the user's permissions, and stdout/stderr are inherited. The CLI reports raw strace status only; it does not claim a verified target exit code or tracer success. Capture is not a sandbox and may change process timing or behavior. One real smoke test confirms FIFO capture and parsing for trivial process invocations, but broader option compatibility, cleanup, and event coverage remain unvalidated. HTML export is not implemented. The initial diff does not normalize file descriptors, paths, or PID-like values embedded in syscall arguments/results; those may appear as differences. Its fixture pair is synthetic.
 
 ## Product principles
 
@@ -49,7 +49,7 @@ Each run must record capture status and relevant limitations, including tracer s
 
 ### Local by default, sensitive by design
 
-The current `inspect` command reads the selected local input and writes JSON to stdout; it has no upload or telemetry path. The resulting JSON retains raw trace text and can contain sensitive command arguments, paths, endpoint details, and other syscall values. The absent capture runner means it does not currently collect stdout/stderr or start a command. Future capture output will need separate retention, privacy, and sanitization decisions. Users must inspect JSON before sharing it.
+`inspect` and `diff` read local inputs and write to stdout; `record` creates one local trace file. There is no upload or telemetry path. Traces retain raw syscall text and can contain sensitive arguments, paths, endpoint details, and other values. Command stdout/stderr are inherited rather than collected. Users must inspect traces before sharing them.
 
 ### Honest network representation
 
