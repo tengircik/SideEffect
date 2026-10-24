@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+
+      - name: Install strace
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y strace
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+      - name: Build CLI
+        run: cargo build --locked --bin sideeffect
+
+      - name: Run local capture and report smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          temp_dir="$(mktemp -d "$RUNNER_TEMP/sideeffect-ci.XXXXXX")"
+          trap 'rm -rf -- "$temp_dir"' EXIT
+          binary="./target/debug/sideeffect"
+
+          "$binary" record --trace "$temp_dir/baseline.trace" -- /usr/bin/true
+          "$binary" record --trace "$temp_dir/candidate.trace" -- /usr/bin/false
+          test -s "$temp_dir/baseline.trace"
+          test -s "$temp_dir/candidate.trace"
+          test "$(stat -c '%a' "$temp_dir/baseline.trace")" = 600
+          test "$(stat -c '%a' "$temp_dir/candidate.trace")" = 600
+
+          "$binary" inspect "$temp_dir/baseline.trace" > /dev/null
+          "$binary" inspect "$temp_dir/candidate.trace" > /dev/null
+          "$binary" diff "$temp_dir/baseline.trace" "$temp_dir/candidate.trace" > "$temp_dir/diff.json"
+          "$binary" diff --format text "$temp_dir/baseline.trace" "$temp_dir/candidate.trace" > "$temp_dir/diff.txt"
+          "$binary" diff --format html --output "$temp_dir/report.html" "$temp_dir/baseline.trace" "$temp_dir/candidate.trace"
+
+          test -s "$temp_dir/diff.json"
+          test -s "$temp_dir/diff.txt"
+          test -s "$temp_dir/report.html"
+          test "$(stat -c '%a' "$temp_dir/report.html")" = 600
+          grep -Fq '<!doctype html>' "$temp_dir/report.html"
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+      - name: Build CLI
+        run: cargo build --locked --bin sideeffect

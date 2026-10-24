@@ -4,7 +4,7 @@ Thank you for your interest in SideEffect.
 
 ## Current project state
 
-The repository has an early Rust implementation of `sideeffect inspect TRACE`: it reads one bounded local trace file and writes a schema-v1 JSON evidence document to stdout. Capture, paired-run comparison, HTML reporting, and CI are not implemented yet. A synthetic fixture exercises the parser but is not a real `strace` capture. Please do not report a real-tracer integration as passing unless it was run with `strace` installed.
+The repository has an early Rust implementation of `sideeffect inspect TRACE`, paired `diff`, Linux `record`, and Linux-only offline HTML export. GitHub Actions CI checks Linux and Windows builds; its Linux job installs the distribution `strace` package and runs only fixed `/usr/bin/true` and `/usr/bin/false` smoke commands. Capture files remain in the runner's temporary directory and are deleted without artifact upload. Synthetic fixtures exercise parser/diff behavior but are not real captures. Please do not report broader real-tracer integration as passing based on this smoke test.
 
 Before proposing implementation work, read:
 
@@ -13,7 +13,7 @@ Before proposing implementation work, read:
 - [`docs/PLAN.md`](docs/PLAN.md)
 - [`SECURITY.md`](SECURITY.md)
 
-The intended capture target is a Rust CLI for Linux x86_64 using an external `strace` executable. Existing WSL2 may be used as a Linux environment, but native Windows tracing is not in the initial scope. The current parser-only command does not invoke `strace`; no LLM or hosted service is required.
+The capture target is a Rust CLI for Linux x86_64 using an external `strace` executable. Existing WSL2 may be used as a Linux environment, but native Windows tracing is not in the initial scope. `inspect` and `diff` do not invoke `strace`; `record` does. No LLM or hosted service is required.
 
 ## Local checks
 
@@ -21,13 +21,14 @@ From the repository root, the current checks are:
 
 ```sh
 cargo fmt --all --check
-cargo test --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
 cargo run -- inspect tests/fixtures/strace/synthetic-minimal.trace
 ```
 
-The included trace is synthetic. Parser and CLI tests do not validate compatibility with a real `strace` release. A real capture integration test remains future work and requires an installed supported tracer.
+The included trace is synthetic. Parser and CLI tests do not validate compatibility with a real `strace` release. CI runs a narrow real-capture smoke test with fixed harmless commands; broader real-tracer integration remains future work and requires an installed supported tracer.
 
-`cargo fmt --all --check` requires the `rustfmt` component; no toolchain components are installed automatically by this repository.
+`cargo fmt --all --check` and Clippy require the `rustfmt` and `clippy` components; install them in your local Rust toolchain with `rustup component add rustfmt clippy`. The CI workflow installs these components on its runners. The real-tracer smoke test runs only on Linux CI and requires the system `strace` package; do not use it as a substitute for broader integration validation.
 
 ## How to propose a change
 
