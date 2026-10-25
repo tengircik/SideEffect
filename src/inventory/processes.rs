@@ -360,9 +360,8 @@ fn parse_status(pid: u32, bytes: &[u8]) -> (ProcessRow, Vec<ProcessDiagnostic>) 
     let mut diagnostics = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut offset = 0usize;
-    let mut line_no = 0usize;
-    for raw in bytes.split_inclusive(|b| *b == b'\n') {
-        line_no += 1;
+    for (line_index, raw) in bytes.split_inclusive(|b| *b == b'\n').enumerate() {
+        let line_no = line_index + 1;
         let line = raw
             .strip_suffix(b"\n")
             .unwrap_or(raw)
