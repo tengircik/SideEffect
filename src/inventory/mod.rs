@@ -3,6 +3,8 @@
 mod debian;
 mod model;
 #[cfg(target_os = "linux")]
+mod permissions;
+#[cfg(target_os = "linux")]
 mod processes;
 #[cfg(target_os = "linux")]
 mod startup;
@@ -15,6 +17,12 @@ pub use model::{
 #[cfg(target_os = "linux")]
 pub use debian::collect_debian_packages;
 pub use debian::parse_dpkg_query_output;
+#[cfg(target_os = "linux")]
+pub use permissions::{
+    AclEntry, AclObservation, AclStatus, AclTag, PermissionDiagnostic, PermissionInventoryDocument,
+    PermissionInventoryStatus, PermissionObject, PermissionObjectStatus, collect_permissions,
+    decode_posix_acl,
+};
 #[cfg(target_os = "linux")]
 pub use processes::{
     ProcessDiagnostic, ProcessEvidence, ProcessInventoryDocument, ProcessInventorySource,

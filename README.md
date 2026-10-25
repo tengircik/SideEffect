@@ -2,7 +2,7 @@
 
 SideEffect's product goal is an on-demand, local audit that helps people understand software on their computer: available permissions and startup hooks/scripts, plus observed runtime activity, all tied to evidence. It does not continuously monitor the computer.
 
-> **Status: early implementation; the product goal is not yet implemented.** The current Linux x86_64 CLI includes read-only Debian package and bounded `/proc` process snapshots, narrow XDG autostart file discovery, local `strace` text and bundle inspection, complete-trace comparison, exact evidence lookup, and recording of one selected command with its traced children. These inventory slices do not establish complete software, process, permission, or effective startup configuration. A narrow Linux integration test records temporary-file and loopback TCP activity plus a child process, then verifies inspect and diff evidence; it has passed in WSL against extracted Ubuntu strace 6.8 and 6.19 packages and in Ubuntu 24.04 CI. These runs do not verify every supported kernel or trace event. Recording is not a sandbox.
+> **Status: early implementation; the product goal is not yet implemented.** The current Linux x86_64 CLI includes read-only Debian package, bounded `/proc` process, and explicit-path file metadata/POSIX ACL snapshots, narrow XDG autostart file discovery, local `strace` text and bundle inspection, complete-trace comparison, exact evidence lookup, and recording of one selected command with its traced children. These inventory slices do not establish complete software, process, permission, or effective startup configuration. The permissions command checks selected paths only and does not calculate effective access. A narrow Linux integration test records temporary-file and loopback TCP activity plus a child process, then verifies inspect and diff evidence; it has passed in WSL against extracted Ubuntu strace 6.8 and 6.19 packages and in Ubuntu 24.04 CI. These runs do not verify every supported kernel or trace event. Recording is not a sandbox.
 
 ## Take a Debian package snapshot (Linux)
 
@@ -13,6 +13,16 @@ sideeffect inventory packages --output ./inventory.json
 This runs a fixed read-only query of the local dpkg package database and writes a point-in-time JSON snapshot. The output path must not already exist; SideEffect publishes the file privately (mode `0600`) and does not overwrite an existing file. A complete source read exits with status `0`; a partial, unavailable, or otherwise incomplete read still writes its status and diagnostics and exits with status `2`. The document records its capture timestamp, source status, and package-row evidence (line, byte offsets and lengths, and record hashes; valid rows also retain the raw row). Check the status and diagnostics before relying on the listed rows.
 
 This is only an inventory of records available from dpkg. Software installed outside dpkg, including manually copied or otherwise unregistered programs, is not enumerated. This command does not take a process snapshot or inspect permissions, ACLs, startup hooks, scripts, or runtime activity. It does not request elevated privileges. Package names, versions, architecture, and raw database rows can reveal installed software and system details, so treat the output as sensitive, choose a private destination, review it before sharing, and delete it when no longer needed. SideEffect does not upload or automatically delete the file.
+
+## Inspect selected file permissions and ACLs (Linux)
+
+```sh
+sideeffect inventory permissions --output ./permissions.json ./some/file ./some/directory
+```
+
+This checks only the paths you name; it does not recurse. The `sideeffect.permission_inventory` v1 JSON records observed file type, owner/group IDs, mode bits, and supported POSIX access ACLs (plus default ACLs on directories). Raw ACL xattr bytes are retained as bounded hex with a SHA-256 fingerprint, alongside decoded entries when the bytes validate. Final-component symlinks are not followed; intermediate components use normal Linux path resolution. Only regular files and directories are supported. Permission denial, unsupported filesystems/xattrs, malformed ACL bytes, I/O errors, and limits are reported, make the snapshot partial, and produce exit status `2`; the partial JSON is still published. Limits are 256 paths, 4 KiB per path, 64 KiB per ACL xattr, 8 MiB aggregate ACL bytes, a 5-second between-path deadline, and the common 64 MiB serialized output cap. The deadline cannot cancel a filesystem syscall already in progress, so one may take longer. No elevated privileges are requested.
+
+This records selected metadata and ACL configuration; it does not calculate whether a particular user can access a file and does not constitute complete permission or system inventory. The mode-0600 output is sensitive because it contains paths, account IDs, modes, and raw ACL data. Choose a private destination, review before sharing, and delete it when no longer needed. SideEffect does not upload or automatically delete the file.
 
 ## Take a Linux process status snapshot
 
@@ -140,7 +150,7 @@ The bundle directory contains exactly `run.json` and `trace.strace`. It is stage
 
 ## Planned product
 
-The broader product goal is a user-triggered, local audit of software on supported platforms: show available permission and startup-hook/script configuration, then observed activity from an explicitly requested capture, with each result tied to its evidence. The current Linux x86_64 CLI includes the narrow Debian package snapshot, bounded `/proc` status snapshot, and bounded XDG autostart file discovery described above, plus trace inspection/comparison. Permission inspection, non-XDG startup hooks/scripts, and native Windows support remain future work. SideEffect does not continuously monitor the computer. Static HTML export exists on Linux; browser compatibility beyond renderer tests remains unverified.
+The broader product goal is a user-triggered, local audit of software on supported platforms: show available permission and startup-hook/script configuration, then observed activity from an explicitly requested capture, with each result tied to its evidence. The current Linux x86_64 CLI includes the narrow Debian package snapshot, bounded `/proc` status snapshot, explicit-path metadata/POSIX ACL snapshot, and bounded XDG autostart file discovery described above, plus trace inspection/comparison. Broader permission inspection, non-XDG startup hooks/scripts, and native Windows support remain future work. SideEffect does not continuously monitor the computer. Static HTML export exists on Linux; browser compatibility beyond renderer tests remains unverified.
 
 ## Limits and privacy
 

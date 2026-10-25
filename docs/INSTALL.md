@@ -27,12 +27,13 @@ The minimums below describe declared support requirements, while the validation 
 | Trace parsing | Bounded outer `strace` text syntax; preserves raw rows and classifies complete, unfinished, resumed, control, and unparsed rows | Synthetic parser fixtures and real integration traces above | Full semantic decoding of every syscall or every `strace` output format |
 | Derived syscall outcomes | Strict results for `execve`, `execveat`, `openat`, `openat2`, and `connect` only | Parser fixtures and the narrow real-tracer workflow | Higher-level effects, unsupported result spellings, or outcomes for other syscalls |
 | Lexical path hints | Narrow `openat`/`openat2` argument subset only; display-only | Deterministic parser fixtures | Filesystem resolution, symlink behavior, descriptor identity, or canonical paths |
+| Linux permission inventory | Explicit paths; metadata and supported POSIX ACL xattrs only | Deterministic ACL byte fixtures, metadata/path handling, and xattr-backed filesystem tests when supported | Recursive or complete inventory, effective access decisions, and other ACL/permission sources |
 | Diff | Exact multiset comparison of parsed syscall rows; PID/timestamp prefixes alone are ignored | Synthetic pairs plus real integration trace pair | Root cause, causal links, normalized paths/FDs, or complete OS observation |
 | Windows | Parser/comparison build workflows only | Windows CI build, Clippy, and tests | Native Windows recording or HTML file export |
 
 The capture filter selects syscall families using `strace`'s own versioned definitions. SideEffect's parser is not an exhaustive syscall allowlist: it recognizes supported outer record syntax and preserves raw arguments/results, while the outcome and path-hint derivations above remain deliberately narrow. Diff category labels are syscall-name buckets, not claims about successful effects.
 
-The latest hosted validation snapshot is commit `69ace8de2aef22e90314bbb56d9daf153c3f1268` on 2026-10-25: Linux, Rust 1.85 MSRV, Ubuntu 24.04 real-tracer compatibility, and Windows CI jobs passed, including Clippy and tests. See the [CI run](https://github.com/tengircik/SideEffect/actions/runs/40201875605). The dependency advisory and declared-license jobs passed at commit `bd0316079edd46449cfbdec4127a2c80f5365da4` in the [dependency audit run](https://github.com/tengircik/SideEffect/actions/runs/40201712795); dependencies and package metadata were unchanged afterward. These point-in-time checks are not legal clearance, broad compatibility proof, or release approval.
+The latest hosted validation snapshot is commit `db4f93bca48657d6c4fc7b4d5bc6fcbda728de0c` on 2026-10-25: Linux, Rust 1.85 MSRV, Ubuntu 24.04 real-tracer compatibility, and Windows CI jobs passed, including Clippy, tests, debug/release builds, and release CLI smoke check. See the [CI run](https://github.com/tengircik/SideEffect/actions/runs/40202117305). The dependency advisory and declared-license jobs passed at commit `bd0316079edd46449cfbdec4127a2c80f5365da4` in the [dependency audit run](https://github.com/tengircik/SideEffect/actions/runs/40201712795); dependencies and package metadata were unchanged afterward. These point-in-time checks are not legal clearance, broad compatibility proof, or release approval.
 
 ## Build from source
 
@@ -54,6 +55,14 @@ Try the parser with the included synthetic trace:
 ```
 
 This does not require `strace`. The fixture is illustrative data, not a capture from a real machine.
+
+## Inspect selected Linux file permissions and ACLs
+
+```sh
+./target/release/sideeffect inventory permissions --output ./permissions.json ./some/file ./some/directory
+```
+
+This is a read-only check of explicit paths only. It records file type, UID/GID, mode, and supported POSIX access ACLs (and directory default ACLs); it does not recurse or determine effective access for any user. Final-component symlinks are not followed, and intermediate path components use normal Linux resolution. The collector uses `/proc/self/fd` to read ACL xattrs from its pinned object descriptor, so procfs must be available for ACL collection. Permission denial, unsupported xattrs, malformed data, and configured limits produce a partial JSON snapshot and exit status `2`; no privilege escalation is requested. Its five-second deadline is checked between paths; a filesystem syscall already in progress cannot be canceled and may run longer. The output is private mode `0600`, does not replace an existing path, and stays until you delete it. It contains sensitive paths, account IDs, modes, and raw ACL bytes; review it before sharing.
 
 ## Record a command on Linux
 
