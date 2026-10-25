@@ -1,8 +1,8 @@
 # SideEffect
 
-SideEffect is a local-first Rust CLI for inspecting `strace` text and preserving event-level evidence in JSON.
+SideEffect's product goal is an on-demand, local audit that helps people understand software on their computer: available permissions and startup hooks/scripts, plus observed runtime activity, all tied to evidence. It does not continuously monitor the computer.
 
-> **Status: early implementation.** `inspect` reads a local trace file or a validated recording bundle and writes versioned JSON by default, or terminal-safe text with `--format text`. `diff` compares two complete parses as JSON or terminal-safe text; Linux can also write a bounded, offline HTML report. `evidence` resolves an exact diff line/byte/length reference to a parsed row in the selected trace file. On Linux, `record --trace` publishes one bounded raw trace, while opt-in `record --bundle` publishes a versioned manifest and the same raw trace together. A Linux integration test records temporary file and loopback TCP activity, plus a child process on one side, then verifies inspect and diff evidence; it has passed in WSL against extracted Ubuntu strace 6.8 and 6.19 packages without system installation. These runs do not verify every strace 6.6 build or kernel combination. Recording is not a sandbox.
+> **Status: early implementation; the product goal is not yet implemented.** The current Linux x86_64 CLI inspects local `strace` text and bundles, compares two complete traces, resolves exact evidence references, and can record one selected command with its traced children. This is not a computer-wide software, permission, or hooks/scripts inventory. A narrow Linux integration test records temporary-file and loopback TCP activity plus a child process, then verifies inspect and diff evidence; it has passed in WSL against extracted Ubuntu strace 6.8 and 6.19 packages and in Ubuntu 24.04 CI. These runs do not verify every supported kernel or trace event. Recording is not a sandbox.
 
 ## Try the current command
 
@@ -110,13 +110,13 @@ The bundle directory contains exactly `run.json` and `trace.strace`. It is stage
 
 ## Planned product
 
-The broader goal is to compare selected process, file, and network-related observations from two command runs and produce an evidence-linked offline report. The initial target is Linux x86_64; an existing WSL2 installation may be used, but native Windows tracing is not in scope. Static HTML export exists on Linux; browser compatibility beyond renderer tests remains unverified.
+The broader product goal is a user-triggered, local audit of software on supported platforms: show available permission and startup-hook/script configuration, then observed activity from an explicitly requested capture, with each result tied to its evidence. The current Linux x86_64 CLI is only the trace-inspection and paired-comparison foundation; inventory and native Windows support are future milestones. SideEffect does not continuously monitor the computer. Static HTML export exists on Linux; browser compatibility beyond renderer tests remains unverified.
 
 ## Limits and privacy
 
 `inspect` and `diff` read local files and write JSON or escaped terminal text to stdout. `record` executes the selected command under `strace` and writes a local raw trace. No command uploads data or uses telemetry. Traces and output retain arguments, paths, network endpoints, or other sensitive values. Review them before sharing.
 
-The planned capture product will be an observation aid, not a sandbox, malware detector, complete audit, or safety verdict. A syscall attempt does not necessarily mean it succeeded, and event proximity does not prove causation. See [SECURITY.md](SECURITY.md).
+The current capture feature is an observation aid, not a sandbox, malware detector, exhaustive computer audit, or safety verdict. A syscall attempt does not necessarily mean it succeeded, and event proximity does not prove causation. See [SECURITY.md](SECURITY.md).
 
 ## Documentation
 

@@ -1,26 +1,28 @@
 # SideEffect Product Brief
 
-**Status:** early implementation. The repository implements bounded `inspect`, conservative `diff` with JSON or terminal-safe text output, Linux-only static HTML report export, and a Linux `record` command that sends strace output through a bounded FIFO. A narrow real-tracer integration test checks a child's successful `execve` as one complete row or as unfinished/resumed rows, plus temporary-file and loopback events through inspect and diff; it has passed with extracted Ubuntu strace packages 6.8 and 6.19 in WSL. Broad real-tracer coverage and browser compatibility remain unvalidated. No security guarantee is claimed.
+**Status:** early implementation; the product target is not yet implemented. The repository currently provides bounded `inspect`, conservative `diff`, evidence lookup, Linux-only static HTML export, and Linux recording of one selected command and traced children. The first real-tracer scenario covers a child execution, temporary-file activity, and loopback TCP; it has passed with strace 6.8 and 6.19 in WSL and with strace 6.8 in Ubuntu 24.04 CI. Broad runtime coverage, system inventory, permission inspection, hooks/scripts inventory, and browser compatibility remain unvalidated. No security guarantee is claimed.
 
 ## Product summary
 
-The product is a local command-line tool for observing selected operating-system interactions made while a command runs, comparing two runs, and exporting an evidence-backed report. Its central result is a paired behavior delta: a reader can see which observed process, file, and network-related syscall rows differ and inspect their source evidence. The current implementation can parse local traces, compare two fully parsed traces, and record a command under external strace on Linux. A Linux integration test has passed with extracted strace 6.8 and 6.19 packages in WSL and verifies a child `execve` attempt and successful return, represented as one or two source rows depending on tracer output, a temporary file operation, and loopback-only TCP activity; broad compatibility and event coverage remain unverified.
+SideEffect is intended to be a user-triggered, local audit of software on a computer. An audit should show what software is present or running, which permission/configuration facts can be read, what startup hooks or scripts are configured, and what activity was observed during an explicitly bounded capture. Every claim should link to the source record or system artifact that supports it. The report must distinguish configured facts from observed runtime behavior and derived analysis, and label inaccessible or unsupported areas as unknown or not checked. SideEffect does not run as an always-on monitor.
 
-The initial implementation is planned for Linux x86_64 and uses an external `strace` executable. Windows users may develop or run it through an existing WSL2 installation, but native Windows support is not part of v0. Rust is the planned implementation language for the CLI, parser, event schema, comparison engine, and local report renderer. No LLM or hosted service is required.
+The current implementation is a narrower technical foundation: it parses local `strace` text, compares two fully parsed traces, and records one selected command under external strace on Linux. A Linux integration test covers a child execution, temporary-file activity, and loopback-only TCP; broad compatibility and event coverage remain unverified. The current implementation is not a system-wide inventory and does not yet inspect installed programs, permissions, hooks, or scripts.
+
+The first implementation platform is Linux x86_64 and the current capture backend uses an external `strace` executable. Native Windows tracing and inventory are not currently supported; a native Windows adapter is planned as a separate milestone, while WSL2 remains only an option for users who already have it. Rust is the implementation language. A future optional local model may explain selected audit evidence, but the core audit must work without an LLM or hosted service.
 
 Published traces, bundles, and report files are written to paths chosen by the user and remain there until the user deletes them. SideEffect does not upload, rotate, or automatically delete published data. Handled failures and cancellation clean up private staging directories; a machine crash can leave one behind. Treat traces and reports as sensitive data.
 
 ## Problem
 
-Developers often know that two executions behaved differently but cannot quickly see the OS-level interactions that changed. Raw syscall logs contain useful evidence, but they are difficult to compare: process IDs, file descriptors, timestamps, and concurrent event ordering vary between runs. Existing runtime tracers can collect broad events, but a useful review artifact needs to connect a compact difference back to the exact observed events without presenting correlation as proof of cause.
+People often cannot tell what installed or running software is configured to do, which permissions or startup entries it has, or what it does when they run it. OS tools expose these facts in different places and formats. SideEffect should bring supported sources into a local report while preserving the source of each claim, distinguishing configured access from observed behavior, and showing areas it could not inspect. Runtime traces can help explain a selected program's actions, but correlation must not be presented as proof of cause.
 
 ## Intended users and use cases
 
-- A developer reviewing what changed after a dependency, build, or configuration update.
-- A maintainer investigating why a command behaves differently on a second machine or environment.
-- A security-conscious user inspecting a local tool before deciding whether to run it. The report is an observation aid, not a security verdict or sandbox.
+- A computer user reviewing installed and running software, supported permission facts, and startup hooks or scripts.
+- A developer or maintainer inspecting a selected program's bounded runtime activity or comparing two runs.
+- A security-conscious user auditing a local tool before deciding whether to run it. The report is an observation aid, not a security verdict or sandbox.
 
-The first release should focus on one reproducible pair of command runs. It is not a continuously running endpoint monitor or a general tracing platform.
+The current foundation release focuses on one reproducible pair of command runs. The broader product goal is an on-demand audit, not a continuously running endpoint monitor or a claim to enumerate every possible behavior.
 
 ## Current implementation
 
@@ -85,7 +87,7 @@ The first release may observe connection-related syscalls. It must distinguish a
 - Cloud accounts, hosted dashboards, telemetry, team collaboration, or report upload.
 - Blanket suppression of temporary paths or other changing values. Any comparison normalization must be explicit and inspectable.
 
-## Success criteria for the first usable release
+## Success criteria for the v0 technical foundation
 
 - A user can record two supported command runs and receive a report that identifies added, removed, and changed observed event groups.
 - Every reported event difference links back to raw evidence and identifies which run it came from.

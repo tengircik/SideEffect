@@ -4,11 +4,11 @@ This file applies to the entire repository. Check for more specific `AGENTS.md` 
 
 ## Project scope
 
-- SideEffect is planned as a local-first Rust CLI for Linux x86_64. The initial capture backend uses an external `strace` executable.
-- WSL2 is an optional environment for users who already have it. Do not describe the product as a native Windows tracer or imply that WSL2 is installed automatically.
-- The core workflow is a paired comparison of observed process, file, and network-related events, with event-level references to raw evidence.
+- SideEffect's product target is a user-triggered, local audit of software on supported operating systems: inventory available permission and startup-hook/script configuration, and show observed runtime activity with links to its evidence.
+- The product does not continuously monitor the computer. Each audit has an explicit scope and capture window; inaccessible or unsupported areas must be shown as unknown or not checked.
+- The current implementation is a Linux x86_64 Rust CLI using external `strace` for a selected command and its traced children. This is a technical foundation, not the full product target. A native Windows adapter is planned but not implemented; WSL2 is optional for users who already have it and does not count as native Windows support.
 - Preserve the distinction between an observed fact, a derived comparison, an uncertainty, and an unsupported inference. Do not claim root cause, complete coverage, or safety.
-- Do not add cloud upload, telemetry, automatic privilege escalation, or an LLM dependency without an explicit product/security review.
+- Do not add cloud upload, telemetry, automatic privilege escalation, or an LLM dependency without an explicit product/security review. Any future AI analysis must be opt-in and local, must not execute commands or modify the system, and must keep its claims distinct from evidence.
 
 ## Language and coordination
 

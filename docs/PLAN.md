@@ -1,13 +1,22 @@
 # SideEffect Delivery Plan
 
-**Status:** implementation is underway; this is not a schedule or release claim. Bounded `inspect`, conservative `diff`, exact-reference `evidence` lookup, terminal-safe text output, Linux-only static HTML export, Linux `record --trace`, and opt-in `record --bundle` plus Linux inspection of its strict v1 bundle format are implemented. Bundle writing publishes `run.json` and `trace.strace` atomically as one private sibling directory using a no-clobber rename; bundle inspection validates the schema, fixed entries, ownership/modes, size bounds, trace length, and SHA-256 before parsing. A Linux integration test exercises real strace captures of a child's successful `execve`, represented as one complete row or separate continuation rows depending on tracer output, a temporary file operation, and loopback-only TCP activity through record, inspect, and diff; WSL runs used task-local extracted Ubuntu strace packages 6.8 and 6.19, without system installation. The hosted CI snapshot at commit `2cd99c25211234b8e80ac29e527a07744da69816` passed Linux, Rust 1.85 MSRV, Ubuntu 24.04 strace integration, Windows parser/comparison, dependency advisory, and declared-license jobs on 2026-10-25. These runs do not validate every 6.6 build or kernel combination. Broad syscall coverage, other tracer/kernel combinations, and browser compatibility remain unverified. See the [compatibility and observation matrix](INSTALL.md#compatibility-and-observation-matrix).
+**Status:** implementation is underway; this is not a schedule or release claim. Bounded `inspect`, conservative `diff`, exact-reference `evidence` lookup, terminal-safe text output, Linux-only static HTML export, Linux `record --trace`, and opt-in `record --bundle` plus Linux inspection of its strict v1 bundle format are implemented. Bundle writing publishes `run.json` and `trace.strace` atomically as one private sibling directory using a no-clobber rename; bundle inspection validates the schema, fixed entries, ownership/modes, size bounds, trace length, and SHA-256 before parsing. A Linux integration test exercises real strace captures of a child's successful `execve`, represented as one complete row or separate continuation rows depending on tracer output, a temporary file operation, and loopback-only TCP activity through record, inspect, and diff; WSL runs used task-local extracted Ubuntu strace packages 6.8 and 6.19, without system installation. The hosted CI snapshot at commit `60e9eb236d25442d65c3f0a1205b25baa2c08340` passed Linux, Rust 1.85 MSRV, Ubuntu 24.04 strace integration, and Windows parser/comparison jobs on 2026-10-25; the dependency advisory and declared-license jobs passed on the parent commit. These runs do not validate every 6.6 build or kernel combination. Broad syscall coverage, other tracer/kernel combinations, and browser compatibility remain unverified. See the [compatibility and observation matrix](INSTALL.md#compatibility-and-observation-matrix).
 
 ## Current implementation slice
+
 
 `sideeffect inspect TRACE` reads a regular local file, accepts a bounded subset of `strace` text, preserves raw lines and source byte offsets in a schema-v4 JSON document, and writes that document to stdout. Its `outcome` field is attached only to complete `execve`/`execveat`, `openat`/`openat2`, and `connect` records. It reports `success` only for strict recognized successful results, `failure` only for strict Linux `-1 ERRNO (message)` results, `in_progress` for strict `connect` `EINPROGRESS` results, and `unknown` otherwise. This is a syscall-result summary; raw results and records remain unchanged and authoritative. Unfinished/resumed rows and other syscall names have no outcome field. `sideeffect inspect --bundle DIR` accepts the current Linux `sideeffect.run` v1 bundle, verifies its strict manifest, private fixed files, trace length, and SHA-256 before parsing, and produces the same document as inspecting the raw trace without including the bundle path. The manifest cap is 16 KiB and the trace uses the existing 32 MiB cap. Its `source_sha256` fingerprints the exact bounded byte buffer parsed. For `openat` and `openat2`, it may include an optional `lexical_path_hint` derived from a plain printable-ASCII path and an absolute `-yy` directory annotation; the hint does not query the filesystem, normalize path segments, follow symlinks, or establish descriptor identity. Earlier trace schemas v1-v3 and diff schemas v1-v2 are standalone; the CLI reads raw `strace` text only and does not import/migrate prior SideEffect JSON exports. `sideeffect inspect --format text TRACE` writes an ASCII-only terminal-safe view of every parsed, control, and unparsed row plus parser diagnostics and labels any hint as lexical. `sideeffect diff LEFT RIGHT` compares completely parsed raw trace inputs and writes schema-v3 JSON observed deltas with source offsets and separate left/right SHA-256 fingerprints; it includes optional side-specific lexical path hints as display-only fields, while `matching_policy.exact_fields` documents exact row/result comparison and `matching_policy.display_only_fields` explicitly excludes the hints. Fingerprints identify bytes only; they do not authenticate capture or establish completeness. `sideeffect evidence TRACE SHA256 LINE BYTE_OFFSET BYTE_LENGTH` verifies the supplied lowercase fingerprint against the exact parsed bytes before checking the source tuple against exactly one parsed syscall row. Partial input is labeled, and malformed/mismatched fingerprints and control, unparsed, out-of-range, or mismatched tuples are rejected. A successful lookup establishes byte identity relative to the supplied fingerprint and position within those bytes; it does not establish authenticity or capture completeness. Fingerprints are sensitive metadata, can reveal equality, and may be guessable for low-entropy traces; trace bytes are not uploaded. `sideeffect diff --format text LEFT RIGHT` writes a human-readable ASCII-only view with terminal controls escaped and clearly labels path hints as display-only. Linux `sideeffect diff --format html --output REPORT LEFT RIGHT` writes a bounded static offline report, with no scripts or remote assets, mode 0600, and no-clobber publication. It omits local input paths but can contain sensitive trace values. Parser and diff fixtures remain synthetic. The Linux integration test uses the real tracer for a narrow file plus loopback scenario; compatibility with broader tracer output remains unverified.
 `sideeffect diff-summary` writes a separate `sideeffect_redacted_diff_summary` schema containing only added/changed/removed diff-group counts by fixed category. Its schema omits syscall names, raw arguments/results, lexical hints, source fingerprints, evidence references, and local input paths. It does not detect secrets or certify that the remaining counts are safe to share. JSON is written to stdout; Linux HTML is capped at 64 MiB, mode 0600, and published without replacing an existing file. This command uploads nothing and is not a redacted detailed diff.
 
 Current hard limits are 32 MiB per input file (64 MiB combined for a diff), 64 KiB per physical record excluding LF, 100,000 records per input, 200,000 diff rows, and 64 MiB for serialized JSON, text, or HTML output. These initial values need review against real captures. `parse_status` describes syntax/continuation parsing only and cannot establish capture completeness. The diff fails closed on partial parses, ignores only parser-level PID/timestamp prefixes when matching, compares exact arguments/results, treats rows as a multiset, and reports excluded control-row counts. It emits a changed row only when exactly one unmatched same-signature record remains on each side; ambiguous result multiplicities remain additions/removals. Before/after references point to the first/second CLI input respectively. Unfinished and resumed rows remain separate observations.
+
+## Product target beyond the current implementation
+
+The product goal is an on-demand, local audit of software on a supported computer. It is broader than the current selected-command trace comparison. A completed product should combine source-linked software/process inventory, readable permission/configuration facts, startup-hook/script inventory, and observed activity from an explicitly bounded capture. It must separate configured facts, observed behavior, derived comparisons, and AI-generated interpretation. Each audit states what was checked, what was inaccessible, and what is unknown. No background daemon or continuous monitoring is part of the target.
+
+The initial inventory and observation platform remains Linux x86_64. Native Windows support requires a separately designed platform adapter and is not implied by WSL2. Platform-specific permission and startup mechanisms must be named individually; the product must not suggest that it has an exhaustive or cross-platform permission model. The optional local LLM is a later, opt-in layer that can summarize selected evidence only; it cannot execute commands, change settings, or replace evidence. Cloud inference, telemetry, and automatic privilege escalation remain out of scope.
+
+Milestones 6–9 below extend the v0 technical foundation and are required for the broader product target; they are not implemented yet.
 
 ## Milestone 0 — Repository and dependency decision
 
@@ -82,7 +91,7 @@ Additional exit criteria: report generation respects documented event/string/out
 - A dedicated read-only workflow audits the committed `Cargo.lock` with `cargo-audit` 0.22.2 weekly, on manual dispatch, and when `Cargo.toml` or `Cargo.lock` changes on push or pull request. It refreshes the advisory database during the run and reports known dependency advisories, but does not assess exploitability, license compatibility, or release readiness.
 - The dependency-audit workflow also runs `cargo-deny` 0.20.2's declared-license check in a separate job using the stable Rust toolchain, leaving the Rust 1.85 application MSRV job unchanged. The explicit allowlist is MIT, Apache-2.0, and Unicode-3.0; `version_check` 0.9.5 is clarified as `MIT OR Apache-2.0` against hashes of its packaged MIT and Apache license files. This check evaluates Cargo declarations and hash-anchored clarifications; it is not legal clearance and does not cover separately installed `strace`. License compatibility and distribution obligations remain for human/legal review. The weekly `cargo-audit` job remains separate and checks advisories, not licenses. See the official [cargo-deny license-check documentation](https://embarkstudios.github.io/cargo-deny/checks/licenses/index.html).
 - GitHub Dependabot alerts are enabled for the private repository. This is separate from the manual weekly `cargo-audit` workflow and does not establish vulnerability remediation or release clearance.
-- At commit `2cd99c25211234b8e80ac29e527a07744da69816`, hosted Linux, Rust 1.85 MSRV, Ubuntu 24.04 real-tracer compatibility, Windows, advisory, and declared-license jobs passed on 2026-10-25. This snapshot does not complete the remaining license/legal, broad compatibility, browser/accessibility, artifact, or release-content reviews.
+- At commit `60e9eb236d25442d65c3f0a1205b25baa2c08340`, hosted Linux, Rust 1.85 MSRV, Ubuntu 24.04 real-tracer compatibility, and Windows jobs passed on 2026-10-25; advisory and declared-license jobs passed on its parent commit. This snapshot does not complete the remaining license/legal, broad compatibility, browser/accessibility, artifact, or release-content reviews.
 - Run the complete automated test suite, including real-tracer capture integration and parser, diff, incomplete-capture, JSON, HTML-injection, offline-rendering, and privacy-focused fixtures. Review a sample report for evidence accuracy and leakage.
 - Review the exact release contents and staged repository changes for raw captures, generated reports, credentials, tokens, environment files, and machine-specific data; keep only clearly identified synthetic fixtures.
 - Keep the repository private until release contents are ready. At the public-visibility transition, enable and verify GitHub private vulnerability reporting before announcing the project; the feature requires a public repository. Update [SECURITY.md](../SECURITY.md) with the tested route.
@@ -91,16 +100,43 @@ Additional exit criteria: report generation respects documented event/string/out
 
 Additional exit criteria: resource-boundary and output-path/symlink safety tests actually run and pass, including tests at each chosen budget boundary and just beyond it.
 
+## Milestone 6 — On-demand software and permission inventory
+
+- Define supported Linux inventory sources for installed software, running processes, and permission facts before implementation.
+- Collect only through read-only, bounded operations; make scope, collection time, and evidence source visible.
+- Report inaccessible or unsupported sources as unknown/not checked. Do not automatically elevate privileges.
+- Keep inventory snapshots local and sensitive; give users an explicit output path and deletion guidance.
+
+## Milestone 7 — Startup hooks, scripts, and runtime evidence
+
+- Identify supported startup mechanisms and script locations with source-file and configuration references; do not execute discovered content.
+- Let the user request a bounded capture of a selected program or process tree, then connect observed events only when the evidence supports that link.
+- Distinguish configured hooks/scripts from ones observed executing. Do not claim that absence from a snapshot proves a hook or behavior does not exist.
+- Review the resulting coverage by platform and avoid any “everything observed” guarantee.
+
+## Milestone 8 — Optional local analysis
+
+- Add a separately enabled local-model integration only after model source, license, data flow, and resource use are reviewed.
+- Send only evidence the user selected, keep analysis offline, and label model text as interpretation rather than an observation.
+- Require source references for factual claims; never let the model launch commands or modify the system.
+
+## Milestone 9 — Native Windows audit adapter
+
+- Design a native Windows read-only inventory and bounded runtime-evidence adapter; do not treat WSL2 as Windows coverage.
+- Select and document the Windows sources for installed applications, running processes, access tokens/permissions, startup entries, services, scheduled tasks, and scripts before implementation.
+- Keep the same evidence, scope, collection-time, unknown-state, no-background-monitor, and no-automatic-elevation guarantees as other adapters.
+- Validate Windows-specific privacy and security boundaries separately; do not reuse Linux coverage claims.
+
+Milestones 6–9 are product requirements, not v0 exit criteria, and none is implemented yet.
+
 ## Deferred work
 
 Potential future work requires separate scoping and evidence:
 
 - additional Linux architectures or tracing backends;
-- native Windows tracing;
 - network payload capture or DNS identity correlation;
 - upload, hosted reports, or team collaboration;
 - automatic redaction or secret detection;
 - stronger process causality or provenance claims;
-- LLM-based interpretation.
 
 None of these capabilities is implied by the v0 plan.

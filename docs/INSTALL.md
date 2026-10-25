@@ -32,7 +32,7 @@ The minimums below describe declared support requirements, while the validation 
 
 The capture filter selects syscall families using `strace`'s own versioned definitions. SideEffect's parser is not an exhaustive syscall allowlist: it recognizes supported outer record syntax and preserves raw arguments/results, while the outcome and path-hint derivations above remain deliberately narrow. Diff category labels are syscall-name buckets, not claims about successful effects.
 
-The last recorded hosted validation snapshot is commit `2cd99c25211234b8e80ac29e527a07744da69816` on 2026-10-25: the Linux, Rust 1.85 MSRV, Ubuntu 24.04 real-tracer compatibility, and Windows CI jobs passed; the dependency advisory and declared-license workflow jobs also passed. See the [CI run](https://github.com/tengircik/SideEffect/actions/runs/40182617862) and [dependency audit run](https://github.com/tengircik/SideEffect/actions/runs/40182617865). These point-in-time checks are not legal clearance, broad compatibility proof, or release approval.
+The last recorded hosted validation snapshot is commit `60e9eb236d25442d65c3f0a1205b25baa2c08340` on 2026-10-25: the Linux, Rust 1.85 MSRV, Ubuntu 24.04 real-tracer compatibility, and Windows CI jobs passed; the dependency advisory and declared-license workflow jobs also passed on its parent commit. See the [CI run](https://github.com/tengircik/SideEffect/actions/runs/40184885758) and [dependency audit run](https://github.com/tengircik/SideEffect/actions/runs/40182617865). These point-in-time checks are not legal clearance, broad compatibility proof, or release approval.
 
 ## Build from source
 
