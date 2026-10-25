@@ -96,6 +96,20 @@ cargo run -- diff tests/fixtures/diff/baseline.synthetic.trace tests/fixtures/di
 
 For complete `execve`/`execveat`, `openat`/`openat2`, and `connect` records, inspection may include an `outcome` of `success`, `failure`, `in_progress`, or `unknown`. The summary is derived only from strict result spellings (`connect`'s `EINPROGRESS` is in progress); unsupported or malformed result forms are `unknown`. It does not describe a higher-level effect. The exact `raw_result`, `raw_line`, and sibling evidence reference remain available. Other syscalls and unfinished/resumed rows have no outcome field.
 
+## Explain bounded observations
+
+Create a deterministic explanation without installing a model:
+
+```sh
+sideeffect explain TRACE
+sideeffect explain --diff BASELINE CANDIDATE
+sideeffect explain --inventory-diff BEFORE.json AFTER.json
+```
+
+Trace explanations summarize selected syscall result classifications, direct evidence-linked process relations, parse and capture limitations, and known unknowns. Diff explanations summarize observed syscall-row changes. Package inventory explanations compare saved `sideeffect.inventory` v2 snapshots for additions, removals, and changed package versions/statuses. An unmatched package is reported as added or removed only when the relevant source is complete on both sides; otherwise it stays unresolved. All three commands emit bounded JSON, preserve evidence locations, and omit raw syscall arguments/results, raw package rows, diagnostic text, and source fingerprints. Inventory comparison covers only the listed supported package sources; it does not provide an exhaustive software inventory.
+
+Trace explanations return status `2` when parsing is partial while still emitting the bounded summary. Trace diffs require complete parses. Package inventory comparisons return status `2` when source coverage is partial and reject malformed, oversized, unsupported, or unknown-field input. These commands do not use a language model. Optional local model analysis remains under evaluation and is not currently included.
+
 ## Create an aggregate diff summary
 
 For an export that omits event-level values, run:

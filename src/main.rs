@@ -16,6 +16,7 @@ use serde::Serialize;
 #[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
 use sideeffect::diff::compare_traces;
+use sideeffect::explain::{explain_diff, explain_trace};
 #[cfg(target_os = "linux")]
 use sideeffect::format::write_html_diff;
 #[cfg(target_os = "linux")]
@@ -25,6 +26,7 @@ use sideeffect::format::{
 };
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{InventoryStatus, collect_packages};
+use sideeffect::inventory::{PackageComparisonStatus, compare_package_inventory_json};
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{PermissionInventoryStatus, collect_permissions};
 #[cfg(target_os = "linux")]
@@ -43,6 +45,9 @@ use sideeffect::startup_correlation::correlate_startup_bytes;
 use sideeffect::trace::strace::parse_trace_bytes;
 
 const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect inspect [--format json|text] --bundle <run-bundle-directory>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff --bundles [--format json|text] <baseline-bundle> <candidate-bundle>\n       sideeffect diff --bundles --format html --output <report.html> <baseline-bundle> <candidate-bundle>\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect inventory packages --output <new-inventory.json>\n\
+       sideeffect explain <strace-trace-file>\n\
+       sideeffect explain --diff <baseline-trace> <candidate-trace>\n\
+       sideeffect explain --inventory-diff <before.json> <after.json>\n\
        sideeffect correlate-startup <startup-inventory.json> <strace-trace-file>\n\
        sideeffect inventory processes --output <new-inventory.json>\n\
        sideeffect inventory startup --output <new-inventory.json>\n\
@@ -70,6 +75,15 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         [command, path] if command == "inspect" => inspect(path),
+        [command, path] if command == "explain" => explain_trace_file(path),
+        [command, diff_flag, left, right] if command == "explain" && diff_flag == "--diff" => {
+            explain_diff_files(left, right)
+        }
+        [command, diff_flag, before, after]
+            if command == "explain" && diff_flag == "--inventory-diff" =>
+        {
+            explain_inventory_diff_files(before, after)
+        }
         [command, startup_path, trace_path] if command == "correlate-startup" => {
             correlate_startup(startup_path, trace_path)
         }
@@ -689,6 +703,56 @@ fn inspect_with_format(format: &OsString, path: &OsString) -> Result<ExitCode, S
         return Err("inspect format must be either 'json' or 'text'".to_owned());
     }
     inspect_bytes_with_format(format, read_bounded(path)?)
+}
+
+fn explain_trace_file(path: &OsString) -> Result<ExitCode, String> {
+    let document = read_and_parse(path)?;
+    let partial = document.parse_status == ParseCompleteness::Partial;
+    let explanation = explain_trace(&document);
+    write_json(&explanation, "JSON trace explanation")?;
+    if partial {
+        Ok(ExitCode::from(2))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+fn explain_diff_files(
+    baseline_path: &OsString,
+    candidate_path: &OsString,
+) -> Result<ExitCode, String> {
+    let baseline = read_and_parse(baseline_path)?;
+    let candidate = read_and_parse(candidate_path)?;
+    let diff = compare_traces(&baseline, &candidate)
+        .map_err(|error| format!("could not compare traces: {error}"))?;
+    let explanation = explain_diff(&diff);
+    write_json(&explanation, "JSON diff explanation")?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn explain_inventory_diff_files(
+    before_path: &OsString,
+    after_path: &OsString,
+) -> Result<ExitCode, String> {
+    let before = read_input_file(
+        Path::new(before_path),
+        MAX_REPORT_BYTES,
+        "package inventory",
+    )?;
+    let after = read_input_file(
+        Path::new(after_path),
+        MAX_REPORT_BYTES.saturating_sub(before.len()),
+        "package inventory",
+    )?;
+    let comparison = compare_package_inventory_json(&before, &after)
+        .map_err(|error| format!("package inventory comparison failed: {error:?}"))?;
+    let partial = comparison.status == PackageComparisonStatus::Partial;
+    write_json(&comparison, "JSON package inventory comparison")?;
+    if partial {
+        Ok(ExitCode::from(2))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
 }
 
 fn inspect_bundle_with_format(format: &OsString, path: &OsString) -> Result<ExitCode, String> {

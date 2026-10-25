@@ -2,6 +2,7 @@
 
 mod debian;
 mod model;
+mod package_diff;
 #[cfg(target_os = "linux")]
 mod packages;
 #[cfg(target_os = "linux")]
@@ -18,6 +19,12 @@ mod systemd_units;
 pub use model::{
     INVENTORY_SCHEMA, INVENTORY_SCHEMA_VERSION, InventoryDiagnostic, InventoryDocument,
     InventoryEvidence, InventoryPackage, InventorySource, InventorySourceStatus, InventoryStatus,
+};
+pub use package_diff::{
+    PackageChangeKind, PackageComparisonCounts, PackageComparisonDiagnostic,
+    PackageComparisonError, PackageComparisonStatus, PackageEvidenceReference, PackageFacts,
+    PackageIdentity, PackageInventoryComparison, PackageInventoryDelta, PackageSourceComparison,
+    compare_package_inventories, compare_package_inventory_json,
 };
 
 #[cfg(target_os = "linux")]

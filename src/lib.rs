@@ -1,4 +1,5 @@
 pub mod diff;
+pub mod explain;
 mod fingerprint;
 pub mod format;
 pub mod inventory;
