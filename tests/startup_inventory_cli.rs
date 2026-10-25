@@ -58,7 +58,7 @@ fn discovers_injected_xdg_roots_and_publishes_private_no_clobber_json() {
             .unwrap()
     };
     let result = run();
-    assert_eq!(result.status.code(), Some(0));
+    assert!(matches!(result.status.code(), Some(0 | 2)));
     assert!(result.stdout.is_empty());
     assert_eq!(
         fs::metadata(&output).unwrap().permissions().mode() & 0o777,
@@ -66,9 +66,15 @@ fn discovers_injected_xdg_roots_and_publishes_private_no_clobber_json() {
     );
     let value: serde_json::Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
     assert_eq!(value["schema"], "sideeffect.startup_inventory");
-    assert_eq!(value["schema_version"], 1);
-    assert_eq!(value["scope"], "xdg_autostart_files_only");
-    let entries = value["entries"].as_array().unwrap();
+    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["scope"], "curated_xdg_systemd_sysv_cron_sources");
+    assert!(value["systemd_units"]["records"].is_array());
+    assert!(value["legacy_sources"]["sources"].is_array());
+    assert_eq!(
+        result.status.code(),
+        Some(if value["status"] == "complete" { 0 } else { 2 })
+    );
+    let entries = value["xdg_autostart"]["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 2);
     let user = entries.iter().find(|e| e["scope"] == "user").unwrap();
     assert_eq!(user["applicability"], "not_evaluated");
@@ -115,7 +121,7 @@ fn malformed_synthetic_desktop_input_publishes_private_partial_inventory() {
         .windows(b"ExecWithoutEquals".len())
         .position(|window| window == b"ExecWithoutEquals")
         .unwrap();
-    let directories = value["directories"].as_array().unwrap();
+    let directories = value["xdg_autostart"]["directories"].as_array().unwrap();
     let user_directory = directories
         .iter()
         .find(|row| row["scope"] == "user")
@@ -133,7 +139,7 @@ fn malformed_synthetic_desktop_input_publishes_private_partial_inventory() {
             && diagnostic["path"].as_str() == Some(source_path.as_ref())
     }));
 
-    let entries = value["entries"].as_array().unwrap();
+    let entries = value["xdg_autostart"]["entries"].as_array().unwrap();
     let entry = entries
         .iter()
         .find(|entry| entry["source_path"].as_str() == Some(source_path.as_ref()))

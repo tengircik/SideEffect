@@ -15,6 +15,19 @@ fn parse(input: &[u8]) -> TraceDocument {
 }
 
 #[test]
+fn parsed_trace_exposes_only_evidence_linked_direct_process_creation() {
+    let trace = parse(b"10 fork() = 11\n11 execve(\"/tmp/child\", [\"child\"], 0x0) = 0\n");
+    assert_eq!(trace.process_lineage.relations.len(), 1);
+    let relation = &trace.process_lineage.relations[0];
+    assert_eq!(relation.parent_pid, 10);
+    assert_eq!(relation.child_pid, 11);
+    assert_eq!(relation.evidence.line_number, 1);
+    assert_eq!(relation.evidence.byte_offset, 0);
+    assert_eq!(relation.evidence.byte_length, 14);
+    assert!(trace.process_lineage.diagnostics.is_empty());
+}
+
+#[test]
 fn synthetic_pair_reports_observed_file_network_and_process_deltas_with_evidence() {
     let left = parse(BASELINE);
     let right = parse(UPDATED);
@@ -449,6 +462,7 @@ fn control_document(count: usize) -> TraceDocument {
         parse_status: ParseCompleteness::Complete,
         records,
         diagnostics: Vec::new(),
+        process_lineage: sideeffect::trace::process_tree::ProcessLineage::default(),
     }
 }
 

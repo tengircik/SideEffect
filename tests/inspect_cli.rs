@@ -53,7 +53,7 @@ fn inspect_defaults_to_versioned_json() {
         String::from_utf8_lossy(&output.stderr)
     );
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(document["schema_version"], 4);
+    assert_eq!(document["schema_version"], 5);
     assert_eq!(document["source_sha256"].as_str().unwrap().len(), 64);
     assert_eq!(document["parse_status"], "complete");
     assert_eq!(
@@ -90,7 +90,7 @@ fn inspect_json_links_conservative_outcome_to_raw_evidence() {
         String::from_utf8_lossy(&output.stderr)
     );
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(document["schema_version"], 4);
+    assert_eq!(document["schema_version"], 5);
     assert_eq!(document["records"][0]["outcome"], "success");
     assert_eq!(document["records"][1]["outcome"], "failure");
     assert_eq!(document["records"][2]["outcome"], "in_progress");

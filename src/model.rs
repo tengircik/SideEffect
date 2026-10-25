@@ -2,7 +2,7 @@ use serde::Serialize;
 
 use crate::trace::LexicalPathHint;
 
-pub const TRACE_DOCUMENT_SCHEMA_VERSION: u32 = 4;
+pub const TRACE_DOCUMENT_SCHEMA_VERSION: u32 = 5;
 pub const TRACE_DIFF_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -86,6 +86,9 @@ pub struct TraceDocument {
     pub parse_status: ParseCompleteness,
     pub records: Vec<TraceRecord>,
     pub diagnostics: Vec<TraceDiagnostic>,
+    /// Direct process-creation relations supported by exact syscall result rows.
+    /// This is not a complete tree or a causal attribution claim.
+    pub process_lineage: crate::trace::process_tree::ProcessLineage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]

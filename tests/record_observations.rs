@@ -440,7 +440,7 @@ fn record_bundle_publishes_manifest_and_exact_trace_for_nonzero_target() {
     let manifest_bytes = fs::read(bundle.join("run.json")).unwrap();
     let manifest: Value = serde_json::from_slice(&manifest_bytes).unwrap();
     assert_eq!(manifest["schema"], "sideeffect.run");
-    assert_eq!(manifest["schema_version"], 1);
+    assert_eq!(manifest["schema_version"], 2);
     assert_eq!(
         manifest["capture"]["strace_reported_status"]["kind"],
         "exit_code"
@@ -638,6 +638,31 @@ fn real_strace_capture_inspect_and_diff_observe_file_and_loopback_events() {
     let child_pid = child_exec["process_id"]
         .as_u64()
         .expect("child execve row PID");
+    let parent_pid = parent_exec["process_id"]
+        .as_u64()
+        .expect("parent execve row PID");
+    assert!(
+        candidate["process_lineage"]["relations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|relation| {
+                relation["parent_pid"] == parent_pid
+                    && relation["child_pid"] == child_pid
+                    && relation["evidence"]["line_number"].as_u64().is_some()
+            }),
+        "the child PID must be linked to the parent only by a supported process-creation evidence row; parent={parent_pid}, child={child_pid}, lineage={}, creation_rows={:?}",
+        candidate["process_lineage"],
+        candidate["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|record| matches!(
+                record["syscall"].as_str(),
+                Some("fork" | "vfork" | "clone" | "clone3")
+            ))
+            .collect::<Vec<_>>()
+    );
     let child_exec_resume = match child_exec["kind"].as_str() {
         Some("syscall") => {
             assert_eq!(child_exec["raw_result"], "0");
@@ -789,5 +814,71 @@ fn real_strace_capture_inspect_and_diff_observe_file_and_loopback_events() {
     assert!(
         !temporary_root.exists(),
         "temporary traces and target files must be removed after the test"
+    );
+}
+
+#[test]
+fn bounded_duration_capture_publishes_partial_bundle_with_explicit_limit_status() {
+    let temp = PrivateTempDirectory::new();
+    let bundle = temp.0.join("timed.run");
+    let marker = temp.0.join("descendant-finished-after-timeout");
+    let started = std::time::Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["record", "--bundle"])
+        .arg(&bundle)
+        .args(["--duration-seconds", "1", "--", "python3", "-c"])
+        .arg(format!(
+            "import os,time; child=os.fork(); (time.sleep(2),open({:?},'w').write('alive'),os._exit(0)) if child==0 else time.sleep(10)",
+            marker
+        ))
+        .output()
+        .expect("launch bounded SideEffect capture");
+    let elapsed = started.elapsed();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(elapsed < std::time::Duration::from_secs(5));
+    assert_record_output_does_not_leak_capture(&output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Capture time limit reached"));
+    assert!(bundle.is_dir());
+    let manifest: Value = serde_json::from_slice(&fs::read(bundle.join("run.json")).unwrap())
+        .expect("read bounded run metadata");
+    assert_eq!(manifest["schema_version"], 2);
+    assert_eq!(manifest["capture"]["time_limit_milliseconds"], 1000);
+    assert_eq!(manifest["capture"]["stop_reason"], "time_limit_reached");
+    assert_eq!(manifest["capture"]["completeness"], "unknown");
+    assert!(fs::metadata(bundle.join("trace.strace")).unwrap().len() > 0);
+
+    let inspected = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["inspect", "--bundle"])
+        .arg(&bundle)
+        .output()
+        .expect("inspect bounded partial bundle");
+    assert_eq!(inspected.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&inspected.stderr)
+            .contains("Absence from the trace is not evidence that an event did not occur")
+    );
+    let trace: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(trace["schema_version"], 5);
+    assert!(
+        trace["records"]
+            .as_array()
+            .is_some_and(|records| !records.is_empty())
+    );
+
+    let compared = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["diff", "--bundles"])
+        .arg(&bundle)
+        .arg(&bundle)
+        .output()
+        .expect("reject comparison of a time-limited bundle");
+    assert_eq!(compared.status.code(), Some(1));
+    assert!(compared.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&compared.stderr).contains("event set is known to be incomplete")
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    assert!(
+        !marker.exists(),
+        "traced descendant continued running after the time-limited capture returned"
     );
 }

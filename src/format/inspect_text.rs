@@ -22,6 +22,8 @@ pub fn write_trace_text<W: Write>(document: &TraceDocument, writer: &mut W) -> i
     writer.write_all(parse_status_name(document.parse_status).as_bytes())?;
     writeln!(writer, "\nRecords: {}", document.records.len())?;
 
+    write_process_lineage(writer, &document.process_lineage)?;
+
     for (index, record) in document.records.iter().enumerate() {
         writeln!(writer, "\nRecord {}", index + 1)?;
         write_record_details(writer, record)?;
@@ -32,6 +34,60 @@ pub fn write_trace_text<W: Write>(document: &TraceDocument, writer: &mut W) -> i
         write_diagnostic(writer, index + 1, diagnostic)?;
     }
     Ok(())
+}
+
+fn write_process_lineage<W: Write>(
+    writer: &mut W,
+    lineage: &crate::trace::process_tree::ProcessLineage,
+) -> io::Result<()> {
+    writer.write_all(b"\nProcess lineage: direct evidence-linked relations only\n")?;
+    writeln!(
+        writer,
+        "Lineage status: {}",
+        if lineage.partial {
+            "partial"
+        } else {
+            "no known ambiguity"
+        }
+    )?;
+    writeln!(writer, "Direct relations: {}", lineage.relations.len())?;
+    for relation in &lineage.relations {
+        writeln!(
+            writer,
+            "  PID {} reported creating PID {} at line={} byte={} length={}",
+            relation.parent_pid,
+            relation.child_pid,
+            relation.evidence.line_number,
+            relation.evidence.byte_offset,
+            relation.evidence.byte_length
+        )?;
+        for evidence in &relation.supporting_evidence {
+            writeln!(
+                writer,
+                "    Supporting evidence: line={} byte={} length={}",
+                evidence.line_number, evidence.byte_offset, evidence.byte_length
+            )?;
+        }
+    }
+    for diagnostic in &lineage.diagnostics {
+        writer.write_all(b"  Lineage diagnostic: ")?;
+        write_quoted(writer, diagnostic.code)?;
+        writer.write_all(b" ")?;
+        write_quoted(writer, diagnostic.message)?;
+        if let Some(evidence) = &diagnostic.evidence {
+            writeln!(
+                writer,
+                " at line={} byte={} length={}",
+                evidence.line_number, evidence.byte_offset, evidence.byte_length
+            )?;
+        } else {
+            writer.write_all(b"\n")?;
+        }
+    }
+    if lineage.diagnostics_truncated {
+        writer.write_all(b"  Lineage diagnostics truncated at the configured cap.\n")?;
+    }
+    writer.write_all(b"No root process, full ancestry, or causal effect is inferred.\n")
 }
 
 /// Write one parsed source record after the CLI has matched its line/offset/length reference.
@@ -271,6 +327,7 @@ mod tests {
                 byte_offset: 80,
                 message: "unexpected text: \u{202E}\nignored".to_owned(),
             }],
+            process_lineage: crate::trace::process_tree::ProcessLineage::default(),
         }
     }
 
@@ -286,7 +343,7 @@ mod tests {
         assert!(bytes.is_ascii());
         let output = String::from_utf8(bytes).unwrap();
 
-        assert!(output.contains("Schema version: 4"));
+        assert!(output.contains("Schema version: 5"));
         assert!(output.contains("Source format: \"strace_text\""));
         assert!(output.contains(&format!("Source SHA-256: {}", "00".repeat(32))));
         assert!(output.contains("Input bytes: 120"));

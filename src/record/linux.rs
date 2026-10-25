@@ -30,6 +30,8 @@ pub struct RecordOutcome {
     pub strace_status: ExitStatus,
     pub trace_path: PathBuf,
     pub trace_bytes: usize,
+    /// True when the caller-requested wall-clock limit stopped the capture.
+    pub time_limit_reached: bool,
 }
 
 #[derive(Debug)]
@@ -38,6 +40,8 @@ pub struct RunBundleOutcome {
     pub bundle_path: PathBuf,
     pub trace_bytes: usize,
     pub parent_directory_sync_confirmed: bool,
+    /// True when the caller-requested wall-clock limit stopped the capture.
+    pub time_limit_reached: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +76,8 @@ struct Capture {
     command_stdout: &'static str,
     command_stderr: &'static str,
     tracer_diagnostics: &'static str,
+    time_limit_milliseconds: Option<u64>,
+    stop_reason: &'static str,
 }
 
 #[derive(Serialize)]
@@ -103,6 +109,7 @@ struct CaptureStage {
     bytes: usize,
     version: StraceVersion,
     trace_file: File,
+    time_limit_reached: bool,
 }
 
 #[derive(Debug)]
@@ -149,6 +156,16 @@ pub fn record_trace(
     program: &OsStr,
     args: &[OsString],
 ) -> Result<RecordOutcome, RecordError> {
+    record_trace_with_duration(destination, program, args, None)
+}
+
+/// Record until the target exits or the optional wall-clock limit is reached.
+pub fn record_trace_with_duration(
+    destination: &Path,
+    program: &OsStr,
+    args: &[OsString],
+    duration_limit: Option<Duration>,
+) -> Result<RecordOutcome, RecordError> {
     let mut captured = record_capture_bounded(
         destination,
         OsStr::new("strace"),
@@ -156,6 +173,7 @@ pub fn record_trace(
         args,
         MAX_TRACE_BYTES,
         false,
+        duration_limit,
     )?;
     let final_path = captured.output.publish_trace().map_err(|error| {
         RecordError::after_launch(format!(
@@ -166,6 +184,7 @@ pub fn record_trace(
         strace_status: captured.status,
         trace_path: final_path,
         trace_bytes: captured.bytes,
+        time_limit_reached: captured.time_limit_reached,
     })
 }
 
@@ -175,12 +194,23 @@ pub fn record_bundle(
     program: &OsStr,
     args: &[OsString],
 ) -> Result<RunBundleOutcome, RecordError> {
+    record_bundle_with_duration(destination, program, args, None)
+}
+
+/// Record until the target exits or the optional wall-clock limit is reached.
+pub fn record_bundle_with_duration(
+    destination: &Path,
+    program: &OsStr,
+    args: &[OsString],
+    duration_limit: Option<Duration>,
+) -> Result<RunBundleOutcome, RecordError> {
     record_bundle_bounded(
         destination,
         OsStr::new("strace"),
         program,
         args,
         MAX_TRACE_BYTES,
+        duration_limit,
     )
 }
 
@@ -190,18 +220,26 @@ fn record_bundle_bounded(
     program: &OsStr,
     args: &[OsString],
     max_trace_bytes: usize,
+    duration_limit: Option<Duration>,
 ) -> Result<RunBundleOutcome, RecordError> {
     if !cfg!(target_arch = "x86_64") {
         return Err(RecordError::before_launch(
             "versioned run bundles currently require Linux x86_64; the command was not started",
         ));
     }
-    let mut capture =
-        record_capture_bounded(destination, tracer, program, args, max_trace_bytes, true)?;
+    let mut capture = record_capture_bounded(
+        destination,
+        tracer,
+        program,
+        args,
+        max_trace_bytes,
+        true,
+        duration_limit,
+    )?;
     let (sha256, byte_length) = hash_exact_trace(&mut capture.trace_file, capture.bytes)?;
     let manifest = RunManifest {
         schema: "sideeffect.run",
-        schema_version: 1,
+        schema_version: 2,
         producer: Producer {
             sideeffect_version: env!("CARGO_PKG_VERSION"),
             operating_system: "linux",
@@ -220,6 +258,12 @@ fn record_bundle_bounded(
             command_stdout: "inherited_not_captured",
             command_stderr: "inherited_not_captured",
             tracer_diagnostics: "inherited_not_captured",
+            time_limit_milliseconds: duration_limit.map(|value| value.as_millis() as u64),
+            stop_reason: if capture.time_limit_reached {
+                "time_limit_reached"
+            } else {
+                "tracer_exited"
+            },
         },
         trace: TraceFile {
             name: "trace.strace",
@@ -259,6 +303,7 @@ fn record_bundle_bounded(
         bundle_path,
         trace_bytes: capture.bytes,
         parent_directory_sync_confirmed,
+        time_limit_reached: capture.time_limit_reached,
     })
 }
 
@@ -320,8 +365,15 @@ fn record_trace_bounded(
     args: &[OsString],
     max_trace_bytes: usize,
 ) -> Result<RecordOutcome, RecordError> {
-    let mut capture =
-        record_capture_bounded(destination, tracer, program, args, max_trace_bytes, false)?;
+    let mut capture = record_capture_bounded(
+        destination,
+        tracer,
+        program,
+        args,
+        max_trace_bytes,
+        false,
+        None,
+    )?;
     let final_path = capture.output.publish_trace().map_err(|error| {
         RecordError::after_launch(format!(
             "could not publish trace without replacing an existing path: {error}"
@@ -331,6 +383,7 @@ fn record_trace_bounded(
         strace_status: capture.status,
         trace_path: final_path,
         trace_bytes: capture.bytes,
+        time_limit_reached: capture.time_limit_reached,
     })
 }
 
@@ -341,6 +394,7 @@ fn record_capture_bounded(
     args: &[OsString],
     max_trace_bytes: usize,
     bundle: bool,
+    duration_limit: Option<Duration>,
 ) -> Result<CaptureStage, RecordError> {
     let version = verify_strace_version(tracer)?;
     let mut output = (if bundle {
@@ -388,8 +442,10 @@ fn record_capture_bounded(
     let mut child = TracerChild::new(child);
 
     let mut total = 0usize;
+    let capture_started = Instant::now();
     let mut buffer = vec![0u8; READ_BUFFER_BYTES.min(max_trace_bytes.saturating_add(1))];
     let mut overflow = false;
+    let mut time_limit_reached = false;
     let mut sink_error = None;
     let status = loop {
         let signal = CANCELLATION_SIGNAL.load(Ordering::Relaxed);
@@ -398,6 +454,14 @@ fn record_capture_bounded(
             return Err(RecordError::after_launch(format!(
                 "capture interrupted by signal {signal}; the partial trace was discarded"
             )));
+        }
+        if duration_limit.is_some_and(|limit| capture_started.elapsed() >= limit) {
+            time_limit_reached = true;
+            break child.kill_and_wait().map_err(|error| {
+                RecordError::after_launch(format!(
+                    "could not stop strace after the capture time limit: {error}"
+                ))
+            })?;
         }
         let mut descriptor = libc::pollfd {
             fd: fifo_anchor.as_raw_fd(),
@@ -468,6 +532,24 @@ fn record_capture_bounded(
             break status;
         }
     };
+    if time_limit_reached {
+        loop {
+            match drain_available(
+                fifo_anchor.as_raw_fd(),
+                &mut staged_trace,
+                &mut total,
+                &mut buffer,
+                max_trace_bytes,
+            ) {
+                Ok(DrainResult::Idle) => break,
+                Ok(DrainResult::Overflow) => overflow = true,
+                Err(error) => {
+                    sink_error = Some(error);
+                    break;
+                }
+            }
+        }
+    }
     drop(fifo_anchor);
 
     if overflow {
@@ -507,6 +589,7 @@ fn record_capture_bounded(
         bytes: total,
         version,
         trace_file: staged_trace,
+        time_limit_reached,
     })
 }
 
@@ -932,6 +1015,36 @@ mod tests {
         )
     }
 
+    fn run_fake_with_duration(
+        directory: &TestDirectory,
+        script_body: &str,
+        output_name: &str,
+        limit: usize,
+        duration: Duration,
+    ) -> Result<super::RecordOutcome, RecordError> {
+        let tracer = directory.fake_tracer(script_body);
+        let mut capture = super::record_capture_bounded(
+            &directory.0.join(output_name),
+            tracer.as_os_str(),
+            OsStr::new("target-must-not-be-run-by-fake-tracer"),
+            &[],
+            limit,
+            false,
+            Some(duration),
+        )?;
+        let final_path = capture.output.publish_trace().map_err(|error| {
+            RecordError::after_launch(format!(
+                "could not publish trace without replacing an existing path: {error}"
+            ))
+        })?;
+        Ok(super::RecordOutcome {
+            strace_status: capture.status,
+            trace_path: final_path,
+            trace_bytes: capture.bytes,
+            time_limit_reached: capture.time_limit_reached,
+        })
+    }
+
     fn run_fake_bundle(
         directory: &TestDirectory,
         script_body: &str,
@@ -945,6 +1058,25 @@ mod tests {
             OsStr::new("private-program-name"),
             &[OsString::from("private-argument-value")],
             limit,
+            None,
+        )
+    }
+
+    fn run_fake_bundle_with_duration(
+        directory: &TestDirectory,
+        script_body: &str,
+        output_name: &str,
+        limit: usize,
+        duration: Duration,
+    ) -> Result<super::RunBundleOutcome, RecordError> {
+        let tracer = directory.fake_tracer(script_body);
+        record_bundle_bounded(
+            &directory.0.join(output_name),
+            tracer.as_os_str(),
+            OsStr::new("private-program-name"),
+            &[OsString::from("private-argument-value")],
+            limit,
+            Some(duration),
         )
     }
 
@@ -979,6 +1111,26 @@ mod tests {
     }
 
     #[test]
+    fn duration_limit_publishes_partial_trace_and_reports_timeout() {
+        let directory = TestDirectory::new();
+        let started = Instant::now();
+        let outcome = run_fake_with_duration(
+            &directory,
+            &format!("{}\nexec sleep 10", write_trace_script("close(1) = 0\\n")),
+            "timed.trace",
+            64,
+            Duration::from_millis(100),
+        )
+        .unwrap();
+
+        assert!(outcome.time_limit_reached);
+        assert_eq!(outcome.strace_status.signal(), Some(libc::SIGKILL));
+        assert_eq!(fs::read(&outcome.trace_path).unwrap(), b"close(1) = 0\n");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
+    }
+
+    #[test]
     fn bundle_manifest_records_fixed_privacy_minimized_schema_hash_size_and_exit_code() {
         let directory = TestDirectory::new();
         let trace = b"close(1) = 0\n";
@@ -996,7 +1148,7 @@ mod tests {
         let manifest_bytes = fs::read(bundle.join("run.json")).unwrap();
         let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
         assert_eq!(manifest["schema"], "sideeffect.run");
-        assert_eq!(manifest["schema_version"], 1);
+        assert_eq!(manifest["schema_version"], 2);
         assert_eq!(
             manifest["producer"]["sideeffect_version"],
             env!("CARGO_PKG_VERSION")
@@ -1020,6 +1172,11 @@ mod tests {
             "not_independently_verified"
         );
         assert_eq!(manifest["capture"]["completeness"], "unknown");
+        assert_eq!(
+            manifest["capture"]["time_limit_milliseconds"],
+            serde_json::Value::Null
+        );
+        assert_eq!(manifest["capture"]["stop_reason"], "tracer_exited");
         assert_eq!(
             manifest["capture"]["command_stdout"],
             "inherited_not_captured"
@@ -1071,6 +1228,30 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn timed_bundle_marks_partial_capture_without_leaking_command_arguments() {
+        let directory = TestDirectory::new();
+        let outcome = run_fake_bundle_with_duration(
+            &directory,
+            &format!("{}\nexec sleep 10", write_trace_script("close(1) = 0\\n")),
+            "timed.run",
+            64,
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        assert!(outcome.time_limit_reached);
+        assert_eq!(outcome.strace_status.signal(), Some(libc::SIGKILL));
+        let manifest_bytes = fs::read(outcome.bundle_path.join("run.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(manifest["schema_version"], 2);
+        assert_eq!(manifest["capture"]["time_limit_milliseconds"], 100);
+        assert_eq!(manifest["capture"]["stop_reason"], "time_limit_reached");
+        assert_eq!(manifest["capture"]["completeness"], "unknown");
+        let text = String::from_utf8(manifest_bytes).unwrap();
+        assert!(!text.contains("private-program-name"));
+        assert!(!text.contains("private-argument-value"));
     }
 
     #[test]
@@ -1417,6 +1598,7 @@ mod tests {
             OsStr::new("must-not-be-run-by-fake-tracer"),
             &[],
             64,
+            None,
         )
         .unwrap_err();
         assert!(error.to_string().contains("capture interrupted by signal"));

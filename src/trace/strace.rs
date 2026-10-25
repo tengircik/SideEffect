@@ -170,6 +170,7 @@ pub fn parse_trace_bytes(input: &[u8], limits: ParseLimits) -> Result<TraceDocum
     } else {
         ParseCompleteness::Partial
     };
+    let process_lineage = super::process_tree::derive_process_lineage(&records);
 
     Ok(TraceDocument {
         schema_version: TRACE_DOCUMENT_SCHEMA_VERSION,
@@ -179,6 +180,7 @@ pub fn parse_trace_bytes(input: &[u8], limits: ParseLimits) -> Result<TraceDocum
         parse_status,
         records,
         diagnostics,
+        process_lineage,
     })
 }
 

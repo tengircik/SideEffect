@@ -73,7 +73,7 @@ fn parses_tcp_peer_arrow_inside_strace_fd_annotation() {
 }
 
 #[test]
-fn legacy_openat_text_without_yy_annotations_remains_inspectable_in_schema_v4() {
+fn legacy_openat_text_without_yy_annotations_remains_inspectable_in_schema_v5() {
     let input = b"123 1700000000.123456 openat(AT_FDCWD, \"relative/file.txt\", O_RDONLY) = 3\n";
 
     let document = parse_trace_bytes(input, ParseLimits::default()).unwrap();

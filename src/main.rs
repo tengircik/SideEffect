@@ -8,6 +8,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 use serde::Deserialize;
@@ -37,14 +38,14 @@ use sideeffect::model::{ParseCompleteness, TraceDiff, TraceRecordKind};
 #[cfg(target_os = "linux")]
 use sideeffect::record::AnchoredOutput;
 #[cfg(target_os = "linux")]
-use sideeffect::record::{publish_private_file, record_bundle, record_trace};
+use sideeffect::record::publish_private_file;
 use sideeffect::trace::strace::parse_trace_bytes;
 
 const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect inspect [--format json|text] --bundle <run-bundle-directory>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff --bundles [--format json|text] <baseline-bundle> <candidate-bundle>\n       sideeffect diff --bundles --format html --output <report.html> <baseline-bundle> <candidate-bundle>\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect inventory packages --output <new-inventory.json>\n\
        sideeffect inventory processes --output <new-inventory.json>\n\
        sideeffect inventory startup --output <new-inventory.json>\n\
        sideeffect inventory permissions --output <new-inventory.json> <path>...\n\
-       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. Inventory packages reads available local dpkg, RPM, pacman, and APK databases and saves a private JSON snapshot; unsupported, unavailable, or incomplete sources remain visible, and unregistered software may be missed. Inventory processes reads bounded numeric /proc status entries and executable-link identities; it does not open executable targets or promise atomic or exhaustive coverage. Inventory startup discovers bounded XDG `.desktop` files and preserves selected inert keys with evidence; it does not evaluate which entries run or claim exhaustive startup coverage. Inventory permissions inspects only explicit Linux paths and records ownership/type/mode, supported POSIX ACLs, and Linux file-capability xattrs; it never follows the final path symlink or calculates effective access. Record runs a command under external strace and writes either a bounded raw trace or an opt-in privacy-minimized run bundle; it is observation, not isolation or a safety check.";
+       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect record --trace <new-trace-file> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. Inventory packages reads available local dpkg, RPM, pacman, and APK databases and saves a private JSON snapshot; unsupported, unavailable, or incomplete sources remain visible, and unregistered software may be missed. Inventory processes reads bounded numeric /proc status entries and executable-link identities; it does not open executable targets or promise atomic or exhaustive coverage. Inventory startup discovers supported Linux startup configuration sources and preserves inert values with source evidence; applicability and execution are not inferred. Inventory permissions inspects only explicit Linux paths and records ownership/type/mode, supported POSIX ACLs, and Linux file-capability xattrs; it never follows the final path symlink or calculates effective access. Record follows a selected command's traced descendants and may enforce a requested wall-clock limit; this is observation, not isolation or a safety check.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -175,11 +176,45 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             command,
             option,
             output,
+            duration_flag,
+            duration,
+            separator,
+            program,
+            target_args @ ..,
+        ] if command == "record"
+            && option == "--trace"
+            && duration_flag == "--duration-seconds"
+            && separator == "--" =>
+        {
+            let duration = parse_duration_seconds(duration)?;
+            record_with_duration(output, program, target_args, Some(duration))
+        }
+        [
+            command,
+            option,
+            output,
+            duration_flag,
+            duration,
+            separator,
+            program,
+            target_args @ ..,
+        ] if command == "record"
+            && option == "--bundle"
+            && duration_flag == "--duration-seconds"
+            && separator == "--" =>
+        {
+            let duration = parse_duration_seconds(duration)?;
+            record_bundle_with_duration_command(output, program, target_args, Some(duration))
+        }
+        [
+            command,
+            option,
+            output,
             separator,
             program,
             target_args @ ..,
         ] if command == "record" && option == "--trace" && separator == "--" => {
-            record(output, program, target_args)
+            record_with_duration(output, program, target_args, None)
         }
         [
             command,
@@ -189,7 +224,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             program,
             target_args @ ..,
         ] if command == "record" && option == "--bundle" && separator == "--" => {
-            record_bundle_command(output, program, target_args)
+            record_bundle_with_duration_command(output, program, target_args, None)
         }
         [command, ..] if command == "record" => Err(USAGE.to_owned()),
         [command, ..] if command == "inventory" => Err(USAGE.to_owned()),
@@ -272,7 +307,7 @@ fn inventory_startup(output: &OsString) -> Result<ExitCode, String> {
         let path = publish_private_file(Path::new(output), &json.bytes, MAX_REPORT_BYTES)
             .map_err(|e| format!("could not publish private startup inventory: {e}"))?;
         eprintln!(
-            "Saved {} XDG autostart discovery to {}. Applicability was not evaluated; this does not represent effective or exhaustive startup configuration.",
+            "Saved a {} curated startup-configuration snapshot to {}. It includes bounded XDG, systemd, SysV, and cron sources; commands are inert evidence, applicability and execution are not inferred, and unobserved sources remain unknown.",
             if complete { "complete" } else { "partial" },
             terminal_safe_path(&path)
         );
@@ -285,7 +320,7 @@ fn inventory_startup(output: &OsString) -> Result<ExitCode, String> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = output;
-        Err("inventory startup currently supports Linux XDG autostart paths only".to_owned())
+        Err("inventory startup currently supports curated Linux XDG, systemd, SysV, and cron sources only".to_owned())
     }
 }
 
@@ -323,11 +358,45 @@ fn inventory_permissions(output: &OsString, paths: &[OsString]) -> Result<ExitCo
     }
 }
 
-fn record(output: &OsString, program: &OsString, args: &[OsString]) -> Result<ExitCode, String> {
+fn parse_duration_seconds(value: &OsString) -> Result<Duration, String> {
+    let Some(text) = value.to_str() else {
+        return Err("capture duration must be an ASCII integer from 1 to 3600 seconds".to_owned());
+    };
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("capture duration must be an ASCII integer from 1 to 3600 seconds".to_owned());
+    }
+    let seconds = text
+        .parse::<u64>()
+        .map_err(|_| "capture duration must be an ASCII integer from 1 to 3600 seconds")?;
+    if !(1..=3600).contains(&seconds) {
+        return Err("capture duration must be from 1 to 3600 seconds".to_owned());
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+fn record_with_duration(
+    output: &OsString,
+    program: &OsString,
+    args: &[OsString],
+    duration: Option<Duration>,
+) -> Result<ExitCode, String> {
     #[cfg(target_os = "linux")]
     {
-        let outcome =
-            record_trace(Path::new(output), program, args).map_err(|error| error.to_string())?;
+        let outcome = sideeffect::record::record_trace_with_duration(
+            Path::new(output),
+            program,
+            args,
+            duration,
+        )
+        .map_err(|error| error.to_string())?;
+        if outcome.time_limit_reached {
+            eprintln!(
+                "Capture time limit reached after {} seconds. A bounded partial trace was published to {}; target outcome and capture completeness are unknown.",
+                duration.map_or(0, |value| value.as_secs()),
+                terminal_safe_path(&outcome.trace_path)
+            );
+            return Ok(ExitCode::from(2));
+        }
         let status = outcome.strace_status;
         if let Some(code) = status.code() {
             eprintln!(
@@ -356,25 +425,39 @@ fn record(output: &OsString, program: &OsString, args: &[OsString]) -> Result<Ex
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (output, program, args);
+        let _ = (output, program, args, duration);
         Err("record is available only on Linux with an external strace executable".to_owned())
     }
 }
 
-fn record_bundle_command(
+fn record_bundle_with_duration_command(
     output: &OsString,
     program: &OsString,
     args: &[OsString],
+    duration: Option<Duration>,
 ) -> Result<ExitCode, String> {
     #[cfg(target_os = "linux")]
     {
-        let outcome =
-            record_bundle(Path::new(output), program, args).map_err(|error| error.to_string())?;
+        let outcome = sideeffect::record::record_bundle_with_duration(
+            Path::new(output),
+            program,
+            args,
+            duration,
+        )
+        .map_err(|error| error.to_string())?;
         if !outcome.parent_directory_sync_confirmed {
             eprintln!(
                 "Warning: bundle {} was atomically published, but syncing its parent directory failed; persistence across sudden power loss is uncertain.",
                 terminal_safe_path(&outcome.bundle_path)
             );
+        }
+        if outcome.time_limit_reached {
+            eprintln!(
+                "Capture time limit reached after {} seconds. Published partial evidence in {}; target outcome and capture completeness are unknown.",
+                duration.map_or(0, |value| value.as_secs()),
+                terminal_safe_path(&outcome.bundle_path)
+            );
+            return Ok(ExitCode::from(2));
         }
         let status = outcome.strace_status;
         if let Some(code) = status.code() {
@@ -404,7 +487,7 @@ fn record_bundle_command(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (output, program, args);
+        let _ = (output, program, args, duration);
         Err(
             "record --bundle is available only on Linux with an external strace executable"
                 .to_owned(),
@@ -576,8 +659,17 @@ fn inspect_bundle_with_format(format: &OsString, path: &OsString) -> Result<Exit
     if !matches!(format.to_str(), Some("json" | "text")) {
         return Err("inspect format must be either 'json' or 'text'".to_owned());
     }
-    let bytes = read_run_bundle(Path::new(path))?;
-    inspect_bytes_with_format(format, bytes)
+    let bundle = read_run_bundle(Path::new(path))?;
+    let partial_capture = bundle.stop_reason == "time_limit_reached";
+    let status = inspect_bytes_with_format(format, bundle.trace_bytes)?;
+    if partial_capture {
+        eprintln!(
+            "Warning: this bundle stopped at its requested time limit. Absence from the trace is not evidence that an event did not occur."
+        );
+        Ok(ExitCode::from(2))
+    } else {
+        Ok(status)
+    }
 }
 
 fn inspect_bytes_with_format(format: &OsString, bytes: Vec<u8>) -> Result<ExitCode, String> {
@@ -740,11 +832,16 @@ fn read_and_parse_bundles(
     ),
     String,
 > {
-    let left_bytes = read_run_bundle(Path::new(left_path))?;
-    let right_bytes = read_run_bundle(Path::new(right_path))?;
-    let left = parse_trace_bytes(&left_bytes, ParseLimits::default())
+    let left_bundle = read_run_bundle(Path::new(left_path))?;
+    let right_bundle = read_run_bundle(Path::new(right_path))?;
+    if left_bundle.stop_reason == "time_limit_reached"
+        || right_bundle.stop_reason == "time_limit_reached"
+    {
+        return Err("cannot compare a bundle stopped at its requested time limit; its event set is known to be incomplete".to_owned());
+    }
+    let left = parse_trace_bytes(&left_bundle.trace_bytes, ParseLimits::default())
         .map_err(|error| format!("trace inspection failed: {error}"))?;
-    let right = parse_trace_bytes(&right_bytes, ParseLimits::default())
+    let right = parse_trace_bytes(&right_bundle.trace_bytes, ParseLimits::default())
         .map_err(|error| format!("trace inspection failed: {error}"))?;
     Ok((left, right))
 }
@@ -895,6 +992,10 @@ struct BundleCapture {
     command_stdout: String,
     command_stderr: String,
     tracer_diagnostics: String,
+    #[serde(default)]
+    time_limit_milliseconds: Option<u64>,
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[cfg(target_os = "linux")]
@@ -928,7 +1029,12 @@ struct BundleTrace {
     sha256: String,
 }
 
-fn read_run_bundle(path: &Path) -> Result<Vec<u8>, String> {
+struct RunBundleData {
+    trace_bytes: Vec<u8>,
+    stop_reason: &'static str,
+}
+
+fn read_run_bundle(path: &Path) -> Result<RunBundleData, String> {
     #[cfg(target_os = "linux")]
     {
         read_run_bundle_linux(path)
@@ -941,7 +1047,7 @@ fn read_run_bundle(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn read_run_bundle_linux(path: &Path) -> Result<Vec<u8>, String> {
+fn read_run_bundle_linux(path: &Path) -> Result<RunBundleData, String> {
     use std::ffi::CStr;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::MetadataExt;
@@ -1035,7 +1141,14 @@ fn read_run_bundle_linux(path: &Path) -> Result<Vec<u8>, String> {
     if actual_hash != manifest.trace.sha256 {
         return Err("bundle trace SHA-256 does not match the manifest".to_owned());
     }
-    Ok(trace)
+    Ok(RunBundleData {
+        trace_bytes: trace,
+        stop_reason: if manifest.capture.stop_reason.as_deref() == Some("time_limit_reached") {
+            "time_limit_reached"
+        } else {
+            "tracer_exited"
+        },
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1079,7 +1192,25 @@ fn validate_bundle_manifest(manifest: &RunManifest) -> Result<(), String> {
         BundleStatus::Signal { value } => (1..=64).contains(&value),
         BundleStatus::Unavailable => true,
     };
-    if manifest.schema != "sideeffect.run" || manifest.schema_version != 1 {
+    let versioned_capture_valid = match manifest.schema_version {
+        1 => {
+            manifest.capture.time_limit_milliseconds.is_none()
+                && manifest.capture.stop_reason.is_none()
+        }
+        2 => match manifest.capture.stop_reason.as_deref() {
+            Some("tracer_exited") => manifest
+                .capture
+                .time_limit_milliseconds
+                .is_none_or(|milliseconds| (1..=3_600_000).contains(&milliseconds)),
+            Some("time_limit_reached") => manifest
+                .capture
+                .time_limit_milliseconds
+                .is_some_and(|milliseconds| (1..=3_600_000).contains(&milliseconds)),
+            _ => false,
+        },
+        _ => false,
+    };
+    if manifest.schema != "sideeffect.run" || !versioned_capture_valid {
         return Err("unsupported bundle schema or schema version".to_owned());
     }
     if manifest.producer.operating_system != "linux"

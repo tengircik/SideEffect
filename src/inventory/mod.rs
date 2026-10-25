@@ -10,6 +10,10 @@ mod permissions;
 mod processes;
 #[cfg(target_os = "linux")]
 mod startup;
+#[cfg(target_os = "linux")]
+mod startup_legacy;
+#[cfg(target_os = "linux")]
+mod systemd_units;
 
 pub use model::{
     INVENTORY_SCHEMA, INVENTORY_SCHEMA_VERSION, InventoryDiagnostic, InventoryDocument,
@@ -34,6 +38,14 @@ pub use processes::{
 };
 #[cfg(target_os = "linux")]
 pub use startup::{
-    StartupInventoryDocument, Status as StartupInventoryStatus, collect_startup,
-    collect_startup_from,
+    Directory as StartupDirectory, Entry as XdgStartupEntry, KeyEvidence as StartupKeyEvidence,
+    StartupInventoryDocument, Status as StartupInventoryStatus, XdgAutostartInventory,
+    collect_startup, collect_startup_from,
 };
+#[cfg(target_os = "linux")]
+pub use startup_legacy::{
+    LegacyStartupDocument, LegacyStartupEntry, LegacyStartupPaths,
+    ScanStatus as LegacyStartupStatus, collect_legacy_startup,
+};
+#[cfg(target_os = "linux")]
+pub use systemd_units::{UnitInventory as SystemdUnitInventory, UnitRecord as SystemdUnitRecord};

@@ -10,12 +10,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const MAX_STARTUP_FILES: usize = 4096;
 pub const MAX_STARTUP_FILE_BYTES: usize = 256 * 1024;
-pub const MAX_STARTUP_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_STARTUP_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_STARTUP_SCAN_TIME: Duration = Duration::from_secs(5);
 pub const MAX_STARTUP_DIRECTORIES: usize = 64;
 pub const MAX_STARTUP_DIRECTORY_ENTRIES: usize = 16_384;
 /// Maximum number of physical lines examined across the whole startup scan.
-const MAX_STARTUP_RECORDS: usize = 100_000;
+const MAX_STARTUP_RECORDS: usize = 10_000;
 const KEYS: &[&str] = &[
     "Type",
     "Name",
@@ -37,6 +37,20 @@ fn now_ms() -> u128 {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct StartupInventoryDocument {
+    pub schema: &'static str,
+    pub schema_version: u32,
+    pub platform: &'static str,
+    pub scope: &'static str,
+    pub capture_started_at_unix_ms: u128,
+    pub capture_ended_at_unix_ms: u128,
+    pub status: Status,
+    pub xdg_autostart: XdgAutostartInventory,
+    pub systemd_units: super::systemd_units::UnitInventory,
+    pub legacy_sources: super::startup_legacy::LegacyStartupDocument,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct XdgAutostartInventory {
     pub schema: &'static str,
     pub schema_version: u32,
     pub platform: &'static str,
@@ -87,12 +101,35 @@ pub struct Diagnostic {
 }
 
 pub fn collect_startup() -> StartupInventoryDocument {
+    let started = now_ms();
     let dirs = resolve_xdg_paths(
         std::env::var_os("HOME").as_deref(),
         std::env::var_os("XDG_CONFIG_HOME").as_deref(),
         std::env::var_os("XDG_CONFIG_DIRS").as_deref(),
     );
-    collect_startup_from(&dirs)
+    let xdg_autostart = collect_startup_from(&dirs);
+    let systemd_units = super::systemd_units::collect_systemd_units();
+    let legacy_sources = super::startup_legacy::collect_legacy_startup();
+    let status = if xdg_autostart.status == Status::Complete
+        && systemd_units.status == super::systemd_units::Status::Complete
+        && legacy_sources.status == super::startup_legacy::ScanStatus::Complete
+    {
+        Status::Complete
+    } else {
+        Status::Partial
+    };
+    StartupInventoryDocument {
+        schema: "sideeffect.startup_inventory",
+        schema_version: 2,
+        platform: "linux",
+        scope: "curated_xdg_systemd_sysv_cron_sources",
+        capture_started_at_unix_ms: started,
+        capture_ended_at_unix_ms: now_ms(),
+        status,
+        xdg_autostart,
+        systemd_units,
+        legacy_sources,
+    }
 }
 
 fn resolve_xdg_paths(
@@ -124,7 +161,7 @@ fn resolve_xdg_paths(
 }
 
 /// Injectable directory roots and limits for deterministic tests.
-pub fn collect_startup_from(dirs: &[(&'static str, PathBuf)]) -> StartupInventoryDocument {
+pub fn collect_startup_from(dirs: &[(&'static str, PathBuf)]) -> XdgAutostartInventory {
     collect(
         dirs,
         MAX_STARTUP_FILES,
@@ -139,7 +176,7 @@ fn collect(
     max_file: usize,
     max_total: usize,
     duration: Duration,
-) -> StartupInventoryDocument {
+) -> XdgAutostartInventory {
     collect_with_record_limit(
         dirs,
         max_files,
@@ -157,7 +194,7 @@ fn collect_with_record_limit(
     max_total: usize,
     duration: Duration,
     max_records: usize,
-) -> StartupInventoryDocument {
+) -> XdgAutostartInventory {
     let started = Instant::now();
     let capture_started = now_ms();
     let mut directory_rows = Vec::new();
@@ -384,8 +421,8 @@ fn collect_with_record_limit(
         directory_rows.push(d);
         partial = true;
     }
-    StartupInventoryDocument {
-        schema: "sideeffect.startup_inventory",
+    XdgAutostartInventory {
+        schema: "sideeffect.xdg_autostart_inventory",
         schema_version: 1,
         platform: "linux",
         scope: "xdg_autostart_files_only",
