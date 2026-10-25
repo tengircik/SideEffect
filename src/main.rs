@@ -48,11 +48,13 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect explain <strace-trace-file>\n\
        sideeffect explain --diff <baseline-trace> <candidate-trace>\n\
        sideeffect explain --inventory-diff <before.json> <after.json>\n\
+       sideeffect model-preview <strace-trace-file>\n\
+       sideeffect model-analyze --runtime <llama-cli> --model <model.gguf> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect correlate-startup <startup-inventory.json> <strace-trace-file>\n\
        sideeffect inventory processes --output <new-inventory.json>\n\
        sideeffect inventory startup --output <new-inventory.json>\n\
        sideeffect inventory permissions --output <new-inventory.json> <path>...\n\
-       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect record --trace <new-trace-file> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. Inventory packages reads available local dpkg, RPM, pacman, and APK databases and saves a private JSON snapshot; unsupported, unavailable, or incomplete sources remain visible, and unregistered software may be missed. Inventory processes reads bounded numeric /proc status entries and executable-link identities; it does not open executable targets or promise atomic or exhaustive coverage. Inventory startup discovers supported Linux startup configuration sources and preserves inert values with source evidence; applicability and execution are not inferred. Inventory permissions inspects only explicit Linux paths and records ownership/type/mode, supported POSIX ACLs, and Linux file-capability xattrs; it never follows the final path symlink or calculates effective access. Record follows a selected command's traced descendants and may enforce a requested wall-clock limit; this is observation, not isolation or a safety check.";
+       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect record --trace <new-trace-file> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect help [command [subcommand]]\n       sideeffect version\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. Inventory packages reads available local dpkg, RPM, pacman, and APK databases and saves a private JSON snapshot; unsupported, unavailable, or incomplete sources remain visible, and unregistered software may be missed. Inventory processes reads bounded numeric /proc status entries and executable-link identities; it does not open executable targets or promise atomic or exhaustive coverage. Inventory startup discovers supported Linux startup configuration sources and preserves inert values with source evidence; applicability and execution are not inferred. Inventory permissions inspects only explicit Linux paths and records ownership/type/mode, supported POSIX ACLs, and Linux file-capability xattrs; it never follows the final path symlink or calculates effective access. Record follows a selected command's traced descendants and may enforce a requested wall-clock limit; this is observation, not isolation or a safety check.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -71,11 +73,43 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         [flag] if flag == "--version" => {
-            println!("sideeffect {}", env!("CARGO_PKG_VERSION"));
+            print_version();
             Ok(ExitCode::SUCCESS)
+        }
+        [command] if command == "version" => {
+            print_version();
+            Ok(ExitCode::SUCCESS)
+        }
+        [command] if command == "help" => command_help(&[]),
+        [command, topic] if command == "help" => command_help(std::slice::from_ref(topic)),
+        [command, topic, subtopic] if command == "help" => {
+            command_help(&[topic.clone(), subtopic.clone()])
+        }
+        [command, flag] if flag == "--help" || flag == "-h" => {
+            command_help(std::slice::from_ref(command))
+        }
+        [command, subcommand, flag] if flag == "--help" || flag == "-h" => {
+            command_help(&[command.clone(), subcommand.clone()])
         }
         [command, path] if command == "inspect" => inspect(path),
         [command, path] if command == "explain" => explain_trace_file(path),
+        [command, path] if command == "model-preview" => model_preview_file(path),
+        [
+            command,
+            runtime_flag,
+            runtime,
+            model_flag,
+            model,
+            confirm_flag,
+            digest,
+            trace,
+        ] if command == "model-analyze"
+            && runtime_flag == "--runtime"
+            && model_flag == "--model"
+            && confirm_flag == "--confirm-sha256" =>
+        {
+            model_analyze_file(runtime, model, digest, trace)
+        }
         [command, diff_flag, left, right] if command == "explain" && diff_flag == "--diff" => {
             explain_diff_files(left, right)
         }
@@ -558,6 +592,73 @@ fn terminal_safe_path(path: &Path) -> String {
     escaped
 }
 
+fn print_version() {
+    println!("sideeffect {}", env!("CARGO_PKG_VERSION"));
+}
+
+fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
+    let topic = topics
+        .iter()
+        .map(|part| {
+            part.to_str()
+                .ok_or_else(|| "help topics must be valid UTF-8".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join(" ");
+    if topic.is_empty() {
+        println!("{USAGE}");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let text = match topic.as_str() {
+        "inspect" => {
+            "Usage: sideeffect inspect [--format json|text] TRACE\n       sideeffect inspect [--format json|text] --bundle DIR\nReads bounded local strace evidence. It never runs the represented command. JSON is the default; text output escapes terminal controls. Partial parses are labeled and exit with status 2."
+        }
+        "diff" => {
+            "Usage: sideeffect diff [--format json|text] LEFT RIGHT\n       sideeffect diff --format html --output REPORT.html LEFT RIGHT\n       sideeffect diff --bundles [--format json|text] LEFT_DIR RIGHT_DIR\nCompares complete parsed observations. HTML reports are available on Linux and are static, offline, and private. Trace values may be sensitive."
+        }
+        "diff-summary" => {
+            "Usage: sideeffect diff-summary [--format json] LEFT RIGHT\n       sideeffect diff-summary --format html --output REPORT.html LEFT RIGHT\nWrites aggregate change counts without event strings or evidence references. Counts may still be sensitive; the output is not a safe-to-share verdict."
+        }
+        "explain" => {
+            "Usage: sideeffect explain TRACE\n       sideeffect explain --diff LEFT RIGHT\n       sideeffect explain --inventory-diff BEFORE.json AFTER.json\nCreates bounded deterministic summaries. It does not use a language model."
+        }
+        "evidence" => {
+            "Usage: sideeffect evidence TRACE SHA256 LINE BYTE_OFFSET BYTE_LENGTH\nVerifies an exact parsed-row reference against the supplied fingerprint. A hash identifies bytes but does not authenticate them or prove capture completeness."
+        }
+        "record" => {
+            "Usage: sideeffect record --trace OUTPUT -- PROGRAM [ARGS...]\n       sideeffect record --bundle DIR -- PROGRAM [ARGS...]\n       sideeffect record --trace OUTPUT --duration-seconds 1..3600 -- PROGRAM [ARGS...]\nRuns the selected program with the current user's permissions under external strace. This is observation, not isolation or a safety check. Available on Linux."
+        }
+        "inventory" => {
+            "Usage: sideeffect inventory packages|processes|startup|permissions --output FILE [PATH...]\nCollects bounded, local Linux snapshots. Sources are curated and coverage can be partial; inspect output and diagnostics before drawing conclusions."
+        }
+        "inventory startup" => {
+            "Usage: sideeffect inventory startup --output FILE\nDiscovers supported Linux XDG, systemd, SysV, and cron startup configuration. It does not execute commands or establish that a configured entry ran. Native Windows startup inventory is planned, not implemented."
+        }
+        "inventory packages" => {
+            "Usage: sideeffect inventory packages --output FILE\nReads available dpkg, RPM, pacman, and APK package databases at fixed Linux paths. Unregistered software and unsupported sources may be missing."
+        }
+        "inventory processes" => {
+            "Usage: sideeffect inventory processes --output FILE\nReads bounded /proc status fields and executable-link text. It does not read command lines or open executable targets."
+        }
+        "inventory permissions" => {
+            "Usage: sideeffect inventory permissions --output FILE PATH...\nInspects only explicit Linux paths for metadata, supported POSIX ACLs, and file capabilities. It does not recurse or calculate effective access."
+        }
+        "correlate-startup" => {
+            "Usage: sideeffect correlate-startup STARTUP_INVENTORY.json TRACE\nFinds narrow exact-path candidate matches between supported saved startup configuration and successful exec evidence. A match does not prove that a hook caused or initiated execution."
+        }
+        "model" | "model-preview" => {
+            "Usage: sideeffect model-preview TRACE\nPreviews the exact bounded local-model request and digest. Review it before confirming analysis. Partial parsing is visible and exits with status 2."
+        }
+        "model-analyze" => {
+            "Usage: sideeffect model-analyze --runtime LLAMA_CLI --model MODEL.gguf --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the pinned optional local model on Linux x86_64 after explicit digest confirmation. It does not download weights or upload evidence. Generated prose is unverified interpretation; see docs/LOCAL_MODEL_EVALUATION.md."
+        }
+        _ => return Err(format!("unknown help topic: {topic}\n\n{USAGE}")),
+    };
+    println!("{text}");
+    Ok(ExitCode::SUCCESS)
+}
+
 fn inspect(path: &OsString) -> Result<ExitCode, String> {
     inspect_with_format(&OsString::from("json"), path)
 }
@@ -753,6 +854,50 @@ fn explain_inventory_diff_files(
     } else {
         Ok(ExitCode::SUCCESS)
     }
+}
+
+fn model_preview_file(path: &OsString) -> Result<ExitCode, String> {
+    let bytes = read_bounded(path)?;
+    let preview = sideeffect::local_model::preview_trace_bytes(&bytes)?;
+    let partial = preview.evidence_summary["parse_status"] == "partial";
+    write_json(&preview, "local model request preview")?;
+    Ok(if partial {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn model_analyze_file(
+    runtime: &OsString,
+    model: &OsString,
+    digest: &OsString,
+    trace: &OsString,
+) -> Result<ExitCode, String> {
+    let Some(digest) = digest.to_str() else {
+        return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
+    }
+    let bytes = read_bounded(trace)?;
+    let analysis = sideeffect::local_model::analyze_trace_bytes(
+        &bytes,
+        Path::new(runtime),
+        Path::new(model),
+        digest,
+    )?;
+    let partial = analysis.evidence_summary["parse_status"] == "partial";
+    write_json(&analysis, "local model interpretation")?;
+    Ok(if partial {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn inspect_bundle_with_format(format: &OsString, path: &OsString) -> Result<ExitCode, String> {
