@@ -2,7 +2,7 @@ use serde::Serialize;
 
 use crate::trace::LexicalPathHint;
 
-pub const TRACE_DOCUMENT_SCHEMA_VERSION: u32 = 5;
+pub const TRACE_DOCUMENT_SCHEMA_VERSION: u32 = 7;
 pub const TRACE_DIFF_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -89,6 +89,17 @@ pub struct TraceDocument {
     /// Direct process-creation relations supported by exact syscall result rows.
     /// This is not a complete tree or a causal attribution claim.
     pub process_lineage: crate::trace::process_tree::ProcessLineage,
+    /// Capture metadata attached when the source was a validated v2 run bundle.
+    /// Raw trace files and legacy v1 bundles do not provide this context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bundle_capture: Option<BundleCaptureContext>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BundleCaptureContext {
+    pub stop_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_limit_milliseconds: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]

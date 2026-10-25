@@ -34,7 +34,7 @@ use sideeffect::inventory::{StartupInventoryStatus, collect_startup};
 #[cfg(target_os = "linux")]
 use sideeffect::limits::MAX_BUNDLE_MANIFEST_BYTES;
 use sideeffect::limits::{MAX_REPORT_BYTES, MAX_TRACE_BYTES, ParseLimits};
-use sideeffect::model::{ParseCompleteness, TraceDiff, TraceRecordKind};
+use sideeffect::model::{BundleCaptureContext, ParseCompleteness, TraceDiff, TraceRecordKind};
 #[cfg(target_os = "linux")]
 use sideeffect::record::AnchoredOutput;
 #[cfg(target_os = "linux")]
@@ -661,7 +661,7 @@ fn inspect_bundle_with_format(format: &OsString, path: &OsString) -> Result<Exit
     }
     let bundle = read_run_bundle(Path::new(path))?;
     let partial_capture = bundle.stop_reason == "time_limit_reached";
-    let status = inspect_bytes_with_format(format, bundle.trace_bytes)?;
+    let status = inspect_bytes_with_capture(format, bundle.trace_bytes, bundle.capture_context)?;
     if partial_capture {
         eprintln!(
             "Warning: this bundle stopped at its requested time limit. Absence from the trace is not evidence that an event did not occur."
@@ -673,13 +673,22 @@ fn inspect_bundle_with_format(format: &OsString, path: &OsString) -> Result<Exit
 }
 
 fn inspect_bytes_with_format(format: &OsString, bytes: Vec<u8>) -> Result<ExitCode, String> {
+    inspect_bytes_with_capture(format, bytes, None)
+}
+
+fn inspect_bytes_with_capture(
+    format: &OsString,
+    bytes: Vec<u8>,
+    capture_context: Option<BundleCaptureContext>,
+) -> Result<ExitCode, String> {
     let format = match format.to_str() {
         Some("json") => DiffOutputFormat::Json,
         Some("text") => DiffOutputFormat::Text,
         _ => return Err("inspect format must be either 'json' or 'text'".to_owned()),
     };
-    let document = parse_trace_bytes(&bytes, ParseLimits::default())
+    let mut document = parse_trace_bytes(&bytes, ParseLimits::default())
         .map_err(|error| format!("trace inspection failed: {error}"))?;
+    document.bundle_capture = capture_context;
     let partial = document.parse_status == ParseCompleteness::Partial;
     match format {
         DiffOutputFormat::Json => write_json(&document, "JSON evidence document")?,
@@ -1032,6 +1041,7 @@ struct BundleTrace {
 struct RunBundleData {
     trace_bytes: Vec<u8>,
     stop_reason: &'static str,
+    capture_context: Option<BundleCaptureContext>,
 }
 
 fn read_run_bundle(path: &Path) -> Result<RunBundleData, String> {
@@ -1148,6 +1158,14 @@ fn read_run_bundle_linux(path: &Path) -> Result<RunBundleData, String> {
         } else {
             "tracer_exited"
         },
+        capture_context: (manifest.schema_version >= 2).then(|| BundleCaptureContext {
+            stop_reason: manifest
+                .capture
+                .stop_reason
+                .clone()
+                .unwrap_or_else(|| "tracer_exited".to_owned()),
+            time_limit_milliseconds: manifest.capture.time_limit_milliseconds,
+        }),
     })
 }
 

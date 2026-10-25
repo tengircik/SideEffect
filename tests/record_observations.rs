@@ -647,11 +647,11 @@ fn real_strace_capture_inspect_and_diff_observe_file_and_loopback_events() {
             .unwrap()
             .iter()
             .any(|relation| {
-                relation["parent_pid"] == parent_pid
+                relation["caller_task_id"] == parent_pid
                     && relation["child_pid"] == child_pid
                     && relation["evidence"]["line_number"].as_u64().is_some()
             }),
-        "the child PID must be linked to the parent only by a supported process-creation evidence row; parent={parent_pid}, child={child_pid}, lineage={}, creation_rows={:?}",
+        "the child PID must be linked to the observed caller task only by a supported process-creation evidence row; caller_task_id={parent_pid}, child={child_pid}, lineage={}, creation_rows={:?}",
         candidate["process_lineage"],
         candidate["records"]
             .as_array()
@@ -858,7 +858,9 @@ fn bounded_duration_capture_publishes_partial_bundle_with_explicit_limit_status(
             .contains("Absence from the trace is not evidence that an event did not occur")
     );
     let trace: Value = serde_json::from_slice(&inspected.stdout).unwrap();
-    assert_eq!(trace["schema_version"], 5);
+    assert_eq!(trace["schema_version"], 7);
+    assert_eq!(trace["bundle_capture"]["stop_reason"], "time_limit_reached");
+    assert_eq!(trace["bundle_capture"]["time_limit_milliseconds"], 1000);
     assert!(
         trace["records"]
             .as_array()

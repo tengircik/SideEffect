@@ -6,8 +6,6 @@
 //! Directive values and paths can contain sensitive local configuration and are
 //! retained without redaction; callers should handle the resulting document as
 //! sensitive data.
-#![cfg(target_os = "linux")]
-
 use crate::fingerprint::sha256_hex;
 use serde::Serialize;
 use std::ffi::OsStr;
@@ -669,6 +667,29 @@ fn collect_with_symlink_budget(
                         continue;
                     }
                     total_bytes = total_bytes.saturating_add(bytes.len());
+                    match path_matches_file_identity(&path, &opened_metadata) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            add_diag(
+                                &mut row,
+                                "file_identity_changed_during_read",
+                                Some(&path),
+                                None,
+                                None,
+                            );
+                            continue;
+                        }
+                        Err(_) => {
+                            add_diag(
+                                &mut row,
+                                "file_metadata_unavailable_after_read",
+                                Some(&path),
+                                None,
+                                None,
+                            );
+                            continue;
+                        }
+                    }
                     if bytes.len() > limit {
                         add_diag(
                             &mut row,
@@ -772,6 +793,12 @@ fn path_bytes_hex(path: &Path) -> String {
 }
 fn same_file_identity(before: &fs::Metadata, opened: &fs::Metadata) -> bool {
     before.dev() == opened.dev() && before.ino() == opened.ino()
+}
+fn path_matches_file_identity(path: &Path, opened: &fs::Metadata) -> io::Result<bool> {
+    let current = fs::symlink_metadata(path)?;
+    Ok(current.is_file()
+        && !current.file_type().is_symlink()
+        && same_file_identity(&current, opened))
 }
 fn hex(bytes: &[u8]) -> String {
     const H: &[u8; 16] = b"0123456789abcdef";
@@ -1192,15 +1219,12 @@ mod tests {
         fs::write(&second, b"[Unit]\n").unwrap();
         let first_before = fs::symlink_metadata(&first).unwrap();
         let first_opened = OpenOptions::new().read(true).open(&first).unwrap();
-        let second_opened = OpenOptions::new().read(true).open(&second).unwrap();
         assert!(same_file_identity(
             &first_before,
             &first_opened.metadata().unwrap()
         ));
-        assert!(!same_file_identity(
-            &first_before,
-            &second_opened.metadata().unwrap()
-        ));
+        fs::rename(&second, &first).unwrap();
+        assert!(!path_matches_file_identity(&first, &first_opened.metadata().unwrap()).unwrap());
     }
 
     #[test]
@@ -1278,5 +1302,52 @@ mod tests {
                 .any(|r| r.source_path.ends_with("custom.unknown"))
         );
         assert_eq!(d.status, Status::Complete);
+    }
+
+    #[test]
+    fn device_units_drop_ins_and_enablement_links_are_discovered() {
+        let t = Temp::new();
+        let root = t.0.join("units");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("example.device"), b"[Unit]\nDescription=Device\n").unwrap();
+        let drop_ins = root.join("example.device.d");
+        fs::create_dir(&drop_ins).unwrap();
+        fs::write(
+            drop_ins.join("override.conf"),
+            b"[Unit]\nDescription=Override\n",
+        )
+        .unwrap();
+        let wants = root.join("devices.target.wants");
+        fs::create_dir(&wants).unwrap();
+        symlink("../example.device", wants.join("example.device")).unwrap();
+
+        let d = collect_with_limits(
+            &[UnitDirectory {
+                scope: "system",
+                path: root,
+            }],
+            10,
+            4096,
+            8192,
+            Duration::from_secs(1),
+            100,
+        );
+        assert_eq!(d.status, Status::Complete);
+        assert!(
+            d.records
+                .iter()
+                .any(|r| r.record_type == "unit_file" && r.source_path.ends_with("example.device"))
+        );
+        assert!(
+            d.records.iter().any(
+                |r| r.record_type == "drop_in_file" && r.source_path.ends_with("override.conf")
+            )
+        );
+        assert!(
+            d.records
+                .iter()
+                .any(|r| r.record_type == "enabled_reference_symlink"
+                    && r.source_path.ends_with("example.device"))
+        );
     }
 }

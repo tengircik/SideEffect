@@ -19,7 +19,7 @@ fn parsed_trace_exposes_only_evidence_linked_direct_process_creation() {
     let trace = parse(b"10 fork() = 11\n11 execve(\"/tmp/child\", [\"child\"], 0x0) = 0\n");
     assert_eq!(trace.process_lineage.relations.len(), 1);
     let relation = &trace.process_lineage.relations[0];
-    assert_eq!(relation.parent_pid, 10);
+    assert_eq!(relation.caller_task_id, 10);
     assert_eq!(relation.child_pid, 11);
     assert_eq!(relation.evidence.line_number, 1);
     assert_eq!(relation.evidence.byte_offset, 0);
@@ -463,6 +463,7 @@ fn control_document(count: usize) -> TraceDocument {
         records,
         diagnostics: Vec::new(),
         process_lineage: sideeffect::trace::process_tree::ProcessLineage::default(),
+        bundle_capture: None,
     }
 }
 

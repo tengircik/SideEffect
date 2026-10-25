@@ -181,6 +181,7 @@ pub fn parse_trace_bytes(input: &[u8], limits: ParseLimits) -> Result<TraceDocum
         records,
         diagnostics,
         process_lineage,
+        bundle_capture: None,
     })
 }
 

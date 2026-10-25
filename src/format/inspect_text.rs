@@ -18,6 +18,12 @@ pub fn write_trace_text<W: Write>(document: &TraceDocument, writer: &mut W) -> i
     write_fingerprint(writer, &document.source_sha256)?;
     writer.write_all(b"\n")?;
     writeln!(writer, "Input bytes: {}", document.input_bytes)?;
+    if let Some(capture) = &document.bundle_capture {
+        writeln!(writer, "Bundle stop reason: {}", capture.stop_reason)?;
+        if let Some(limit) = capture.time_limit_milliseconds {
+            writeln!(writer, "Bundle time limit: {limit} ms")?;
+        }
+    }
     writer.write_all(b"Parse status: ")?;
     writer.write_all(parse_status_name(document.parse_status).as_bytes())?;
     writeln!(writer, "\nRecords: {}", document.records.len())?;
@@ -54,8 +60,8 @@ fn write_process_lineage<W: Write>(
     for relation in &lineage.relations {
         writeln!(
             writer,
-            "  PID {} reported creating PID {} at line={} byte={} length={}",
-            relation.parent_pid,
+            "  Caller task ID {} reported creating process ID {} at line={} byte={} length={}",
+            relation.caller_task_id,
             relation.child_pid,
             relation.evidence.line_number,
             relation.evidence.byte_offset,
@@ -328,6 +334,7 @@ mod tests {
                 message: "unexpected text: \u{202E}\nignored".to_owned(),
             }],
             process_lineage: crate::trace::process_tree::ProcessLineage::default(),
+            bundle_capture: None,
         }
     }
 
@@ -343,7 +350,7 @@ mod tests {
         assert!(bytes.is_ascii());
         let output = String::from_utf8(bytes).unwrap();
 
-        assert!(output.contains("Schema version: 5"));
+        assert!(output.contains("Schema version: 7"));
         assert!(output.contains("Source format: \"strace_text\""));
         assert!(output.contains(&format!("Source SHA-256: {}", "00".repeat(32))));
         assert!(output.contains("Input bytes: 120"));
@@ -370,6 +377,20 @@ mod tests {
         assert!(output.contains("Code: \"malformed_record\""));
         assert!(output.contains("Location: line=5 byte=80"));
         assert!(output.contains("Message: \"unexpected text: \\u{202E}\\u{A}ignored\""));
+    }
+
+    #[test]
+    fn prints_bundle_capture_context_when_present() {
+        let mut document = document();
+        document.bundle_capture = Some(crate::model::BundleCaptureContext {
+            stop_reason: "time_limit_reached".to_owned(),
+            time_limit_milliseconds: Some(1_000),
+        });
+        let mut bytes = Vec::new();
+        write_trace_text(&document, &mut bytes).unwrap();
+        let output = String::from_utf8(bytes).unwrap();
+        assert!(output.contains("Bundle stop reason: time_limit_reached"));
+        assert!(output.contains("Bundle time limit: 1000 ms"));
     }
 
     #[test]

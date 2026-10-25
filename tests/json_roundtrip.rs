@@ -54,6 +54,15 @@ struct TraceDocument {
     records: Vec<TraceRecord>,
     diagnostics: Vec<TraceDiagnostic>,
     process_lineage: ProcessLineage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bundle_capture: Option<BundleCaptureContext>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct BundleCaptureContext {
+    stop_reason: String,
+    time_limit_milliseconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -68,7 +77,7 @@ struct ProcessLineage {
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct ProcessRelation {
-    parent_pid: u32,
+    caller_task_id: u32,
     child_pid: u32,
     evidence: EvidenceReference,
 }
@@ -251,7 +260,7 @@ fn inspect_json_round_trips_through_the_typed_trace_schema() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let document: TraceDocument = serde_json::from_slice(&output.stdout)
         .expect("inspect output must satisfy the versioned typed trace schema");
-    assert_eq!(document.schema_version, 5);
+    assert_eq!(document.schema_version, 7);
     assert_eq!(document.records[0].outcome, Some(SyscallOutcome::Success));
     assert_eq!(document.records[0].evidence.line_number, 1);
     assert_eq!(

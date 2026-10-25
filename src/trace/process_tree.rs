@@ -3,7 +3,8 @@
 //! This helper does not identify a capture root, build a complete tree, infer
 //! PID generations, or attribute unrelated rows. A returned relation means
 //! only that one complete successful process-creation syscall row reported the
-//! child PID and the row's caller PID.
+//! child PID and the row's caller task ID. Under strace -f this may be a TID,
+//! not the thread group's PID or the child's Linux parent PID.
 
 use crate::model::{EvidenceReference, TraceRecord, TraceRecordKind};
 use serde::Serialize;
@@ -22,7 +23,8 @@ const CLONE_PARENT: u64 = 0x0000_8000;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ProcessRelation {
-    pub parent_pid: u32,
+    /// PID/TID prefix of the syscall row; with strace -f this may be a thread ID.
+    pub caller_task_id: u32,
     pub child_pid: u32,
     /// Exact result row for a successful fork/vfork/clone syscall.
     pub evidence: EvidenceReference,
@@ -56,10 +58,11 @@ struct Candidate {
     relation: ProcessRelation,
 }
 
-/// Derive direct parent-to-child relations from successful complete creation
-/// calls. Only exact decimal positive child PIDs are accepted. For clone calls,
-/// a fully understood flags value is required and `CLONE_THREAD` calls are
-/// explicitly excluded.
+/// Derive direct caller-task-to-child-PID evidence links from successful
+/// complete creation calls. The caller task ID comes from the trace line and
+/// is not normalized to a thread-group or OS parent PID. Only exact decimal
+/// positive child PIDs are accepted. For clone calls, a fully understood flags
+/// value is required and `CLONE_THREAD` calls are explicitly excluded.
 pub fn derive_process_lineage(records: &[TraceRecord]) -> ProcessLineage {
     let mut result = ProcessLineage {
         relations: Vec::new(),
@@ -141,12 +144,12 @@ pub fn derive_process_lineage(records: &[TraceRecord]) -> ProcessLineage {
             );
             continue;
         }
-        let Some(parent_pid) = record.process_id.filter(|pid| *pid > 0) else {
+        let Some(caller_task_id) = record.process_id.filter(|pid| *pid > 0) else {
             add_record_diagnostic(
                 &mut result,
-                "missing_parent_pid",
+                "missing_caller_task_id",
                 record,
-                "process-creation row has no positive caller PID",
+                "process-creation row has no positive caller task ID",
             );
             continue;
         };
@@ -209,7 +212,7 @@ pub fn derive_process_lineage(records: &[TraceRecord]) -> ProcessLineage {
         }
         candidates.push(Candidate {
             relation: ProcessRelation {
-                parent_pid,
+                caller_task_id,
                 child_pid,
                 evidence: record.evidence.clone(),
                 supporting_evidence: resumed_from
@@ -226,7 +229,7 @@ pub fn derive_process_lineage(records: &[TraceRecord]) -> ProcessLineage {
     candidates.sort_by_key(|candidate| {
         (
             candidate.relation.child_pid,
-            candidate.relation.parent_pid,
+            candidate.relation.caller_task_id,
             candidate.relation.evidence.byte_offset,
         )
     });
@@ -254,7 +257,7 @@ pub fn derive_process_lineage(records: &[TraceRecord]) -> ProcessLineage {
 
     result.relations.sort_by_key(|relation| {
         (
-            relation.parent_pid,
+            relation.caller_task_id,
             relation.child_pid,
             relation.evidence.byte_offset,
         )
@@ -533,7 +536,7 @@ mod tests {
         let result = derive_process_lineage(&rows);
         assert!(!result.partial);
         assert_eq!(result.relations.len(), 4);
-        assert_eq!(result.relations[0].parent_pid, 10);
+        assert_eq!(result.relations[0].caller_task_id, 10);
         assert_eq!(result.relations[0].child_pid, 11);
         assert_eq!(result.relations[0].evidence, rows[0].evidence);
         assert!(result.relations.iter().any(|edge| edge.child_pid == 14));
@@ -672,7 +675,7 @@ mod tests {
         assert_eq!(result.diagnostics.len(), 3);
         assert_eq!(result.diagnostics[0].code, "invalid_child_pid_result");
         assert_eq!(result.diagnostics[1].code, "incomplete_creation_record");
-        assert_eq!(result.diagnostics[2].code, "missing_parent_pid");
+        assert_eq!(result.diagnostics[2].code, "missing_caller_task_id");
     }
 
     #[test]
@@ -699,7 +702,7 @@ mod tests {
         let result = derive_process_lineage(&rows);
         assert!(!result.partial);
         assert_eq!(result.relations.len(), 1);
-        assert_eq!(result.relations[0].parent_pid, 10);
+        assert_eq!(result.relations[0].caller_task_id, 10);
         assert_eq!(result.relations[0].child_pid, 11);
         assert_eq!(result.relations[0].evidence, rows[1].evidence);
         assert_eq!(
