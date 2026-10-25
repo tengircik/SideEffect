@@ -2,7 +2,17 @@
 
 SideEffect's product goal is an on-demand, local audit that helps people understand software on their computer: available permissions and startup hooks/scripts, plus observed runtime activity, all tied to evidence. It does not continuously monitor the computer.
 
-> **Status: early implementation; the product goal is not yet implemented.** The current Linux x86_64 CLI inspects local `strace` text and bundles, compares two complete traces, resolves exact evidence references, and can record one selected command with its traced children. This is not a computer-wide software, permission, or hooks/scripts inventory. A narrow Linux integration test records temporary-file and loopback TCP activity plus a child process, then verifies inspect and diff evidence; it has passed in WSL against extracted Ubuntu strace 6.8 and 6.19 packages and in Ubuntu 24.04 CI. These runs do not verify every supported kernel or trace event. Recording is not a sandbox.
+> **Status: early implementation; the product goal is not yet implemented.** The current Linux x86_64 CLI includes a read-only, on-demand Debian package database snapshot, and inspects local `strace` text and bundles, compares two complete traces, resolves exact evidence references, and can record one selected command with its traced children. The package snapshot is not a complete software inventory and does not inspect permissions, startup hooks, or runtime activity. A narrow Linux integration test records temporary-file and loopback TCP activity plus a child process, then verifies inspect and diff evidence; it has passed in WSL against extracted Ubuntu strace 6.8 and 6.19 packages and in Ubuntu 24.04 CI. These runs do not verify every supported kernel or trace event. Recording is not a sandbox.
+
+## Take a Debian package snapshot (Linux)
+
+```sh
+sideeffect inventory packages --output ./inventory.json
+```
+
+This runs a fixed read-only query of the local dpkg package database and writes a point-in-time JSON snapshot. The output path must not already exist; SideEffect publishes the file privately (mode `0600`) and does not overwrite an existing file. A complete source read exits with status `0`; a partial, unavailable, or otherwise incomplete read still writes its status and diagnostics and exits with status `2`. The document records its capture timestamp, source status, and package-row evidence (line, byte offsets and lengths, and record hashes; valid rows also retain the raw row). Check the status and diagnostics before relying on the listed rows.
+
+This is only an inventory of records available from dpkg. Software installed outside dpkg, including manually copied or otherwise unregistered programs, is not enumerated. This command does not take a process snapshot or inspect permissions, ACLs, startup hooks, scripts, or runtime activity. It does not request elevated privileges. Package names, versions, architecture, and raw database rows can reveal installed software and system details, so treat the output as sensitive, choose a private destination, review it before sharing, and delete it when no longer needed. SideEffect does not upload or automatically delete the file.
 
 ## Try the current command
 
@@ -110,7 +120,7 @@ The bundle directory contains exactly `run.json` and `trace.strace`. It is stage
 
 ## Planned product
 
-The broader product goal is a user-triggered, local audit of software on supported platforms: show available permission and startup-hook/script configuration, then observed activity from an explicitly requested capture, with each result tied to its evidence. The current Linux x86_64 CLI is only the trace-inspection and paired-comparison foundation; inventory and native Windows support are future milestones. SideEffect does not continuously monitor the computer. Static HTML export exists on Linux; browser compatibility beyond renderer tests remains unverified.
+The broader product goal is a user-triggered, local audit of software on supported platforms: show available permission and startup-hook/script configuration, then observed activity from an explicitly requested capture, with each result tied to its evidence. The current Linux x86_64 CLI includes the narrow Debian package snapshot described above and trace inspection/comparison; process inventory, permission inspection, startup-hook/script inventory, and native Windows support remain future work. SideEffect does not continuously monitor the computer. Static HTML export exists on Linux; browser compatibility beyond renderer tests remains unverified.
 
 ## Limits and privacy
 

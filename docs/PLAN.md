@@ -16,7 +16,7 @@ The product goal is an on-demand, local audit of software on a supported compute
 
 The initial inventory and observation platform remains Linux x86_64. Native Windows support requires a separately designed platform adapter and is not implied by WSL2. Platform-specific permission and startup mechanisms must be named individually; the product must not suggest that it has an exhaustive or cross-platform permission model. The optional local LLM is a later, opt-in layer that can summarize selected evidence only; it cannot execute commands, change settings, or replace evidence. Cloud inference, telemetry, and automatic privilege escalation remain out of scope.
 
-Milestones 6–9 below extend the v0 technical foundation and are required for the broader product target; they are not implemented yet.
+Milestones 6–9 below extend the v0 technical foundation and are required for the broader product target. Milestone 6 has an implemented first slice: an on-demand Debian package database snapshot; its process and permission coverage is still planned. Milestones 7–9 remain unimplemented.
 
 ## Milestone 0 — Repository and dependency decision
 
@@ -102,11 +102,13 @@ Additional exit criteria: resource-boundary and output-path/symlink safety tests
 
 ## Milestone 6 — On-demand software and permission inventory
 
-- Start with read-only Debian package inventory through [`dpkg-query`](https://man7.org/linux/man-pages/man1/dpkg-query.1.html), plus a point-in-time process snapshot from [`/proc/PID/status`](https://man7.org/linux/man-pages/man5/proc_pid_status.5.html) and [`/proc/PID/cmdline`](https://www.man7.org/linux/man-pages/man5/proc_pid_cmdline.5.html). State that package databases omit manually copied or otherwise unregistered programs, and procfs may hide or expose mutable process text.
+The first slice is implemented as `sideeffect inventory packages --output FILE`: a user-triggered, read-only, point-in-time snapshot from the local Debian dpkg package database on Linux. It records source scope, capture time, source and overall status, package fields, per-row evidence references, and diagnostics in `sideeffect.inventory` v1 JSON. The fixed `/usr/bin/dpkg-query` query runs with a cleared environment and no privilege escalation. The bounded output file is mode `0600`, does not replace an existing destination, and remains until the user deletes it. Incomplete or unavailable source data is represented as partial/unknown and exits with status 2.
+
+This is not a complete software inventory: manually copied and otherwise unregistered programs are outside dpkg's database. This slice does not inspect running processes, permissions or ACLs, startup hooks/scripts, or runtime activity. Those remain planned work. A future process snapshot through [`/proc/PID/status`](https://man7.org/linux/man-pages/man5/proc_pid_status.5.html) and [`/proc/PID/cmdline`](https://www.man7.org/linux/man-pages/man5/proc_pid_cmdline.5.html) must account for procfs visibility and mutable process text.
 - Inspect selected file ownership, mode, and ACL data using documented system sources such as [`getfacl`](https://man7.org/linux/man-pages/man1/getfacl.1.html); report process credentials and Linux capability sets separately. These inputs do not prove the effective access decision in every namespace or security-module context.
 - Collect only through bounded, read-only operations; make scope, collection time, source, and source-specific coverage visible.
 - Report inaccessible or unsupported sources as unknown/not checked. Do not automatically elevate privileges.
-- Keep inventory snapshots local and sensitive; give users an explicit output path and deletion guidance.
+- Keep inventory snapshots local and sensitive; give users an explicit output path and deletion guidance. Package names, versions, architecture, and raw source rows can reveal installed software and system details; review before sharing and delete when no longer needed.
 
 ## Milestone 7 — Startup hooks, scripts, and runtime evidence
 
@@ -129,7 +131,7 @@ Additional exit criteria: resource-boundary and output-path/symlink safety tests
 - Keep the same evidence, scope, collection-time, unknown-state, no-background-monitor, and no-automatic-elevation guarantees as other adapters.
 - Validate Windows-specific privacy and security boundaries separately; do not reuse Linux coverage claims.
 
-Milestones 6–9 are product requirements, not v0 exit criteria, and none is implemented yet.
+Milestones 6–9 are product requirements, not v0 exit criteria. The Debian dpkg package snapshot is the implemented first slice of Milestone 6; process inventory, permission/ACL inspection, startup hooks/scripts, broader source coverage, and Milestones 7–9 remain unimplemented.
 
 ## Deferred work
 

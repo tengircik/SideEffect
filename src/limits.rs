@@ -5,6 +5,10 @@ pub const MAX_RECORD_BYTES: usize = 64 * 1024;
 pub const MAX_RECORDS: usize = 100_000;
 pub const MAX_DIFF_RECORDS: usize = MAX_RECORDS * 2;
 pub const MAX_REPORT_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_INVENTORY_STDOUT_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_INVENTORY_STDERR_BYTES: usize = 64 * 1024;
+pub const MAX_INVENTORY_ROW_BYTES: usize = 8 * 1024;
+pub const MAX_INVENTORY_ROWS: usize = 200_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ParseLimits {

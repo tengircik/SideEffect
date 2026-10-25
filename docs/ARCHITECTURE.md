@@ -1,16 +1,21 @@
 # SideEffect Architecture Plan
 
-**Status:** early implementation. The source implements bounded `inspect`, conservative `diff`, fingerprint-verified evidence lookup, a separate aggregate-only diff summary schema, an ASCII-only terminal text view, Linux static HTML exports, and Linux `record` using an external `strace` process with a bounded FIFO sink. Opt-in `record --bundle` publishes a `sideeffect.run` v1 manifest and raw trace together; Linux `inspect --bundle DIR` validates and reads only that fixed v1 format. Trace inspection JSON uses schema v4 and detailed diff JSON uses schema v3; both carry SHA-256 fingerprints over exact parsed input bytes. Earlier trace schema v1-v3 and diff schema v1-v2 JSON are not imported or migrated. The aggregate summary uses its own schema v1 and omits event-level source values and references. A real-tracer integration test covers a child `execve` and successful return, either together or as separate continuation records depending on output, plus temporary file and loopback TCP observations through inspect/diff; broader coverage remains unverified.
+**Status:** early implementation. The source implements a Linux-only, read-only Debian dpkg package inventory snapshot, bounded `inspect`, conservative `diff`, fingerprint-verified evidence lookup, a separate aggregate-only diff summary schema, an ASCII-only terminal text view, Linux static HTML exports, and Linux `record` using an external `strace` process with a bounded FIFO sink. Opt-in `record --bundle` publishes a `sideeffect.run` v1 manifest and raw trace together; Linux `inspect --bundle DIR` validates and reads only that fixed v1 format. Trace inspection JSON uses schema v4 and detailed diff JSON uses schema v3; both carry SHA-256 fingerprints over exact parsed input bytes. Earlier trace schema v1-v3 and diff schema v1-v2 JSON are not imported or migrated. The aggregate summary uses its own schema v1 and omits event-level source values and references. A real-tracer integration test covers a child `execve` and successful return, either together or as separate continuation records depending on output, plus temporary file and loopback TCP observations through inspect/diff; broader coverage remains unverified.
 
 The security requirements and current safeguards are summarized in [SECURITY.md](../SECURITY.md); requirements marked future remain release gates.
 
 ## Goals
-
 - Build a local-first Linux x86_64 CLI in Rust, using an external `strace` executable for initial capture.
 - Preserve raw evidence while making paired-run differences readable and reviewable.
 - Keep uncertain or incomplete observations explicit.
 - Render portable JSON and offline HTML without executing trace-provided content.
 - Keep dependencies and runtime infrastructure small; no hosted service or LLM is required.
+
+## Debian package inventory slice
+
+`inventory packages --output FILE` collects one on-demand snapshot from `/usr/bin/dpkg-query` on Linux. Its fixed query asks for binary package name, version, architecture, and dpkg status abbreviation; the child receives a cleared environment with `LC_ALL=C`, no stdin, and no user-provided command arguments. This is a read-only read of the local package database, not a complete inventory of software on the computer. Manually copied or otherwise unregistered programs are not represented. The command does not enumerate running processes or inspect permissions, ACLs, startup hooks/scripts, or runtime activity.
+
+The schema-v1 document records scope, collection timestamp, source status, package row values, raw-row evidence and diagnostics. The collector bounds stdout to 32 MiB, stderr to 64 KiB, each row to 8 KiB, rows to 200,000, execution time to 20 seconds, and serialized output to 64 MiB. Malformed or missing row terminators remain diagnostics; source failures, timeout, and limit conditions make the document partial rather than presenting affected data as absent. The user-selected output file is published privately with mode `0600` and no-clobber semantics. Package values and raw rows can disclose installed software or system details, remain on disk until deleted, and are not automatically redacted.
 
 ## Proposed data path
 

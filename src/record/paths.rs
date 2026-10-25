@@ -1,6 +1,6 @@
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
@@ -12,6 +12,7 @@ const TRACE_NAME: &[u8] = b"trace.raw";
 const BUNDLE_TRACE_NAME: &[u8] = b"trace.strace";
 const MANIFEST_NAME: &[u8] = b"run.json";
 const REPORT_NAME: &[u8] = b"report.html";
+const PRIVATE_FILE_NAME: &[u8] = b"private-output";
 const STAGE_PREFIX: &[u8] = b".sideeffect-capture-";
 static NEXT_STAGE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -32,6 +33,7 @@ pub struct AnchoredOutput {
     fifo_identity: Option<(libc::dev_t, libc::ino_t)>,
     trace_identity: Option<(libc::dev_t, libc::ino_t)>,
     report_identity: Option<(libc::dev_t, libc::ino_t)>,
+    private_file_identity: Option<(libc::dev_t, libc::ino_t)>,
     manifest_identity: Option<(libc::dev_t, libc::ino_t)>,
     bundle: bool,
     bundle_published: bool,
@@ -41,15 +43,19 @@ pub struct AnchoredOutput {
 impl AnchoredOutput {
     /// Resolve and hold the destination parent, then create a private staging directory in it.
     pub fn prepare(destination: &Path) -> io::Result<Self> {
-        Self::prepare_kind(destination, false)
+        Self::prepare_kind(destination, false, false)
     }
 
     /// Create a private sibling staging directory for an atomically published run bundle.
     pub fn prepare_bundle(destination: &Path) -> io::Result<Self> {
-        Self::prepare_kind(destination, true)
+        Self::prepare_kind(destination, true, true)
     }
 
-    fn prepare_kind(destination: &Path, bundle: bool) -> io::Result<Self> {
+    fn prepare_kind(
+        destination: &Path,
+        bundle: bool,
+        require_trusted_parent: bool,
+    ) -> io::Result<Self> {
         let destination_name = destination
             .file_name()
             .filter(|name| !name.is_empty())
@@ -63,8 +69,8 @@ impl AnchoredOutput {
             .unwrap_or_else(|| Path::new("."));
         let parent_path = fs::canonicalize(parent_request)?;
         let parent_dir = open_directory(&parent_path)?;
-        if bundle {
-            ensure_bundle_parent_trusted(&parent_dir)?;
+        if require_trusted_parent {
+            ensure_private_output_parent_trusted(&parent_dir)?;
         }
         ensure_destination_absent(parent_dir.as_raw_fd(), &destination_name)?;
 
@@ -81,6 +87,7 @@ impl AnchoredOutput {
             fifo_identity: None,
             trace_identity: None,
             report_identity: None,
+            private_file_identity: None,
             manifest_identity: None,
             bundle,
             bundle_published: false,
@@ -330,6 +337,66 @@ impl AnchoredOutput {
         Ok(current_parent.join(&self.destination_name))
     }
 
+    fn create_private_file(&mut self) -> io::Result<File> {
+        if self.bundle {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private file output cannot use bundle staging",
+            ));
+        }
+        if self.private_file_identity.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "private output file has already been created",
+            ));
+        }
+        let file = self.create_private_staged_file(PRIVATE_FILE_NAME)?;
+        let stat = stat_fd(file.as_raw_fd())?;
+        if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(io::Error::other(
+                "created private output staging entry is not a regular file",
+            ));
+        }
+        self.private_file_identity = Some((stat.st_dev, stat.st_ino));
+        // SAFETY: file is the newly created regular staging file owned by this process.
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(file)
+    }
+
+    fn publish_private_file(&mut self) -> io::Result<PathBuf> {
+        if self.private_file_identity.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private output staging file has not been created",
+            ));
+        }
+        if self.published {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "output has already been published",
+            ));
+        }
+        let (device, inode) = self.private_file_identity.unwrap();
+        if !named_entry_matches(self.stage_dir.as_raw_fd(), PRIVATE_FILE_NAME, device, inode) {
+            return Err(io::Error::other(
+                "private output staging file identity changed before publication",
+            ));
+        }
+        publish_entry(
+            self.stage_dir.as_raw_fd(),
+            PRIVATE_FILE_NAME,
+            self.parent_dir.as_raw_fd(),
+            self.destination_name.as_os_str().as_bytes(),
+            link_entry,
+        )?;
+        self.published = true;
+        let current_parent = read_fd_path(self.parent_dir.as_raw_fd())
+            .unwrap_or_else(|_| self.parent_path_at_prepare.clone());
+        Ok(current_parent.join(&self.destination_name))
+    }
+
     fn create_private_staged_file(&self, filename: &[u8]) -> io::Result<File> {
         let name = c_name(filename)?;
         // SAFETY: stage_dir is a held directory; flags reject symlinks and existing entries.
@@ -352,6 +419,35 @@ impl AnchoredOutput {
     fn stage_path_for_test(&self) -> PathBuf {
         self.parent_path_at_prepare.join(&self.stage_name)
     }
+}
+
+/// Atomically publish bounded private bytes at a new destination without replacing existing data.
+///
+/// The output is staged in a mode-0700 sibling directory and the published file has mode 0600.
+/// The destination parent must not be group- or world-writable unless it has the sticky bit.
+/// Existing files and symlinks are rejected, including destinations created concurrently.
+pub fn publish_private_file(
+    destination: &Path,
+    bytes: &[u8],
+    max_bytes: usize,
+) -> io::Result<PathBuf> {
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "private output exceeds the {max_bytes} byte limit ({} bytes provided)",
+                bytes.len()
+            ),
+        ));
+    }
+
+    let mut output = AnchoredOutput::prepare_kind(destination, false, true)?;
+    let mut file = output.create_private_file()?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+    output.publish_private_file()
 }
 
 fn publish_entry<F>(
@@ -477,6 +573,16 @@ impl Drop for AnchoredOutput {
                 }
             }
         }
+        if let Some((device, inode)) = self.private_file_identity {
+            if named_entry_matches(self.stage_dir.as_raw_fd(), PRIVATE_FILE_NAME, device, inode) {
+                let private_file =
+                    c_name(PRIVATE_FILE_NAME).expect("fixed private output name contains no NUL");
+                // SAFETY: the held stage descriptor and inode check identify the file to remove.
+                unsafe {
+                    libc::unlinkat(self.stage_dir.as_raw_fd(), private_file.as_ptr(), 0);
+                }
+            }
+        }
 
         if verify_named_directory(
             self.parent_dir.as_raw_fd(),
@@ -510,14 +616,14 @@ fn open_directory(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-fn ensure_bundle_parent_trusted(parent: &File) -> io::Result<()> {
+fn ensure_private_output_parent_trusted(parent: &File) -> io::Result<()> {
     let stat = stat_fd(parent.as_raw_fd())?;
     let writable_by_others = stat.st_mode & (libc::S_IWGRP | libc::S_IWOTH) != 0;
     let sticky = stat.st_mode & libc::S_ISVTX != 0;
     if writable_by_others && !sticky {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "bundle destination parent is writable by other users without sticky-bit protection",
+            "output destination parent is writable by other users without sticky-bit protection",
         ));
     }
     Ok(())
@@ -817,7 +923,7 @@ fn c_name(name: &[u8]) -> io::Result<CString> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnchoredOutput, REPORT_NAME, TRACE_NAME, publish_entry};
+    use super::{AnchoredOutput, REPORT_NAME, TRACE_NAME, publish_entry, publish_private_file};
     use std::fs;
     use std::io::{self, Write};
     use std::os::fd::AsRawFd;
@@ -1045,6 +1151,113 @@ mod tests {
         assert_eq!(fs::read(&destination).unwrap(), b"concurrent writer");
         drop(report);
         drop(output);
+    }
+
+    #[test]
+    fn private_file_publication_enforces_limit_permissions_and_cleans_staging() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("inventory.json");
+        let bytes = br#"{"schema":"sideeffect.inventory","schema_version":1}"#;
+
+        let published = publish_private_file(&destination, bytes, bytes.len()).unwrap();
+
+        assert_eq!(published, destination);
+        assert_eq!(fs::read(&published).unwrap(), bytes);
+        assert_eq!(
+            fs::metadata(&published).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+        assert!(
+            fs::read_dir(&directory.0)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".sideeffect-capture-"))
+        );
+    }
+
+    #[test]
+    fn private_file_publication_rejects_oversized_bytes_before_staging() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("inventory.json");
+
+        let error = publish_private_file(&destination, b"oversized", 8).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("8 byte limit"));
+        assert!(!destination.exists());
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn private_file_publication_rejects_untrusted_parent() {
+        let directory = TestDirectory::new();
+        let parent = directory.0.join("shared");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = publish_private_file(&parent.join("inventory.json"), b"{}", 16).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn private_file_publication_refuses_existing_file_and_symlink() {
+        let directory = TestDirectory::new();
+        let existing = directory.0.join("existing.json");
+        fs::write(&existing, b"keep me").unwrap();
+        assert_eq!(
+            publish_private_file(&existing, b"replace", 16)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&existing).unwrap(), b"keep me");
+
+        let target = directory.0.join("symlink-target");
+        let dangling_link = directory.0.join("dangling.json");
+        std::os::unix::fs::symlink(&target, &dangling_link).unwrap();
+        assert_eq!(
+            publish_private_file(&dangling_link, b"must not follow", 32)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert!(!target.exists());
+        assert!(
+            fs::symlink_metadata(&dangling_link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn private_file_publication_race_preserves_destination_and_cleans_staging() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("raced.json");
+        let mut output = AnchoredOutput::prepare(&destination).unwrap();
+        let mut file = output.create_private_file().unwrap();
+        file.write_all(b"staged JSON").unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        drop(file);
+        fs::write(&destination, b"concurrent writer").unwrap();
+
+        assert_eq!(
+            output.publish_private_file().unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"concurrent writer");
+        let stage = output.stage_path_for_test();
+        drop(output);
+        assert!(!stage.exists());
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
     }
 
     #[test]
