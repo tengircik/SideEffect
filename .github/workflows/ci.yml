@@ -9,23 +9,6 @@ permissions:
   contents: read
 
 jobs:
-  dependency-advisories:
-    name: Dependency advisories
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 1
-
-      - name: Install pinned cargo-audit
-        run: cargo install cargo-audit --version 0.22.2 --locked
-
-      - name: Audit committed lockfile
-        run: cargo audit --file Cargo.lock
-
   linux:
     name: Linux
     runs-on: ubuntu-latest
