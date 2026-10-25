@@ -437,6 +437,7 @@ fn control_document(count: usize) -> TraceDocument {
             syscall: None,
             raw_arguments: None,
             raw_result: None,
+            outcome: None,
             lexical_path_hint: None,
         })
         .collect();

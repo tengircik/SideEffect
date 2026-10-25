@@ -11,8 +11,8 @@ use std::fmt;
 use super::derive_lexical_path_hint;
 use crate::limits::ParseLimits;
 use crate::model::{
-    EvidenceReference, ParseCompleteness, TRACE_DOCUMENT_SCHEMA_VERSION, TraceDiagnostic,
-    TraceDocument, TraceRecord, TraceRecordKind,
+    EvidenceReference, ParseCompleteness, SyscallOutcome, TRACE_DOCUMENT_SCHEMA_VERSION,
+    TraceDiagnostic, TraceDocument, TraceRecord, TraceRecordKind,
 };
 
 const SOURCE_FORMAT: &str = "strace_text";
@@ -590,6 +590,206 @@ struct ParsedFields {
     raw_result: Option<String>,
 }
 
+fn classify_syscall_outcome(syscall: &str, raw_result: &str) -> Option<SyscallOutcome> {
+    let is_exec = matches!(syscall, "execve" | "execveat");
+    let is_open = matches!(syscall, "openat" | "openat2");
+    let is_connect = syscall == "connect";
+    if !(is_exec || is_open || is_connect) {
+        return None;
+    }
+
+    if let Some(errno) = parse_linux_errno_result(raw_result) {
+        return Some(if is_connect && errno == "EINPROGRESS" {
+            SyscallOutcome::InProgress
+        } else {
+            SyscallOutcome::Failure
+        });
+    }
+
+    let successful = if is_exec || is_connect {
+        raw_result == "0"
+    } else {
+        parse_open_fd_result(raw_result)
+    };
+    Some(if successful {
+        SyscallOutcome::Success
+    } else {
+        SyscallOutcome::Unknown
+    })
+}
+
+fn parse_open_fd_result(raw_result: &str) -> bool {
+    let number = match raw_result.split_once('<') {
+        Some((number, suffix)) => {
+            let Some(annotation) = suffix.strip_suffix('>') else {
+                return false;
+            };
+            if annotation.is_empty() || annotation.contains(['<', '>']) {
+                return false;
+            }
+            number
+        }
+        None => raw_result,
+    };
+    number.parse::<i32>().is_ok_and(|fd| fd >= 0)
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn parse_linux_errno_result(raw_result: &str) -> Option<&str> {
+    let error = raw_result.strip_prefix("-1 ")?;
+    let (errno, message) = error.split_once(' ')?;
+    if !is_linux_errno(errno)
+        || !message.starts_with('(')
+        || !message.ends_with(')')
+        || message.len() <= 2
+        || message[1..message.len() - 1].trim().is_empty()
+        || message.contains(['\r', '\n'])
+    {
+        return None;
+    }
+    Some(errno)
+}
+
+fn is_linux_errno(value: &str) -> bool {
+    matches!(
+        value,
+        "EPERM"
+            | "ENOENT"
+            | "ESRCH"
+            | "EINTR"
+            | "EIO"
+            | "ENXIO"
+            | "E2BIG"
+            | "ENOEXEC"
+            | "EBADF"
+            | "ECHILD"
+            | "EAGAIN"
+            | "EWOULDBLOCK"
+            | "ENOMEM"
+            | "EACCES"
+            | "EFAULT"
+            | "ENOTBLK"
+            | "EBUSY"
+            | "EEXIST"
+            | "EXDEV"
+            | "ENODEV"
+            | "ENOTDIR"
+            | "EISDIR"
+            | "EINVAL"
+            | "ENFILE"
+            | "EMFILE"
+            | "ENOTTY"
+            | "ETXTBSY"
+            | "EFBIG"
+            | "ENOSPC"
+            | "ESPIPE"
+            | "EROFS"
+            | "EMLINK"
+            | "EPIPE"
+            | "EDOM"
+            | "ERANGE"
+            | "EDEADLK"
+            | "EDEADLOCK"
+            | "ENAMETOOLONG"
+            | "ENOLCK"
+            | "ENOSYS"
+            | "ENOTEMPTY"
+            | "ELOOP"
+            | "ENOMSG"
+            | "EIDRM"
+            | "ECHRNG"
+            | "EL2NSYNC"
+            | "EL3HLT"
+            | "EL3RST"
+            | "ELNRNG"
+            | "EUNATCH"
+            | "ENOCSI"
+            | "EL2HLT"
+            | "EBADE"
+            | "EBADR"
+            | "EXFULL"
+            | "ENOANO"
+            | "EBADRQC"
+            | "EBADSLT"
+            | "EBFONT"
+            | "ENOSTR"
+            | "ENODATA"
+            | "ETIME"
+            | "ENOSR"
+            | "ENONET"
+            | "ENOPKG"
+            | "EREMOTE"
+            | "ENOLINK"
+            | "EADV"
+            | "ESRMNT"
+            | "ECOMM"
+            | "EPROTO"
+            | "EMULTIHOP"
+            | "EDOTDOT"
+            | "EBADMSG"
+            | "EOVERFLOW"
+            | "ENOTUNIQ"
+            | "EBADFD"
+            | "EREMCHG"
+            | "ELIBACC"
+            | "ELIBBAD"
+            | "ELIBSCN"
+            | "ELIBMAX"
+            | "ELIBEXEC"
+            | "EILSEQ"
+            | "ERESTART"
+            | "ESTRPIPE"
+            | "EUSERS"
+            | "ENOTSOCK"
+            | "EDESTADDRREQ"
+            | "EMSGSIZE"
+            | "EPROTOTYPE"
+            | "ENOPROTOOPT"
+            | "EPROTONOSUPPORT"
+            | "ESOCKTNOSUPPORT"
+            | "EOPNOTSUPP"
+            | "ENOTSUP"
+            | "EPFNOSUPPORT"
+            | "EAFNOSUPPORT"
+            | "EADDRINUSE"
+            | "EADDRNOTAVAIL"
+            | "ENETDOWN"
+            | "ENETUNREACH"
+            | "ENETRESET"
+            | "ECONNABORTED"
+            | "ECONNRESET"
+            | "ENOBUFS"
+            | "EISCONN"
+            | "ENOTCONN"
+            | "ESHUTDOWN"
+            | "ETOOMANYREFS"
+            | "ETIMEDOUT"
+            | "ECONNREFUSED"
+            | "EHOSTDOWN"
+            | "EHOSTUNREACH"
+            | "EALREADY"
+            | "EINPROGRESS"
+            | "ESTALE"
+            | "EUCLEAN"
+            | "ENOTNAM"
+            | "ENAVAIL"
+            | "EISNAM"
+            | "EREMOTEIO"
+            | "EDQUOT"
+            | "ENOMEDIUM"
+            | "EMEDIUMTYPE"
+            | "ECANCELED"
+            | "ENOKEY"
+            | "EKEYEXPIRED"
+            | "EKEYREVOKED"
+            | "EKEYREJECTED"
+            | "EOWNERDEAD"
+            | "ENOTRECOVERABLE"
+            | "ERFKILL"
+            | "EHWPOISON"
+    )
+}
+
 fn record(
     raw_line: &str,
     line_number: u64,
@@ -597,6 +797,15 @@ fn record(
     byte_length: u64,
     fields: ParsedFields,
 ) -> TraceRecord {
+    let outcome = if fields.kind == TraceRecordKind::Syscall {
+        fields
+            .syscall
+            .as_deref()
+            .zip(fields.raw_result.as_deref())
+            .and_then(|(syscall, result)| classify_syscall_outcome(syscall, result))
+    } else {
+        None
+    };
     let lexical_path_hint = if fields.kind == TraceRecordKind::Syscall {
         fields
             .syscall
@@ -619,6 +828,7 @@ fn record(
         syscall: fields.syscall,
         raw_arguments: fields.raw_arguments,
         raw_result: fields.raw_result,
+        outcome,
         lexical_path_hint,
     }
 }

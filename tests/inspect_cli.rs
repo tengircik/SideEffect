@@ -53,7 +53,7 @@ fn inspect_defaults_to_versioned_json() {
         String::from_utf8_lossy(&output.stderr)
     );
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(document["schema_version"], 3);
+    assert_eq!(document["schema_version"], 4);
     assert_eq!(document["source_sha256"].as_str().unwrap().len(), 64);
     assert_eq!(document["parse_status"], "complete");
     assert_eq!(
@@ -68,6 +68,43 @@ fn inspect_defaults_to_versioned_json() {
         document["records"][0]["lexical_path_hint"]["basis"],
         "at_fdcwd_annotation"
     );
+}
+
+#[test]
+fn inspect_json_links_conservative_outcome_to_raw_evidence() {
+    let contents = concat!(
+        "9 execve(\"/bin/tool\", [\"tool\"], 0x0) = 0\n",
+        "9 openat(AT_FDCWD, \"/tmp/missing\", O_RDONLY) = -1 ENOENT (No such file or directory)\n",
+        "9 connect(3, {sa_family=AF_INET}, 16) = -1 EINPROGRESS (Operation now in progress)\n",
+        "9 socket(AF_INET, SOCK_STREAM, 0) = 3\n",
+    );
+    let trace = TempTrace::with_contents(contents.as_bytes());
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("inspect")
+        .arg(&trace.0)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["schema_version"], 4);
+    assert_eq!(document["records"][0]["outcome"], "success");
+    assert_eq!(document["records"][1]["outcome"], "failure");
+    assert_eq!(document["records"][2]["outcome"], "in_progress");
+    assert!(document["records"][3].get("outcome").is_none());
+    assert_eq!(
+        document["records"][1]["raw_result"],
+        "-1 ENOENT (No such file or directory)"
+    );
+    assert_eq!(
+        document["records"][1]["raw_line"],
+        "9 openat(AT_FDCWD, \"/tmp/missing\", O_RDONLY) = -1 ENOENT (No such file or directory)"
+    );
+    assert_eq!(document["records"][1]["evidence"]["line_number"], 2);
+    assert_eq!(document["records"][1]["evidence"]["byte_offset"], 41);
 }
 
 #[test]
@@ -89,6 +126,7 @@ fn inspect_text_discloses_the_basis_of_a_lexical_path_hint() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("Lexical path hint: \"/tmp/work/assets/icon.svg\""));
     assert!(text.contains("Path hint basis: at_fdcwd_annotation"));
+    assert!(text.contains("Outcome: success"));
 }
 
 #[test]

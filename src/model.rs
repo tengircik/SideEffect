@@ -2,7 +2,7 @@ use serde::Serialize;
 
 use crate::trace::LexicalPathHint;
 
-pub const TRACE_DOCUMENT_SCHEMA_VERSION: u32 = 3;
+pub const TRACE_DOCUMENT_SCHEMA_VERSION: u32 = 4;
 pub const TRACE_DIFF_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -22,6 +22,17 @@ pub enum TraceRecordKind {
     ResumedSyscall,
     Control,
     Unparsed,
+}
+
+/// A conservative interpretation of the observed result for selected syscalls.
+/// This describes only the syscall result text, not a higher-level effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyscallOutcome {
+    Success,
+    Failure,
+    InProgress,
+    Unknown,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -46,6 +57,10 @@ pub struct TraceRecord {
     pub raw_arguments: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_result: Option<String>,
+    /// Present only for supported complete records of selected syscalls.
+    /// The sibling evidence reference points to the exact raw source record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<SyscallOutcome>,
     /// A conservative path spelling joined with an absolute `-yy` dirfd base.
     /// This is lexical only; it is not canonical or filesystem-resolved.
     #[serde(skip_serializing_if = "Option::is_none")]

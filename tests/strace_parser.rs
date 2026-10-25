@@ -1,5 +1,5 @@
 use sideeffect::limits::{MAX_RECORD_BYTES, ParseLimits};
-use sideeffect::model::{ParseCompleteness, TraceRecordKind};
+use sideeffect::model::{ParseCompleteness, SyscallOutcome, TraceRecordKind};
 use sideeffect::trace::strace::{ParseError, parse_trace_bytes};
 
 fn limits(max_trace_bytes: usize, max_record_bytes: usize, max_records: usize) -> ParseLimits {
@@ -73,7 +73,7 @@ fn parses_tcp_peer_arrow_inside_strace_fd_annotation() {
 }
 
 #[test]
-fn legacy_openat_text_without_yy_annotations_remains_inspectable_in_schema_v3() {
+fn legacy_openat_text_without_yy_annotations_remains_inspectable_in_schema_v4() {
     let input = b"123 1700000000.123456 openat(AT_FDCWD, \"relative/file.txt\", O_RDONLY) = 3\n";
 
     let document = parse_trace_bytes(input, ParseLimits::default()).unwrap();
@@ -91,6 +91,74 @@ fn legacy_openat_text_without_yy_annotations_remains_inspectable_in_schema_v3() 
         document.source_sha256,
         "b73a1d5fb794a28ef14fa5b71cad35afe38ae9c24c66a2ebc1e2cd27a4f92ca4"
     );
+}
+
+#[test]
+fn classifies_only_selected_complete_syscalls_from_strict_results() {
+    let input = concat!(
+        "1 execve(\"/bin/tool\", [\"tool\"], 0x0) = 0\n",
+        "1 execveat(3, \"tool\", [\"tool\"], 0x0, 0) = -1 ENOENT (No such file or directory)\n",
+        "1 openat(AT_FDCWD, \"/tmp/file\", O_RDONLY) = 3</tmp/file>\n",
+        "1 openat2(AT_FDCWD, \"/tmp/file\", {flags=O_RDONLY}, 24) = -1 EACCES (Permission denied)\n",
+        "1 connect(3, {sa_family=AF_INET}, 16) = -1 EINPROGRESS (Operation now in progress)\n",
+        "1 connect(3, {sa_family=AF_INET}, 16) = 0\n",
+        "1 connect(3, {sa_family=AF_INET}, 16) = -1 ERESTARTSYS (restart_syscall)\n",
+        "1 connect(3, {sa_family=AF_INET}, 16) = -1 ENOT_A_REAL_ERRNO (not recognized)\n",
+        "1 connect(3, {sa_family=AF_INET}, 16) = -1 ECONNREFUSED\n",
+        "1 read(3, \"x\", 1) = 1\n",
+    );
+    let document = parse_trace_bytes(input.as_bytes(), ParseLimits::default()).unwrap();
+    assert_eq!(document.parse_status, ParseCompleteness::Complete);
+
+    let outcomes: Vec<_> = document
+        .records
+        .iter()
+        .map(|record| record.outcome)
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            Some(SyscallOutcome::Success),
+            Some(SyscallOutcome::Failure),
+            Some(SyscallOutcome::Success),
+            Some(SyscallOutcome::Failure),
+            Some(SyscallOutcome::InProgress),
+            Some(SyscallOutcome::Success),
+            Some(SyscallOutcome::Unknown),
+            Some(SyscallOutcome::Unknown),
+            Some(SyscallOutcome::Unknown),
+            None,
+        ]
+    );
+
+    let open = &document.records[2];
+    assert_eq!(open.raw_result.as_deref(), Some("3</tmp/file>"));
+    assert_eq!(
+        open.raw_line,
+        "1 openat(AT_FDCWD, \"/tmp/file\", O_RDONLY) = 3</tmp/file>"
+    );
+    assert_eq!(open.evidence.line_number, 3);
+    assert_eq!(open.evidence.byte_length, open.raw_line.len() as u64);
+}
+
+#[test]
+fn outcome_is_omitted_for_unlisted_and_continuation_records() {
+    let input = concat!(
+        "1 execve(\"/bin/tool\", [\"tool\"], 0x0 <unfinished ...>\n",
+        "1 <... execve resumed>\"/bin/tool\", [\"tool\"], 0x0) = 0\n",
+        "1 socket(AF_INET, SOCK_STREAM, 0) = 3\n",
+        "1 openat(AT_FDCWD, \"x\", O_RDONLY) = 3 trailing\n",
+        "1 connect(3, {}, 0) = -1 EINVAL (Invalid argument) extra\n",
+    );
+    let document = parse_trace_bytes(input.as_bytes(), ParseLimits::default()).unwrap();
+    assert_eq!(document.parse_status, ParseCompleteness::Complete);
+    assert_eq!(document.records[0].kind, TraceRecordKind::UnfinishedSyscall);
+    assert_eq!(document.records[1].kind, TraceRecordKind::ResumedSyscall);
+    assert_eq!(document.records[0].outcome, None);
+    assert_eq!(document.records[1].outcome, None);
+    assert_eq!(document.records[2].outcome, None);
+    assert_eq!(document.records[3].outcome, Some(SyscallOutcome::Unknown));
+    assert_eq!(document.records[4].outcome, Some(SyscallOutcome::Unknown));
 }
 
 #[test]

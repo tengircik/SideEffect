@@ -76,6 +76,11 @@ fn write_record_details<W: Write>(
     write_optional_quoted(writer, "  Syscall", record.syscall.as_deref())?;
     write_optional_quoted(writer, "  Arguments", record.raw_arguments.as_deref())?;
     write_optional_quoted(writer, "  Result", record.raw_result.as_deref())?;
+    if let Some(outcome) = record.outcome {
+        writer.write_all(b"  Outcome: ")?;
+        writer.write_all(syscall_outcome_name(outcome).as_bytes())?;
+        writer.write_all(b"\n")?;
+    }
     if let Some(hint) = record.lexical_path_hint.as_ref() {
         write_optional_quoted(writer, "  Lexical path hint", Some(&hint.path))?;
         writer.write_all(b"  Path hint basis: ")?;
@@ -86,6 +91,15 @@ fn write_record_details<W: Write>(
     writer.write_all(b"  Raw line: ")?;
     write_quoted(writer, &record.raw_line)?;
     writer.write_all(b"\n")
+}
+
+fn syscall_outcome_name(outcome: crate::model::SyscallOutcome) -> &'static str {
+    match outcome {
+        crate::model::SyscallOutcome::Success => "success",
+        crate::model::SyscallOutcome::Failure => "failure",
+        crate::model::SyscallOutcome::InProgress => "in_progress",
+        crate::model::SyscallOutcome::Unknown => "unknown",
+    }
 }
 
 fn write_optional_u32<W: Write>(writer: &mut W, label: &str, value: Option<u32>) -> io::Result<()> {
@@ -217,6 +231,7 @@ mod tests {
             syscall: syscall.map(str::to_owned),
             raw_arguments: syscall.map(|_| "AT_FDCWD, \"path\"".to_owned()),
             raw_result: syscall.map(|_| "0".to_owned()),
+            outcome: None,
             lexical_path_hint: None,
         }
     }
@@ -271,7 +286,7 @@ mod tests {
         assert!(bytes.is_ascii());
         let output = String::from_utf8(bytes).unwrap();
 
-        assert!(output.contains("Schema version: 3"));
+        assert!(output.contains("Schema version: 4"));
         assert!(output.contains("Source format: \"strace_text\""));
         assert!(output.contains(&format!("Source SHA-256: {}", "00".repeat(32))));
         assert!(output.contains("Input bytes: 120"));
