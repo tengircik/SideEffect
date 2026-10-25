@@ -17,7 +17,7 @@ use crate::limits::MAX_TRACE_BYTES;
 
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 const POLL_INTERVAL_MS: i32 = 50;
-const MIN_STRACE_VERSION: (u64, u64) = (6, 6);
+const MIN_STRACE_VERSION: (u64, u64) = (6, 8);
 const MAX_VERSION_OUTPUT_BYTES: usize = 4096;
 const VERSION_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 static CANCELLATION_SIGNAL: AtomicI32 = AtomicI32::new(0);
@@ -643,7 +643,7 @@ fn verify_strace_version_with_timeout(
     })?;
     if version < MIN_STRACE_VERSION {
         return Err(RecordError::before_launch(format!(
-            "strace {}.{} or newer is required for --kill-on-exit; found {}.{}; the command was not started",
+            "SideEffect requires strace {}.{} or newer; found {}.{}; the command was not started",
             MIN_STRACE_VERSION.0, MIN_STRACE_VERSION.1, version.0, version.1
         )));
     }
@@ -857,7 +857,7 @@ mod tests {
         }
 
         fn fake_tracer(&self, script_body: &str) -> PathBuf {
-            self.fake_tracer_version(script_body, "6.6")
+            self.fake_tracer_version(script_body, "6.8")
         }
 
         fn fake_tracer_version(&self, script_body: &str, version: &str) -> PathBuf {
@@ -896,7 +896,7 @@ mod tests {
         output_name: &str,
         limit: usize,
     ) -> Result<super::RecordOutcome, RecordError> {
-        run_fake_with_version(directory, script_body, output_name, limit, "6.6")
+        run_fake_with_version(directory, script_body, output_name, limit, "6.8")
     }
 
     fn run_fake_with_version(
@@ -1202,14 +1202,14 @@ mod tests {
             &format!("touch '{escaped_marker}'"),
             "old.trace",
             64,
-            "6.5",
+            "6.7",
         )
         .unwrap_err();
 
         assert!(
             error
                 .to_string()
-                .contains("strace 6.6 or newer is required")
+                .contains("SideEffect requires strace 6.8 or newer")
         );
         assert!(error.to_string().contains("the command was not started"));
         assert!(!directory.0.join("old.trace").exists());
@@ -1224,8 +1224,8 @@ mod tests {
     #[test]
     fn strace_version_parser_rejects_unknown_and_accepts_numeric_versions() {
         assert_eq!(
-            super::parse_strace_version(b"strace -- version 6.6\n"),
-            Some((6, 6))
+            super::parse_strace_version(b"strace -- version 6.8\n"),
+            Some((6, 8))
         );
         assert_eq!(
             super::parse_strace_version(b"strace -- version 7.0.1\n"),
@@ -1275,7 +1275,7 @@ mod tests {
         let directory = TestDirectory::new();
         let target_marker = directory.0.join("target-was-started");
         let escaped_marker = target_marker.to_string_lossy().replace('\'', "'\\''");
-        let oversized = format!("6.6.{}", "0".repeat(MAX_VERSION_OUTPUT_BYTES));
+        let oversized = format!("6.8.{}", "0".repeat(MAX_VERSION_OUTPUT_BYTES));
         let error = run_fake_with_version(
             &directory,
             &format!("touch '{escaped_marker}'"),

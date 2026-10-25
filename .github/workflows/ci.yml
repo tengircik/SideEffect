@@ -36,9 +36,9 @@ jobs:
             echo "Could not parse the installed strace major.minor version" >&2
             exit 1
           fi
-          echo "Installed strace version: $version (required: 6.6 or newer)"
-          if ! dpkg --compare-versions "$version" ge 6.6; then
-            echo "strace $version is older than the supported minimum 6.6" >&2
+          echo "Installed strace version: $version (required: 6.8 or newer)"
+          if ! dpkg --compare-versions "$version" ge 6.8; then
+            echo "strace $version is older than the supported minimum 6.8" >&2
             exit 1
           fi
 
