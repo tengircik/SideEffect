@@ -9,6 +9,42 @@ permissions:
   contents: read
 
 jobs:
+  strace-minimum-compatibility:
+    name: Linux strace compatibility (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install strace and integration-test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y strace python3
+
+      - name: Check and report installed strace version
+        shell: bash
+        run: |
+          strace --version
+          version="$(strace --version | sed -nE '1s/^strace -- version ([0-9]+\.[0-9]+).*$/\1/p')"
+          if [[ -z "$version" ]]; then
+            echo "Could not parse the installed strace major.minor version" >&2
+            exit 1
+          fi
+          echo "Installed strace version: $version (required: 6.6 or newer)"
+          if ! dpkg --compare-versions "$version" ge 6.6; then
+            echo "strace $version is older than the supported minimum 6.6" >&2
+            exit 1
+          fi
+
+      - name: Run real strace capture integration test
+        run: cargo test --locked --test record_observations real_strace_capture_inspect_and_diff_observe_file_and_loopback_events -- --exact
+
   linux:
     name: Linux
     runs-on: ubuntu-latest
