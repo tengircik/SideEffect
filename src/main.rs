@@ -25,6 +25,8 @@ use sideeffect::format::{
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{InventoryStatus, collect_debian_packages};
 #[cfg(target_os = "linux")]
+use sideeffect::inventory::{ProcessInventoryStatus, collect_processes};
+#[cfg(target_os = "linux")]
 use sideeffect::limits::MAX_BUNDLE_MANIFEST_BYTES;
 use sideeffect::limits::{MAX_REPORT_BYTES, MAX_TRACE_BYTES, ParseLimits};
 use sideeffect::model::{ParseCompleteness, TraceDiff, TraceRecordKind};
@@ -35,7 +37,8 @@ use sideeffect::record::{publish_private_file, record_bundle, record_trace};
 use sideeffect::trace::strace::parse_trace_bytes;
 
 const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect inspect [--format json|text] --bundle <run-bundle-directory>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff --bundles [--format json|text] <baseline-bundle> <candidate-bundle>\n       sideeffect diff --bundles --format html --output <report.html> <baseline-bundle> <candidate-bundle>\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect inventory packages --output <new-inventory.json>\n\
-       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. Inventory packages performs a user-requested, read-only snapshot of records from the local Debian package database and saves a private JSON file; it does not enumerate unregistered software or inspect permissions, startup hooks, or runtime activity. Record runs a command under external strace and writes either a bounded raw trace or an opt-in privacy-minimized run bundle; it is observation, not isolation or a safety check.";
+       sideeffect inventory processes --output <new-inventory.json>\n\
+       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. Inventory packages performs a user-requested, read-only snapshot of records from the local Debian package database and saves a private JSON file; it does not enumerate unregistered software or inspect permissions, startup hooks, or runtime activity. Inventory processes reads bounded numeric /proc status entries and saves a private point-in-time process snapshot; it omits command lines and executable paths and does not promise atomic or exhaustive coverage. Record runs a command under external strace and writes either a bounded raw trace or an opt-in privacy-minimized run bundle; it is observation, not isolation or a safety check.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -62,6 +65,11 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             if command == "inventory" && subcommand == "packages" && option == "--output" =>
         {
             inventory_packages(output)
+        }
+        [command, subcommand, option, output]
+            if command == "inventory" && subcommand == "processes" && option == "--output" =>
+        {
+            inventory_processes(output)
         }
         [command, flag, path] if command == "inspect" && flag == "--bundle" => {
             inspect_bundle_with_format(&OsString::from("json"), path)
@@ -204,6 +212,35 @@ fn inventory_packages(output: &OsString) -> Result<ExitCode, String> {
     }
 }
 
+fn inventory_processes(output: &OsString) -> Result<ExitCode, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let document = collect_processes();
+        let complete = document.status == ProcessInventoryStatus::Complete;
+        let mut json = CappedBuffer::new(MAX_REPORT_BYTES);
+        serde_json::to_writer(&mut json, &document).map_err(|error| format!("could not serialize process inventory within the {MAX_REPORT_BYTES} byte limit: {error}"))?;
+        let published = publish_private_file(Path::new(output), &json.bytes, MAX_REPORT_BYTES)
+            .map_err(|error| format!("could not publish private process inventory: {error}"))?;
+        if complete {
+            eprintln!(
+                "Saved a complete /proc status snapshot to {}. This is a non-atomic point-in-time observation, not exhaustive system coverage.",
+                terminal_safe_path(&published)
+            );
+            Ok(ExitCode::SUCCESS)
+        } else {
+            eprintln!(
+                "Saved a partial /proc status snapshot to {}. Check its diagnostics; unreadable or unobserved process data is unknown.",
+                terminal_safe_path(&published)
+            );
+            Ok(ExitCode::from(2))
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = output;
+        Err("inventory processes requires Linux procfs".to_owned())
+    }
+}
 fn record(output: &OsString, program: &OsString, args: &[OsString]) -> Result<ExitCode, String> {
     #[cfg(target_os = "linux")]
     {

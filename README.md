@@ -14,6 +14,16 @@ This runs a fixed read-only query of the local dpkg package database and writes 
 
 This is only an inventory of records available from dpkg. Software installed outside dpkg, including manually copied or otherwise unregistered programs, is not enumerated. This command does not take a process snapshot or inspect permissions, ACLs, startup hooks, scripts, or runtime activity. It does not request elevated privileges. Package names, versions, architecture, and raw database rows can reveal installed software and system details, so treat the output as sensitive, choose a private destination, review it before sharing, and delete it when no longer needed. SideEffect does not upload or automatically delete the file.
 
+## Take a Linux process status snapshot
+
+```sh
+sideeffect inventory processes --output ./processes.json
+```
+
+This reads one `/proc/<pid>/status` file for each numeric procfs entry visible during the walk. It emits the `sideeffect.process_inventory` v1 schema with the capture start/end timestamps, selected process identity, state, UID/GID values, capability masks, `NoNewPrivs` and `Seccomp`, and byte-offset/length/SHA-256 evidence for each selected source line. The walk is an interval, not an atomic snapshot; processes can appear, exit, or change while it runs. It covers only entries visible through the current procfs view and does not claim exhaustive system coverage. Unreadable, vanished, malformed, missing, or omitted data and reached limits are recorded as diagnostics, make the result partial, and produce exit status `2` while still publishing the file.
+
+The collector does not read command lines, executable paths, or other procfs files, and does not request elevated privileges. It is bounded to 8,192 numeric process directories, 64 KiB per status file, 32 MiB of aggregate status bytes, a 10-second scan deadline, and 64 MiB of serialized JSON. Output is private (mode `0600`) and no-clobber. Process names, IDs, credentials, capability masks, and security mode values are sensitive system information; the output is not redacted or uploaded. Review it before sharing and delete it when no longer needed.
+
 ## Try the current command
 
 From the repository root, run:
@@ -120,7 +130,7 @@ The bundle directory contains exactly `run.json` and `trace.strace`. It is stage
 
 ## Planned product
 
-The broader product goal is a user-triggered, local audit of software on supported platforms: show available permission and startup-hook/script configuration, then observed activity from an explicitly requested capture, with each result tied to its evidence. The current Linux x86_64 CLI includes the narrow Debian package snapshot described above and trace inspection/comparison; process inventory, permission inspection, startup-hook/script inventory, and native Windows support remain future work. SideEffect does not continuously monitor the computer. Static HTML export exists on Linux; browser compatibility beyond renderer tests remains unverified.
+The broader product goal is a user-triggered, local audit of software on supported platforms: show available permission and startup-hook/script configuration, then observed activity from an explicitly requested capture, with each result tied to its evidence. The current Linux x86_64 CLI includes the narrow Debian package snapshot and bounded `/proc` status snapshot described above, plus trace inspection/comparison; permission inspection, startup-hook/script inventory, and native Windows support remain future work. SideEffect does not continuously monitor the computer. Static HTML export exists on Linux; browser compatibility beyond renderer tests remains unverified.
 
 ## Limits and privacy
 

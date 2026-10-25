@@ -2,6 +2,8 @@
 
 mod debian;
 mod model;
+#[cfg(target_os = "linux")]
+mod processes;
 
 pub use model::{
     INVENTORY_SCHEMA, INVENTORY_SCHEMA_VERSION, InventoryDiagnostic, InventoryDocument,
@@ -11,3 +13,8 @@ pub use model::{
 #[cfg(target_os = "linux")]
 pub use debian::collect_debian_packages;
 pub use debian::parse_dpkg_query_output;
+#[cfg(target_os = "linux")]
+pub use processes::{
+    ProcessDiagnostic, ProcessEvidence, ProcessInventoryDocument, ProcessInventorySource,
+    ProcessInventoryStatus, ProcessRow, collect_processes, collect_processes_from,
+};
