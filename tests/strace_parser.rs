@@ -312,7 +312,10 @@ fn configured_record_size_limit_accepts_exactly_max_bytes() {
     assert_eq!(document.parse_status, ParseCompleteness::Complete);
     assert_eq!(document.records.len(), 1);
     assert_eq!(document.records[0].kind, TraceRecordKind::Syscall);
-    assert_eq!(document.records[0].evidence.byte_length, MAX_RECORD_BYTES as u64);
+    assert_eq!(
+        document.records[0].evidence.byte_length,
+        MAX_RECORD_BYTES as u64
+    );
 
     record.push(b' ');
     assert_eq!(
