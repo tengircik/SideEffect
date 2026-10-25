@@ -165,6 +165,99 @@ fn assert_published_nonempty_trace(path: &Path) {
 }
 
 #[test]
+fn fake_strace_diagnostic_trace_and_reported_status_follow_milestone_one_contract() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const TRACE_ROW: &str =
+        "123 1700000000.000001 openat(AT_FDCWD, \"/synthetic/fake-tracer\", O_RDONLY) = 3";
+    const FAKE_DIAGNOSTIC: &str = "fake strace runtime diagnostic marker";
+
+    let directory = PrivateTempDirectory::new();
+    let fake_bin = directory.path().join("fake-bin");
+    fs::create_dir(&fake_bin).expect("create private fake tracer directory");
+    let fake_strace = fake_bin.join("strace");
+    let script = format!(
+        r##"#!/bin/sh
+if [ "$#" -eq 1 ] && [ "$1" = "-V" ]; then
+    printf '%s\n' 'strace -- version 6.8'
+    exit 0
+fi
+trace=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o) trace=$2; shift 2 ;;
+        --) shift; break ;;
+        *) shift ;;
+    esac
+done
+[ "$trace" != "" ] || exit 90
+[ "$#" -eq 4 ] || exit 91
+[ "$1" = "/fake target/program" ] || exit 92
+[ "$2" = "two words stay together" ] || exit 93
+[ "$3" = "; literal shell text" ] || exit 94
+[ "$4" = '$(not-a-shell)' ] || exit 95
+printf '%s\n' '{TRACE_ROW}' > "$trace" || exit 96
+printf '%s\n' '{FAKE_DIAGNOSTIC}' >&2
+exit 37
+"##
+    );
+    fs::write(&fake_strace, script).expect("write fake strace executable");
+    fs::set_permissions(&fake_strace, fs::Permissions::from_mode(0o700))
+        .expect("make fake strace executable");
+
+    let trace_path = directory.path().join("fake-capture.trace");
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut path_entries = vec![fake_bin];
+    path_entries.extend(std::env::split_paths(&inherited_path));
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["record", "--trace"])
+        .arg(&trace_path)
+        .args(["--", "/fake target/program", "two words stay together"])
+        .args(["; literal shell text", "$(not-a-shell)"])
+        .env(
+            "PATH",
+            std::env::join_paths(path_entries).expect("join PATH entries"),
+        )
+        .output()
+        .expect("launch SideEffect against fake strace");
+
+    assert_eq!(
+        output.status.code(),
+        Some(37),
+        "the CLI should propagate only the fake tracer's reported status; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(FAKE_DIAGNOSTIC), "stderr: {stderr}");
+    assert!(
+        stderr.contains("strace-reported and propagated exit status: 37"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("strace normally mirrors the wrapped command")
+            && stderr.contains("does not prove tracer success or capture completeness"),
+        "the status caveat should remain explicit; stderr: {stderr}"
+    );
+    assert!(!stderr.contains("target exited"), "stderr: {stderr}");
+
+    assert_published_nonempty_trace(&trace_path);
+    assert_eq!(
+        fs::read_to_string(&trace_path).unwrap(),
+        format!("{TRACE_ROW}\n")
+    );
+    let inspected = inspect_trace(&trace_path);
+    assert_eq!(inspected["parse_status"], "complete");
+    assert!(
+        inspected["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| { record["kind"] == "syscall" && record["raw_line"] == TRACE_ROW })
+    );
+}
+
+#[test]
 fn record_propagates_nonzero_target_exit_after_publishing_trace() {
     require_tool("strace", &["--version"]);
     require_tool("python3", &["--version"]);

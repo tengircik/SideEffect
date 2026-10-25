@@ -1212,7 +1212,7 @@ mod tests {
     use super::{
         AnchoredOutput, ParseLimits, compare_traces, parse_trace_bytes, publish_html_report,
     };
-    use super::{CappedBuffer, read_limited, read_trace_file};
+    use super::{CappedBuffer, MAX_REPORT_BYTES, read_limited, read_trace_file};
     use std::fs::{self, OpenOptions};
     use std::io::{self, Cursor, Write};
     use std::path::PathBuf;
@@ -1260,6 +1260,19 @@ mod tests {
         buffer.write_all(b"abc").unwrap();
         assert!(buffer.write_all(b"d").is_err());
         assert_eq!(buffer.bytes, b"abc");
+        assert!(buffer.exceeded);
+    }
+
+    #[test]
+    fn capped_buffer_enforces_production_report_limit_at_boundary() {
+        let mut buffer = CappedBuffer::new(MAX_REPORT_BYTES);
+        buffer.bytes.resize(MAX_REPORT_BYTES - 1, 0);
+        buffer.write_all(b"x").unwrap();
+        assert_eq!(buffer.bytes.len(), MAX_REPORT_BYTES);
+        assert!(!buffer.exceeded);
+
+        assert!(buffer.write_all(b"y").is_err());
+        assert_eq!(buffer.bytes.len(), MAX_REPORT_BYTES);
         assert!(buffer.exceeded);
     }
 
@@ -1314,6 +1327,40 @@ mod tests {
         drop(output);
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
         fs::remove_dir(&directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn html_publish_race_cleans_staging_and_preserves_source_evidence() {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "sideeffect-html-race-test-{}-{id}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let baseline_path = directory.join("baseline.trace");
+        let candidate_path = directory.join("candidate.trace");
+        let report_path = directory.join("race.html");
+        fs::write(&baseline_path, b"close(1) = 0\n").unwrap();
+        fs::write(&candidate_path, b"").unwrap();
+        let baseline_evidence = fs::read(&baseline_path).unwrap();
+        let candidate_evidence = fs::read(&candidate_path).unwrap();
+
+        let baseline = parse_trace_bytes(&baseline_evidence, ParseLimits::default()).unwrap();
+        let candidate = parse_trace_bytes(&candidate_evidence, ParseLimits::default()).unwrap();
+        let diff = compare_traces(&baseline, &candidate).unwrap();
+        let mut output = AnchoredOutput::prepare(&report_path).unwrap();
+        fs::write(&report_path, b"concurrent writer").unwrap();
+
+        let error = publish_html_report(&mut output, &diff, MAX_REPORT_BYTES).unwrap_err();
+        assert!(error.contains("without replacing a file"));
+        drop(output);
+
+        assert_eq!(fs::read(&report_path).unwrap(), b"concurrent writer");
+        assert_eq!(fs::read(&baseline_path).unwrap(), baseline_evidence);
+        assert_eq!(fs::read(&candidate_path).unwrap(), candidate_evidence);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 3);
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[cfg(target_os = "linux")]

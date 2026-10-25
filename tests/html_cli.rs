@@ -64,6 +64,8 @@ fn run_html(
 fn html_command_publishes_private_offline_escaped_report_without_input_paths() {
     let directory = TempDirectory::new();
     let (baseline, candidate) = directory.traces();
+    let baseline_evidence = fs::read(&baseline).unwrap();
+    let candidate_evidence = fs::read(&candidate).unwrap();
     let report_path = directory.0.join("comparison.html");
     let output = run_html(&report_path, &baseline, &candidate);
 
@@ -85,18 +87,26 @@ fn html_command_publishes_private_offline_escaped_report_without_input_paths() {
     assert!(!report.contains("<script"));
     assert!(!report.contains("src=\"http"));
     assert!(!report.contains("href=\"http"));
+    assert_eq!(fs::read(&baseline).unwrap(), baseline_evidence);
+    assert_eq!(fs::read(&candidate).unwrap(), candidate_evidence);
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 3);
 }
 
 #[test]
 fn existing_file_and_symlink_destinations_are_left_untouched() {
     let directory = TempDirectory::new();
     let (baseline, candidate) = directory.traces();
+    let baseline_evidence = fs::read(&baseline).unwrap();
+    let candidate_evidence = fs::read(&candidate).unwrap();
     let existing = directory.0.join("existing.html");
     fs::write(&existing, b"keep existing report").unwrap();
     let output = run_html(&existing, &baseline, &candidate);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("already exists"));
     assert_eq!(fs::read(&existing).unwrap(), b"keep existing report");
+    assert_eq!(fs::read(&baseline).unwrap(), baseline_evidence);
+    assert_eq!(fs::read(&candidate).unwrap(), candidate_evidence);
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 3);
 
     let target = directory.0.join("symlink-target.html");
     fs::write(&target, b"keep symlink target").unwrap();

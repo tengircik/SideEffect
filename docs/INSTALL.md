@@ -36,7 +36,7 @@ The last recorded hosted validation snapshot is commit `60e9eb236d25442d65c3f0a1
 
 ## Build from source
 
-You need repository access to obtain the source. Anonymous HTTPS access to the repository has not been confirmed; if access has been granted to your account, use the clone method configured for that account (HTTPS or SSH). The HTTPS command below is an example, not a promise that the repository is publicly readable:
+The source repository is public and can be cloned over HTTPS or SSH:
 
 ```sh
 git clone https://github.com/tengircik/SideEffect.git

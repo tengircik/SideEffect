@@ -153,7 +153,7 @@ See [SECURITY.md](../SECURITY.md) for the project threat model, privacy guidance
 
 ## Runtime and distribution assumptions
 
-Rust is the planned implementation stack for the core CLI, parser, schema, diff engine, and renderer to support a compact distributable executable. The external `strace` dependency remains required and must be checked at runtime. Supported version range, installation instructions, packaging, and license compatibility are unresolved implementation decisions. This plan does not authorize installing toolchains or modifying source code.
+Rust is the implementation stack for the core CLI, parser, schema, diff engine, and renderer. The source crate declares Apache-2.0 in `Cargo.toml` and includes the matching `LICENSE`. Runtime capture requires a separately installed external `strace` 6.8 or newer; SideEffect does not link, bundle, or redistribute `strace`. Upstream identifies `strace` itself as LGPL-2.1-or-later ([upstream license statement](https://github.com/strace/strace/blob/master/README.md)). Users obtain it through their operating-system package source. Any future installer or binary distribution that includes `strace` requires a separate review of the exact binary's license, notices, and package obligations; current source-only distribution does not establish legal clearance for such bundling.
 
 The initial platform target is Linux x86_64. Existing WSL2 environments may be used by Windows developers/users as a Linux environment, but SideEffect v0 makes no native Windows tracing claim and does not assume WSL2 is installed.
 

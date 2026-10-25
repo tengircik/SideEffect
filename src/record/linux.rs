@@ -537,11 +537,28 @@ fn verify_strace_version_with_timeout(
             Ok(())
         });
     }
-    let mut child = version_command.spawn().map_err(|error| {
-        RecordError::before_launch(format!(
-            "could not query strace version: {error}; the command was not started"
-        ))
-    })?;
+    let deadline = Instant::now() + query_timeout;
+    let mut child = loop {
+        match version_command.spawn() {
+            Ok(child) => break child,
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(RecordError::before_launch(format!(
+                        "strace version check timed out after {query_timeout:?} while the executable remained busy; the command was not started"
+                    )));
+                }
+                std::thread::sleep(
+                    Duration::from_millis(POLL_INTERVAL_MS as u64).min(deadline - now),
+                );
+            }
+            Err(error) => {
+                return Err(RecordError::before_launch(format!(
+                    "could not query strace version: {error}; the command was not started"
+                )));
+            }
+        }
+    };
     let Some(mut stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
@@ -549,7 +566,6 @@ fn verify_strace_version_with_timeout(
             "could not read strace version output; the command was not started",
         ));
     };
-    let deadline = Instant::now() + query_timeout;
     let mut output = Vec::with_capacity(128);
     let mut buffer = [0u8; 512];
     let mut eof = false;
@@ -1311,6 +1327,32 @@ mod tests {
         assert!(error.to_string().contains("version check timed out"));
         assert!(started.elapsed() >= Duration::from_millis(100));
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn version_query_retries_while_tracer_executable_is_write_locked() {
+        let directory = TestDirectory::new();
+        let tracer = directory.fake_tracer_script(
+            "#!/bin/sh\nif [ \"$1\" = \"-V\" ]; then printf '%s\\n' 'strace -- version 6.8'; exit 0; fi\nexit 1\n",
+        );
+        let writer = OpenOptions::new()
+            .write(true)
+            .open(&tracer)
+            .expect("hold tracer open for writing");
+        let release_writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(125));
+            drop(writer);
+        });
+
+        let started = Instant::now();
+        let version =
+            verify_strace_version_with_timeout(&tracer.as_os_str(), Duration::from_secs(2))
+                .expect("version query retries until the transient write lock is released");
+        release_writer.join().unwrap();
+
+        assert_eq!((version.major, version.minor), (6, 8));
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

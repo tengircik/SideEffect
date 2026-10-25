@@ -267,6 +267,7 @@ fn record_kind_name(kind: TraceRecordKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::write_html_diff;
+    use crate::limits::MAX_REPORT_BYTES;
     use crate::model::{
         CaptureCompleteness, DeltaKind, EventCategory, EvidenceReference, MatchingPolicy,
         ObservedDelta, TRACE_DIFF_SCHEMA_VERSION, TraceDiff, TraceRecordKind,
@@ -443,6 +444,39 @@ mod tests {
         cap: usize,
     }
 
+    struct CappedCounter {
+        bytes: usize,
+        cap: usize,
+    }
+
+    impl Write for CappedCounter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            let remaining = self.cap.saturating_sub(self.bytes);
+            if remaining == 0 {
+                return Err(io::Error::other("output cap exceeded"));
+            }
+            let written = remaining.min(buffer.len());
+            self.bytes += written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn arguments_for_rendered_size(base_size: usize, target_size: usize) -> String {
+        let extra = target_size - base_size;
+        let escaped = extra / 5;
+        let plain = extra % 5;
+        let mut arguments = "&".repeat(escaped);
+        arguments.push_str(&"x".repeat(plain));
+        arguments
+    }
+
     impl Write for CappedWriter {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
             let remaining = self.cap.saturating_sub(self.bytes.len());
@@ -472,5 +506,30 @@ mod tests {
         let error = write_html_diff(&diff, &mut capped).unwrap_err();
         assert_eq!(error.to_string(), "output cap exceeded");
         assert_eq!(capped.bytes.len(), 48);
+    }
+
+    #[test]
+    fn html_render_accepts_exact_report_limit_and_rejects_one_byte_over() {
+        let base = make_diff("");
+        let mut base_bytes = Vec::new();
+        write_html_diff(&base, &mut base_bytes).unwrap();
+        let exact_arguments = arguments_for_rendered_size(base_bytes.len(), MAX_REPORT_BYTES);
+        let exact = make_diff(&exact_arguments);
+        let mut exact_counter = CappedCounter {
+            bytes: 0,
+            cap: MAX_REPORT_BYTES,
+        };
+        write_html_diff(&exact, &mut exact_counter).unwrap();
+        assert_eq!(exact_counter.bytes, MAX_REPORT_BYTES);
+
+        let over_arguments = arguments_for_rendered_size(base_bytes.len(), MAX_REPORT_BYTES + 1);
+        let over = make_diff(&over_arguments);
+        let mut over_counter = CappedCounter {
+            bytes: 0,
+            cap: MAX_REPORT_BYTES,
+        };
+        let error = write_html_diff(&over, &mut over_counter).unwrap_err();
+        assert_eq!(error.to_string(), "output cap exceeded");
+        assert_eq!(over_counter.bytes, MAX_REPORT_BYTES);
     }
 }
