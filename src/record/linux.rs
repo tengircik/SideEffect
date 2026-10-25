@@ -1158,14 +1158,15 @@ mod tests {
         let directory = TestDirectory::new();
         let destination = directory.0.join("raced.trace");
         let script = format!(
-            "while [ \"$1\" != \"-o\" ]; do shift; done\nfifo=$2\nprintf 'captured\\n' > \"$fifo\"\nprintf 'concurrent writer' > '{}'",
+            "while [ \"$1\" != \"-o\" ]; do shift; done\nfifo=$2\nprintf 'concurrent writer' > '{}'\nprintf 'captured\\n' > \"$fifo\"",
             destination.display()
         );
         let error = run_fake(&directory, &script, "raced.trace", 64).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("without replacing an existing path")
+                .contains("without replacing an existing path"),
+            "unexpected recorder error: {error}"
         );
         assert_eq!(fs::read(&destination).unwrap(), b"concurrent writer");
         assert_eq!(
