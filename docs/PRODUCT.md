@@ -8,6 +8,8 @@ The product is a local command-line tool for observing selected operating-system
 
 The initial implementation is planned for Linux x86_64 and uses an external `strace` executable. Windows users may develop or run it through an existing WSL2 installation, but native Windows support is not part of v0. Rust is the planned implementation language for the CLI, parser, event schema, comparison engine, and local report renderer. No LLM or hosted service is required.
 
+Published traces, bundles, and report files are written to paths chosen by the user and remain there until the user deletes them. SideEffect does not upload, rotate, or automatically delete published data. Handled failures and cancellation clean up private staging directories; a machine crash can leave one behind. Treat traces and reports as sensitive data.
+
 ## Problem
 
 Developers often know that two executions behaved differently but cannot quickly see the OS-level interactions that changed. Raw syscall logs contain useful evidence, but they are difficult to compare: process IDs, file descriptors, timestamps, and concurrent event ordering vary between runs. Existing runtime tracers can collect broad events, but a useful review artifact needs to connect a compact difference back to the exact observed events without presenting correlation as proof of cause.
@@ -99,7 +101,7 @@ These are acceptance targets for future implementation and tests, not claims abo
 ## Open decisions
 
 - Exact `strace` version range, supported distributions, and behavior when a requested event class is unavailable.
-- Trace storage layout, retention/deletion behavior, and whether raw traces are compressed.
+- Whether raw traces should be compressed; published-data retention and deletion are user-controlled as described above.
 - Capture diagnostics needed to independently distinguish tracer failure from a wrapped command result. `record` currently propagates strace's reported status only after successful trace publication and does not independently verify tracer success or command status.
 - Safe handling of command output when stdout/stderr are streamed or captured.
 - JSON schema versioning and compatibility policy.
