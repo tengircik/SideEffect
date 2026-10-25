@@ -248,7 +248,12 @@ fn record_inherits_target_output_and_publishes_failed_exec_evidence() {
     let failure = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .args(["record", "--trace"])
         .arg(&failure_trace)
-        .arg("--")
+        .args([
+            "--",
+            "python3",
+            "-c",
+            "import os, sys; os.execv(sys.argv[1], [sys.argv[1]])",
+        ])
         .arg(&failed_program)
         .output()
         .expect("launch SideEffect record command for failed exec");
