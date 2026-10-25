@@ -302,6 +302,31 @@ fn physical_record_size_limit_is_enforced_at_and_beyond_boundary() {
 }
 
 #[test]
+fn configured_record_size_limit_accepts_exactly_max_bytes() {
+    let mut record = b"close(3".to_vec();
+    record.resize(MAX_RECORD_BYTES - b") = 0".len(), b' ');
+    record.extend_from_slice(b") = 0");
+
+    let document = parse_trace_bytes(&record, ParseLimits::default()).unwrap();
+    assert_eq!(record.len(), MAX_RECORD_BYTES);
+    assert_eq!(document.parse_status, ParseCompleteness::Complete);
+    assert_eq!(document.records.len(), 1);
+    assert_eq!(document.records[0].kind, TraceRecordKind::Syscall);
+    assert_eq!(document.records[0].evidence.byte_length, MAX_RECORD_BYTES as u64);
+
+    record.push(b' ');
+    assert_eq!(
+        parse_trace_bytes(&record, ParseLimits::default()),
+        Err(ParseError::RecordTooLarge {
+            line_number: 1,
+            byte_offset: 0,
+            actual_bytes: MAX_RECORD_BYTES + 1,
+            maximum_bytes: MAX_RECORD_BYTES,
+        })
+    );
+}
+
+#[test]
 fn within_limit_unterminated_fd_annotation_is_retained_as_malformed() {
     let prefix = b"1 1700000008.000001 close(";
     let mut line = prefix.to_vec();
