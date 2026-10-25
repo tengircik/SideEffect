@@ -1,4 +1,4 @@
-use sideeffect::limits::{MAX_RECORD_BYTES, ParseLimits};
+use sideeffect::limits::{MAX_RECORD_BYTES, MAX_RECORDS, ParseLimits};
 use sideeffect::model::{ParseCompleteness, SyscallOutcome, TraceRecordKind};
 use sideeffect::trace::strace::{ParseError, parse_trace_bytes};
 
@@ -357,6 +357,28 @@ fn record_count_limit_is_enforced_without_silent_truncation() {
             .records
             .len(),
         1
+    );
+}
+
+#[test]
+fn configured_record_count_limit_accepts_exactly_max_records() {
+    let row = b"close(3) = 0\n";
+    let mut input = Vec::with_capacity(row.len() * (MAX_RECORDS + 1));
+    for _ in 0..MAX_RECORDS {
+        input.extend_from_slice(row);
+    }
+
+    let document = parse_trace_bytes(&input, ParseLimits::default()).unwrap();
+    assert_eq!(document.records.len(), MAX_RECORDS);
+    assert_eq!(document.parse_status, ParseCompleteness::Complete);
+
+    input.extend_from_slice(row);
+    assert_eq!(
+        parse_trace_bytes(&input, ParseLimits::default()),
+        Err(ParseError::TooManyRecords {
+            line_number: (MAX_RECORDS + 1) as u64,
+            maximum_records: MAX_RECORDS,
+        })
     );
 }
 
