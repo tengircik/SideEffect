@@ -332,13 +332,12 @@ fn collect_with_record_limit(
                 continue;
             }
             let record_budget = max_records.saturating_sub(records_parsed);
-            let (keys, issues, has_desktop_entry, records_read, limit_at) =
-                parse_with_limit(&bytes, record_budget);
-            records_parsed = records_parsed.saturating_add(records_read);
-            for (line, byte_offset) in &issues {
+            let parsed = parse_with_limit(&bytes, record_budget);
+            records_parsed = records_parsed.saturating_add(parsed.records_read);
+            for (line, byte_offset) in &parsed.issues {
                 diag_at(&mut d, "malformed_line", Some(&path), *line, *byte_offset);
             }
-            if let Some((line, byte_offset)) = limit_at {
+            if let Some((line, byte_offset)) = parsed.limit_at {
                 diag_at(
                     &mut d,
                     "record_limit_exceeded",
@@ -349,7 +348,7 @@ fn collect_with_record_limit(
                 partial = true;
                 record_limit_reached = true;
             }
-            if !issues.is_empty() || !has_desktop_entry {
+            if !parsed.issues.is_empty() || !parsed.has_desktop_entry {
                 diag(&mut d, "malformed_desktop_entry", Some(&path));
                 partial = true;
             }
@@ -357,7 +356,7 @@ fn collect_with_record_limit(
                 scope,
                 source_path: display_path(&path),
                 applicability: "not_evaluated",
-                keys,
+                keys: parsed.keys,
             });
             if record_limit_reached {
                 break;
@@ -367,7 +366,7 @@ fn collect_with_record_limit(
             diag(&mut d, code, None);
             partial = true;
         }
-        if d.diagnostics.len() > 0 {
+        if !d.diagnostics.is_empty() {
             d.status = Status::Partial;
             partial = true;
         }
@@ -403,20 +402,19 @@ fn collect_with_record_limit(
 }
 #[cfg(test)]
 fn parse(bytes: &[u8]) -> (Vec<KeyEvidence>, Vec<(usize, usize)>, bool) {
-    let (keys, issues, has_desktop_entry, _, _) = parse_with_limit(bytes, MAX_STARTUP_RECORDS);
-    (keys, issues, has_desktop_entry)
+    let parsed = parse_with_limit(bytes, MAX_STARTUP_RECORDS);
+    (parsed.keys, parsed.issues, parsed.has_desktop_entry)
 }
 
-fn parse_with_limit(
-    bytes: &[u8],
-    max_records: usize,
-) -> (
-    Vec<KeyEvidence>,
-    Vec<(usize, usize)>,
-    bool,
-    usize,
-    Option<(usize, usize)>,
-) {
+struct ParsedStartupFile {
+    keys: Vec<KeyEvidence>,
+    issues: Vec<(usize, usize)>,
+    has_desktop_entry: bool,
+    records_read: usize,
+    limit_at: Option<(usize, usize)>,
+}
+
+fn parse_with_limit(bytes: &[u8], max_records: usize) -> ParsedStartupFile {
     let mut out = Vec::new();
     let mut issues = Vec::new();
     let mut section = false;
@@ -472,7 +470,13 @@ fn parse_with_limit(
         }
         offset += line0.len();
     }
-    (out, issues, has_desktop_entry, records_read, limit_at)
+    ParsedStartupFile {
+        keys: out,
+        issues,
+        has_desktop_entry,
+        records_read,
+        limit_at,
+    }
 }
 fn unparsed(line: &[u8], number: usize, offset: usize, raw_line: &[u8]) -> KeyEvidence {
     let (value, value_hex) = match std::str::from_utf8(line) {
@@ -501,7 +505,13 @@ fn trim_ascii(b: &[u8]) -> &[u8] {
     &b[a..z]
 }
 fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(b.len().saturating_mul(2));
+    for byte in b {
+        output.push(char::from(HEX[(byte >> 4) as usize]));
+        output.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+    output
 }
 fn display_path(p: &Path) -> String {
     p.to_string_lossy().into_owned()
@@ -571,20 +581,20 @@ mod tests {
     #[test]
     fn physical_line_record_limit_accepts_exact_boundary_and_reports_next_line() {
         let exact = b"[Desktop Entry]\nName=a\n";
-        let (keys, issues, found, records, limit_at) = parse_with_limit(exact, 2);
-        assert_eq!(records, 2);
-        assert!(limit_at.is_none());
-        assert!(issues.is_empty());
-        assert!(found);
-        assert_eq!(keys.len(), 1);
+        let parsed = parse_with_limit(exact, 2);
+        assert_eq!(parsed.records_read, 2);
+        assert!(parsed.limit_at.is_none());
+        assert!(parsed.issues.is_empty());
+        assert!(parsed.has_desktop_entry);
+        assert_eq!(parsed.keys.len(), 1);
 
         let over = b"[Desktop Entry]\nName=a\nextra\n";
-        let (keys, issues, found, records, limit_at) = parse_with_limit(over, 2);
-        assert_eq!(records, 2);
-        assert_eq!(limit_at, Some((3, exact.len())));
-        assert!(issues.is_empty());
-        assert!(found);
-        assert_eq!(keys.len(), 1);
+        let parsed = parse_with_limit(over, 2);
+        assert_eq!(parsed.records_read, 2);
+        assert_eq!(parsed.limit_at, Some((3, exact.len())));
+        assert!(parsed.issues.is_empty());
+        assert!(parsed.has_desktop_entry);
+        assert_eq!(parsed.keys.len(), 1);
     }
     #[test]
     fn missing_desktop_entry_section_is_detected() {
