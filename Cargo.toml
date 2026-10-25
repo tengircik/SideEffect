@@ -5,6 +5,10 @@ edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
 description = "Evidence-preserving inspection of strace text captures"
+repository = "https://github.com/tengircik/SideEffect"
+homepage = "https://github.com/tengircik/SideEffect"
+documentation = "https://github.com/tengircik/SideEffect/blob/main/docs/INSTALL.md"
+readme = "README.md"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
