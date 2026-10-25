@@ -280,10 +280,11 @@ fn add_unknown(object: &mut serde_json::Map<String, Value>, unknown: &str) {
     if let Some(unknowns) = object
         .get_mut("known_unknowns")
         .and_then(Value::as_array_mut)
-        && !unknowns.iter().any(|value| value.as_str() == Some(unknown))
     {
-        unknowns.push(Value::String(unknown.to_owned()));
-        unknowns.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+        if !unknowns.iter().any(|value| value.as_str() == Some(unknown)) {
+            unknowns.push(Value::String(unknown.to_owned()));
+            unknowns.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+        }
     }
 }
 
