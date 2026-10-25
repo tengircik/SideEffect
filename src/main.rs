@@ -39,9 +39,11 @@ use sideeffect::model::{BundleCaptureContext, ParseCompleteness, TraceDiff, Trac
 use sideeffect::record::AnchoredOutput;
 #[cfg(target_os = "linux")]
 use sideeffect::record::publish_private_file;
+use sideeffect::startup_correlation::correlate_startup_bytes;
 use sideeffect::trace::strace::parse_trace_bytes;
 
 const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect inspect [--format json|text] --bundle <run-bundle-directory>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff --bundles [--format json|text] <baseline-bundle> <candidate-bundle>\n       sideeffect diff --bundles --format html --output <report.html> <baseline-bundle> <candidate-bundle>\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect inventory packages --output <new-inventory.json>\n\
+       sideeffect correlate-startup <startup-inventory.json> <strace-trace-file>\n\
        sideeffect inventory processes --output <new-inventory.json>\n\
        sideeffect inventory startup --output <new-inventory.json>\n\
        sideeffect inventory permissions --output <new-inventory.json> <path>...\n\
@@ -68,6 +70,9 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         [command, path] if command == "inspect" => inspect(path),
+        [command, startup_path, trace_path] if command == "correlate-startup" => {
+            correlate_startup(startup_path, trace_path)
+        }
         [command, subcommand, option, output]
             if command == "inventory" && subcommand == "packages" && option == "--output" =>
         {
@@ -541,6 +546,37 @@ fn terminal_safe_path(path: &Path) -> String {
 
 fn inspect(path: &OsString) -> Result<ExitCode, String> {
     inspect_with_format(&OsString::from("json"), path)
+}
+
+fn correlate_startup(startup_path: &OsString, trace_path: &OsString) -> Result<ExitCode, String> {
+    let startup_bytes = read_input_file(
+        Path::new(startup_path),
+        MAX_REPORT_BYTES,
+        "startup inventory",
+    )?;
+    let trace_bytes = read_input_file(Path::new(trace_path), MAX_TRACE_BYTES, "trace")?;
+    let report = correlate_startup_bytes(&startup_bytes, &trace_bytes)?;
+    let complete = report.status == "complete";
+    let match_count = report.summary.candidate_match_path_count;
+    let mut json = CappedBuffer::new(MAX_REPORT_BYTES);
+    serde_json::to_writer(&mut json, &report).map_err(|error| {
+        format!("startup correlation exceeds the {MAX_REPORT_BYTES} byte output limit: {error}")
+    })?;
+    json.write_all(b"\n").map_err(|_| {
+        format!("startup correlation exceeds the {MAX_REPORT_BYTES} byte output limit")
+    })?;
+    write_buffer(&json, "startup correlation")?;
+    if complete {
+        eprintln!(
+            "Compared the supplied snapshots and found {match_count} candidate path-match group(s). Candidate matches do not prove startup-hook execution or causation."
+        );
+        Ok(ExitCode::SUCCESS)
+    } else {
+        eprintln!(
+            "Saved partial startup-correlation results with {match_count} candidate path-match group(s). Check input statuses and diagnostics; missing matches remain unknown."
+        );
+        Ok(ExitCode::from(2))
+    }
 }
 
 fn evidence(
@@ -1307,27 +1343,34 @@ fn read_bounded(path: &OsString) -> Result<Vec<u8>, String> {
 }
 
 fn read_trace_file(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
-    let metadata =
-        fs::metadata(path).map_err(|error| format!("could not inspect trace input: {error}"))?;
+    read_input_file(path, limit, "trace")
+}
+
+fn read_input_file(path: &Path, limit: usize, description: &str) -> Result<Vec<u8>, String> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("could not inspect {description} input: {error}"))?;
     if !metadata.is_file() {
-        return Err(
-            "trace input must be a regular file; pipes and devices are not accepted".to_owned(),
-        );
+        return Err(format!(
+            "{description} input must be a regular file; pipes and devices are not accepted"
+        ));
     }
     let length = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
     if length > limit {
-        return Err(format!("trace input exceeds the {limit} byte limit"));
+        return Err(format!(
+            "{description} input exceeds the {limit} byte limit"
+        ));
     }
-    let file =
-        open_trace_file(path).map_err(|error| format!("could not open trace input: {error}"))?;
+    let file = open_trace_file(path)
+        .map_err(|error| format!("could not open {description} input: {error}"))?;
     if !file
         .metadata()
-        .map_err(|error| format!("could not inspect opened trace input: {error}"))?
+        .map_err(|error| format!("could not inspect opened {description} input: {error}"))?
         .is_file()
     {
-        return Err("opened trace input is not a regular file".to_owned());
+        return Err(format!("opened {description} input is not a regular file"));
     }
     read_limited(file, limit)
+        .map_err(|error| error.replace("trace input", &format!("{description} input")))
 }
 
 #[cfg(target_os = "linux")]

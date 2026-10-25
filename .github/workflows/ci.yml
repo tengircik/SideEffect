@@ -45,6 +45,9 @@ jobs:
       - name: Run real strace capture integration test
         run: cargo test --locked --test record_observations real_strace_capture_inspect_and_diff_observe_file_and_loopback_events -- --exact
 
+      - name: Run startup correlation against a real strace capture
+        run: cargo test --locked --test startup_correlation_real_strace real_strace_capture_can_match_a_synthetic_literal_startup_row -- --exact
+
   linux:
     name: Linux
     runs-on: ubuntu-latest

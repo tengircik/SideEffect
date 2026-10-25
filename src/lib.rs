@@ -5,4 +5,5 @@ pub mod inventory;
 pub mod limits;
 pub mod model;
 pub mod record;
+pub mod startup_correlation;
 pub mod trace;
