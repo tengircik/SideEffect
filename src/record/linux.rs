@@ -989,7 +989,7 @@ mod tests {
         assert_eq!(manifest["producer"]["architecture"], "x86_64");
         assert_eq!(manifest["capture"]["tracer"]["name"], "strace");
         assert_eq!(manifest["capture"]["tracer"]["major"], 6);
-        assert_eq!(manifest["capture"]["tracer"]["minor"], 6);
+        assert_eq!(manifest["capture"]["tracer"]["minor"], 8);
         assert_eq!(
             manifest["capture"]["capture_profile"],
             "linux_process_file_network_v1"
