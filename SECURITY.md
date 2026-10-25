@@ -67,9 +67,9 @@ The current comparison is a conservative parser-row diff, not a capture-complete
 
 ## Reporting a vulnerability
 
-**Availability of private reporting has not yet been verified.** Before the first public code release, maintainers must verify that GitHub private vulnerability reporting is enabled for this repository and publish its working report path here. No security email address or other private channel is designated in this document.
+**Private reporting is not currently available.** This repository is private, and GitHub's private vulnerability reporting feature is available only for public repositories. Before making the repository public, maintainers must decide on a private disclosure route. As part of the visibility transition, enable and verify GitHub private vulnerability reporting before announcing the project or inviting reports, then update this section with the working path. See GitHub's [private vulnerability reporting requirements](https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/configure-vulnerability-reporting/configure-for-a-repository). No security email address or other private channel is designated here.
 
-Until a private channel is verified, do not post exploit details, sensitive traces, or unpublished vulnerability information in a public issue. There is currently no confirmed private disclosure route; maintainers must configure one before the first public executable release.
+Until a private channel is verified, do not post exploit details, sensitive traces, or unpublished vulnerability information in a public issue. Do not announce a security reporting route until maintainers have tested it.
 
 When a verified channel is available, please include the affected commit or release, operating system and architecture, required tracer version, reproduction steps, and the impact you observed. Do not include real secrets or personal data in a report unless they are essential and you have arranged a private channel.
 
