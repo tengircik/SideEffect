@@ -59,6 +59,12 @@ fn live_proc_inventory_writes_private_schema_without_fixed_count_assumptions() {
             .iter()
             .all(|row| row.get("cmdline").is_none() && row.get("exe").is_none())
     );
+    assert!(value["processes"].as_array().unwrap().iter().all(|row| {
+        matches!(
+            row["executable_link"]["status"].as_str(),
+            Some("observed" | "inaccessible" | "vanished" | "over_limit" | "unsupported" | "error")
+        )
+    }));
     let collision = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .args(["inventory", "processes", "--output"])
         .arg(&output)

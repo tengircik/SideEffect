@@ -50,7 +50,7 @@ fn live_dpkg_query_writes_a_private_point_in_time_inventory() {
         .arg(&output)
         .output()
         .expect("start SideEffect inventory CLI");
-    assert_eq!(result.status.code(), Some(0));
+    assert!(matches!(result.status.code(), Some(0 | 2)));
     assert!(result.stdout.is_empty());
 
     let metadata = fs::metadata(&output).expect("inventory output exists");
@@ -59,10 +59,23 @@ fn live_dpkg_query_writes_a_private_point_in_time_inventory() {
     let inventory: serde_json::Value =
         serde_json::from_slice(&bytes).expect("inventory output is valid JSON");
     assert_eq!(inventory["schema"], "sideeffect.inventory");
-    assert_eq!(inventory["schema_version"], 1);
-    assert_eq!(inventory["status"], "complete");
-    assert_eq!(inventory["sources"][0]["id"], "dpkg_query");
-    assert_eq!(inventory["sources"][0]["status"], "complete");
+    assert_eq!(inventory["schema_version"], 2);
+    assert!(inventory["status"] == "complete" || inventory["status"] == "partial");
+    let dpkg = inventory["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["id"] == "dpkg_query")
+        .expect("dpkg source is reported");
+    assert_eq!(dpkg["status"], "complete");
+    assert_eq!(
+        result.status.code(),
+        Some(if inventory["status"] == "complete" {
+            0
+        } else {
+            2
+        })
+    );
     assert!(
         inventory["packages"]
             .as_array()

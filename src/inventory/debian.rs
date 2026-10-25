@@ -13,31 +13,92 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const DPKG_QUERY_PATH: &str = "/usr/bin/dpkg-query";
-const DPKG_QUERY_FORMAT: &str =
-    "${binary:Package}\\t${Version}\\t${Architecture}\\t${db:Status-Abbrev}\\n";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum PackageSourceKind {
+    Dpkg,
+    Rpm,
+    Pacman,
+    Apk,
+}
+
+pub(crate) struct PackageSourceRun {
+    pub(crate) document: InventoryDocument,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) stdout_bytes: usize,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) stderr_bytes: usize,
+}
+
+pub(crate) struct PackageSourceConfig {
+    pub(crate) id: &'static str,
+    pub(crate) executable: &'static str,
+    pub(crate) args: &'static [&'static str],
+    pub(crate) kind: PackageSourceKind,
+    pub(crate) stdout_limit: usize,
+    pub(crate) stderr_limit: usize,
+    pub(crate) row_limit: usize,
+    pub(crate) timeout: Duration,
+}
+
+pub(crate) fn current_time_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
 
 /// Run the fixed, read-only dpkg query and return a bounded point-in-time snapshot.
 /// No user input is passed to the child process and no privilege escalation is attempted.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn collect_debian_packages() -> InventoryDocument {
-    let captured_at_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let mut document = empty_document(captured_at_unix_ms);
+    collect_package_source(
+        PackageSourceConfig {
+            id: "dpkg_query",
+            executable: "/usr/bin/dpkg-query",
+            args: &[
+                "-W",
+                "-f",
+                "${binary:Package}\\t${Version}\\t${Architecture}\\t${db:Status-Abbrev}\\n",
+            ],
+            kind: PackageSourceKind::Dpkg,
+            stdout_limit: MAX_INVENTORY_STDOUT_BYTES,
+            stderr_limit: MAX_INVENTORY_STDERR_BYTES,
+            row_limit: MAX_INVENTORY_ROWS,
+            timeout: COMMAND_TIMEOUT,
+        },
+        current_time_unix_ms(),
+    )
+    .document
+}
 
-    let mut command = Command::new(DPKG_QUERY_PATH);
+pub(crate) fn collect_package_source(
+    config: PackageSourceConfig,
+    captured_at_unix_ms: u128,
+) -> PackageSourceRun {
+    let PackageSourceConfig {
+        id: source_id,
+        executable,
+        args,
+        kind,
+        stdout_limit,
+        stderr_limit,
+        row_limit,
+        timeout: command_timeout,
+    } = config;
+    let mut document = empty_document(source_id, captured_at_unix_ms);
+
+    let mut command = Command::new(executable);
     command
-        .arg("-W")
-        .arg("-f")
-        .arg(DPKG_QUERY_FORMAT)
+        .args(args)
         // Clear dpkg and shell-related redirection variables (including DPKG_ADMINDIR,
-        // DPKG_ROOT, DPKG_PAGER, PAGER, and SHELL) before invoking the fixed binary.
+        // DPKG_ROOT, DPKG_PAGER, PAGER, and SHELL) before invoking fixed package tools.
         .env_clear()
         .env("LC_ALL", "C")
+        .env("LANG", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -53,7 +114,11 @@ pub fn collect_debian_packages() -> InventoryDocument {
                 (InventorySourceStatus::Failed, "source_start_failed")
             };
             set_source_failure(&mut document, status, code);
-            return document;
+            return PackageSourceRun {
+                document,
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+            };
         }
     };
 
@@ -65,7 +130,11 @@ pub fn collect_debian_packages() -> InventoryDocument {
         );
         let _ = child.kill();
         let _ = child.wait();
-        return document;
+        return PackageSourceRun {
+            document,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+        };
     };
     let Some(stderr) = child.stderr.take() else {
         set_source_failure(
@@ -75,17 +144,21 @@ pub fn collect_debian_packages() -> InventoryDocument {
         );
         let _ = child.kill();
         let _ = child.wait();
-        return document;
+        return PackageSourceRun {
+            document,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+        };
     };
 
     let (stdout_tx, stdout_rx) = mpsc::sync_channel(1);
     let stdout_thread = thread::spawn(move || {
-        let result = read_capped(stdout, MAX_INVENTORY_STDOUT_BYTES);
+        let result = read_capped(stdout, stdout_limit);
         let _ = stdout_tx.send(result);
     });
     let (stderr_tx, stderr_rx) = mpsc::sync_channel(1);
     let stderr_thread = thread::spawn(move || {
-        let result = read_capped(stderr, MAX_INVENTORY_STDERR_BYTES);
+        let result = read_capped(stderr, stderr_limit);
         let _ = stderr_tx.send(result);
     });
 
@@ -109,7 +182,7 @@ pub fn collect_debian_packages() -> InventoryDocument {
             stderr_read_failed = result.read_failed;
             stderr_result = Some(result);
         }
-        if started.elapsed() >= COMMAND_TIMEOUT {
+        if started.elapsed() >= command_timeout {
             timed_out = true;
             let _ = child.kill();
             status = child.wait().ok();
@@ -150,12 +223,21 @@ pub fn collect_debian_packages() -> InventoryDocument {
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
     let stdout_bytes = stdout_result.bytes;
+    let stderr_bytes_read = stderr_result.bytes.len();
     let stderr_exceeded = stderr_result.exceeded;
     let stdout_exceeded = stdout_result.exceeded;
     stdout_read_failed |= stdout_result.read_failed;
     stderr_read_failed |= stderr_result.read_failed;
 
-    let parsed = parse_dpkg_query_output(&stdout_bytes, captured_at_unix_ms);
+    let stdout_bytes_read = stdout_bytes.len();
+    let parsed = parse_package_source_output(
+        source_id,
+        kind,
+        &stdout_bytes,
+        captured_at_unix_ms,
+        stdout_limit,
+        row_limit,
+    );
     document = parsed;
     let exit_code = status.as_ref().and_then(|exit| exit.code());
     finalize_child_result(
@@ -165,24 +247,47 @@ pub fn collect_debian_packages() -> InventoryDocument {
             wait_completed: status.is_some(),
             timed_out,
             stdout_exceeded,
+            stderr_bytes_read,
             stderr_exceeded,
             stdout_read_failed,
             stderr_read_failed,
         },
     );
-    document
+    PackageSourceRun {
+        document,
+        stdout_bytes: stdout_bytes_read,
+        stderr_bytes: stderr_bytes_read,
+    }
 }
 
 /// Parse bounded output from a synthetic fixture or a completed dpkg-query invocation.
 /// Every captured source row is represented as a package record or a diagnostic record.
 pub fn parse_dpkg_query_output(bytes: &[u8], captured_at_unix_ms: u128) -> InventoryDocument {
-    let mut document = empty_document(captured_at_unix_ms);
+    parse_package_source_output(
+        "dpkg_query",
+        PackageSourceKind::Dpkg,
+        bytes,
+        captured_at_unix_ms,
+        MAX_INVENTORY_STDOUT_BYTES,
+        MAX_INVENTORY_ROWS,
+    )
+}
+
+pub(crate) fn parse_package_source_output(
+    source_id: &'static str,
+    kind: PackageSourceKind,
+    bytes: &[u8],
+    captured_at_unix_ms: u128,
+    stdout_limit: usize,
+    row_limit: usize,
+) -> InventoryDocument {
+    let mut document = empty_document(source_id, captured_at_unix_ms);
     let source = &mut document.sources[0];
-    let bounded_bytes = &bytes[..bytes.len().min(MAX_INVENTORY_STDOUT_BYTES)];
+    let bounded_bytes = &bytes[..bytes.len().min(stdout_limit)];
     let mut offset = 0usize;
     let mut line = 1usize;
     while offset < bounded_bytes.len() {
-        if source.records_seen >= MAX_INVENTORY_ROWS {
+        if source.records_seen >= row_limit {
             let remainder = &bounded_bytes[offset..];
             source.diagnostics.push(InventoryDiagnostic {
                 code: "row_count_limit_exceeded",
@@ -204,26 +309,40 @@ pub fn parse_dpkg_query_output(bytes: &[u8], captured_at_unix_ms: u128) -> Inven
         source.records_seen += 1;
 
         if raw.len() > MAX_INVENTORY_ROW_BYTES {
-            let package = malformed_row(raw, line, record_offset, "row_length_limit_exceeded");
+            let package = malformed_row(
+                source_id,
+                raw,
+                line,
+                record_offset,
+                "row_length_limit_exceeded",
+            );
             add_row_diagnostic(source, &package);
             document.packages.push(package);
             source.status = InventorySourceStatus::Partial;
         } else if !terminated {
-            let package = malformed_row(raw, line, record_offset, "missing_line_terminator");
+            let package = malformed_row(
+                source_id,
+                raw,
+                line,
+                record_offset,
+                "missing_line_terminator",
+            );
             add_row_diagnostic(source, &package);
             document.packages.push(package);
             source.status = InventorySourceStatus::Partial;
-        } else if let Some((name, version, architecture, status_abbrev)) = parse_row(raw) {
+        } else if let Some((name, version, architecture, status_abbrev)) = parse_row(kind, raw) {
             document.packages.push(InventoryPackage {
+                source_id,
                 name: Some(name),
                 version: Some(version),
-                architecture: Some(architecture),
-                status_abbrev: Some(status_abbrev),
+                architecture,
+                status_abbrev,
                 evidence: evidence(raw, line, record_offset, true),
                 diagnostic_code: None,
             });
         } else {
-            let package = malformed_row(raw, line, record_offset, "malformed_source_row");
+            let package =
+                malformed_row(source_id, raw, line, record_offset, "malformed_source_row");
             add_row_diagnostic(source, &package);
             document.packages.push(package);
             source.status = InventorySourceStatus::Partial;
@@ -233,13 +352,13 @@ pub fn parse_dpkg_query_output(bytes: &[u8], captured_at_unix_ms: u128) -> Inven
         line += 1;
     }
 
-    if bytes.len() > MAX_INVENTORY_STDOUT_BYTES {
+    if bytes.len() > stdout_limit {
         source.status = InventorySourceStatus::OutputLimitExceeded;
         source.diagnostics.push(InventoryDiagnostic {
             code: "stdout_limit_exceeded",
             line: None,
-            byte_offset: Some(MAX_INVENTORY_STDOUT_BYTES),
-            byte_length: Some(bytes.len() - MAX_INVENTORY_STDOUT_BYTES),
+            byte_offset: Some(stdout_limit),
+            byte_length: Some(bytes.len() - stdout_limit),
             record_sha256: None,
         });
     }
@@ -252,26 +371,92 @@ pub fn parse_dpkg_query_output(bytes: &[u8], captured_at_unix_ms: u128) -> Inven
     document
 }
 
-fn parse_row(raw: &[u8]) -> Option<(String, String, String, String)> {
-    let fields = raw.split(|byte| *byte == b'\t').collect::<Vec<_>>();
-    if fields.len() != 4
-        || fields[0].is_empty()
-        || fields[0].iter().any(|byte| !is_field_byte(*byte))
-        || fields[1].iter().any(|byte| !is_field_byte(*byte))
-        || fields[2].iter().any(|byte| !is_field_byte(*byte))
-        || fields[3].len() != 3
-        || fields[3]
-            .iter()
-            .any(|byte| !byte.is_ascii() || (*byte != b' ' && byte.is_ascii_control()))
-    {
-        return None;
+fn parse_row(
+    kind: PackageSourceKind,
+    raw: &[u8],
+) -> Option<(String, String, Option<String>, Option<String>)> {
+    match kind {
+        PackageSourceKind::Dpkg => {
+            let fields = raw.split(|byte| *byte == b'\t').collect::<Vec<_>>();
+            if fields.len() != 4
+                || fields[0].is_empty()
+                || fields[0].iter().any(|byte| !is_field_byte(*byte))
+                || fields[1].iter().any(|byte| !is_field_byte(*byte))
+                || fields[2].iter().any(|byte| !is_field_byte(*byte))
+                || fields[3].len() != 3
+                || fields[3]
+                    .iter()
+                    .any(|byte| !byte.is_ascii() || (*byte != b' ' && byte.is_ascii_control()))
+            {
+                return None;
+            }
+            Some((
+                utf8(fields[0])?,
+                utf8(fields[1])?,
+                Some(utf8(fields[2])?),
+                Some(utf8(fields[3])?),
+            ))
+        }
+        PackageSourceKind::Rpm => {
+            let fields = raw.split(|byte| *byte == b'\t').collect::<Vec<_>>();
+            if fields.len() != 4
+                || fields[0].is_empty()
+                || fields[1].is_empty()
+                || fields[2].is_empty()
+                || fields[3] != b"installed"
+                || fields[..3]
+                    .iter()
+                    .any(|field| field.iter().any(|byte| !is_field_byte(*byte)))
+            {
+                return None;
+            }
+            Some((
+                utf8(fields[0])?,
+                utf8(fields[1])?,
+                Some(utf8(fields[2])?),
+                None,
+            ))
+        }
+        PackageSourceKind::Pacman => {
+            let separator = raw.iter().position(|byte| *byte == b' ')?;
+            let (name, version_with_separator) = raw.split_at(separator);
+            let version = &version_with_separator[1..];
+            if name.is_empty()
+                || version.is_empty()
+                || version.contains(&b' ')
+                || name.iter().chain(version).any(|byte| !is_field_byte(*byte))
+            {
+                return None;
+            }
+            Some((utf8(name)?, utf8(version)?, None, None))
+        }
+        PackageSourceKind::Apk => {
+            let split = raw
+                .windows(2)
+                .rposition(|pair| pair[0] == b'-' && pair[1].is_ascii_digit())?;
+            let name = &raw[..split];
+            let version = &raw[split + 1..];
+            if name.is_empty()
+                || version.is_empty()
+                || !version[0].is_ascii_digit()
+                || !name[0].is_ascii_alphanumeric()
+                || name.iter().any(|byte| {
+                    !byte.is_ascii_alphanumeric() && !matches!(*byte, b'.' | b'_' | b'+' | b'-')
+                })
+                || version.iter().any(|byte| {
+                    !byte.is_ascii_alphanumeric()
+                        && !matches!(*byte, b'.' | b'_' | b'~' | b'-' | b'+')
+                })
+            {
+                return None;
+            }
+            Some((utf8(name)?, utf8(version)?, None, None))
+        }
     }
-    Some((
-        String::from_utf8(fields[0].to_vec()).ok()?,
-        String::from_utf8(fields[1].to_vec()).ok()?,
-        String::from_utf8(fields[2].to_vec()).ok()?,
-        String::from_utf8(fields[3].to_vec()).ok()?,
-    ))
+}
+
+fn utf8(bytes: &[u8]) -> Option<String> {
+    String::from_utf8(bytes.to_vec()).ok()
 }
 
 fn is_field_byte(byte: u8) -> bool {
@@ -279,12 +464,14 @@ fn is_field_byte(byte: u8) -> bool {
 }
 
 fn malformed_row(
+    source_id: &'static str,
     raw: &[u8],
     line: usize,
     byte_offset: usize,
     code: &'static str,
 ) -> InventoryPackage {
     InventoryPackage {
+        source_id,
         name: None,
         version: None,
         architecture: None,
@@ -316,16 +503,16 @@ fn encode_hex(bytes: &[u8]) -> String {
     encoded
 }
 
-fn empty_document(captured_at_unix_ms: u128) -> InventoryDocument {
+fn empty_document(source_id: &'static str, captured_at_unix_ms: u128) -> InventoryDocument {
     InventoryDocument {
         schema: INVENTORY_SCHEMA,
         schema_version: INVENTORY_SCHEMA_VERSION,
         platform: "linux",
-        scope: "debian_package_database",
+        scope: "available_package_manager_databases",
         captured_at_unix_ms,
         status: InventoryStatus::Partial,
         sources: vec![InventorySource {
-            id: "dpkg_query",
+            id: source_id,
             status: InventorySourceStatus::Complete,
             exit_code: None,
             records_seen: 0,
@@ -370,6 +557,7 @@ struct ChildResult {
     wait_completed: bool,
     timed_out: bool,
     stdout_exceeded: bool,
+    stderr_bytes_read: usize,
     stderr_exceeded: bool,
     stdout_read_failed: bool,
     stderr_read_failed: bool,
@@ -390,6 +578,12 @@ fn finalize_child_result(document: &mut InventoryDocument, result: ChildResult) 
         if result.stderr_exceeded {
             source.diagnostics.push(diagnostic("stderr_limit_exceeded"));
         }
+    }
+    if result.stderr_bytes_read > 0 && !result.stderr_exceeded {
+        source.status = InventorySourceStatus::Partial;
+        source
+            .diagnostics
+            .push(diagnostic("source_stderr_nonempty"));
     }
     if result.stdout_read_failed || result.stderr_read_failed {
         source.status = InventorySourceStatus::Failed;
@@ -498,6 +692,7 @@ mod tests {
                 wait_completed: true,
                 timed_out: false,
                 stdout_exceeded: false,
+                stderr_bytes_read: 0,
                 stderr_exceeded: false,
                 stdout_read_failed: false,
                 stderr_read_failed: false,
@@ -515,6 +710,7 @@ mod tests {
                 wait_completed: true,
                 timed_out: false,
                 stdout_exceeded: false,
+                stderr_bytes_read: 0,
                 stderr_exceeded: false,
                 stdout_read_failed: false,
                 stderr_read_failed: false,
@@ -535,6 +731,7 @@ mod tests {
                 wait_completed: false,
                 timed_out: false,
                 stdout_exceeded: false,
+                stderr_bytes_read: 0,
                 stderr_exceeded: false,
                 stdout_read_failed: false,
                 stderr_read_failed: false,
@@ -552,6 +749,7 @@ mod tests {
                 wait_completed: true,
                 timed_out: false,
                 stdout_exceeded: false,
+                stderr_bytes_read: 0,
                 stderr_exceeded: false,
                 stdout_read_failed: true,
                 stderr_read_failed: false,

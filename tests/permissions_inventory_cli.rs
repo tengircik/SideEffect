@@ -53,11 +53,15 @@ fn explicit_path_inventory_is_private_versioned_and_no_clobber() {
     assert_eq!(value["schema"], "sideeffect.permission_inventory");
     assert_eq!(value["schema_version"], 1);
     assert_eq!(value["platform"], "linux");
-    assert_eq!(value["scope"], "explicit_paths_metadata_posix_acl");
+    assert_eq!(
+        value["scope"],
+        "explicit_paths_metadata_posix_acl_file_capability"
+    );
     assert_eq!(value["objects"].as_array().unwrap().len(), 1);
     assert_eq!(value["objects"][0]["object_type"], "regular_file");
     assert_eq!(value["objects"][0]["mode"].as_u64().unwrap() & 0o777, 0o640);
     assert_eq!(value["objects"][0]["path"], source.to_str().unwrap());
+    assert!(value["objects"][0]["file_capability"]["status"].is_string());
 
     let original = fs::read(&output).unwrap();
     let collision = Command::new(env!("CARGO_BIN_EXE_sideeffect"))

@@ -19,9 +19,9 @@ const SYNTHETIC_DPKG_QUERY_OUTPUT: &[u8] =
 fn parses_synthetic_rows_with_exact_evidence_offsets_and_schema() {
     let document = parse_dpkg_query_output(SYNTHETIC_DPKG_QUERY_OUTPUT, 1234);
     assert_eq!(document.schema, "sideeffect.inventory");
-    assert_eq!(document.schema_version, 1);
+    assert_eq!(document.schema_version, 2);
     assert_eq!(document.platform, "linux");
-    assert_eq!(document.scope, "debian_package_database");
+    assert_eq!(document.scope, "available_package_manager_databases");
     assert_eq!(document.captured_at_unix_ms, 1234);
     assert_eq!(document.status, InventoryStatus::Complete);
     assert_eq!(document.sources[0].id, "dpkg_query");
@@ -31,6 +31,7 @@ fn parses_synthetic_rows_with_exact_evidence_offsets_and_schema() {
 
     let first = &document.packages[0];
     assert_eq!(first.name.as_deref(), Some("alpha:amd64"));
+    assert_eq!(first.source_id, "dpkg_query");
     assert_eq!(first.version.as_deref(), Some("1.2.3"));
     assert_eq!(first.architecture.as_deref(), Some("amd64"));
     assert_eq!(first.status_abbrev.as_deref(), Some("ii "));
@@ -58,7 +59,7 @@ fn parses_synthetic_rows_with_exact_evidence_offsets_and_schema() {
 
     let json = serde_json::to_value(&document).unwrap();
     assert_eq!(json["schema"], "sideeffect.inventory");
-    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["schema_version"], 2);
     assert_eq!(json["packages"][0]["evidence"]["line"], 1);
     assert!(json.get("stderr").is_none());
 }
@@ -150,7 +151,7 @@ fn serialized_model_keeps_source_strings_inert_and_excludes_machine_metadata() {
     assert_eq!(value["packages"][0]["name"], "pkg&lt;script&gt;");
     assert_eq!(value["sources"][0]["id"], "dpkg_query");
     assert_eq!(value["platform"], "linux");
-    assert_eq!(value["scope"], "debian_package_database");
+    assert_eq!(value["scope"], "available_package_manager_databases");
     assert_eq!(value.as_object().unwrap().len(), 8);
     let rendered = serde_json::to_string(&value).unwrap();
     assert!(!rendered.contains("/usr/bin/dpkg-query"));

@@ -1,4 +1,4 @@
-//! Bounded, explicit-path Linux file metadata and POSIX ACL inventory.
+//! Bounded, explicit-path Linux file metadata, POSIX ACL, and file capability inventory.
 
 use crate::fingerprint::sha256_hex;
 use serde::Serialize;
@@ -14,12 +14,19 @@ pub const MAX_PERMISSION_PATHS: usize = 256;
 pub const MAX_PERMISSION_PATH_BYTES: usize = 4096;
 pub const MAX_ACL_XATTR_BYTES: usize = 64 * 1024;
 pub const MAX_PERMISSION_TOTAL_ACL_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_CAPABILITY_XATTR_BYTES: usize = 64 * 1024;
+pub const MAX_PERMISSION_TOTAL_CAPABILITY_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_PERMISSION_SCAN_DURATION: Duration = Duration::from_secs(5);
 
 const ACL_XATTR_ACCESS: &[u8] = b"system.posix_acl_access\0";
 const ACL_XATTR_DEFAULT: &[u8] = b"system.posix_acl_default\0";
+const CAPABILITY_XATTR: &[u8] = b"security.capability\0";
 const ACL_XATTR_VERSION: u32 = 0x0002;
 const ACL_UNDEFINED_ID: u32 = u32::MAX;
+const VFS_CAP_REVISION_1: u32 = 0x0100_0000;
+const VFS_CAP_REVISION_2: u32 = 0x0200_0000;
+const VFS_CAP_REVISION_3: u32 = 0x0300_0000;
+const VFS_CAP_FLAGS_EFFECTIVE: u32 = 0x0000_0001;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,6 +57,18 @@ pub enum AclStatus {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileCapabilityStatus {
+    Present,
+    Absent,
+    Inaccessible,
+    Unsupported,
+    Malformed,
+    LimitExceeded,
+    Failed,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct PermissionInventoryDocument {
     pub schema: &'static str,
@@ -60,6 +79,7 @@ pub struct PermissionInventoryDocument {
     pub status: PermissionInventoryStatus,
     pub paths_requested: usize,
     pub acl_bytes_read: usize,
+    pub capability_bytes_read: usize,
     pub objects: Vec<PermissionObject>,
     pub diagnostics: Vec<PermissionDiagnostic>,
 }
@@ -85,6 +105,7 @@ pub struct PermissionObject {
     pub inode: Option<u64>,
     pub access_acl: AclObservation,
     pub default_acl: AclObservation,
+    pub file_capability: FileCapabilityObservation,
     pub diagnostics: Vec<PermissionDiagnostic>,
 }
 
@@ -101,6 +122,29 @@ pub struct AclObservation {
     pub sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entries: Option<Vec<AclEntry>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FileCapabilityObservation {
+    pub status: FileCapabilityStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub byte_length: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permitted: Option<Vec<u8>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inheritable: Option<Vec<u8>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_id: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -142,6 +186,8 @@ struct Limits {
     path_bytes: usize,
     acl_bytes: usize,
     total_acl_bytes: usize,
+    capability_bytes: usize,
+    total_capability_bytes: usize,
     scan_duration: Duration,
 }
 
@@ -150,6 +196,8 @@ const LIMITS: Limits = Limits {
     path_bytes: MAX_PERMISSION_PATH_BYTES,
     acl_bytes: MAX_ACL_XATTR_BYTES,
     total_acl_bytes: MAX_PERMISSION_TOTAL_ACL_BYTES,
+    capability_bytes: MAX_CAPABILITY_XATTR_BYTES,
+    total_capability_bytes: MAX_PERMISSION_TOTAL_CAPABILITY_BYTES,
     scan_duration: MAX_PERMISSION_SCAN_DURATION,
 };
 
@@ -165,6 +213,7 @@ fn collect_with_limits(paths: &[PathBuf], limits: Limits) -> PermissionInventory
     let mut objects = Vec::new();
     let mut diagnostics = Vec::new();
     let mut acl_bytes_read = 0usize;
+    let mut capability_bytes_read = 0usize;
     let mut partial = false;
     let count = paths.len().min(limits.paths);
     let started = Instant::now();
@@ -177,7 +226,8 @@ fn collect_with_limits(paths: &[PathBuf], limits: Limits) -> PermissionInventory
                 code: "scan_deadline_exceeded",
                 path_index: Some(index),
                 source: None,
-                message: "The permission scan time limit was reached; remaining paths were not checked.",
+                message:
+                    "The permission scan time limit was reached; remaining paths were not checked.",
             });
             break;
         }
@@ -191,8 +241,10 @@ fn collect_with_limits(paths: &[PathBuf], limits: Limits) -> PermissionInventory
             });
             continue;
         }
-        let (object, read, has_partial) = collect_one(path, index, acl_bytes_read, limits);
+        let (object, read, capability_read, has_partial) =
+            collect_one(path, index, acl_bytes_read, capability_bytes_read, limits);
         acl_bytes_read = acl_bytes_read.saturating_add(read);
+        capability_bytes_read = capability_bytes_read.saturating_add(capability_read);
         partial |= has_partial;
         objects.push(object);
     }
@@ -209,7 +261,7 @@ fn collect_with_limits(paths: &[PathBuf], limits: Limits) -> PermissionInventory
         schema: "sideeffect.permission_inventory",
         schema_version: 1,
         platform: "linux",
-        scope: "explicit_paths_metadata_posix_acl",
+        scope: "explicit_paths_metadata_posix_acl_file_capability",
         captured_at_unix_ms,
         status: if partial {
             PermissionInventoryStatus::Partial
@@ -218,6 +270,7 @@ fn collect_with_limits(paths: &[PathBuf], limits: Limits) -> PermissionInventory
         },
         paths_requested: paths.len(),
         acl_bytes_read,
+        capability_bytes_read,
         objects,
         diagnostics,
     }
@@ -227,8 +280,9 @@ fn collect_one(
     path: &Path,
     index: usize,
     total_read: usize,
+    total_capability_read: usize,
     limits: Limits,
-) -> (PermissionObject, usize, bool) {
+) -> (PermissionObject, usize, usize, bool) {
     let path_bytes = path.as_os_str().as_bytes();
     let mut row = PermissionObject {
         path: path.to_str().map(str::to_owned),
@@ -242,6 +296,7 @@ fn collect_one(
         inode: None,
         access_acl: acl_initial(AclStatus::Failed, "system.posix_acl_access"),
         default_acl: acl_initial(AclStatus::NotApplicable, "system.posix_acl_default"),
+        file_capability: capability_initial(FileCapabilityStatus::Failed),
         diagnostics: Vec::new(),
     };
     let c_path = match std::ffi::CString::new(path_bytes) {
@@ -255,7 +310,7 @@ fn collect_one(
                 source: None,
                 message: "The selected path contains a NUL byte and was not checked.",
             });
-            return (row, 0, true);
+            return (row, 0, 0, true);
         }
     };
     // Pin the final path component first without opening a device or following a final symlink.
@@ -296,13 +351,14 @@ fn collect_one(
         row.status = status;
         row.access_acl.status = AclStatus::Inaccessible;
         row.default_acl.status = AclStatus::Inaccessible;
+        row.file_capability.status = FileCapabilityStatus::Inaccessible;
         row.diagnostics.push(PermissionDiagnostic {
             code,
             path_index: Some(index),
             source: None,
             message,
         });
-        return (row, 0, true);
+        return (row, 0, 0, true);
     }
     // SAFETY: open returned a new owned file descriptor.
     let pinned = unsafe { File::from_raw_fd(fd) };
@@ -312,13 +368,14 @@ fn collect_one(
             row.status = PermissionObjectStatus::Partial;
             row.access_acl.status = AclStatus::Failed;
             row.default_acl.status = AclStatus::Failed;
+            row.file_capability.status = FileCapabilityStatus::Failed;
             row.diagnostics.push(PermissionDiagnostic {
                 code: "metadata_unavailable",
                 path_index: Some(index),
                 source: Some("fstat"),
                 message: "File metadata could not be read from the pinned object.",
             });
-            return (row, 0, true);
+            return (row, 0, 0, true);
         }
     };
     let kind = stat.st_mode & libc::S_IFMT;
@@ -337,25 +394,27 @@ fn collect_one(
         row.status = PermissionObjectStatus::Partial;
         row.access_acl.status = AclStatus::Unsupported;
         row.default_acl.status = AclStatus::NotApplicable;
+        row.file_capability.status = FileCapabilityStatus::Unsupported;
         row.diagnostics.push(PermissionDiagnostic {
             code: "final_symlink_not_followed",
             path_index: Some(index),
             source: Some("fstat"),
             message: "The final path component is a symlink; its target was not followed and ACLs were not read.",
         });
-        return (row, 0, true);
+        return (row, 0, 0, true);
     }
     if kind != libc::S_IFREG && kind != libc::S_IFDIR {
         row.status = PermissionObjectStatus::Partial;
         row.access_acl.status = AclStatus::Unsupported;
         row.default_acl.status = AclStatus::NotApplicable;
+        row.file_capability.status = FileCapabilityStatus::Unsupported;
         row.diagnostics.push(PermissionDiagnostic {
             code: "object_type_unsupported",
             path_index: Some(index),
             source: Some("fstat"),
             message: "Only regular files and directories are supported; no ACL was read.",
         });
-        return (row, 0, true);
+        return (row, 0, 0, true);
     }
     let readable_fd = match reopen_pinned_readonly(pinned.as_raw_fd(), &stat) {
         Ok(file) => file,
@@ -372,16 +431,18 @@ fn collect_one(
             } else {
                 AclStatus::NotApplicable
             };
+            row.file_capability.status = FileCapabilityStatus::Inaccessible;
             row.diagnostics.push(PermissionDiagnostic {
                 code,
                 path_index: Some(index),
                 source: Some("fgetxattr"),
                 message: "ACL data could not be read using current-user permissions.",
             });
-            return (row, 0, true);
+            return (row, 0, 0, true);
         }
     };
     let mut read = 0usize;
+    let mut capability_read = 0usize;
     let mut partial = false;
     row.access_acl = read_acl(
         readable_fd.as_raw_fd(),
@@ -413,10 +474,23 @@ fn collect_one(
             partial = true;
         }
     }
+    row.file_capability = read_file_capability(
+        readable_fd.as_raw_fd(),
+        total_capability_read,
+        limits,
+        &mut capability_read,
+        index,
+        &mut row.diagnostics,
+    );
+    if row.file_capability.status != FileCapabilityStatus::Present
+        && row.file_capability.status != FileCapabilityStatus::Absent
+    {
+        partial = true;
+    }
     if partial {
         row.status = PermissionObjectStatus::Partial;
     }
-    (row, read, partial)
+    (row, read, capability_read, partial)
 }
 
 fn stat_fd(fd: i32) -> io::Result<libc::stat> {
@@ -554,6 +628,233 @@ fn read_acl(
         bytes_hex: Some(hex(&bytes)),
         sha256: Some(sha256_hex(&bytes)),
         entries,
+    }
+}
+
+fn read_file_capability(
+    fd: i32,
+    total_read: usize,
+    limits: Limits,
+    read: &mut usize,
+    index: usize,
+    diagnostics: &mut Vec<PermissionDiagnostic>,
+) -> FileCapabilityObservation {
+    let source = "security.capability";
+    let name_ptr = CAPABILITY_XATTR.as_ptr().cast::<libc::c_char>();
+    let size = unsafe { libc::fgetxattr(fd, name_ptr, std::ptr::null_mut(), 0) };
+    if size < 0 {
+        let error = io::Error::last_os_error();
+        let status = if error.raw_os_error() == Some(libc::ENODATA) {
+            FileCapabilityStatus::Absent
+        } else if error.kind() == io::ErrorKind::PermissionDenied {
+            FileCapabilityStatus::Inaccessible
+        } else if error.raw_os_error() == Some(libc::EOPNOTSUPP) {
+            FileCapabilityStatus::Unsupported
+        } else {
+            FileCapabilityStatus::Failed
+        };
+        if status != FileCapabilityStatus::Absent {
+            diagnostics.push(PermissionDiagnostic {
+                code: capability_diagnostic_code(status),
+                path_index: Some(index),
+                source: Some(source),
+                message: capability_diagnostic_message(status),
+            });
+        }
+        return capability_initial(status);
+    }
+    let size = size as usize;
+    let aggregate_remaining = limits.total_capability_bytes.saturating_sub(total_read);
+    if size > limits.capability_bytes || size > aggregate_remaining {
+        diagnostics.push(PermissionDiagnostic {
+            code: "capability_byte_limit_exceeded",
+            path_index: Some(index),
+            source: Some(source),
+            message: "File capability xattr exceeded a configured byte limit and was not retained.",
+        });
+        return capability_initial(FileCapabilityStatus::LimitExceeded);
+    }
+    let mut bytes = vec![0u8; size];
+    let actual = unsafe { libc::fgetxattr(fd, name_ptr, bytes.as_mut_ptr().cast(), bytes.len()) };
+    if actual < 0 {
+        let error = io::Error::last_os_error();
+        let status = if error.kind() == io::ErrorKind::PermissionDenied {
+            FileCapabilityStatus::Inaccessible
+        } else if error.raw_os_error() == Some(libc::EOPNOTSUPP) {
+            FileCapabilityStatus::Unsupported
+        } else {
+            FileCapabilityStatus::Failed
+        };
+        diagnostics.push(PermissionDiagnostic {
+            code: capability_diagnostic_code(status),
+            path_index: Some(index),
+            source: Some(source),
+            message:
+                "File capability xattr changed or could not be read after its bounded size probe.",
+        });
+        return capability_initial(status);
+    }
+    let actual = actual as usize;
+    bytes.truncate(actual);
+    *read = read.saturating_add(actual);
+    if actual != size {
+        diagnostics.push(PermissionDiagnostic {
+            code: "capability_changed_during_read",
+            path_index: Some(index),
+            source: Some(source),
+            message: "File capability xattr size changed between the bounded size probe and read; raw bytes were retained but not decoded.",
+        });
+        return capability_raw(FileCapabilityStatus::Failed, &bytes);
+    }
+    match decode_file_capability(&bytes) {
+        Ok(decoded) => FileCapabilityObservation {
+            status: FileCapabilityStatus::Present,
+            source: Some(source),
+            byte_length: Some(actual),
+            bytes_hex: Some(hex(&bytes)),
+            sha256: Some(sha256_hex(&bytes)),
+            revision: Some(decoded.revision),
+            effective: Some(decoded.effective),
+            permitted: Some(decoded.permitted),
+            inheritable: Some(decoded.inheritable),
+            root_id: decoded.root_id,
+        },
+        Err(CapabilityDecodeError::UnsupportedVersion) => {
+            diagnostics.push(PermissionDiagnostic {
+                code: "capability_version_unsupported",
+                path_index: Some(index),
+                source: Some(source),
+                message: "File capability xattr uses an unsupported Linux VFS capability version; raw bytes were retained.",
+            });
+            capability_raw(FileCapabilityStatus::Unsupported, &bytes)
+        }
+        Err(CapabilityDecodeError::InvalidFormat) => {
+            diagnostics.push(PermissionDiagnostic {
+                code: "capability_malformed",
+                path_index: Some(index),
+                source: Some(source),
+                message: "File capability xattr bytes did not match the supported Linux VFS capability format; raw bytes were retained.",
+            });
+            capability_raw(FileCapabilityStatus::Malformed, &bytes)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CapabilityDecodeError {
+    UnsupportedVersion,
+    InvalidFormat,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DecodedFileCapability {
+    revision: u8,
+    effective: bool,
+    permitted: Vec<u8>,
+    inheritable: Vec<u8>,
+    root_id: Option<u32>,
+}
+
+fn decode_file_capability(bytes: &[u8]) -> Result<DecodedFileCapability, CapabilityDecodeError> {
+    if bytes.len() < 4 {
+        return Err(CapabilityDecodeError::InvalidFormat);
+    }
+    let magic = read_u32(&bytes[..4]);
+    let version = magic & 0xff00_0000;
+    let expected = match version {
+        VFS_CAP_REVISION_1 => 12,
+        VFS_CAP_REVISION_2 => 20,
+        VFS_CAP_REVISION_3 => 24,
+        _ => return Err(CapabilityDecodeError::UnsupportedVersion),
+    };
+    if bytes.len() != expected || magic & !(0xff00_0000 | VFS_CAP_FLAGS_EFFECTIVE) != 0 {
+        return Err(CapabilityDecodeError::InvalidFormat);
+    }
+    let words = if version == VFS_CAP_REVISION_1 { 1 } else { 2 };
+    let mut permitted = Vec::with_capacity(words * 32);
+    let mut inheritable = Vec::with_capacity(words * 32);
+    for word in 0..words {
+        let offset = 4 + word * 8;
+        let permitted_word = read_u32(&bytes[offset..offset + 4]);
+        let inheritable_word = read_u32(&bytes[offset + 4..offset + 8]);
+        for bit in 0..32 {
+            if permitted_word & (1 << bit) != 0 {
+                permitted.push((word * 32 + bit) as u8);
+            }
+            if inheritable_word & (1 << bit) != 0 {
+                inheritable.push((word * 32 + bit) as u8);
+            }
+        }
+    }
+    let root_id = if version == VFS_CAP_REVISION_3 {
+        Some(read_u32(&bytes[20..24]))
+    } else {
+        None
+    };
+    Ok(DecodedFileCapability {
+        revision: match version {
+            VFS_CAP_REVISION_1 => 1,
+            VFS_CAP_REVISION_2 => 2,
+            _ => 3,
+        },
+        effective: magic & VFS_CAP_FLAGS_EFFECTIVE != 0,
+        permitted,
+        inheritable,
+        root_id,
+    })
+}
+
+fn capability_initial(status: FileCapabilityStatus) -> FileCapabilityObservation {
+    FileCapabilityObservation {
+        status,
+        source: Some("security.capability"),
+        byte_length: None,
+        bytes_hex: None,
+        sha256: None,
+        revision: None,
+        effective: None,
+        permitted: None,
+        inheritable: None,
+        root_id: None,
+    }
+}
+
+fn capability_raw(status: FileCapabilityStatus, bytes: &[u8]) -> FileCapabilityObservation {
+    FileCapabilityObservation {
+        status,
+        source: Some("security.capability"),
+        byte_length: Some(bytes.len()),
+        bytes_hex: Some(hex(bytes)),
+        sha256: Some(sha256_hex(bytes)),
+        revision: None,
+        effective: None,
+        permitted: None,
+        inheritable: None,
+        root_id: None,
+    }
+}
+
+fn capability_diagnostic_code(status: FileCapabilityStatus) -> &'static str {
+    match status {
+        FileCapabilityStatus::Inaccessible => "capability_inaccessible",
+        FileCapabilityStatus::Unsupported => "capability_unsupported",
+        FileCapabilityStatus::LimitExceeded => "capability_byte_limit_exceeded",
+        FileCapabilityStatus::Malformed => "capability_malformed",
+        FileCapabilityStatus::Absent => "capability_absent",
+        FileCapabilityStatus::Present => "capability_present",
+        FileCapabilityStatus::Failed => "capability_read_failed",
+    }
+}
+
+fn capability_diagnostic_message(status: FileCapabilityStatus) -> &'static str {
+    match status {
+        FileCapabilityStatus::Inaccessible => {
+            "File capability xattr could not be read with current-user permissions."
+        }
+        FileCapabilityStatus::Unsupported => {
+            "The filesystem or object does not support the file capability xattr."
+        }
+        _ => "File capability xattr could not be read.",
     }
 }
 
@@ -697,6 +998,23 @@ mod tests {
         bytes
     }
 
+    fn capability_fixture(
+        version: u32,
+        permitted: &[u32],
+        inheritable: &[u32],
+        root_id: Option<u32>,
+    ) -> Vec<u8> {
+        let mut bytes = (version | VFS_CAP_FLAGS_EFFECTIVE).to_le_bytes().to_vec();
+        for (permitted, inheritable) in permitted.iter().zip(inheritable) {
+            bytes.extend(permitted.to_le_bytes());
+            bytes.extend(inheritable.to_le_bytes());
+        }
+        if let Some(root_id) = root_id {
+            bytes.extend(root_id.to_le_bytes());
+        }
+        bytes
+    }
+
     fn temp_dir() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "sideeffect-permissions-{}-{}",
@@ -741,6 +1059,124 @@ mod tests {
             (0x20, 1, ACL_UNDEFINED_ID),
         ]);
         assert!(decode_posix_acl(&bad_permissions).is_err());
+    }
+
+    #[test]
+    fn decodes_supported_file_capability_versions_and_sets() {
+        let v1 = capability_fixture(VFS_CAP_REVISION_1, &[0x8000_0001], &[0x2], None);
+        let decoded = decode_file_capability(&v1).unwrap();
+        assert_eq!(decoded.revision, 1);
+        assert!(decoded.effective);
+        assert_eq!(decoded.permitted, vec![0, 31]);
+        assert_eq!(decoded.inheritable, vec![1]);
+        assert_eq!(decoded.root_id, None);
+
+        let v2 = capability_fixture(VFS_CAP_REVISION_2, &[0x1, 0x4], &[0x2, 0x8], None);
+        let decoded = decode_file_capability(&v2).unwrap();
+        assert_eq!(decoded.permitted, vec![0, 34]);
+        assert_eq!(decoded.inheritable, vec![1, 35]);
+        assert_eq!(decoded.root_id, None);
+
+        let v3 = capability_fixture(VFS_CAP_REVISION_3, &[0x10, 0], &[0, 0x20], Some(1234));
+        let decoded = decode_file_capability(&v3).unwrap();
+        assert_eq!(decoded.revision, 3);
+        assert_eq!(decoded.permitted, vec![4]);
+        assert_eq!(decoded.inheritable, vec![37]);
+        assert_eq!(decoded.root_id, Some(1234));
+    }
+
+    #[test]
+    fn rejects_malformed_and_unknown_file_capability_forms() {
+        assert_eq!(
+            decode_file_capability(&[]),
+            Err(CapabilityDecodeError::InvalidFormat)
+        );
+        assert_eq!(
+            decode_file_capability(&[1, 0, 0, 0]),
+            Err(CapabilityDecodeError::UnsupportedVersion)
+        );
+        assert_eq!(
+            decode_file_capability(&capability_fixture(VFS_CAP_REVISION_1, &[0], &[0], None)[..11]),
+            Err(CapabilityDecodeError::InvalidFormat)
+        );
+        let mut unknown_flags = capability_fixture(VFS_CAP_REVISION_1, &[0], &[0], None);
+        unknown_flags[0] |= 0x02;
+        assert_eq!(
+            decode_file_capability(&unknown_flags),
+            Err(CapabilityDecodeError::InvalidFormat)
+        );
+        assert_eq!(
+            decode_file_capability(&capability_fixture(VFS_CAP_REVISION_3, &[0], &[0], None)),
+            Err(CapabilityDecodeError::InvalidFormat)
+        );
+    }
+
+    #[test]
+    fn reads_bounded_file_capability_xattr_from_pinned_descriptor_when_supported() {
+        let root = temp_dir();
+        let file = root.join("capability-file");
+        std::fs::write(&file, b"synthetic capability fixture").unwrap();
+        let bytes = capability_fixture(VFS_CAP_REVISION_2, &[0x20, 0x4], &[0x80, 0], None);
+        let c_path = CString::new(file.as_os_str().as_bytes()).unwrap();
+        let set_result = unsafe {
+            libc::setxattr(
+                c_path.as_ptr(),
+                CAPABILITY_XATTR.as_ptr().cast(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                0,
+            )
+        };
+        if set_result != 0 {
+            let error = io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EOPNOTSUPP) | Some(libc::EPERM) | Some(libc::EINVAL)
+            ) {
+                std::fs::remove_dir_all(root).unwrap();
+                return;
+            }
+            panic!("could not install synthetic capability xattr fixture: {error}");
+        }
+        let exact = collect_with_limits(
+            std::slice::from_ref(&file),
+            Limits {
+                paths: 1,
+                path_bytes: 4096,
+                acl_bytes: MAX_ACL_XATTR_BYTES,
+                total_acl_bytes: MAX_PERMISSION_TOTAL_ACL_BYTES,
+                capability_bytes: bytes.len(),
+                total_capability_bytes: bytes.len(),
+                scan_duration: Duration::from_secs(5),
+            },
+        );
+        assert_eq!(exact.status, PermissionInventoryStatus::Complete);
+        assert_eq!(exact.capability_bytes_read, bytes.len());
+        let observation = &exact.objects[0].file_capability;
+        assert_eq!(observation.status, FileCapabilityStatus::Present);
+        assert_eq!(observation.revision, Some(2));
+        assert_eq!(observation.permitted.as_deref(), Some(&[5, 34][..]));
+        assert_eq!(observation.inheritable.as_deref(), Some(&[7][..]));
+        assert_eq!(observation.bytes_hex.as_deref(), Some(hex(&bytes).as_str()));
+
+        let limited = collect_with_limits(
+            std::slice::from_ref(&file),
+            Limits {
+                paths: 1,
+                path_bytes: 4096,
+                acl_bytes: MAX_ACL_XATTR_BYTES,
+                total_acl_bytes: MAX_PERMISSION_TOTAL_ACL_BYTES,
+                capability_bytes: bytes.len() - 1,
+                total_capability_bytes: MAX_PERMISSION_TOTAL_CAPABILITY_BYTES,
+                scan_duration: Duration::from_secs(5),
+            },
+        );
+        assert_eq!(limited.status, PermissionInventoryStatus::Partial);
+        assert_eq!(
+            limited.objects[0].file_capability.status,
+            FileCapabilityStatus::LimitExceeded
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -848,6 +1284,8 @@ mod tests {
                 path_bytes: 4096,
                 acl_bytes: bytes.len(),
                 total_acl_bytes: bytes.len(),
+                capability_bytes: MAX_CAPABILITY_XATTR_BYTES,
+                total_capability_bytes: MAX_PERMISSION_TOTAL_CAPABILITY_BYTES,
                 scan_duration: Duration::from_secs(5),
             },
         );
@@ -861,6 +1299,8 @@ mod tests {
                 path_bytes: 4096,
                 acl_bytes: bytes.len() - 1,
                 total_acl_bytes: 8 * 1024 * 1024,
+                capability_bytes: MAX_CAPABILITY_XATTR_BYTES,
+                total_capability_bytes: MAX_PERMISSION_TOTAL_CAPABILITY_BYTES,
                 scan_duration: Duration::from_secs(5),
             },
         );
@@ -876,6 +1316,8 @@ mod tests {
                 path_bytes: 4096,
                 acl_bytes: 64 * 1024,
                 total_acl_bytes: bytes.len(),
+                capability_bytes: MAX_CAPABILITY_XATTR_BYTES,
+                total_capability_bytes: MAX_PERMISSION_TOTAL_CAPABILITY_BYTES,
                 scan_duration: Duration::from_secs(5),
             },
         );
@@ -906,6 +1348,8 @@ mod tests {
                 path_bytes: 1,
                 acl_bytes: 64 * 1024,
                 total_acl_bytes: 8 * 1024 * 1024,
+                capability_bytes: MAX_CAPABILITY_XATTR_BYTES,
+                total_capability_bytes: MAX_PERMISSION_TOTAL_CAPABILITY_BYTES,
                 scan_duration: Duration::from_secs(5),
             },
         );
@@ -931,6 +1375,8 @@ mod tests {
                 path_bytes: 4096,
                 acl_bytes: 64 * 1024,
                 total_acl_bytes: 8 * 1024 * 1024,
+                capability_bytes: MAX_CAPABILITY_XATTR_BYTES,
+                total_capability_bytes: MAX_PERMISSION_TOTAL_CAPABILITY_BYTES,
                 scan_duration: Duration::from_secs(5),
             },
         );
@@ -944,6 +1390,8 @@ mod tests {
                 path_bytes: 3,
                 acl_bytes: 64 * 1024,
                 total_acl_bytes: 8 * 1024 * 1024,
+                capability_bytes: MAX_CAPABILITY_XATTR_BYTES,
+                total_capability_bytes: MAX_PERMISSION_TOTAL_CAPABILITY_BYTES,
                 scan_duration: Duration::from_secs(5),
             },
         );
@@ -957,6 +1405,8 @@ mod tests {
                 path_bytes: 4096,
                 acl_bytes: 64 * 1024,
                 total_acl_bytes: 8 * 1024 * 1024,
+                capability_bytes: MAX_CAPABILITY_XATTR_BYTES,
+                total_capability_bytes: MAX_PERMISSION_TOTAL_CAPABILITY_BYTES,
                 scan_duration: Duration::ZERO,
             },
         );

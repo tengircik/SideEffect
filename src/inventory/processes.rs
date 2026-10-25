@@ -9,6 +9,8 @@ pub const MAX_PROCESS_DIRECTORIES: usize = 8_192;
 pub const MAX_STATUS_BYTES: usize = 64 * 1024;
 pub const MAX_AGGREGATE_STATUS_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_PROCESS_SCAN_DURATION: Duration = Duration::from_secs(10);
+pub const MAX_EXECUTABLE_LINK_BYTES: usize = 4 * 1024;
+pub const MAX_AGGREGATE_EXECUTABLE_LINK_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,6 +44,7 @@ pub struct ProcessInventorySource {
 #[derive(Clone, Debug, Serialize)]
 pub struct ProcessRow {
     pub pid: u32,
+    pub executable_link: ProcessExecutableLink,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,6 +72,39 @@ pub struct ProcessRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seccomp: Option<u32>,
     pub evidence: Vec<ProcessEvidence>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProcessExecutableLink {
+    pub status: ProcessExecutableLinkStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_display: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_bytes_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub byte_length: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<ProcessExecutableEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessExecutableLinkStatus {
+    Observed,
+    Inaccessible,
+    Vanished,
+    OverLimit,
+    Unsupported,
+    Error,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProcessExecutableEvidence {
+    pub source: String,
+    pub byte_length: usize,
+    pub sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -127,6 +163,7 @@ fn collect_with_limits(root: &Path, limits: Limits) -> ProcessInventoryDocument 
     let mut rows = Vec::new();
     let mut diagnostics = Vec::new();
     let mut total_bytes = 0usize;
+    let mut executable_bytes = 0usize;
     let mut directories_seen = 0usize;
     let mut partial = false;
     let entries = match fs::read_dir(root) {
@@ -252,10 +289,29 @@ fn collect_with_limits(root: &Path, limits: Limits) -> ProcessInventoryDocument 
             }
         };
         total_bytes = total_bytes.saturating_add(bytes.len());
-        let (row, mut row_diags) = parse_status(pid, &bytes);
+        let (mut row, mut row_diags) = parse_status(pid, &bytes);
         if !row_diags.is_empty() {
             partial = true;
         }
+        let executable_limit = MAX_EXECUTABLE_LINK_BYTES
+            .min(MAX_AGGREGATE_EXECUTABLE_LINK_BYTES.saturating_sub(executable_bytes));
+        row.executable_link =
+            match read_executable_link(&directory.join("exe"), pid, executable_limit) {
+                Ok(identity) => {
+                    executable_bytes =
+                        executable_bytes.saturating_add(identity.byte_length.unwrap_or(0));
+                    if identity.status != ProcessExecutableLinkStatus::Observed {
+                        partial = true;
+                        diagnostics.push(executable_link_diagnostic(pid, identity.status));
+                    }
+                    identity
+                }
+                Err(status) => {
+                    partial = true;
+                    diagnostics.push(executable_link_diagnostic(pid, status));
+                    empty_executable_link(status)
+                }
+            };
         rows.push(row);
         diagnostics.append(&mut row_diags);
     }
@@ -342,6 +398,7 @@ fn diag(
 fn parse_status(pid: u32, bytes: &[u8]) -> (ProcessRow, Vec<ProcessDiagnostic>) {
     let mut row = ProcessRow {
         pid,
+        executable_link: empty_executable_link(ProcessExecutableLinkStatus::Unsupported),
         name: None,
         tgid: None,
         ppid: None,
@@ -400,7 +457,13 @@ fn parse_status(pid: u32, bytes: &[u8]) -> (ProcessRow, Vec<ProcessDiagnostic>) 
                         .then(|| hex_bytes(line)),
                 };
                 if !seen.insert(field) {
-                    diagnostics.push(ProcessDiagnostic { code: "duplicate_status_field", pid: Some(pid), field: Some(field), message: "A status field appeared more than once; the first value is retained.", evidence: Some(evidence) });
+                    if field == "Pid" {
+                        row.pid = pid;
+                    } else {
+                        clear_field(&mut row, field);
+                    }
+                    diagnostics.push(ProcessDiagnostic { code: "duplicate_status_field", pid: Some(pid), field: Some(field), message: "A status field appeared more than once; the ambiguous value is omitted.", evidence: Some(evidence.clone()) });
+                    row.evidence.push(evidence);
                 } else {
                     let value = std::str::from_utf8(&line[colon + 1..]).ok().map(str::trim);
                     if value.is_none() || !set_field(&mut row, field, value.unwrap_or("")) {
@@ -454,6 +517,110 @@ fn parse_status(pid: u32, bytes: &[u8]) -> (ProcessRow, Vec<ProcessDiagnostic>) 
     (row, diagnostics)
 }
 
+fn empty_executable_link(status: ProcessExecutableLinkStatus) -> ProcessExecutableLink {
+    ProcessExecutableLink {
+        status,
+        target_display: None,
+        target_bytes_hex: None,
+        byte_length: None,
+        sha256: None,
+        evidence: None,
+    }
+}
+
+fn executable_link_diagnostic(pid: u32, status: ProcessExecutableLinkStatus) -> ProcessDiagnostic {
+    let (code, message) = match status {
+        ProcessExecutableLinkStatus::Inaccessible => (
+            "process_executable_inaccessible",
+            "The process executable link could not be read due to access restrictions.",
+        ),
+        ProcessExecutableLinkStatus::Vanished => (
+            "process_executable_vanished",
+            "The process executable link disappeared during collection.",
+        ),
+        ProcessExecutableLinkStatus::OverLimit => (
+            "process_executable_link_limit_exceeded",
+            "The process executable link exceeded the configured byte limit.",
+        ),
+        ProcessExecutableLinkStatus::Unsupported => (
+            "process_executable_unsupported",
+            "Executable link collection is unsupported for this process entry.",
+        ),
+        ProcessExecutableLinkStatus::Error => (
+            "process_executable_error",
+            "The process executable link could not be read due to an I/O error.",
+        ),
+        ProcessExecutableLinkStatus::Observed => (
+            "process_executable_observed",
+            "The process executable link was read.",
+        ),
+    };
+    diag(code, Some(pid), Some("exe"), message)
+}
+
+/// Reads the procfs symlink itself with a fixed-size buffer; the target is never opened.
+fn read_executable_link(
+    path: &Path,
+    pid: u32,
+    limit: usize,
+) -> Result<ProcessExecutableLink, ProcessExecutableLinkStatus> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| ProcessExecutableLinkStatus::Error)?;
+    let mut buffer = vec![0u8; limit.saturating_add(1)];
+    // SAFETY: path is NUL-terminated and buffer is writable for its declared length.
+    let count = unsafe { libc::readlink(path.as_ptr(), buffer.as_mut_ptr().cast(), buffer.len()) };
+    if count < 0 {
+        let error = io::Error::last_os_error();
+        return Err(match error.kind() {
+            io::ErrorKind::NotFound => match path_parent_state(&path) {
+                ProcessExecutableLinkStatus::Observed => ProcessExecutableLinkStatus::Unsupported,
+                state => state,
+            },
+            io::ErrorKind::PermissionDenied => ProcessExecutableLinkStatus::Inaccessible,
+            _ => ProcessExecutableLinkStatus::Error,
+        });
+    }
+    let count = count as usize;
+    if count > limit {
+        return Err(ProcessExecutableLinkStatus::OverLimit);
+    }
+    buffer.truncate(count);
+    let hash = sha256_hex(&buffer);
+    let source = format!("{pid}/exe");
+    Ok(ProcessExecutableLink {
+        status: ProcessExecutableLinkStatus::Observed,
+        target_display: std::str::from_utf8(&buffer).ok().map(str::to_owned),
+        target_bytes_hex: Some(hex_bytes(&buffer)),
+        byte_length: Some(buffer.len()),
+        sha256: Some(hash.clone()),
+        evidence: Some(ProcessExecutableEvidence {
+            source,
+            byte_length: buffer.len(),
+            sha256: hash,
+        }),
+    })
+}
+
+fn path_parent_state(path: &std::ffi::CStr) -> ProcessExecutableLinkStatus {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(parent) = Path::new(std::ffi::OsStr::from_bytes(path.to_bytes())).parent() else {
+        return ProcessExecutableLinkStatus::Error;
+    };
+    match fs::metadata(parent) {
+        Ok(_) => ProcessExecutableLinkStatus::Observed,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            ProcessExecutableLinkStatus::Vanished
+        }
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            ProcessExecutableLinkStatus::Inaccessible
+        }
+        Err(_) => ProcessExecutableLinkStatus::Error,
+    }
+}
+
 fn set_field(row: &mut ProcessRow, field: &str, value: &str) -> bool {
     match field {
         "Name" => {
@@ -487,6 +654,26 @@ fn set_field(row: &mut ProcessRow, field: &str, value: &str) -> bool {
         "NoNewPrivs" => set_num(value, &mut row.no_new_privs),
         "Seccomp" => set_num(value, &mut row.seccomp),
         _ => false,
+    }
+}
+
+fn clear_field(row: &mut ProcessRow, field: &str) {
+    match field {
+        "Name" => row.name = None,
+        "Pid" => {}
+        "Tgid" => row.tgid = None,
+        "PPid" => row.ppid = None,
+        "State" => row.state = None,
+        "Uid" => row.uid = None,
+        "Gid" => row.gid = None,
+        "CapInh" => row.cap_inh = None,
+        "CapPrm" => row.cap_prm = None,
+        "CapEff" => row.cap_eff = None,
+        "CapBnd" => row.cap_bnd = None,
+        "CapAmb" => row.cap_amb = None,
+        "NoNewPrivs" => row.no_new_privs = None,
+        "Seccomp" => row.seccomp = None,
+        _ => {}
     }
 }
 fn parse_num(s: &str) -> Option<u32> {
@@ -547,7 +734,9 @@ fn hex_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::symlink;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -567,6 +756,11 @@ mod tests {
             let d = self.0.join(pid.to_string());
             fs::create_dir(&d).unwrap();
             fs::write(d.join("status"), bytes).unwrap();
+        }
+        fn executable_link(&self, pid: u32, target: &[u8]) {
+            let directory = self.0.join(pid.to_string());
+            fs::create_dir_all(&directory).unwrap();
+            symlink(std::ffi::OsStr::from_bytes(target), directory.join("exe")).unwrap();
         }
     }
     impl Drop for Temp {
@@ -626,6 +820,73 @@ mod tests {
         );
     }
     #[test]
+    fn duplicate_status_keys_are_omitted_as_ambiguous() {
+        let bytes = b"Name:\tforged\nCapEff:\tffffffffffffffff\nUid:\t1 1 1 1\nCapEff:\t0000000000000000\nUid:\t1000 1000 1000 1000\nPid:\t7\n";
+        let (row, diagnostics) = parse_status(7, bytes);
+        assert_eq!(row.cap_eff, None);
+        assert_eq!(row.uid, None);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|item| item.code == "duplicate_status_field" && item.field == Some("CapEff"))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|item| item.code == "duplicate_status_field" && item.field == Some("Uid"))
+        );
+    }
+    #[test]
+    fn executable_link_preserves_bytes_and_distinguishes_invalid_utf8() {
+        let t = Temp::new();
+        t.executable_link(42, b"/usr/bin/example");
+        let observed = read_executable_link(&t.0.join("42/exe"), 42, 64).unwrap();
+        assert_eq!(observed.status, ProcessExecutableLinkStatus::Observed);
+        assert_eq!(observed.target_display.as_deref(), Some("/usr/bin/example"));
+        assert_eq!(
+            observed.target_bytes_hex.as_deref(),
+            Some("2f7573722f62696e2f6578616d706c65")
+        );
+        assert_eq!(observed.byte_length, Some(16));
+        assert_eq!(
+            observed.sha256.as_deref(),
+            Some(sha256_hex(b"/usr/bin/example").as_str())
+        );
+        assert_eq!(observed.evidence.as_ref().unwrap().byte_length, 16);
+
+        t.executable_link(43, b"/bin/bad\xff");
+        let invalid = read_executable_link(&t.0.join("43/exe"), 43, 64).unwrap();
+        assert_eq!(invalid.target_display, None);
+        assert_eq!(
+            invalid.target_bytes_hex.as_deref(),
+            Some("2f62696e2f626164ff")
+        );
+        assert_eq!(invalid.byte_length, Some(9));
+    }
+    #[test]
+    fn executable_link_missing_error_and_over_limit_are_explicit() {
+        let t = Temp::new();
+        assert_eq!(
+            read_executable_link(&t.0.join("missing/exe"), 7, 8).unwrap_err(),
+            ProcessExecutableLinkStatus::Vanished
+        );
+        fs::create_dir(t.0.join("no-executable")).unwrap();
+        assert_eq!(
+            read_executable_link(&t.0.join("no-executable/exe"), 7, 8).unwrap_err(),
+            ProcessExecutableLinkStatus::Unsupported
+        );
+        fs::create_dir(t.0.join("not-a-link")).unwrap();
+        assert_eq!(
+            read_executable_link(&t.0.join("not-a-link"), 7, 8).unwrap_err(),
+            ProcessExecutableLinkStatus::Error
+        );
+        t.executable_link(42, b"/a/long/target");
+        assert_eq!(
+            read_executable_link(&t.0.join("42/exe"), 42, 4).unwrap_err(),
+            ProcessExecutableLinkStatus::OverLimit
+        );
+    }
+    #[test]
     fn missing_unreadable_and_vanished_rows_are_partial() {
         let t = Temp::new();
         t.status(1, b"Name:\tpartial\nPid:\t1\n");
@@ -665,6 +926,7 @@ mod tests {
     fn exact_status_limit_succeeds_and_limit_plus_one_is_partial() {
         let t = Temp::new();
         t.status(42, VALID);
+        t.executable_link(42, b"/synthetic/not-opened");
         let doc = collect_with_limits(
             &t.0,
             Limits {

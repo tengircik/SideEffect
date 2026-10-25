@@ -23,7 +23,7 @@ use sideeffect::format::{
     RedactedDiffSummary, summarize_diff, write_text_diff, write_trace_evidence_text,
 };
 #[cfg(target_os = "linux")]
-use sideeffect::inventory::{InventoryStatus, collect_debian_packages};
+use sideeffect::inventory::{InventoryStatus, collect_packages};
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{PermissionInventoryStatus, collect_permissions};
 #[cfg(target_os = "linux")]
@@ -44,7 +44,7 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect inventory processes --output <new-inventory.json>\n\
        sideeffect inventory startup --output <new-inventory.json>\n\
        sideeffect inventory permissions --output <new-inventory.json> <path>...\n\
-       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. Inventory packages performs a user-requested, read-only snapshot of records from the local Debian package database and saves a private JSON file; it does not enumerate unregistered software or inspect permissions, startup hooks, or runtime activity. Inventory processes reads bounded numeric /proc status entries and saves a private point-in-time process snapshot; it omits command lines and executable paths and does not promise atomic or exhaustive coverage. Inventory startup discovers bounded XDG `.desktop` files and preserves selected inert keys with evidence; it does not evaluate which entries run or claim exhaustive startup coverage. Inventory permissions inspects only explicit Linux paths, records ownership/type/mode and supported POSIX ACL xattrs, never follows the final path symlink, and does not calculate effective access. Record runs a command under external strace and writes either a bounded raw trace or an opt-in privacy-minimized run bundle; it is observation, not isolation or a safety check.";
+       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. Inventory packages reads available local dpkg, RPM, pacman, and APK databases and saves a private JSON snapshot; unsupported, unavailable, or incomplete sources remain visible, and unregistered software may be missed. Inventory processes reads bounded numeric /proc status entries and executable-link identities; it does not open executable targets or promise atomic or exhaustive coverage. Inventory startup discovers bounded XDG `.desktop` files and preserves selected inert keys with evidence; it does not evaluate which entries run or claim exhaustive startup coverage. Inventory permissions inspects only explicit Linux paths and records ownership/type/mode, supported POSIX ACLs, and Linux file-capability xattrs; it never follows the final path symlink or calculates effective access. Record runs a command under external strace and writes either a bounded raw trace or an opt-in privacy-minimized run bundle; it is observation, not isolation or a safety check.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -200,7 +200,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
 fn inventory_packages(output: &OsString) -> Result<ExitCode, String> {
     #[cfg(target_os = "linux")]
     {
-        let document = collect_debian_packages();
+        let document = collect_packages();
         let complete = document.status == InventoryStatus::Complete;
         let mut json = CappedBuffer::new(MAX_REPORT_BYTES);
         serde_json::to_writer(&mut json, &document).map_err(|error| {
@@ -212,13 +212,13 @@ fn inventory_packages(output: &OsString) -> Result<ExitCode, String> {
             .map_err(|error| format!("could not publish private inventory: {error}"))?;
         if complete {
             eprintln!(
-                "Saved a complete dpkg package database snapshot to {}. This is a point-in-time source inventory, not a complete list of software on the computer.",
+                "Saved a complete snapshot of detected, applicable package-manager databases to {}. This is a point-in-time source inventory, not a complete list of software on the computer.",
                 terminal_safe_path(&published)
             );
             Ok(ExitCode::SUCCESS)
         } else {
             eprintln!(
-                "Saved a partial dpkg package database snapshot to {}. Check its source status and diagnostics; unavailable or incomplete package data must be treated as unknown.",
+                "Saved a partial package-manager snapshot to {}. Check its source status and diagnostics; unavailable or incomplete package data must be treated as unknown.",
                 terminal_safe_path(&published)
             );
             Ok(ExitCode::from(2))
@@ -227,7 +227,7 @@ fn inventory_packages(output: &OsString) -> Result<ExitCode, String> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = output;
-        Err("inventory packages requires Linux and the Debian dpkg package database".to_owned())
+        Err("inventory packages requires Linux package-manager sources".to_owned())
     }
 }
 

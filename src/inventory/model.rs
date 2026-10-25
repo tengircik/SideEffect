@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 pub const INVENTORY_SCHEMA: &str = "sideeffect.inventory";
-pub const INVENTORY_SCHEMA_VERSION: u32 = 1;
+pub const INVENTORY_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -15,6 +15,9 @@ pub enum InventoryStatus {
 pub enum InventorySourceStatus {
     Complete,
     Partial,
+    NotChecked,
+    Unsupported,
+    NotApplicable,
     Unavailable,
     AccessDenied,
     Failed,
@@ -45,6 +48,8 @@ pub struct InventorySource {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct InventoryPackage {
+    /// Identifies the package-manager source whose raw row supports this entry.
+    pub source_id: &'static str,
     /// Package fields are absent only when the source row could not be parsed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
