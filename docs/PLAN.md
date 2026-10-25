@@ -102,14 +102,15 @@ Additional exit criteria: resource-boundary and output-path/symlink safety tests
 
 ## Milestone 6 — On-demand software and permission inventory
 
-- Define supported Linux inventory sources for installed software, running processes, and permission facts before implementation.
-- Collect only through read-only, bounded operations; make scope, collection time, and evidence source visible.
+- Start with read-only Debian package inventory through [`dpkg-query`](https://man7.org/linux/man-pages/man1/dpkg-query.1.html), plus a point-in-time process snapshot from [`/proc/PID/status`](https://man7.org/linux/man-pages/man5/proc_pid_status.5.html) and [`/proc/PID/cmdline`](https://www.man7.org/linux/man-pages/man5/proc_pid_cmdline.5.html). State that package databases omit manually copied or otherwise unregistered programs, and procfs may hide or expose mutable process text.
+- Inspect selected file ownership, mode, and ACL data using documented system sources such as [`getfacl`](https://man7.org/linux/man-pages/man1/getfacl.1.html); report process credentials and Linux capability sets separately. These inputs do not prove the effective access decision in every namespace or security-module context.
+- Collect only through bounded, read-only operations; make scope, collection time, source, and source-specific coverage visible.
 - Report inaccessible or unsupported sources as unknown/not checked. Do not automatically elevate privileges.
 - Keep inventory snapshots local and sensitive; give users an explicit output path and deletion guidance.
 
 ## Milestone 7 — Startup hooks, scripts, and runtime evidence
 
-- Identify supported startup mechanisms and script locations with source-file and configuration references; do not execute discovered content.
+- Begin with Linux [`systemd` service units](https://freedesktop.org/software/systemd/man/latest/systemd.service.html) and [XDG autostart entries](https://specifications.freedesktop.org/autostart/latest/), with source-file and configuration references; parse discovered commands and scripts as inert data and never execute them.
 - Let the user request a bounded capture of a selected program or process tree, then connect observed events only when the evidence supports that link.
 - Distinguish configured hooks/scripts from ones observed executing. Do not claim that absence from a snapshot proves a hook or behavior does not exist.
 - Review the resulting coverage by platform and avoid any “everything observed” guarantee.
@@ -123,7 +124,8 @@ Additional exit criteria: resource-boundary and output-path/symlink safety tests
 ## Milestone 9 — Native Windows audit adapter
 
 - Design a native Windows read-only inventory and bounded runtime-evidence adapter; do not treat WSL2 as Windows coverage.
-- Select and document the Windows sources for installed applications, running processes, access tokens/permissions, startup entries, services, scheduled tasks, and scripts before implementation.
+- Start with [uninstall registry entries](https://learn.microsoft.com/en-us/powershell/scripting/samples/working-with-software-installations), a [Tool Help process snapshot](https://learn.microsoft.com/en-us/windows/desktop/ToolHelp/taking-a-snapshot-and-viewing-processes), [access tokens](https://learn.microsoft.com/en-us/windows/win32/secauthz/access-tokens), [file security descriptors and ACLs](https://learn.microsoft.com/en-us/windows/win32/fileio/file-security-and-access-rights), [Run/RunOnce keys](https://learn.microsoft.com/en-us/windows/win32/setupapi/run-and-runonce-registry-keys), [Startup folders](https://learn.microsoft.com/en-us/windows/win32/shell/knownfolderid), [service configuration](https://learn.microsoft.com/en-us/windows/win32/services/service-configuration), and [scheduled-task definitions](https://learn.microsoft.com/en-us/windows/win32/taskschd/about-the-task-scheduler). These are curated sources: Microsoft documents that software inventory does not find every application, and inaccessible processes or entries must remain unknown. Avoid `Win32_Product`, whose installer checks can alter machine state.
+- Evaluate bounded runtime collection through [Event Tracing for Windows (ETW)](https://learn.microsoft.com/en-us/windows/win32/etw/about-event-tracing) as a separate capability. Document provider/filter scope, event loss, and [session permissions](https://learn.microsoft.com/en-us/windows/win32/etw/controlling-event-tracing-sessions); do not elevate automatically or imply that ETW captures every event.
 - Keep the same evidence, scope, collection-time, unknown-state, no-background-monitor, and no-automatic-elevation guarantees as other adapters.
 - Validate Windows-specific privacy and security boundaries separately; do not reuse Linux coverage claims.
 
