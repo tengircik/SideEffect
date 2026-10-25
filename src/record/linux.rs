@@ -1346,7 +1346,7 @@ mod tests {
 
         let started = Instant::now();
         let version =
-            verify_strace_version_with_timeout(&tracer.as_os_str(), Duration::from_secs(2))
+            verify_strace_version_with_timeout(tracer.as_os_str(), Duration::from_secs(2))
                 .expect("version query retries until the transient write lock is released");
         release_writer.join().unwrap();
 
