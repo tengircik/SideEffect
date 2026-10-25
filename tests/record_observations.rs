@@ -224,6 +224,68 @@ fn record_propagates_target_signal_after_publishing_trace() {
 }
 
 #[test]
+fn record_inherits_target_output_and_publishes_failed_exec_evidence() {
+    require_tool("strace", &["--version"]);
+    require_tool("python3", &["--version"]);
+
+    let directory = PrivateTempDirectory::new();
+    let output_trace = directory.path().join("output.trace");
+    let output = run_record_target_status(
+        &output_trace,
+        "import os; os.write(1, b'SideEffect inherited stdout\\n'); os.write(2, b'SideEffect inherited stderr\\n')",
+    );
+    assert_success(&output, "record target output capture");
+    assert_eq!(output.stdout, b"SideEffect inherited stdout\n");
+    assert!(
+        output.stderr.starts_with(b"SideEffect inherited stderr\n"),
+        "target stderr should be inherited before SideEffect's record summary; got: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_published_nonempty_trace(&output_trace);
+
+    let failed_program = directory.path().join("program-that-does-not-exist");
+    let failure_trace = directory.path().join("failed-exec.trace");
+    let failure = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["record", "--trace"])
+        .arg(&failure_trace)
+        .arg("--")
+        .arg(&failed_program)
+        .output()
+        .expect("launch SideEffect record command for failed exec");
+    assert!(!failure.status.success(), "a failed target exec must fail");
+    assert!(
+        String::from_utf8_lossy(&failure.stderr).contains("Recorded "),
+        "SideEffect should report the published trace: {}",
+        String::from_utf8_lossy(&failure.stderr)
+    );
+    assert_published_nonempty_trace(&failure_trace);
+
+    let trace = inspect_trace(&failure_trace);
+    let failed_exec = trace["records"]
+        .as_array()
+        .expect("inspect records array")
+        .iter()
+        .find(|record| {
+            record["kind"] == "syscall"
+                && record["syscall"] == "execve"
+                && record["raw_arguments"]
+                    .as_str()
+                    .is_some_and(|arguments| arguments.contains("program-that-does-not-exist"))
+        })
+        .expect("real strace trace should retain the failed execve attempt");
+    assert!(
+        failed_exec["raw_result"]
+            .as_str()
+            .unwrap()
+            .starts_with("-1 ENOENT")
+    );
+    assert_eq!(failed_exec["outcome"], "failure");
+    assert!(failed_exec["evidence"]["line_number"].as_u64().is_some());
+    assert!(failed_exec["evidence"]["byte_offset"].as_u64().is_some());
+    assert!(failed_exec["evidence"]["byte_length"].as_u64().is_some());
+}
+
+#[test]
 fn record_bundle_publishes_manifest_and_exact_trace_for_nonzero_target() {
     require_tool("strace", &["--version"]);
     require_tool("python3", &["--version"]);
