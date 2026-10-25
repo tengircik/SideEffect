@@ -21,7 +21,6 @@ pub use debian::parse_dpkg_query_output;
 pub use permissions::{
     AclEntry, AclObservation, AclStatus, AclTag, PermissionDiagnostic, PermissionInventoryDocument,
     PermissionInventoryStatus, PermissionObject, PermissionObjectStatus, collect_permissions,
-    decode_posix_acl,
 };
 #[cfg(target_os = "linux")]
 pub use processes::{
