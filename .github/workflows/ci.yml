@@ -40,6 +40,14 @@ jobs:
       - name: Build CLI
         run: cargo build --locked --bin sideeffect
 
+      - name: Build optimized release CLI
+        run: cargo build --locked --release --bin sideeffect
+
+      - name: Smoke-check optimized release CLI
+        run: |
+          ./target/release/sideeffect --help
+          ./target/release/sideeffect --version
+
   msrv:
     name: Linux MSRV (Rust 1.85)
     runs-on: ubuntu-latest
