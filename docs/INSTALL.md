@@ -4,6 +4,8 @@
 
 The current supported product target is Linux x86_64. This repository provides source code; it does not currently publish prebuilt binaries or a package repository. Windows builds cover parser/comparison workflows, but command recording and HTML file export are Linux-only. SideEffect does not provide native Windows tracing.
 
+Windows is a first-class product target in the roadmap. Its native inventory and bounded runtime capture are not implemented yet; a Windows build passing compilation and fixture tests does not mean Windows is already useful for the full audit. The cross-platform 1.0 release gate requires native Windows inventory and record/inspect/diff workflows with real Windows validation. WSL2 runs count only as Linux-environment validation.
+
 Builds use Rust and Cargo. `Cargo.toml` declares Rust 1.85 as its minimum version. The hosted Linux MSRV job has passed with Rust 1.85.0. Install Rust and Cargo using the [official Rust installation instructions](https://rust-lang.org/tools/install/). The Linux system also needs a C toolchain/linker for Rust targets; install one with your distribution's package manager if it is not already present.
 
 The `record` command requires an external `strace` version 6.8 or newer. This is the lowest release exercised by the real-tracer integration tests; strace introduced `--kill-on-exit` in 6.6, but SideEffect does not declare 6.6 or 6.7 supported. Check the installed version before recording:
@@ -32,7 +34,7 @@ The minimums below describe declared support requirements, while the validation 
 | Linux process inventory | Visible `/proc` status fields and bounded `/proc/PID/exe` link text | Synthetic procfs fixtures and Linux CLI tests | Atomic or exhaustive process coverage; command lines or executable contents |
 | Linux startup configuration | Aggregate schema v2: curated XDG, systemd, SysV, and cron source snapshots with inert evidence | CLI tests and deterministic source/parser fixtures | Effective applicability, manager runtime state, all distribution-specific paths, or exhaustive startup coverage |
 | Diff | Exact multiset comparison of parsed syscall rows; PID/timestamp prefixes alone are ignored | Synthetic pairs plus real integration trace pair | Root cause, causal links, normalized paths/FDs, or complete OS observation |
-| Windows | Parser/comparison build workflows only | Windows CI build, Clippy, and tests | Native Windows recording or HTML file export |
+| Windows | Current: parser/comparison workflows only. Planned: native inventory, bounded runtime capture, and offline reports for cross-platform 1.0 | Windows CI build, Clippy, and tests | Native Windows inventory, recording, or report export; a real Windows capture matrix |
 
 The capture filter selects syscall families using `strace`'s own versioned definitions. SideEffect's parser is not an exhaustive syscall allowlist: it recognizes supported outer record syntax and preserves raw arguments/results, while the outcome and path-hint derivations above remain deliberately narrow. Diff category labels are syscall-name buckets, not claims about successful effects.
 
