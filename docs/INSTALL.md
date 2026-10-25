@@ -4,7 +4,7 @@
 
 The current supported product target is Linux x86_64. This repository provides source code; it does not currently publish prebuilt binaries or a package repository. Windows builds cover parser/comparison workflows, but command recording and HTML file export are Linux-only. SideEffect does not provide native Windows tracing.
 
-Builds use Rust and Cargo. `Cargo.toml` declares Rust 1.85 as its minimum version, and CI now has a dedicated Linux job configured to run formatting, Clippy, tests, and a build with Rust 1.85. Its hosted result has not yet been confirmed. Install Rust and Cargo using the [official Rust installation instructions](https://rust-lang.org/tools/install/). The Linux system also needs a C toolchain/linker for Rust targets; install one with your distribution's package manager if it is not already present.
+Builds use Rust and Cargo. `Cargo.toml` declares Rust 1.85 as its minimum version. The hosted Linux MSRV job has passed with Rust 1.85.0. Install Rust and Cargo using the [official Rust installation instructions](https://rust-lang.org/tools/install/). The Linux system also needs a C toolchain/linker for Rust targets; install one with your distribution's package manager if it is not already present.
 
 The `record` command requires an external `strace` version 6.6 or newer. Check the installed version before recording:
 
@@ -13,6 +13,26 @@ strace --version
 ```
 
 For example, Ubuntu 24.04's `strace` package is version 6.8 in the Ubuntu package archive ([package details](https://packages.ubuntu.com/noble/strace)). Package versions in other distributions and repositories differ; if `strace --version` reports a version below 6.6, do not use `record` with it. The Linux real-tracer integration test has passed in WSL with extracted Ubuntu packages for strace 6.8 and 6.19, without installing them system-wide; this does not verify every 6.6 build or kernel combination. Parser, diff, and evidence commands consume an existing trace and do not launch `strace`.
+
+## Compatibility and observation matrix
+
+The minimums below describe declared support requirements, while the validation column lists only environments actually exercised. A successful test does not establish complete syscall observation.
+
+| Area | Declared scope or behavior | Exercised | Not established |
+| --- | --- | --- | --- |
+| Product platform | Linux x86_64 for recording and HTML file export | Ubuntu 24.04 hosted CI; WSL2 integration runs | Other Linux distributions, architectures, or kernel-version range |
+| Rust | Rust 1.85 minimum from `Cargo.toml` | Linux CI on Rust 1.85.0 and stable; Windows build/test job | Other target/toolchain combinations beyond the listed jobs |
+| External tracer | `strace` 6.6 or newer, required for `--kill-on-exit` | 6.8 in Ubuntu 24.04 CI and WSL; 6.19 in WSL | Exact 6.6 behavior, other intermediate releases, and a general kernel compatibility range |
+| Capture filter | `-f -ttt -yy -s 256 -e trace=%process,%file,%network --kill-on-exit` | Narrow real capture of a child exec, temporary-file operation, and loopback TCP activity | Exhaustive syscall coverage, capture completeness, and identical output across tracer/kernel combinations |
+| Trace parsing | Bounded outer `strace` text syntax; preserves raw rows and classifies complete, unfinished, resumed, control, and unparsed rows | Synthetic parser fixtures and real integration traces above | Full semantic decoding of every syscall or every `strace` output format |
+| Derived syscall outcomes | Strict results for `execve`, `execveat`, `openat`, `openat2`, and `connect` only | Parser fixtures and the narrow real-tracer workflow | Higher-level effects, unsupported result spellings, or outcomes for other syscalls |
+| Lexical path hints | Narrow `openat`/`openat2` argument subset only; display-only | Deterministic parser fixtures | Filesystem resolution, symlink behavior, descriptor identity, or canonical paths |
+| Diff | Exact multiset comparison of parsed syscall rows; PID/timestamp prefixes alone are ignored | Synthetic pairs plus real integration trace pair | Root cause, causal links, normalized paths/FDs, or complete OS observation |
+| Windows | Parser/comparison build workflows only | Windows CI build, Clippy, and tests | Native Windows recording or HTML file export |
+
+The capture filter selects syscall families using `strace`'s own versioned definitions. SideEffect's parser is not an exhaustive syscall allowlist: it recognizes supported outer record syntax and preserves raw arguments/results, while the outcome and path-hint derivations above remain deliberately narrow. Diff category labels are syscall-name buckets, not claims about successful effects.
+
+The last recorded hosted validation snapshot is commit `2cd99c25211234b8e80ac29e527a07744da69816` on 2026-10-25: the Linux, Rust 1.85 MSRV, Ubuntu 24.04 real-tracer compatibility, and Windows CI jobs passed; the dependency advisory and declared-license workflow jobs also passed. See the [CI run](https://github.com/tengircik/SideEffect/actions/runs/40182617862) and [dependency audit run](https://github.com/tengircik/SideEffect/actions/runs/40182617865). These point-in-time checks are not legal clearance, broad compatibility proof, or release approval.
 
 ## Build from source
 

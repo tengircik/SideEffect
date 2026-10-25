@@ -30,7 +30,7 @@ Published traces, bundles, and report files stay at the output paths you choose 
 
 ## What the parser accepts
 
-The parser handles a bounded subset of line-oriented `strace` text, including syscall records, common control lines, and `-yy` file-descriptor annotations. `record` uses `-f -ttt -yy -s 256 -e trace=%process,%file,%network --kill-on-exit` and a generated FIFO output path; `inspect` does not verify how an input was produced. See the [`strace(1)` manual](https://man7.org/linux/man-pages/man1/strace.1.html). Smoke testing used extracted strace 6.19 in WSL, not a system installation, and does not validate all supported records or events.
+The parser handles bounded outer syntax for line-oriented `strace` text, including syscall records, common control lines, and `-yy` file-descriptor annotations; it preserves raw arguments and results rather than fully decoding each syscall. `record` uses `-f -ttt -yy -s 256 -e trace=%process,%file,%network --kill-on-exit` and a generated FIFO output path; `inspect` does not verify how an input was produced. See the [`strace(1)` manual](https://man7.org/linux/man-pages/man1/strace.1.html). Narrow real-tracer checks have exercised strace 6.8 in Ubuntu 24.04 CI and WSL, and 6.19 in WSL; they do not validate all records or events. See the [compatibility and observation matrix](docs/INSTALL.md#compatibility-and-observation-matrix).
 
 Input is limited to 32 MiB, each physical record to 64 KiB, and the document to 100,000 records. JSON and text output are limited to 64 MiB. Oversized or invalid UTF-8 input fails without emitting an inspection document. Unrecognized, malformed, or unpaired continuation lines remain visible as raw records with diagnostics.
 
