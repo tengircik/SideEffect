@@ -114,6 +114,11 @@ pub enum AclTag {
     Other,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AclDecodeError {
+    InvalidFormat,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AclEntry {
     pub tag: AclTag,
@@ -532,7 +537,7 @@ fn read_acl(
     let decoded = decode_posix_acl(&bytes);
     let (status, entries) = match decoded {
         Ok(entries) => (AclStatus::Present, Some(entries)),
-        Err(()) => {
+        Err(AclDecodeError::InvalidFormat) => {
             diagnostics.push(PermissionDiagnostic {
                 code: "acl_malformed",
                 path_index: Some(index),
@@ -579,16 +584,16 @@ fn acl_diagnostic_message(status: AclStatus) -> &'static str {
     }
 }
 
-pub fn decode_posix_acl(bytes: &[u8]) -> Result<Vec<AclEntry>, ()> {
+fn decode_posix_acl(bytes: &[u8]) -> Result<Vec<AclEntry>, AclDecodeError> {
     if bytes.len() < 4 || (bytes.len() - 4) % 8 != 0 || read_u32(&bytes[..4]) != ACL_XATTR_VERSION {
-        return Err(());
+        return Err(AclDecodeError::InvalidFormat);
     }
     let mut entries = Vec::with_capacity((bytes.len() - 4) / 8);
     for chunk in bytes[4..].chunks_exact(8) {
         let tag = u16::from_le_bytes([chunk[0], chunk[1]]);
         let permissions = u16::from_le_bytes([chunk[2], chunk[3]]);
         if permissions > 7 {
-            return Err(());
+            return Err(AclDecodeError::InvalidFormat);
         }
         let raw_id = read_u32(&chunk[4..8]);
         let (tag, id) = match tag {
@@ -598,7 +603,7 @@ pub fn decode_posix_acl(bytes: &[u8]) -> Result<Vec<AclEntry>, ()> {
             0x08 if raw_id != ACL_UNDEFINED_ID => (AclTag::Group, Some(raw_id)),
             0x10 if raw_id == ACL_UNDEFINED_ID => (AclTag::Mask, None),
             0x20 if raw_id == ACL_UNDEFINED_ID => (AclTag::Other, None),
-            _ => return Err(()),
+            _ => return Err(AclDecodeError::InvalidFormat),
         };
         entries.push(AclEntry {
             tag,
@@ -607,7 +612,7 @@ pub fn decode_posix_acl(bytes: &[u8]) -> Result<Vec<AclEntry>, ()> {
         });
     }
     if !valid_acl_order(&entries) {
-        return Err(());
+        return Err(AclDecodeError::InvalidFormat);
     }
     Ok(entries)
 }
@@ -766,7 +771,7 @@ mod tests {
         name.push(0xff);
         let path = root.join(std::ffi::OsString::from_vec(name));
         std::fs::write(&path, b"fixture").unwrap();
-        let document = collect_permissions(&[path.clone()]);
+        let document = collect_permissions(std::slice::from_ref(&path));
         let row = &document.objects[0];
         assert!(row.path.is_none());
         assert!(row.path_bytes_hex.ends_with("ff"));
