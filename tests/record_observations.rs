@@ -276,6 +276,9 @@ fn record_inherits_target_output_and_publishes_failed_exec_evidence() {
                 && record["raw_arguments"]
                     .as_str()
                     .is_some_and(|arguments| arguments.contains("program-that-does-not-exist"))
+                && record["raw_result"]
+                    .as_str()
+                    .is_some_and(|result| result.starts_with("-1 ENOENT"))
         })
         .expect("real strace trace should retain the failed execve attempt");
     assert!(
