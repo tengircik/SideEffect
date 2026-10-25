@@ -869,17 +869,23 @@ mod tests {
         fn fake_tracer_script(&self, script: &str) -> PathBuf {
             let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
             let path = self.0.join(format!("fake-strace-{id}"));
+            let staging_path = self.0.join(format!(".fake-strace-{id}.staging"));
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&path)
+                .open(&staging_path)
                 .expect("create fake tracer");
             file.write_all(script.as_bytes())
                 .expect("write fake tracer");
-            let mut permissions = file.metadata().unwrap().permissions();
+            file.sync_all().expect("sync fake tracer");
+            drop(file);
+
+            let mut permissions = fs::metadata(&staging_path)
+                .expect("stat fake tracer")
+                .permissions();
             permissions.set_mode(0o700);
-            file.set_permissions(permissions)
-                .expect("chmod fake tracer");
+            fs::set_permissions(&staging_path, permissions).expect("chmod fake tracer");
+            fs::rename(&staging_path, &path).expect("publish fake tracer");
             path
         }
     }
