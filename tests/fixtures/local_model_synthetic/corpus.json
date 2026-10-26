@@ -1,0 +1,118 @@
+{
+  "schema": "sideeffect.local_model_evaluation_corpus",
+  "schema_version": 1,
+  "status": "preregistered_synthetic_cases",
+  "cases": [
+    {
+      "id": "failure_first",
+      "trace": "synthetic-failure-first.trace",
+      "question": "Which observed syscall failed?",
+      "expected_evidence_ids": [
+        "E001"
+      ],
+      "outcome_priority_baseline": [
+        "E001"
+      ],
+      "candidate_evidence_ids": [
+        "E001"
+      ]
+    },
+    {
+      "id": "failure_middle",
+      "trace": "synthetic-failure-middle.trace",
+      "question": "Which observed syscall failed?",
+      "expected_evidence_ids": [
+        "E024"
+      ],
+      "outcome_priority_baseline": [
+        "E024"
+      ],
+      "candidate_evidence_ids": [
+        "E024"
+      ]
+    },
+    {
+      "id": "failure_last",
+      "trace": "synthetic-failure-last.trace",
+      "question": "Which observed syscall failed?",
+      "expected_evidence_ids": [
+        "E048"
+      ],
+      "outcome_priority_baseline": [
+        "E048"
+      ],
+      "candidate_evidence_ids": [
+        "E048"
+      ]
+    },
+    {
+      "id": "success_only_failure_question",
+      "trace": "synthetic-success-only.trace",
+      "question": "Which syscall failed?",
+      "expected_evidence_ids": [],
+      "outcome_priority_baseline": [],
+      "candidate_evidence_ids": []
+    },
+    {
+      "id": "multiple_failure_targeted_syscall",
+      "trace": "synthetic-multiple-failures.trace",
+      "question": "Which connect syscall failed?",
+      "expected_evidence_ids": [
+        "E002"
+      ],
+      "outcome_priority_baseline": [
+        "E001"
+      ],
+      "candidate_evidence_ids": [
+        "E001",
+        "E002"
+      ]
+    },
+    {
+      "id": "duplicate_failed_connections",
+      "trace": "synthetic-duplicate-failures.trace",
+      "question": "Which connect operation failed?",
+      "expected_evidence_ids": [
+        "E001",
+        "E002"
+      ],
+      "outcome_priority_baseline": [
+        "E001"
+      ],
+      "candidate_evidence_ids": [
+        "E001",
+        "E002"
+      ]
+    },
+    {
+      "id": "partial_failure_trace",
+      "trace": "synthetic-partial-failure.trace",
+      "question": "Which syscall failed?",
+      "expected_evidence_ids": [
+        "E001"
+      ],
+      "outcome_priority_baseline": [
+        "E001"
+      ],
+      "expected_parse_status": "partial",
+      "candidate_evidence_ids": [
+        "E001"
+      ]
+    },
+    {
+      "id": "successful_syscall_query",
+      "trace": "synthetic-success-query.trace",
+      "question": "Which syscall succeeded?",
+      "expected_evidence_ids": [
+        "E002"
+      ],
+      "outcome_priority_baseline": [
+        "E001"
+      ],
+      "candidate_evidence_ids": [
+        "E001",
+        "E002"
+      ]
+    }
+  ]
+}

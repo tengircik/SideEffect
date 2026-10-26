@@ -1,0 +1,4 @@
+100 execve("/usr/bin/true", ["true"], 0x0) = 0
+101 execve("/usr/bin/true", ["true"], 0x0) = 0
+102 execve("/usr/bin/true", ["true"], 0x0) = 0
+103 execve("/usr/bin/true", ["true"], 0x0) = 0

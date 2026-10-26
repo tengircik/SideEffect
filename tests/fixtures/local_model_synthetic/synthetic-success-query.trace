@@ -1,0 +1,2 @@
+100 execve("/does/not/exist", [], 0x0) = -1 ENOENT (No such file or directory)
+101 execve("/usr/bin/true", ["true"], 0x0) = 0

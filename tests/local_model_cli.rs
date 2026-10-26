@@ -34,12 +34,12 @@ impl Drop for TempTrace {
 }
 
 fn run_preview(trace: &TempTrace) -> std::process::Output {
+    run_preview_with_question("Which executable was observed?", trace)
+}
+
+fn run_preview_with_question(question: &str, trace: &TempTrace) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_sideeffect"))
-        .args([
-            "model-preview",
-            "--question",
-            "Which executable was observed?",
-        ])
+        .args(["model-preview", "--question", question])
         .arg(&trace.0)
         .output()
         .unwrap()
@@ -90,6 +90,51 @@ fn partial_parse_is_visible_and_uses_partial_exit_status() {
     assert_eq!(output.status.code(), Some(2));
     let preview: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(preview["evidence_summary"]["parse_status"], "partial");
+}
+
+#[test]
+fn preregistered_synthetic_corpus_builds_expected_bounded_candidates() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/local_model_synthetic");
+    let corpus: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture_root.join("corpus.json")).unwrap()).unwrap();
+    assert_eq!(corpus["schema"], "sideeffect.local_model_evaluation_corpus");
+
+    for case in corpus["cases"].as_array().unwrap() {
+        let trace_path = fixture_root.join(case["trace"].as_str().unwrap());
+        let trace = TempTrace::with_contents(&fs::read(trace_path).unwrap());
+        let question = case["question"].as_str().unwrap();
+        let output = run_preview_with_question(question, &trace);
+        let expected_parse_status = case["expected_parse_status"].as_str().unwrap_or("complete");
+        let expected_exit = if expected_parse_status == "partial" {
+            Some(2)
+        } else {
+            Some(0)
+        };
+        assert_eq!(
+            output.status.code(),
+            expected_exit,
+            "unexpected preview status for {}: {}",
+            case["id"],
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let preview: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            preview["evidence_summary"]["parse_status"], expected_parse_status,
+            "unexpected parse state for {}",
+            case["id"]
+        );
+        assert_eq!(
+            preview["output_schema"]["properties"]["evidence_ids"]["items"]["enum"],
+            case["candidate_evidence_ids"],
+            "unexpected candidate IDs for {}",
+            case["id"]
+        );
+        if case["id"] == "multiple_failure_targeted_syscall" {
+            let prompt = preview["prompt"].as_str().unwrap();
+            assert!(prompt.find("E002").unwrap() < prompt.find("E001").unwrap());
+        }
+    }
 }
 
 #[test]

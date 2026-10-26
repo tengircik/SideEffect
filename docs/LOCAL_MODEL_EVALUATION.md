@@ -17,7 +17,7 @@ Primary references: [Qwen GGUF file](https://huggingface.co/ggml-org/Qwen3-0.6B-
 
 ## Data flow and limits
 
-1. `sideeffect model-preview --question QUESTION TRACE` strictly parses the local trace and prints the exact bounded typed event facts, question, separate system/user prompt messages, JSON output schema, model/runtime pins, and `request_sha256` for review. The digest covers both messages, both revisions, and the schema. It omits raw arguments, raw results, raw lines, free-form parser diagnostics, capture metadata, and local input paths. Partial parsing remains visible and exits with status 2.
+1. `sideeffect model-preview --question QUESTION TRACE` strictly parses the local trace and prints the exact bounded typed event facts, question, separate system/user prompt messages, JSON output schema, model/runtime pins, and `request_sha256` for review. A lexical check for failure terms restricts eligible citations to observed failed or in-progress results; nearby negations are excluded. A syscall name written in the question is moved first in the prompt. Unusual wording may be misclassified, so inspect the candidate ID list in the preview and use the deterministic summary to interpret the result. The digest covers both messages, both revisions, and the schema. It omits raw arguments, raw results, raw lines, free-form parser diagnostics, capture metadata, and local input paths. Partial parsing remains visible and exits with status 2.
 2. `sideeffect model-analyze --question QUESTION` requires the same trace, question, and exact preview digest copied by the user. A changed request is rejected before the runtime starts. The model receives only syscall result facts and direct process relations; it does not receive traces, diffs, package/process/startup/permission inventories, or capture metadata.
 3. The program streams the selected model into a private mode-0600 temporary file while hashing it, then gives llama.cpp that verified copy. A private temporary JSON schema is also created for the run. The child environment is cleared, inference uses a private working directory and offline one-shot mode, and CPU, address-space, file-size, core-dump, file-descriptor, wall-clock, and output limits apply. A Linux seccomp filter denies socket syscalls and `io_uring_setup`; it rejects non-x86_64 and x32 syscall ABIs. The runtime is still an executable attack surface and this is defense in depth, not a sandbox. It can read or alter files accessible to the user; provide only a trusted locally built runtime and a verified model.
 4. SideEffect independently parses the model output, rejects unknown fields and malformed/duplicate/unknown evidence IDs, and accepts at most one ID already present in the request. The output label is `model_selected_single_evidence_for_human_review_not_verified_findings`; the deterministic evidence summary remains present beside it. A valid ID establishes only that the cited record was included in the request, not that it answers the question. The model cannot emit factual prose in this schema. Invalid or malformed output is rejected.
@@ -56,6 +56,17 @@ sideeffect model-analyze \
   --confirm-sha256 REVIEWED_REQUEST_SHA256 TRACE
 ```
 
+To replay the preregistered synthetic evaluation corpus, use the interactive helper below. It displays each exact typed request and output schema, then requires you to enter that request's full SHA-256 digest before invoking the local model. It does not auto-confirm requests.
+
+```sh
+python3 scripts/evaluate_local_model.py \
+  --sideeffect ./target/release/sideeffect \
+  --runtime "$PWD/llama.cpp/build/bin/llama-cli" \
+  --model "$HOME/.cache/sideeffect/models/Qwen3-0.6B-Q4_0.gguf"
+```
+
+The fixture files and preregistered expectations are under [`tests/fixtures/local_model_synthetic`](../tests/fixtures/local_model_synthetic/README.md). They are synthetic test data, not captures from a user's machine.
+
 Do not pass server, repository, URL, tools, or hosted API options to another runtime. The supported command checks for the reviewed llama.cpp version and exact model hash. Native Windows analysis is not supported; WSL2 can be used by users who already have it, but does not constitute native Windows support.
 
 ## Validation and known limitations
@@ -68,13 +79,28 @@ Do not pass server, repository, URL, tools, or hosted API options to another run
 - The official [Qwen2.5-0.5B-Instruct-GGUF model card](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/tree/9217f5db79a29953eb74d5343926648285ec7e67) describes a 0.49B-parameter instruction-tuned model and declares Apache-2.0. Its Q4_0 file at revision `9217f5db79a29953eb74d5343926648285ec7e67` was 428,730,208 bytes with SHA-256 `7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed`. Direct offline llama.cpp probes with the exact SideEffect prompt/schema returned E001–E003 for failure positions 1, 24, and 48, catching only the first-position failure. These comparison runs did not use SideEffect's model-hash gate or seccomp wrapper and this model is not configured by the application.
 - The 1.7B comparison file was fetched from the official [ggml-org Qwen3-1.7B GGUF repository](https://huggingface.co/ggml-org/Qwen3-1.7B-GGUF/tree/daeb8e2d528a760970442092f6bf1e55c3b659eb). Its pinned revision was `daeb8e2d528a760970442092f6bf1e55c3b659eb`, file SHA-256 was `d2387ca2dbfee2ffabce7120d3770dadca0b293052bc2f0e138fdc940d9bc7b5`, and size was about 1.28 GB. It was used only for this local evaluation and is not the configured SideEffect model.
 - The instruction-tuned comparison used the [HuggingFaceTB SmolLM2-1.7B-Instruct model](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct) quantized as [SmolLM2-1.7B-Instruct-Q4_K_M.gguf](https://huggingface.co/bartowski/SmolLM2-1.7B-Instruct-GGUF/blob/1f03464768bfcc0319fc50da8ff5fb20b6417ba2/SmolLM2-1.7B-Instruct-Q4_K_M.gguf). The quantization repository revision was `1f03464768bfcc0319fc50da8ff5fb20b6417ba2`, file SHA-256 was `77665ea4815999596525c636fbeb56ba8b080b46ae85efef4f0d986a139834d7`, and size was about 1.06 GB. It was used only for this local evaluation and is not the configured SideEffect model.
-- The structured evidence-selection output has not yet passed a multi-case corpus. There is no representative real-capture usefulness, prioritization-accuracy rate, latency, or peak-memory study.
+- A guarded trial of the Qwen3-1.7B Q4_K_M candidate exceeded the application's 2 GiB address-space limit on all three test cases (about 1.97 GiB peak RSS before the runtime failed). It is not configured; the Qwen3-0.6B model remains the supported model.
 - Network denial was tested for IPv4, IPv6, and Unix socket creation with the runtime subprocess filter active. This is not a proof of complete isolation.
-- With chronological prompt order, the Qwen3-0.6B model and two 1.7B comparisons selected the first three IDs and omitted a later failure; Qwen2.5-0.5B showed the same behavior. Outcome-based ordering now puts known failure/in-progress records first in the model-only prompt, and the pinned application model selected a single failure at each tested position. Treat selections as unverified review aids and inspect the deterministic summary directly. The current evidence still does not establish that the model adds useful ranking beyond deterministic ordering.
-- M8 release readiness remains unmet: structured selection must show useful ranking across diverse synthetic cases and reviewed examples, followed by code review, CI, and product-security review of the current boundary. A completed standard security scan of immutable revision `5365c84` reported three low-severity findings in package-diagnostic allocation, local-runtime timeout handling, and unsupported startup record completeness. They were fixed in later commits `60f934c`, `229ed10`, and `bea728e`, respectively. The scan is partial because tests, fixtures, and some documentation were inventoried but not reviewed line by line. CI passed through commit `bb516a6`; no model weights are included in SideEffect releases.
-- The next usefulness evaluation should use a preregistered synthetic corpus and compare model selections with a deterministic outcome-based baseline. Vary actionable failures across first, middle, and last positions; include success-only, partial, duplicate-row, and varied-length inputs. Record failure recall, top-three precision, omission rate, permutation sensitivity, latency, and peak memory. This experiment is planned; no results are claimed yet.
+- The earlier three-position probes used a broader candidate list and exposed order sensitivity. The current implementation narrows failure-question candidates and prioritizes a syscall named by the question. The expanded result below supersedes those exploratory accuracy figures but does not erase them.
 
-### Question-focused single-record probe (2026-10-26)
+### Preregistered question-focused corpus (2026-10-26)
+
+Before the inference runs, eight synthetic cases were recorded in `tests/fixtures/local_model_synthetic/corpus.json`. The corpus covers a single failure at first/middle/last positions, a success-only trace queried for a failure, a targeted syscall among two failures, duplicate failure evidence, a partial trace, and a question about successful activity. The pinned Qwen3-0.6B model ran through SideEffect's model hash check, exact request digest check, resource limits, and Linux network-denial filter for every case.
+
+| Case | Expected | Model | Outcome-priority baseline |
+|---|---|---|---|
+| Failure first | E001 | E001 | E001 |
+| Failure middle | E024 | E024 | E024 |
+| Failure last | E048 | E048 | E048 |
+| Success-only, asked for failure | Empty | Empty | Empty |
+| Two failures, asked for `connect` | E002 | E002 | E001 |
+| Duplicate failed connections | E001 or E002 | E001 | E001 |
+| Partial trace with one observed failure | E001, status stays partial | E001, status stays partial | E001 |
+| Asked which syscall succeeded | E002 | E002 | E001 |
+
+The model matched the expected answer set in 8/8 cases; the simple outcome-priority baseline matched 6/8. Mean inference time was 2.64 seconds, and peak RSS across the eight runs was 975,908 KiB (about 953 MiB) on this WSL2 host. These measurements are host-specific. This is a small synthetic corpus: the baseline does not use the question text, only one host and model were measured, and no representative user-reviewed real capture has been evaluated. The result is not enough to establish added value over a strong deterministic query-aware retriever or reliable general question answering. Keep M8 experimental and do not describe the model as reliable or decision-making software.
+
+### Historical four-case probe before candidate filtering (2026-10-26)
 
 The first question-oriented change still returned every available evidence ID for a failure question. The output was restricted to one ID, the question was moved to the first field of the serialized prompt, and only event facts were retained in the model request. These changes were then checked through SideEffect's actual model hash, request digest, resource-limit, and seccomp path using the pinned 0.6B model and a synthetic fixture. This exploratory four-case permutation probe produced:
 
