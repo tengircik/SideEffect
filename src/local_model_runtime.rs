@@ -58,26 +58,54 @@ pub fn create_private_temp_dir() -> Result<PathBuf, String> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn read_capped_pipe<R: Read>(mut reader: R, limit: usize) -> io::Result<BoundedPipe> {
-    let mut bytes = Vec::new();
-    let mut truncated = false;
+fn set_pipe_nonblocking(fd: std::os::fd::RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn drain_pipe<R: Read>(
+    reader: &mut R,
+    pipe: &mut BoundedPipe,
+    limit: usize,
+    closed: &mut bool,
+    deadline: std::time::Instant,
+) -> io::Result<()> {
     let mut buffer = [0_u8; 4096];
     loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "local runtime exceeded its wall-clock limit",
+            ));
         }
-        let remaining = limit.saturating_sub(bytes.len());
-        let retained = read.min(remaining);
-        if retained > 0 {
-            bytes
-                .try_reserve(retained)
-                .map_err(|_| io::Error::other("bounded output allocation failed"))?;
-            bytes.extend_from_slice(&buffer[..retained]);
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                *closed = true;
+                return Ok(());
+            }
+            Ok(read) => {
+                let remaining = limit.saturating_sub(pipe.bytes.len());
+                let retained = read.min(remaining);
+                if retained > 0 {
+                    pipe.bytes
+                        .try_reserve(retained)
+                        .map_err(|_| io::Error::other("bounded output allocation failed"))?;
+                    pipe.bytes.extend_from_slice(&buffer[..retained]);
+                }
+                pipe.truncated |= retained < read;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error),
         }
-        truncated |= retained < read;
     }
-    Ok(BoundedPipe { bytes, truncated })
 }
 
 #[cfg(target_os = "linux")]
@@ -99,26 +127,92 @@ pub fn run_bounded(
         command.current_dir(directory);
     }
     set_child_limits(&mut command)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
     let mut child = command
         .spawn()
         .map_err(|error| format!("could not start the selected local runtime: {error}"))?;
-    let stdout = child.stdout.take().expect("piped runtime stdout");
-    let stderr = child.stderr.take().expect("piped runtime stderr");
-    let stdout_reader = std::thread::spawn(move || read_capped_pipe(stdout, output_limit));
-    let stderr_reader = std::thread::spawn(move || read_capped_pipe(stderr, 16 * 1024));
-    let status = wait_for_child(&mut child, timeout_seconds)?;
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| "local runtime stdout reader stopped unexpectedly".to_owned())?
-        .map_err(|error| format!("could not read local runtime output: {error}"))?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| "local runtime stderr reader stopped unexpectedly".to_owned())?
-        .map_err(|error| format!("could not read local runtime diagnostics: {error}"))?;
+    let mut stdout = child.stdout.take().expect("piped runtime stdout");
+    let mut stderr = child.stderr.take().expect("piped runtime stderr");
+    if let Err(error) = set_pipe_nonblocking(std::os::fd::AsRawFd::as_raw_fd(&stdout))
+        .and_then(|()| set_pipe_nonblocking(std::os::fd::AsRawFd::as_raw_fd(&stderr)))
+    {
+        kill_process_group(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!(
+            "could not configure bounded runtime output pipes: {error}"
+        ));
+    }
+    let mut stdout_pipe = BoundedPipe {
+        bytes: Vec::new(),
+        truncated: false,
+    };
+    let mut stderr_pipe = BoundedPipe {
+        bytes: Vec::new(),
+        truncated: false,
+    };
+    let mut stdout_closed = false;
+    let mut stderr_closed = false;
+    let mut status = None;
+    loop {
+        if !stdout_closed {
+            drain_pipe(
+                &mut stdout,
+                &mut stdout_pipe,
+                output_limit,
+                &mut stdout_closed,
+                deadline,
+            )
+            .map_err(|error| {
+                kill_process_group(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                format!("could not read local runtime output: {error}")
+            })?;
+        }
+        if !stderr_closed {
+            drain_pipe(
+                &mut stderr,
+                &mut stderr_pipe,
+                16 * 1024,
+                &mut stderr_closed,
+                deadline,
+            )
+            .map_err(|error| {
+                kill_process_group(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                format!("could not read local runtime diagnostics: {error}")
+            })?;
+        }
+        if status.is_none() {
+            status = match child.try_wait() {
+                Ok(status) => status,
+                Err(error) => {
+                    kill_process_group(child.id());
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("could not wait for local runtime: {error}"));
+                }
+            };
+        }
+        if status.is_some() && stdout_closed && stderr_closed {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            kill_process_group(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "local runtime exceeded the {timeout_seconds} second time limit"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     Ok(BoundedCommandOutput {
-        status,
-        stdout,
-        stderr,
+        status: status.expect("runtime status was observed before output pipes closed"),
+        stdout: stdout_pipe,
+        stderr: stderr_pipe,
     })
 }
 
@@ -285,31 +379,11 @@ unsafe fn install_network_deny_filter() -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn wait_for_child(
-    child: &mut std::process::Child,
-    timeout_seconds: u64,
-) -> Result<ExitStatus, String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("could not wait for local runtime: {error}"))?
-        {
-            return Ok(status);
-        }
-        if std::time::Instant::now() >= deadline {
-            // The selected runtime is expected to be the pinned direct CLI. Kill
-            // its process group too so an unexpected child cannot hold pipes open.
-            unsafe {
-                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!(
-                "local runtime exceeded the {timeout_seconds} second time limit"
-            ));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
+fn kill_process_group(child_id: u32) {
+    // The runtime is placed in its own process group before exec. This best-effort
+    // cleanup also covers children that inherited the stdout/stderr pipe handles.
+    unsafe {
+        libc::kill(-(child_id as libc::pid_t), libc::SIGKILL);
     }
 }
 
