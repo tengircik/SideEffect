@@ -5,6 +5,8 @@ mod model;
 mod package_diff;
 #[cfg(target_os = "linux")]
 mod packages;
+#[cfg(windows)]
+mod packages_windows;
 #[cfg(target_os = "linux")]
 mod permissions;
 #[cfg(target_os = "linux")]
@@ -36,6 +38,12 @@ pub use debian::collect_debian_packages;
 pub use debian::parse_dpkg_query_output;
 #[cfg(target_os = "linux")]
 pub use packages::collect_packages;
+#[cfg(windows)]
+pub use packages_windows::{
+    WindowsRegistryValue, WindowsSoftwareDiagnostic, WindowsSoftwareInventoryDocument,
+    WindowsSoftwareRegistration, WindowsSoftwareSource, WindowsSoftwareStatus,
+    collect_windows_software,
+};
 #[cfg(target_os = "linux")]
 pub use permissions::{
     AclEntry, AclObservation, AclStatus, AclTag, PermissionDiagnostic, PermissionInventoryDocument,
