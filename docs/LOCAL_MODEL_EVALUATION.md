@@ -56,7 +56,7 @@ sideeffect model-analyze \
   --confirm-sha256 REVIEWED_REQUEST_SHA256 TRACE
 ```
 
-To replay the preregistered synthetic evaluation corpus, use the interactive helper below. It displays each exact typed request and output schema, then requires you to enter that request's full SHA-256 digest before invoking the local model. It does not auto-confirm requests.
+To replay the preregistered synthetic evaluation corpus, use the interactive helper below. It displays each exact typed request and output schema, reports a question-aware deterministic selection from the same typed facts, then requires you to enter that request's full SHA-256 digest before invoking the local model. It does not auto-confirm requests.
 
 ```sh
 python3 scripts/evaluate_local_model.py \
@@ -98,7 +98,7 @@ Before the inference runs, eight synthetic cases were recorded in `tests/fixture
 | Partial trace with one observed failure | E001, status stays partial | E001, status stays partial | E001 |
 | Asked which syscall succeeded | E002 | E002 | E001 |
 
-The model matched the expected answer set in 8/8 cases; the simple outcome-priority baseline matched 6/8. Mean inference time was 2.64 seconds, and peak RSS across the eight runs was 975,908 KiB (about 953 MiB) on this WSL2 host. These measurements are host-specific. This is a small synthetic corpus: the baseline does not use the question text, only one host and model were measured, and no representative user-reviewed real capture has been evaluated. The result is not enough to establish added value over a strong deterministic query-aware retriever or reliable general question answering. Keep M8 experimental and do not describe the model as reliable or decision-making software.
+The model matched the expected answer set in 8/8 cases; the simple outcome-priority baseline matched 6/8. A separate deterministic selector that uses the question's named syscall and requested outcome also matched 8/8, using the same bounded typed facts and no inference. The model therefore showed no added accuracy on this corpus and took a mean 2.64 seconds, with peak RSS of 975,908 KiB (about 953 MiB) on this WSL2 host; the deterministic baseline runs without that inference cost. These measurements are host-specific. This small synthetic corpus does not establish broad real-world performance, and no representative user-reviewed real capture has been evaluated. M8 has no release endorsement: the current model path is experimental and has not demonstrated value beyond deterministic selection. Do not describe it as reliable or as decision-making software.
 
 ### Historical four-case probe before candidate filtering (2026-10-26)
 

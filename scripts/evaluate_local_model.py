@@ -24,6 +24,38 @@ def is_match(selected: list[str], expected: list[str]) -> bool:
     return len(selected) == 1 and selected[0] in expected
 
 
+def deterministic_selection(preview: dict[str, Any]) -> list[str]:
+    """Select one matching typed fact without model inference."""
+    try:
+        prompt = json.loads(preview["prompt"])
+        facts = prompt["observed_syscall_results"]
+        question = prompt["user_question"].lower()
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return []
+
+    words = {word.strip(".,?!:;()[]{}\"'") for word in question.split()}
+    syscall_matches = [
+        fact for fact in facts if fact.get("syscall", "").lower() in words
+    ]
+    candidates = syscall_matches or facts
+    if any(
+        term in words
+        for term in ("failed", "failure", "error", "denied", "unsuccessful")
+    ):
+        candidates = [
+            fact
+            for fact in candidates
+            if fact.get("outcome") in ("failure", "in_progress")
+        ]
+    elif any(term in words for term in ("succeeded", "success", "successful")):
+        candidates = [fact for fact in candidates if fact.get("outcome") == "success"]
+
+    if not candidates:
+        return []
+    evidence_id = candidates[0].get("evidence_id")
+    return [evidence_id] if isinstance(evidence_id, str) else []
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sideeffect", required=True, type=Path, help="Built SideEffect executable")
@@ -69,6 +101,8 @@ def main() -> int:
         print(f"System prompt: {preview['system_prompt']}")
         print(f"Model facts: {preview['prompt']}")
         print(f"Allowed output schema: {json.dumps(preview['output_schema'], sort_keys=True)}")
+        deterministic = deterministic_selection(preview)
+        print(f"Question-aware deterministic selection: {deterministic}")
         digest = preview["request_sha256"]
         confirmation = input(f"Review the request, then type its digest to run: {digest}\n> ").strip()
         if confirmation != digest:
@@ -115,6 +149,7 @@ def main() -> int:
         baseline = case["outcome_priority_baseline"]
         model_match = is_match(selected, expected)
         baseline_match = is_match(baseline, expected)
+        deterministic_match = is_match(deterministic, expected)
         outcomes.append(
             {
                 "id": case["id"],
@@ -122,6 +157,8 @@ def main() -> int:
                 "expected_evidence_ids": expected,
                 "model_match": model_match,
                 "baseline_match": baseline_match,
+                "query_aware_deterministic_selection": deterministic,
+                "query_aware_deterministic_match": deterministic_match,
                 "elapsed_seconds": elapsed,
             }
         )
@@ -129,6 +166,7 @@ def main() -> int:
             f"Selected: {selected}; expected set: {expected}; "
             f"model={'PASS' if model_match else 'FAIL'}; "
             f"outcome-priority baseline={'PASS' if baseline_match else 'FAIL'}; "
+            f"query-aware deterministic baseline={'PASS' if deterministic_match else 'FAIL'}; "
             f"elapsed={elapsed:.2f}s"
         )
 
@@ -138,10 +176,12 @@ def main() -> int:
     if valid:
         model_correct = sum(case["model_match"] for case in valid)
         baseline_correct = sum(case["baseline_match"] for case in valid)
+        deterministic_correct = sum(case["query_aware_deterministic_match"] for case in valid)
         print(
             f"Scored: {len(valid)}/{len(corpus['cases'])}; "
             f"model: {model_correct}/{len(valid)}; "
-            f"outcome-priority baseline: {baseline_correct}/{len(valid)}"
+            f"outcome-priority baseline: {baseline_correct}/{len(valid)}; "
+            f"query-aware deterministic baseline: {deterministic_correct}/{len(valid)}"
         )
     return 0 if len(valid) == len(corpus["cases"]) and all(case["model_match"] for case in valid) else 2
 
