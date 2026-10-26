@@ -369,6 +369,15 @@ pub fn correlate_startup_bytes(
 
     for record in &startup.systemd_units.records {
         if !matches!(record.record_type.as_str(), "unit_file" | "drop_in_file") {
+            for directive in &record.directives {
+                if directive.section == "Service"
+                    && systemd_exec_evidence_key(&directive.key).is_some()
+                {
+                    examined_config_rows = examined_config_rows.saturating_add(1);
+                    ensure_config_row_limit(examined_config_rows)?;
+                    unsupported_systemd = unsupported_systemd.saturating_add(1);
+                }
+            }
             continue;
         }
         for directive in record.directives.iter().filter(|directive| {
