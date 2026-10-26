@@ -134,7 +134,7 @@ pub fn preview_trace_document(
 }
 
 fn model_prompt_facts(evidence_summary: &Value) -> Value {
-    let results = evidence_summary
+    let mut results = evidence_summary
         .get("result_facts")
         .and_then(Value::as_array)
         .into_iter()
@@ -147,6 +147,13 @@ fn model_prompt_facts(evidence_summary: &Value) -> Value {
             })
         })
         .collect::<Vec<_>>();
+    // Keep evidence IDs stable in the deterministic summary, but place already-observed
+    // failure and in-progress results first in the model-only view. Small local models can
+    // over-weight prompt position; this makes the prompt order reflect observable outcomes.
+    results.sort_by_key(|fact| match fact.get("outcome").and_then(Value::as_str) {
+        Some("failure" | "in_progress") => 0,
+        _ => 1,
+    });
     json!({
         "parse_status": evidence_summary.get("parse_status"),
         "capture_completeness": evidence_summary.get("capture_completeness"),
