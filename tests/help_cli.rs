@@ -30,7 +30,10 @@ fn focused_help_covers_command_and_nested_inventory_topics() {
     assert!(startup.status.success());
     let startup_help = String::from_utf8_lossy(&startup.stdout);
     assert!(startup_help.contains("configured entry ran"));
-    assert!(startup_help.contains("Native Windows startup inventory is planned"));
+    #[cfg(target_os = "linux")]
+    assert!(startup_help.contains("supported Linux"));
+    #[cfg(windows)]
+    assert!(startup_help.contains("services and scheduled tasks are reported as not checked"));
 }
 
 #[test]

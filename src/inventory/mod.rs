@@ -15,6 +15,8 @@ mod processes_windows;
 mod startup;
 #[cfg(target_os = "linux")]
 mod startup_legacy;
+#[cfg(windows)]
+mod startup_windows;
 #[cfg(target_os = "linux")]
 mod systemd_units;
 
@@ -61,6 +63,13 @@ pub use startup::{
 pub use startup_legacy::{
     LegacyStartupDocument, LegacyStartupEntry, LegacyStartupPaths,
     ScanStatus as LegacyStartupStatus, collect_legacy_startup,
+};
+#[cfg(windows)]
+pub use startup_windows::{
+    WindowsRegistryStartupEntry, WindowsRegistryStartupEvidence, WindowsRegistryView,
+    WindowsStartupDiagnostic, WindowsStartupFolderEntry, WindowsStartupFolderEvidence,
+    WindowsStartupInventoryDocument, WindowsStartupSource, WindowsStartupStatus,
+    collect_windows_startup,
 };
 #[cfg(target_os = "linux")]
 pub use systemd_units::{UnitInventory as SystemdUnitInventory, UnitRecord as SystemdUnitRecord};
