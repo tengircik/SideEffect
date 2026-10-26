@@ -252,6 +252,23 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             program,
             target_args @ ..,
         ] if command == "record"
+            && option == "--windows-etw"
+            && duration_flag == "--duration-seconds"
+            && separator == "--" =>
+        {
+            let duration = parse_windows_duration_seconds(duration)?;
+            record_windows_etw(output, program, target_args, duration)
+        }
+        [
+            command,
+            option,
+            output,
+            duration_flag,
+            duration,
+            separator,
+            program,
+            target_args @ ..,
+        ] if command == "record"
             && option == "--trace"
             && duration_flag == "--duration-seconds"
             && separator == "--" =>
@@ -536,6 +553,78 @@ fn inventory_permissions(output: &OsString, paths: &[OsString]) -> Result<ExitCo
     }
 }
 
+fn parse_windows_duration_seconds(value: &OsString) -> Result<Duration, String> {
+    let Some(text) = value.to_str() else {
+        return Err(
+            "Windows ETW duration must be an ASCII integer from 1 to 60 seconds".to_owned(),
+        );
+    };
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(
+            "Windows ETW duration must be an ASCII integer from 1 to 60 seconds".to_owned(),
+        );
+    }
+    let seconds = text
+        .parse::<u64>()
+        .map_err(|_| "Windows ETW duration must be an ASCII integer from 1 to 60 seconds")?;
+    if !(1..=60).contains(&seconds) {
+        return Err("Windows ETW duration must be from 1 to 60 seconds".to_owned());
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+fn record_windows_etw(
+    output: &OsString,
+    program: &OsString,
+    args: &[OsString],
+    duration: Duration,
+) -> Result<ExitCode, String> {
+    #[cfg(windows)]
+    {
+        let capture = sideeffect::record::record_windows_process_capture(
+            Path::new(output),
+            program,
+            args,
+            duration,
+        )?;
+        eprintln!(
+            "Saved {} Windows process lifecycle records to {} (collection: {:?}; capture completeness: unknown; ETW loss stats available: {}, final snapshot: {}, observation: {}).",
+            capture.events.len(),
+            terminal_safe_path(Path::new(output)),
+            capture.collection_status,
+            capture.event_loss.loss_statistics_available,
+            capture.event_loss.final_snapshot_available,
+            capture.event_loss.observation,
+        );
+        if capture.collection_status == sideeffect::record::WindowsRuntimeCollectionStatus::Partial
+        {
+            return Ok(ExitCode::from(2));
+        }
+        match capture.target.exit_code {
+            None => Ok(ExitCode::SUCCESS),
+            Some(code) => match windows_child_exit_code(code) {
+                Some(code) => Ok(ExitCode::from(code)),
+                None => {
+                    eprintln!(
+                        "Windows target exit code {code} is outside the 0–255 range representable by this CLI; returning failure."
+                    );
+                    Ok(ExitCode::FAILURE)
+                }
+            },
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (output, program, args, duration);
+        Err("record --windows-etw is available only on native Windows".to_owned())
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_child_exit_code(code: i32) -> Option<u8> {
+    u8::try_from(code).ok()
+}
+
 fn parse_duration_seconds(value: &OsString) -> Result<Duration, String> {
     let Some(text) = value.to_str() else {
         return Err("capture duration must be an ASCII integer from 1 to 3600 seconds".to_owned());
@@ -767,7 +856,14 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect evidence TRACE SHA256 LINE BYTE_OFFSET BYTE_LENGTH\nVerifies an exact parsed-row reference against the supplied fingerprint. A hash identifies bytes but does not authenticate them or prove capture completeness."
         }
         "record" => {
-            "Usage: sideeffect record --trace OUTPUT -- PROGRAM [ARGS...]\n       sideeffect record --bundle DIR -- PROGRAM [ARGS...]\n       sideeffect record --trace OUTPUT --duration-seconds 1..3600 -- PROGRAM [ARGS...]\nRuns the selected program with the current user's permissions under external strace. This is observation, not isolation or a safety check. Available on Linux."
+            #[cfg(windows)]
+            {
+                "Usage: sideeffect record --windows-etw OUTPUT.json --duration-seconds 1..60 -- PROGRAM [ARGS...]\nStarts a bounded native ETW process-lifecycle capture. The NT Kernel Logger observes system-wide process events for the capture window; records are not attributed to the selected command or its descendants. Controlling the NT Kernel Logger requires administrative privileges. No automatic elevation is requested. This is observation, not isolation or a safety check."
+            }
+            #[cfg(not(windows))]
+            {
+                "Usage: sideeffect record --trace OUTPUT -- PROGRAM [ARGS...]\n       sideeffect record --bundle DIR -- PROGRAM [ARGS...]\n       sideeffect record --trace OUTPUT --duration-seconds 1..3600 -- PROGRAM [ARGS...]\nRuns the selected program with the current user's permissions under external strace. This is observation, not isolation or a safety check. Available on Linux."
+            }
         }
         "inventory" => {
             "Usage: sideeffect inventory packages|processes|startup|permissions --output FILE [PATH...]\nCollects bounded, local snapshots from sources supported on this platform. Sources are curated and coverage can be partial; inspect output and diagnostics before drawing conclusions."
@@ -1891,6 +1987,14 @@ mod tests {
         buffer.write_all(b"abc").unwrap();
         assert_eq!(buffer.bytes, b"abc");
         assert!(!buffer.exceeded);
+    }
+
+    #[test]
+    fn windows_child_exit_code_does_not_wrap_out_of_range_values() {
+        assert_eq!(super::windows_child_exit_code(0), Some(0));
+        assert_eq!(super::windows_child_exit_code(255), Some(255));
+        assert_eq!(super::windows_child_exit_code(256), None);
+        assert_eq!(super::windows_child_exit_code(-1), None);
     }
 
     #[test]

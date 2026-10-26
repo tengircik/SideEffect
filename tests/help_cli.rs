@@ -23,8 +23,11 @@ fn focused_help_covers_command_and_nested_inventory_topics() {
     let record = run(&["record", "--help"]);
     assert!(record.status.success());
     let record_help = String::from_utf8_lossy(&record.stdout);
+    #[cfg(target_os = "linux")]
     assert!(record_help.contains("current user's permissions"));
-    assert!(record_help.contains("not isolation"));
+    #[cfg(windows)]
+    assert!(record_help.contains("system-wide process events"));
+    assert!(record_help.contains("not isolation") || record_help.contains("not a safety check"));
 
     let startup = run(&["help", "inventory", "startup"]);
     assert!(startup.status.success());

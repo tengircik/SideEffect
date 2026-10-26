@@ -3,6 +3,8 @@ mod command;
 mod paths;
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+mod windows_etw;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -14,6 +16,11 @@ pub(crate) use command::build_strace_command_for;
 pub use paths::{AnchoredOutput, publish_private_file};
 #[cfg(windows)]
 pub use windows::publish_private_file as publish_private_windows_file;
+#[cfg(windows)]
+pub use windows_etw::{
+    CollectionStatus as WindowsRuntimeCollectionStatus, WindowsRuntimeCapture,
+    record_windows_process_capture,
+};
 
 #[cfg(target_os = "linux")]
 pub use linux::{
