@@ -651,7 +651,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect model-preview TRACE\nPreviews the exact bounded local-model request and digest. Review it before confirming analysis. Partial parsing is visible and exits with status 2."
         }
         "model-analyze" => {
-            "Usage: sideeffect model-analyze --runtime LLAMA_CLI --model MODEL.gguf --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the pinned optional local model on Linux x86_64 after explicit digest confirmation. It does not download weights or upload evidence. Generated prose is unverified interpretation; see docs/LOCAL_MODEL_EVALUATION.md."
+            "Usage: sideeffect model-analyze --runtime LLAMA_CLI --model MODEL.gguf --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the pinned optional local model on Linux x86_64 after explicit digest confirmation. It does not download weights or upload evidence. The model selects source evidence IDs for human review; this is not a finding. See docs/LOCAL_MODEL_EVALUATION.md."
         }
         _ => return Err(format!("unknown help topic: {topic}\n\n{USAGE}")),
     };
@@ -892,7 +892,7 @@ fn model_analyze_file(
         digest,
     )?;
     let partial = analysis.evidence_summary["parse_status"] == "partial";
-    write_json(&analysis, "local model interpretation")?;
+    write_json(&analysis, "local model evidence selection")?;
     Ok(if partial {
         ExitCode::from(2)
     } else {
