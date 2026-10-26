@@ -156,6 +156,8 @@ The implemented Linux `sideeffect.startup_inventory` v2 aggregate combines bound
 
 **M10 exit criteria:** deterministic Windows tests cover all listed sources, malformed/oversized values, inaccessible scopes, and inert command text. A real Windows run demonstrates each inventory command and explicitly reports its visible scope. Package registrations and startup configuration remain curated snapshots, not complete inventories or proof that an entry ran.
 
+**Current status:** the first native Windows process snapshot is implemented with Tool Help enumeration and limited-information image-path queries, bounded to 8,192 processes and a 10-second collection window. It uses a Windows-specific schema, makes inaccessible and vanished processes partial, and writes through a current-user-only DACL staging directory with no-clobber publication. This does not complete M10: Windows package, selected-path permission, and startup adapters remain unimplemented, and the real Windows CLI smoke test is still to be exercised on Windows CI and the supported source matrix remains incomplete.
+
 ## Milestone 11 — Native Windows runtime evidence and core workflow parity
 
 - Prototype native bounded runtime capture using [ETW](https://learn.microsoft.com/en-us/windows/win32/etw/about-event-tracing) or a justified Windows-native alternative. Cover process creation/lifecycle, selected file activity, and connection-related observations to provide the same core investigative jobs as Linux `record`/`inspect`/`diff`.

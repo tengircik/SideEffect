@@ -38,6 +38,14 @@ This reads one `/proc/<pid>/status` file and the `/proc/<pid>/exe` link for each
 
 The collector does not read command lines or other procfs files, and does not request elevated privileges. It is bounded to 8,192 numeric process directories, 64 KiB per status file, 32 MiB of aggregate status bytes, 4 KiB per executable link, 4 MiB aggregate executable-link bytes, a 10-second scan deadline, and 64 MiB of serialized JSON. Output is private (mode `0600`) and no-clobber. Process names, executable paths, IDs, credentials, capability masks, and security mode values are sensitive system information; the output is not redacted or uploaded. Review it before sharing and delete it when no longer needed.
 
+## Take a Windows process snapshot
+
+```powershell
+.\target\release\sideeffect.exe inventory processes --output .\processes.json
+```
+
+The first native Windows inventory uses one Tool Help process snapshot and queries image paths only when Windows grants limited query access. It does not read command lines, inspect process memory, run processes, or request elevation. The process snapshot and image-path lookups are separate observations; processes may exit or a process ID may be reused between them. Inaccessible image paths remain unknown and make the document partial. Collection is bounded to 8,192 entries, 10 seconds, 32,768 UTF-16 code units per path, 4 Mi aggregate path code units, and 64 MiB of JSON. Output uses a current-user-only Windows DACL and no-clobber publication. Names and paths may be sensitive. This command does not complete Windows package, permission, startup, or runtime auditing.
+
 ## Discover Linux startup configuration
 
 ```sh

@@ -33,6 +33,8 @@ use sideeffect::inventory::{PermissionInventoryStatus, collect_permissions};
 use sideeffect::inventory::{ProcessInventoryStatus, collect_processes};
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{StartupInventoryStatus, collect_startup};
+#[cfg(windows)]
+use sideeffect::inventory::{WindowsProcessInventoryStatus, collect_windows_processes};
 #[cfg(target_os = "linux")]
 use sideeffect::limits::MAX_BUNDLE_MANIFEST_BYTES;
 use sideeffect::limits::{MAX_REPORT_BYTES, MAX_TRACE_BYTES, ParseLimits};
@@ -41,6 +43,8 @@ use sideeffect::model::{BundleCaptureContext, ParseCompleteness, TraceDiff, Trac
 use sideeffect::record::AnchoredOutput;
 #[cfg(target_os = "linux")]
 use sideeffect::record::publish_private_file;
+#[cfg(windows)]
+use sideeffect::record::publish_private_windows_file;
 use sideeffect::startup_correlation::correlate_startup_bytes;
 use sideeffect::trace::strace::parse_trace_bytes;
 
@@ -54,7 +58,7 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect inventory processes --output <new-inventory.json>\n\
        sideeffect inventory startup --output <new-inventory.json>\n\
        sideeffect inventory permissions --output <new-inventory.json> <path>...\n\
-       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect record --trace <new-trace-file> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect help [command [subcommand]]\n       sideeffect version\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. Inventory packages reads available local dpkg, RPM, pacman, and APK databases and saves a private JSON snapshot; unsupported, unavailable, or incomplete sources remain visible, and unregistered software may be missed. Inventory processes reads bounded numeric /proc status entries and executable-link identities; it does not open executable targets or promise atomic or exhaustive coverage. Inventory startup discovers supported Linux startup configuration sources and preserves inert values with source evidence; applicability and execution are not inferred. Inventory permissions inspects only explicit Linux paths and records ownership/type/mode, supported POSIX ACLs, and Linux file-capability xattrs; it never follows the final path symlink or calculates effective access. Record follows a selected command's traced descendants and may enforce a requested wall-clock limit; this is observation, not isolation or a safety check.";
+       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect record --trace <new-trace-file> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect help [command [subcommand]]\n       sideeffect version\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. Inventory packages reads available local dpkg, RPM, pacman, and APK databases and saves a private JSON snapshot; unsupported, unavailable, or incomplete sources remain visible, and unregistered software may be missed. On Linux, inventory processes reads bounded numeric /proc status entries and executable-link identities; on Windows, it reads a Tool Help snapshot and queries accessible image paths. Neither adapter reads command lines or promises atomic or exhaustive coverage. Inventory startup discovers supported Linux startup configuration sources and preserves inert values with source evidence; applicability and execution are not inferred. Inventory permissions inspects only explicit Linux paths and records ownership/type/mode, supported POSIX ACLs, and Linux file-capability xattrs; it never follows the final path symlink or calculates effective access. Record follows a selected command's traced descendants and may enforce a requested wall-clock limit; this is observation, not isolation or a safety check.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -349,10 +353,38 @@ fn inventory_processes(output: &OsString) -> Result<ExitCode, String> {
             Ok(ExitCode::from(2))
         }
     }
+    #[cfg(windows)]
+    {
+        let document = collect_windows_processes();
+        let complete = document.status == WindowsProcessInventoryStatus::Complete;
+        let mut json = CappedBuffer::new(MAX_REPORT_BYTES);
+        serde_json::to_writer(&mut json, &document).map_err(|error| {
+            format!("could not serialize Windows process inventory within the {MAX_REPORT_BYTES} byte limit: {error}")
+        })?;
+        let published =
+            publish_private_windows_file(Path::new(output), &json.bytes, MAX_REPORT_BYTES)
+                .map_err(|error| {
+                    format!("could not publish private Windows process inventory: {error}")
+                })?;
+        if complete {
+            eprintln!(
+                "Saved a Windows Tool Help process snapshot to {}. Process paths may be inaccessible, and the snapshot is non-atomic and not exhaustive.",
+                terminal_safe_path(&published)
+            );
+            Ok(ExitCode::SUCCESS)
+        } else {
+            eprintln!(
+                "Saved a partial Windows process snapshot to {}. Check its diagnostics; inaccessible or unobserved process data is unknown.",
+                terminal_safe_path(&published)
+            );
+            Ok(ExitCode::from(2))
+        }
+    }
     #[cfg(not(target_os = "linux"))]
+    #[cfg(not(windows))]
     {
         let _ = output;
-        Err("inventory processes requires Linux procfs".to_owned())
+        Err("inventory processes is not supported on this platform".to_owned())
     }
 }
 
@@ -599,6 +631,21 @@ fn terminal_safe_path(path: &Path) -> String {
     escaped
 }
 
+#[cfg(windows)]
+fn terminal_safe_path(path: &Path) -> String {
+    use std::fmt::Write as _;
+
+    let mut escaped = String::new();
+    for character in path.to_string_lossy().chars() {
+        if character.is_control() {
+            let _ = write!(escaped, "\\u{{{:x}}}", character as u32);
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
 fn print_version() {
     println!("sideeffect {}", env!("CARGO_PKG_VERSION"));
 }
@@ -646,7 +693,18 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect inventory packages --output FILE\nReads available dpkg, RPM, pacman, and APK package databases at fixed Linux paths. Unregistered software and unsupported sources may be missing."
         }
         "inventory processes" => {
-            "Usage: sideeffect inventory processes --output FILE\nReads bounded /proc status fields and executable-link text. It does not read command lines or open executable targets."
+            #[cfg(target_os = "linux")]
+            {
+                "Usage: sideeffect inventory processes --output FILE\nReads bounded /proc status fields and executable-link text. It does not read command lines or open executable targets."
+            }
+            #[cfg(windows)]
+            {
+                "Usage: sideeffect inventory processes --output FILE\nReads a bounded Tool Help snapshot and queries accessible image paths. It does not read command lines, inspect process memory, or request elevation."
+            }
+            #[cfg(not(any(target_os = "linux", windows)))]
+            {
+                "Usage: sideeffect inventory processes --output FILE\nProcess inventory is not supported on this platform."
+            }
         }
         "inventory permissions" => {
             "Usage: sideeffect inventory permissions --output FILE PATH...\nInspects only explicit Linux paths for metadata, supported POSIX ACLs, and file capabilities. It does not recurse or calculate effective access."

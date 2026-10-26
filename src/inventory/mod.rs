@@ -9,6 +9,8 @@ mod packages;
 mod permissions;
 #[cfg(target_os = "linux")]
 mod processes;
+#[cfg(windows)]
+mod processes_windows;
 #[cfg(target_os = "linux")]
 mod startup;
 #[cfg(target_os = "linux")]
@@ -42,6 +44,12 @@ pub use processes::{
     ProcessDiagnostic, ProcessEvidence, ProcessExecutableEvidence, ProcessExecutableLink,
     ProcessExecutableLinkStatus, ProcessInventoryDocument, ProcessInventorySource,
     ProcessInventoryStatus, ProcessRow, collect_processes, collect_processes_from,
+};
+#[cfg(windows)]
+pub use processes_windows::{
+    WindowsProcessDiagnostic, WindowsProcessImage, WindowsProcessImageStatus,
+    WindowsProcessInventoryDocument, WindowsProcessInventoryStatus, WindowsProcessRow,
+    collect_windows_processes,
 };
 #[cfg(target_os = "linux")]
 pub use startup::{
