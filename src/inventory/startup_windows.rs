@@ -1,7 +1,8 @@
 //! Bounded native Windows startup configuration snapshot.
 //!
-//! Registry commands and startup-folder paths are data only. This module never
-//! expands environment strings, parses command lines, or launches entries.
+//! Registry commands, service image paths, and startup-folder paths are data only.
+//! This module never expands environment strings, parses command lines, or
+//! launches entries.
 
 use serde::Serialize;
 use std::ffi::{OsStr, c_void};
@@ -15,6 +16,7 @@ const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_MORE_DATA: u32 = 234;
 const ERROR_NO_MORE_ITEMS: u32 = 259;
+const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const REG_SZ: u32 = 1;
 const REG_EXPAND_SZ: u32 = 2;
 const KEY_READ: u32 = 0x0002_0019;
@@ -28,11 +30,64 @@ const MAX_STARTUP_ENTRIES: usize = 8_192;
 const MAX_PATH_UNITS: usize = 32_768;
 const MAX_AGGREGATE_PATH_UNITS: usize = 4 * 1024 * 1024;
 const MAX_SCAN_DURATION_MS: u128 = 10_000;
+const MAX_SERVICE_ENUM_BYTES: usize = 256 * 1024;
+const MAX_SERVICE_CONFIG_BYTES: usize = 64 * 1024;
+const MAX_AGGREGATE_SERVICE_CONFIG_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SERVICE_ENTRIES: usize = 8_192;
+const MAX_SERVICE_STRING_UNITS: usize = 32_768;
+const MAX_AGGREGATE_SERVICE_STRING_UNITS: usize = 4 * 1024 * 1024;
+const MAX_SERVICE_DIAGNOSTICS: usize = 256;
+const SC_MANAGER_CONNECT: u32 = 0x0001;
+const SC_MANAGER_ENUMERATE_SERVICE: u32 = 0x0004;
+const SERVICE_QUERY_CONFIG: u32 = 0x0001;
+const SC_ENUM_PROCESS_INFO: u32 = 0;
+const SERVICE_DRIVER: u32 = 0x0000_000b;
+const SERVICE_WIN32: u32 = 0x0000_0030;
+const SERVICE_TYPE_ALL: u32 = SERVICE_DRIVER | SERVICE_WIN32;
+const SERVICE_STATE_ALL: u32 = 0x0000_0003;
+const SERVICE_BOOT_START: u32 = 0;
+const SERVICE_SYSTEM_START: u32 = 1;
+const SERVICE_AUTO_START: u32 = 2;
+const SERVICE_DEMAND_START: u32 = 3;
+const SERVICE_DISABLED: u32 = 4;
 const KF_FLAG_DONT_VERIFY: u32 = 0x0000_4000;
 const REGISTRY_ROOT_CURRENT_USER: isize = -2_147_483_647;
 const REGISTRY_ROOT_LOCAL_MACHINE: isize = -2_147_483_646;
 
 type Handle = *mut c_void;
+
+#[repr(C)]
+struct ServiceStatusProcess {
+    service_type: u32,
+    current_state: u32,
+    controls_accepted: u32,
+    win32_exit_code: u32,
+    service_specific_exit_code: u32,
+    check_point: u32,
+    wait_hint: u32,
+    process_id: u32,
+    service_flags: u32,
+}
+
+#[repr(C)]
+struct EnumServiceStatusProcessW {
+    service_name: *mut u16,
+    display_name: *mut u16,
+    status: ServiceStatusProcess,
+}
+
+#[repr(C)]
+struct QueryServiceConfigW {
+    service_type: u32,
+    start_type: u32,
+    error_control: u32,
+    binary_path_name: *mut u16,
+    load_order_group: *mut u16,
+    tag_id: u32,
+    dependencies: *mut u16,
+    service_start_name: *mut u16,
+    display_name: *mut u16,
+}
 
 #[repr(C)]
 struct Guid {
@@ -76,6 +131,36 @@ unsafe extern "system" {
         data_length: *mut u32,
     ) -> i32;
     fn RegCloseKey(key: Handle) -> i32;
+    fn OpenSCManagerW(
+        machine_name: *const u16,
+        database_name: *const u16,
+        desired_access: u32,
+    ) -> Handle;
+    fn EnumServicesStatusExW(
+        manager: Handle,
+        info_level: u32,
+        service_type: u32,
+        service_state: u32,
+        buffer: *mut u8,
+        buffer_size: u32,
+        bytes_needed: *mut u32,
+        services_returned: *mut u32,
+        resume_handle: *mut u32,
+        group_name: *const u16,
+    ) -> i32;
+    fn OpenServiceW(manager: Handle, service_name: *const u16, desired_access: u32) -> Handle;
+    fn QueryServiceConfigW(
+        service: Handle,
+        config: *mut QueryServiceConfigW,
+        buffer_size: u32,
+        bytes_needed: *mut u32,
+    ) -> i32;
+    fn CloseServiceHandle(service: Handle) -> i32;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetLastError() -> u32;
 }
 
 #[link(name = "shell32")]
@@ -120,6 +205,8 @@ pub struct WindowsStartupDiagnostic {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value_index: Option<usize>,
     pub message: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub win32_error: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -167,6 +254,25 @@ pub struct WindowsStartupFolderEvidence {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct WindowsServiceStartupEntry {
+    pub service_name: String,
+    pub display_name: String,
+    pub start_type: &'static str,
+    pub start_type_code: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<String>,
+    pub evidence: WindowsServiceStartupEvidence,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WindowsServiceStartupEvidence {
+    pub source: &'static str,
+    pub service_index: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct WindowsStartupSource {
     pub id: &'static str,
     pub status: WindowsStartupStatus,
@@ -196,6 +302,7 @@ pub struct WindowsStartupInventoryDocument {
     pub sources: Vec<WindowsStartupSource>,
     pub registry_entries: Vec<WindowsRegistryStartupEntry>,
     pub folder_entries: Vec<WindowsStartupFolderEntry>,
+    pub service_entries: Vec<WindowsServiceStartupEntry>,
 }
 
 #[derive(Clone, Copy)]
@@ -334,6 +441,7 @@ pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
     let mut sources = Vec::new();
     let mut registry_entries = Vec::new();
     let mut folder_entries = Vec::new();
+    let mut service_entries = Vec::new();
     let mut aggregate_registry_bytes = 0usize;
     let mut aggregate_registry_names = 0usize;
     let mut registry_values_checked = 0usize;
@@ -403,16 +511,9 @@ pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
         sources.push(result);
     }
 
-    sources.push(source_result(
-        "service_start_configuration",
-        WindowsStartupStatus::NotChecked,
-        0,
-        vec![diagnostic(
-            "service_sources_not_implemented",
-            None,
-            "Windows service start configuration is not checked by this adapter.",
-        )],
-    ));
+    let (service_source, services) = collect_service_start_configuration(started);
+    sources.push(service_source);
+    service_entries.extend(services);
     sources.push(source_result(
         "scheduled_task_triggers",
         WindowsStartupStatus::NotChecked,
@@ -435,15 +536,500 @@ pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
     };
     WindowsStartupInventoryDocument {
         schema: "sideeffect.windows_startup_inventory",
-        schema_version: 1,
+        schema_version: 2,
         platform: "windows",
-        scope: "current_user_and_accessible_machine_run_keys_and_startup_folders",
+        scope: "current_user_and_accessible_machine_run_keys_startup_folders_and_services",
         capture_started_at_unix_ms: started_at,
         capture_ended_at_unix_ms: now_ms(),
         status,
         sources,
         registry_entries,
         folder_entries,
+        service_entries,
+    }
+}
+
+struct ServiceHandle(Handle);
+
+impl Drop for ServiceHandle {
+    fn drop(&mut self) {
+        unsafe { CloseServiceHandle(self.0) };
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceStringError {
+    Missing,
+    OutsideBuffer,
+    Misaligned,
+    Unterminated,
+    OverLimit,
+    MalformedUtf16,
+}
+
+fn collect_service_start_configuration(
+    started: Instant,
+) -> (WindowsStartupSource, Vec<WindowsServiceStartupEntry>) {
+    let mut diagnostics = Vec::new();
+    let mut entries = Vec::new();
+    let mut status = WindowsStartupStatus::Complete;
+    let mut aggregate_config_bytes = 0usize;
+    let mut aggregate_string_units = 0usize;
+    let mut enumerated = 0usize;
+    let manager = unsafe {
+        OpenSCManagerW(
+            std::ptr::null(),
+            std::ptr::null(),
+            SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE,
+        )
+    };
+    if manager.is_null() {
+        let error = unsafe { GetLastError() };
+        let status = if error == ERROR_ACCESS_DENIED {
+            WindowsStartupStatus::Inaccessible
+        } else {
+            WindowsStartupStatus::Unavailable
+        };
+        return (
+            source_result(
+                "service_start_configuration",
+                status,
+                0,
+                vec![diagnostic_win32(
+                    if error == ERROR_ACCESS_DENIED {
+                        "service_manager_access_denied"
+                    } else {
+                        "service_manager_unavailable"
+                    },
+                    None,
+                    "Windows could not open the Service Control Manager with read-only enumeration access.",
+                    error,
+                )],
+            ),
+            entries,
+        );
+    }
+    let manager = ServiceHandle(manager);
+    let enum_words = MAX_SERVICE_ENUM_BYTES.div_ceil(std::mem::size_of::<u64>());
+    let mut resume = 0u32;
+    let mut previous_resume = u32::MAX;
+    let mut enumeration_finished = false;
+    while !enumeration_finished && enumerated < MAX_SERVICE_ENTRIES {
+        if elapsed(started) {
+            status = WindowsStartupStatus::Partial;
+            push_service_diagnostic(
+                &mut diagnostics,
+                diagnostic(
+                    "service_scan_deadline_exceeded",
+                    None,
+                    "The startup inventory time limit was reached during service enumeration.",
+                ),
+            );
+            break;
+        }
+        let mut buffer = vec![0u64; enum_words];
+        let buffer_bytes = buffer.len() * std::mem::size_of::<u64>();
+        let mut bytes_needed = 0u32;
+        let mut returned = 0u32;
+        let prior_resume = resume;
+        let success = unsafe {
+            EnumServicesStatusExW(
+                manager.0,
+                SC_ENUM_PROCESS_INFO,
+                SERVICE_TYPE_ALL,
+                SERVICE_STATE_ALL,
+                buffer.as_mut_ptr().cast(),
+                buffer_bytes as u32,
+                &mut bytes_needed,
+                &mut returned,
+                &mut resume,
+                std::ptr::null(),
+            )
+        } != 0;
+        let error = if success {
+            0
+        } else {
+            unsafe { GetLastError() }
+        };
+        if !success && error != ERROR_MORE_DATA {
+            status = WindowsStartupStatus::Partial;
+            push_service_diagnostic(
+                &mut diagnostics,
+                diagnostic_win32(
+                    if error == ERROR_ACCESS_DENIED {
+                        "service_enumeration_access_denied"
+                    } else {
+                        "service_enumeration_failed"
+                    },
+                    None,
+                    "Windows could not enumerate all service configurations visible to this user.",
+                    error,
+                ),
+            );
+            break;
+        }
+        let item_size = std::mem::size_of::<EnumServiceStatusProcessW>();
+        let capacity = buffer_bytes / item_size;
+        if returned as usize > capacity {
+            status = WindowsStartupStatus::Partial;
+            push_service_diagnostic(
+                &mut diagnostics,
+                diagnostic(
+                    "service_enumeration_result_malformed",
+                    None,
+                    "Windows returned a service count that exceeded the bounded enumeration buffer.",
+                ),
+            );
+            break;
+        }
+        let base = buffer.as_ptr().cast::<u8>();
+        for index in 0..returned as usize {
+            if elapsed(started) {
+                status = WindowsStartupStatus::Partial;
+                push_service_diagnostic(
+                    &mut diagnostics,
+                    diagnostic(
+                        "service_scan_deadline_exceeded",
+                        Some(enumerated),
+                        "The startup inventory time limit was reached while querying services.",
+                    ),
+                );
+                enumeration_finished = true;
+                break;
+            }
+            let item_ptr = unsafe {
+                base.add(index * item_size)
+                    .cast::<EnumServiceStatusProcessW>()
+            };
+            let item = unsafe { &*item_ptr };
+            let name = bounded_wide_in_buffer(
+                base,
+                buffer_bytes,
+                item.service_name,
+                MAX_SERVICE_STRING_UNITS,
+            );
+            let display = bounded_wide_in_buffer(
+                base,
+                buffer_bytes,
+                item.display_name,
+                MAX_SERVICE_STRING_UNITS,
+            );
+            let (Ok(name), Ok(display)) = (name, display) else {
+                status = WindowsStartupStatus::Partial;
+                push_service_diagnostic(
+                    &mut diagnostics,
+                    diagnostic(
+                        "service_enumeration_string_invalid",
+                        Some(enumerated),
+                        "Windows returned a malformed or over-limit service name or display name; that row was omitted.",
+                    ),
+                );
+                enumerated += 1;
+                continue;
+            };
+            let row_units = name
+                .encode_utf16()
+                .count()
+                .saturating_add(display.encode_utf16().count());
+            if aggregate_string_units.saturating_add(row_units) > MAX_AGGREGATE_SERVICE_STRING_UNITS
+            {
+                status = WindowsStartupStatus::Partial;
+                push_service_diagnostic(
+                    &mut diagnostics,
+                    diagnostic(
+                        "service_string_budget_exceeded",
+                        Some(enumerated),
+                        "The aggregate service-string limit was reached; remaining services were not checked.",
+                    ),
+                );
+                enumeration_finished = true;
+                break;
+            }
+            aggregate_string_units += row_units;
+            let service_name_wide = wide_z(name.as_str());
+            let service = unsafe {
+                OpenServiceW(manager.0, service_name_wide.as_ptr(), SERVICE_QUERY_CONFIG)
+            };
+            if service.is_null() {
+                let error = unsafe { GetLastError() };
+                status = WindowsStartupStatus::Partial;
+                push_service_diagnostic(
+                    &mut diagnostics,
+                    diagnostic_win32(
+                        if error == ERROR_ACCESS_DENIED {
+                            "service_configuration_access_denied"
+                        } else {
+                            "service_open_failed"
+                        },
+                        Some(enumerated),
+                        "Windows denied or failed opening this service for configuration query; the service row is unknown.",
+                        error,
+                    ),
+                );
+                enumerated += 1;
+                continue;
+            }
+            let service = ServiceHandle(service);
+            let mut required_bytes = 0u32;
+            let first_result = unsafe {
+                QueryServiceConfigW(service.0, std::ptr::null_mut(), 0, &mut required_bytes)
+            };
+            let first_error = if first_result == 0 {
+                unsafe { GetLastError() }
+            } else {
+                0
+            };
+            if first_result != 0 || first_error != ERROR_INSUFFICIENT_BUFFER {
+                status = WindowsStartupStatus::Partial;
+                push_service_diagnostic(
+                    &mut diagnostics,
+                    diagnostic_win32(
+                        if first_error == ERROR_ACCESS_DENIED {
+                            "service_configuration_access_denied"
+                        } else {
+                            "service_configuration_query_failed"
+                        },
+                        Some(enumerated),
+                        "Windows could not determine the bounded service-configuration buffer size.",
+                        first_error,
+                    ),
+                );
+                enumerated += 1;
+                continue;
+            }
+            let config_bytes = required_bytes as usize;
+            if config_bytes < std::mem::size_of::<QueryServiceConfigW>()
+                || config_bytes > MAX_SERVICE_CONFIG_BYTES
+                || aggregate_config_bytes.saturating_add(config_bytes)
+                    > MAX_AGGREGATE_SERVICE_CONFIG_BYTES
+            {
+                status = WindowsStartupStatus::Partial;
+                push_service_diagnostic(
+                    &mut diagnostics,
+                    diagnostic(
+                        "service_configuration_budget_exceeded",
+                        Some(enumerated),
+                        "The service configuration was malformed or exceeded a per-entry or aggregate byte limit; it was omitted.",
+                    ),
+                );
+                enumerated += 1;
+                continue;
+            }
+            let word_count = config_bytes.div_ceil(std::mem::size_of::<u64>());
+            let mut config_buffer = vec![0u64; word_count];
+            let mut actual_bytes = 0u32;
+            let query_success = unsafe {
+                QueryServiceConfigW(
+                    service.0,
+                    config_buffer.as_mut_ptr().cast(),
+                    config_bytes as u32,
+                    &mut actual_bytes,
+                )
+            } != 0;
+            if !query_success {
+                let error = unsafe { GetLastError() };
+                status = WindowsStartupStatus::Partial;
+                push_service_diagnostic(
+                    &mut diagnostics,
+                    diagnostic_win32(
+                        if error == ERROR_ACCESS_DENIED {
+                            "service_configuration_access_denied"
+                        } else {
+                            "service_configuration_query_failed"
+                        },
+                        Some(enumerated),
+                        "Windows could not read this service's configuration; its row is unknown.",
+                        error,
+                    ),
+                );
+                enumerated += 1;
+                continue;
+            }
+            aggregate_config_bytes += config_bytes;
+            let config_base = config_buffer.as_ptr().cast::<u8>();
+            let config = unsafe { &*config_buffer.as_ptr().cast::<QueryServiceConfigW>() };
+            let account = bounded_optional_wide_in_buffer(
+                config_base,
+                config_bytes,
+                config.service_start_name,
+                MAX_SERVICE_STRING_UNITS,
+            );
+            let binary_path = bounded_optional_wide_in_buffer(
+                config_base,
+                config_bytes,
+                config.binary_path_name,
+                MAX_SERVICE_STRING_UNITS,
+            );
+            let (Ok(account), Ok(binary_path)) = (account, binary_path) else {
+                status = WindowsStartupStatus::Partial;
+                push_service_diagnostic(
+                    &mut diagnostics,
+                    diagnostic(
+                        "service_configuration_string_invalid",
+                        Some(enumerated),
+                        "A service account or binary path was malformed or over limit; the service row was omitted.",
+                    ),
+                );
+                enumerated += 1;
+                continue;
+            };
+            let extra_units = account
+                .as_ref()
+                .map_or(0, |value| value.encode_utf16().count())
+                + binary_path
+                    .as_ref()
+                    .map_or(0, |value| value.encode_utf16().count());
+            if aggregate_string_units.saturating_add(extra_units)
+                > MAX_AGGREGATE_SERVICE_STRING_UNITS
+            {
+                status = WindowsStartupStatus::Partial;
+                push_service_diagnostic(
+                    &mut diagnostics,
+                    diagnostic(
+                        "service_string_budget_exceeded",
+                        Some(enumerated),
+                        "The aggregate service-string limit was reached; remaining services were not checked.",
+                    ),
+                );
+                enumeration_finished = true;
+                break;
+            }
+            aggregate_string_units += extra_units;
+            entries.push(WindowsServiceStartupEntry {
+                service_name: name,
+                display_name: display,
+                start_type: service_start_type(config.start_type),
+                start_type_code: config.start_type,
+                account,
+                binary_path,
+                evidence: WindowsServiceStartupEvidence {
+                    source: "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW",
+                    service_index: enumerated,
+                },
+            });
+            enumerated += 1;
+        }
+        if enumeration_finished {
+            break;
+        }
+        if !success {
+            if returned == 0 || resume == prior_resume || resume == previous_resume {
+                status = WindowsStartupStatus::Partial;
+                push_service_diagnostic(
+                    &mut diagnostics,
+                    diagnostic(
+                        "service_enumeration_buffer_insufficient",
+                        None,
+                        "The bounded SCM enumeration buffer could not advance; remaining services were not checked.",
+                    ),
+                );
+                break;
+            }
+            previous_resume = prior_resume;
+        } else {
+            enumeration_finished = true;
+        }
+        if enumerated >= MAX_SERVICE_ENTRIES {
+            status = WindowsStartupStatus::Partial;
+            push_service_diagnostic(
+                &mut diagnostics,
+                diagnostic(
+                    "service_entry_limit_exceeded",
+                    None,
+                    "The service-entry limit was reached; remaining services were not checked.",
+                ),
+            );
+        }
+    }
+    (
+        source_result(
+            "service_start_configuration",
+            status,
+            entries.len(),
+            diagnostics,
+        ),
+        entries,
+    )
+}
+
+fn push_service_diagnostic(
+    diagnostics: &mut Vec<WindowsStartupDiagnostic>,
+    item: WindowsStartupDiagnostic,
+) {
+    if diagnostics.len() < MAX_SERVICE_DIAGNOSTICS {
+        diagnostics.push(item);
+    } else if diagnostics
+        .last()
+        .is_some_and(|last| last.code != "service_diagnostics_limit_exceeded")
+    {
+        *diagnostics.last_mut().expect("diagnostic count is nonzero") = diagnostic(
+            "service_diagnostics_limit_exceeded",
+            None,
+            "Additional service diagnostics were omitted after the bounded diagnostic limit.",
+        );
+    }
+}
+
+fn service_start_type(code: u32) -> &'static str {
+    match code {
+        SERVICE_BOOT_START => "boot",
+        SERVICE_SYSTEM_START => "system",
+        SERVICE_AUTO_START => "automatic",
+        SERVICE_DEMAND_START => "manual",
+        SERVICE_DISABLED => "disabled",
+        _ => "unknown",
+    }
+}
+
+fn bounded_wide_in_buffer(
+    base: *const u8,
+    buffer_bytes: usize,
+    value: *const u16,
+    maximum_units: usize,
+) -> Result<String, ServiceStringError> {
+    bounded_optional_wide_in_buffer(base, buffer_bytes, value, maximum_units)?
+        .ok_or(ServiceStringError::Missing)
+}
+
+fn bounded_optional_wide_in_buffer(
+    base: *const u8,
+    buffer_bytes: usize,
+    value: *const u16,
+    maximum_units: usize,
+) -> Result<Option<String>, ServiceStringError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let base_address = base as usize;
+    let address = value as usize;
+    let Some(offset) = address.checked_sub(base_address) else {
+        return Err(ServiceStringError::OutsideBuffer);
+    };
+    if offset >= buffer_bytes {
+        return Err(ServiceStringError::OutsideBuffer);
+    }
+    if offset % std::mem::align_of::<u16>() != 0 {
+        return Err(ServiceStringError::Misaligned);
+    }
+    let available_units = (buffer_bytes - offset) / 2;
+    let units_to_check = available_units.min(maximum_units.saturating_add(1));
+    let mut units = Vec::with_capacity(units_to_check.min(maximum_units));
+    for index in 0..units_to_check {
+        let unit = unsafe { std::ptr::read_unaligned(value.add(index)) };
+        if unit == 0 {
+            return String::from_utf16(&units)
+                .map(Some)
+                .map_err(|_| ServiceStringError::MalformedUtf16);
+        }
+        if index == maximum_units {
+            return Err(ServiceStringError::OverLimit);
+        }
+        units.push(unit);
+    }
+    if available_units > maximum_units {
+        Err(ServiceStringError::OverLimit)
+    } else {
+        Err(ServiceStringError::Unterminated)
     }
 }
 
@@ -1071,6 +1657,21 @@ fn diagnostic(
         code,
         value_index,
         message,
+        win32_error: None,
+    }
+}
+
+fn diagnostic_win32(
+    code: &'static str,
+    value_index: Option<usize>,
+    message: &'static str,
+    win32_error: u32,
+) -> WindowsStartupDiagnostic {
+    WindowsStartupDiagnostic {
+        code,
+        value_index,
+        message,
+        win32_error: Some(win32_error),
     }
 }
 
@@ -1135,5 +1736,68 @@ mod tests {
         );
         assert_eq!(FOLDER_IDS[0].0, "user_startup");
         assert_eq!(FOLDER_IDS[1].0, "common_startup");
+    }
+
+    #[test]
+    fn service_start_type_mapping_preserves_unknown_values() {
+        assert_eq!(service_start_type(SERVICE_BOOT_START), "boot");
+        assert_eq!(service_start_type(SERVICE_SYSTEM_START), "system");
+        assert_eq!(service_start_type(SERVICE_AUTO_START), "automatic");
+        assert_eq!(service_start_type(SERVICE_DEMAND_START), "manual");
+        assert_eq!(service_start_type(SERVICE_DISABLED), "disabled");
+        assert_eq!(service_start_type(99), "unknown");
+    }
+
+    #[test]
+    fn service_strings_must_be_terminated_inside_the_bounded_buffer() {
+        let mut bytes = [0u8; 16];
+        bytes[2..8].copy_from_slice(&[b'A', 0, b'B', 0, 0, 0]);
+        let value = unsafe { bytes.as_ptr().add(2).cast::<u16>() };
+        assert_eq!(
+            bounded_wide_in_buffer(bytes.as_ptr(), bytes.len(), value, 4).unwrap(),
+            "AB"
+        );
+        assert_eq!(
+            bounded_wide_in_buffer(bytes.as_ptr(), bytes.len(), value, 1),
+            Err(ServiceStringError::OverLimit)
+        );
+        assert_eq!(
+            bounded_optional_wide_in_buffer(bytes.as_ptr(), bytes.len(), std::ptr::null(), 4)
+                .unwrap(),
+            None
+        );
+        let outside = unsafe { bytes.as_ptr().add(bytes.len()).cast::<u16>() };
+        assert_eq!(
+            bounded_wide_in_buffer(bytes.as_ptr(), bytes.len(), outside, 4),
+            Err(ServiceStringError::OutsideBuffer)
+        );
+        let malformed = [0x00, 0xd8, 0x00, 0x00];
+        assert_eq!(
+            bounded_wide_in_buffer(
+                malformed.as_ptr(),
+                malformed.len(),
+                malformed.as_ptr().cast(),
+                4,
+            ),
+            Err(ServiceStringError::MalformedUtf16)
+        );
+    }
+
+    #[test]
+    fn service_limits_are_finite_and_diagnostics_bounded() {
+        assert_eq!(MAX_SERVICE_ENTRIES, 8_192);
+        assert_eq!(MAX_SERVICE_DIAGNOSTICS, 256);
+        let mut diagnostics = (0..MAX_SERVICE_DIAGNOSTICS)
+            .map(|_| diagnostic("service_open_failed", None, "failed"))
+            .collect::<Vec<_>>();
+        push_service_diagnostic(
+            &mut diagnostics,
+            diagnostic("service_query_failed", None, "failed"),
+        );
+        assert_eq!(diagnostics.len(), MAX_SERVICE_DIAGNOSTICS);
+        assert_eq!(
+            diagnostics.last().unwrap().code,
+            "service_diagnostics_limit_exceeded"
+        );
     }
 }

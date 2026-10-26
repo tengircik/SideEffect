@@ -18,7 +18,7 @@ fn temporary_directory() -> std::path::PathBuf {
 }
 
 #[test]
-fn windows_startup_command_reports_scope_inert_values_and_unchecked_sources() {
+fn windows_startup_command_reports_services_and_leaves_tasks_unchecked() {
     let directory = temporary_directory();
     let output = directory.join("startup.json");
     let run = || {
@@ -39,12 +39,12 @@ fn windows_startup_command_reports_scope_inert_values_and_unchecked_sources() {
     let bytes = fs::read(&output).unwrap();
     let document: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(document["schema"], "sideeffect.windows_startup_inventory");
-    assert_eq!(document["schema_version"], 1);
+    assert_eq!(document["schema_version"], 2);
     assert_eq!(document["platform"], "windows");
     assert_eq!(document["status"], "partial");
     assert_eq!(
         document["scope"],
-        "current_user_and_accessible_machine_run_keys_and_startup_folders"
+        "current_user_and_accessible_machine_run_keys_startup_folders_and_services"
     );
     let sources = document["sources"].as_array().unwrap();
     for required in [
@@ -61,12 +61,32 @@ fn windows_startup_command_reports_scope_inert_values_and_unchecked_sources() {
     ] {
         assert!(sources.iter().any(|source| source["id"] == required));
     }
-    for unchecked in ["service_start_configuration", "scheduled_task_triggers"] {
-        let source = sources
-            .iter()
-            .find(|source| source["id"] == unchecked)
-            .unwrap();
-        assert_eq!(source["status"], "not_checked");
+    let service_source = sources
+        .iter()
+        .find(|source| source["id"] == "service_start_configuration")
+        .unwrap();
+    assert!(matches!(
+        service_source["status"].as_str(),
+        Some("complete" | "partial")
+    ));
+    assert!(service_source["entries_seen"].as_u64().unwrap() > 0);
+    assert!(!document["service_entries"].as_array().unwrap().is_empty());
+    let scheduled_tasks = sources
+        .iter()
+        .find(|source| source["id"] == "scheduled_task_triggers")
+        .unwrap();
+    assert_eq!(scheduled_tasks["status"], "not_checked");
+    for entry in document["service_entries"].as_array().unwrap() {
+        assert!(entry["service_name"].is_string());
+        assert!(entry["display_name"].is_string());
+        assert!(entry["start_type"].is_string());
+        assert!(entry["start_type_code"].is_number());
+        assert!(entry["binary_path"].is_null() || entry["binary_path"].is_string());
+        assert!(entry["account"].is_null() || entry["account"].is_string());
+        assert_eq!(
+            entry["evidence"]["source"],
+            "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW"
+        );
     }
     for entry in document["registry_entries"].as_array().unwrap() {
         assert!(entry["command"].is_null() || entry["command"].is_string());
