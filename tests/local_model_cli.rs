@@ -35,7 +35,11 @@ impl Drop for TempTrace {
 
 fn run_preview(trace: &TempTrace) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_sideeffect"))
-        .arg("model-preview")
+        .args([
+            "model-preview",
+            "--question",
+            "Which executable was observed?",
+        ])
         .arg(&trace.0)
         .output()
         .unwrap()
@@ -68,6 +72,11 @@ fn preview_digest_covers_only_the_bounded_typed_request() {
         first_json["model_sha256"],
         sideeffect::local_model::MODEL_SHA256
     );
+    assert_eq!(
+        first_json["model_repository_revision"],
+        sideeffect::local_model::MODEL_REPOSITORY_REVISION
+    );
+    assert_eq!(first_json["question"], "Which executable was observed?");
     assert!(first_json["prompt"].as_str().unwrap().contains("E001"));
     assert!(!String::from_utf8_lossy(&first_output.stdout).contains("PRIVATE_ABC_117"));
     assert!(!String::from_utf8_lossy(&second_output.stdout).contains("PRIVATE_XYZ_224"));
@@ -91,6 +100,8 @@ fn model_execution_rejects_unconfirmed_request_before_starting_runtime() {
     let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .args([
             "model-analyze",
+            "--question",
+            "Which executable was observed?",
             "--runtime",
             "C:\\missing\\runtime.exe",
             "--model",

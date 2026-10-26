@@ -48,8 +48,8 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect explain <strace-trace-file>\n\
        sideeffect explain --diff <baseline-trace> <candidate-trace>\n\
        sideeffect explain --inventory-diff <before.json> <after.json>\n\
-       sideeffect model-preview <strace-trace-file>\n\
-       sideeffect model-analyze --runtime <llama-cli> --model <model.gguf> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
+       sideeffect model-preview --question <question> <strace-trace-file>\n\
+       sideeffect model-analyze --question <question> --runtime <llama-cli> --model <model.gguf> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect correlate-startup <startup-inventory.json> <strace-trace-file>\n\
        sideeffect inventory processes --output <new-inventory.json>\n\
        sideeffect inventory startup --output <new-inventory.json>\n\
@@ -93,9 +93,15 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         }
         [command, path] if command == "inspect" => inspect(path),
         [command, path] if command == "explain" => explain_trace_file(path),
-        [command, path] if command == "model-preview" => model_preview_file(path),
+        [command, question_flag, question, path]
+            if command == "model-preview" && question_flag == "--question" =>
+        {
+            model_preview_file(question, path)
+        }
         [
             command,
+            question_flag,
+            question,
             runtime_flag,
             runtime,
             model_flag,
@@ -104,11 +110,12 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             digest,
             trace,
         ] if command == "model-analyze"
+            && question_flag == "--question"
             && runtime_flag == "--runtime"
             && model_flag == "--model"
             && confirm_flag == "--confirm-sha256" =>
         {
-            model_analyze_file(runtime, model, digest, trace)
+            model_analyze_file(question, runtime, model, digest, trace)
         }
         [command, diff_flag, left, right] if command == "explain" && diff_flag == "--diff" => {
             explain_diff_files(left, right)
@@ -648,10 +655,10 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect correlate-startup STARTUP_INVENTORY.json TRACE\nFinds narrow exact-path candidate matches between supported saved startup configuration and successful exec evidence. A match does not prove that a hook caused or initiated execution."
         }
         "model" | "model-preview" => {
-            "Usage: sideeffect model-preview TRACE\nPreviews the exact bounded local-model request and digest. Review it before confirming analysis. Partial parsing is visible and exits with status 2."
+            "Usage: sideeffect model-preview --question QUESTION TRACE\nPreviews the bounded typed facts, question, JSON schema, and request digest. Review this exact request before confirming local analysis. Partial parsing is visible and exits with status 2."
         }
         "model-analyze" => {
-            "Usage: sideeffect model-analyze --runtime LLAMA_CLI --model MODEL.gguf --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the pinned optional local model on Linux x86_64 after explicit digest confirmation. It does not download weights or upload evidence. The model selects source evidence IDs for human review; this is not a finding. See docs/LOCAL_MODEL_EVALUATION.md."
+            "Usage: sideeffect model-analyze --question QUESTION --runtime LLAMA_CLI --model MODEL.gguf --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the pinned optional local model on Linux x86_64 after explicit digest confirmation. It does not download weights or upload evidence. The model may select at most one source evidence ID as an unverified hint; it can be wrong and is not a finding. See docs/LOCAL_MODEL_EVALUATION.md."
         }
         _ => return Err(format!("unknown help topic: {topic}\n\n{USAGE}")),
     };
@@ -856,9 +863,12 @@ fn explain_inventory_diff_files(
     }
 }
 
-fn model_preview_file(path: &OsString) -> Result<ExitCode, String> {
+fn model_preview_file(question: &OsString, path: &OsString) -> Result<ExitCode, String> {
+    let question = question
+        .to_str()
+        .ok_or("local model question must be valid UTF-8")?;
     let bytes = read_bounded(path)?;
-    let preview = sideeffect::local_model::preview_trace_bytes(&bytes)?;
+    let preview = sideeffect::local_model::preview_trace_bytes(&bytes, question)?;
     let partial = preview.evidence_summary["parse_status"] == "partial";
     write_json(&preview, "local model request preview")?;
     Ok(if partial {
@@ -869,11 +879,15 @@ fn model_preview_file(path: &OsString) -> Result<ExitCode, String> {
 }
 
 fn model_analyze_file(
+    question: &OsString,
     runtime: &OsString,
     model: &OsString,
     digest: &OsString,
     trace: &OsString,
 ) -> Result<ExitCode, String> {
+    let question = question
+        .to_str()
+        .ok_or("local model question must be valid UTF-8")?;
     let Some(digest) = digest.to_str() else {
         return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
     };
@@ -887,6 +901,7 @@ fn model_analyze_file(
     let bytes = read_bounded(trace)?;
     let analysis = sideeffect::local_model::analyze_trace_bytes(
         &bytes,
+        question,
         Path::new(runtime),
         Path::new(model),
         digest,
