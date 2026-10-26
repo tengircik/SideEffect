@@ -1,3 +1,4 @@
+pub mod audit_session;
 pub mod diff;
 pub mod explain;
 mod fingerprint;
