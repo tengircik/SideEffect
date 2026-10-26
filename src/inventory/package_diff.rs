@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_SOURCES: usize = 256;
 const MAX_PACKAGES_PER_DOCUMENT: usize = 200_000;
+const MAX_DIAGNOSTICS_PER_DOCUMENT: usize = 200_000;
 const MAX_DELTAS: usize = 100_000;
 const MAX_FIELD_BYTES: usize = 2_048;
 const MAX_DOCUMENT_TEXT_BYTES: usize = 16 * 1024 * 1024;
@@ -157,7 +158,7 @@ struct PackageSourceInput {
     exit_code: Option<i32>,
     records_seen: usize,
     #[serde(default, deserialize_with = "deserialize_diagnostics")]
-    diagnostics: Vec<PackageDiagnosticInput>,
+    diagnostics: usize,
 }
 
 #[derive(Deserialize)]
@@ -260,7 +261,7 @@ impl PackageInventoryInput {
                     .ok_or(PackageComparisonError::UnsupportedSourceId)?;
                 // Diagnostic text and fingerprints are validated by the strict input shape but
                 // deliberately discarded; comparison output does not propagate either.
-                let _discarded_diagnostics = source.diagnostics;
+                let _discarded_diagnostic_count = source.diagnostics;
                 Ok(InventorySource {
                     id,
                     status: source.status.into(),
@@ -333,7 +334,36 @@ fn deserialize_sources<'de, D>(deserializer: D) -> Result<Vec<PackageSourceInput
 where
     D: serde::Deserializer<'de>,
 {
-    deserialize_bounded_vec::<_, _, MAX_SOURCES>(deserializer)
+    struct PackageSourcesVisitor;
+    impl<'de> serde::de::Visitor<'de> for PackageSourcesVisitor {
+        type Value = Vec<PackageSourceInput>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "a sequence with at most {MAX_SOURCES} sources")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut sources = Vec::new();
+            let mut diagnostic_count = 0usize;
+            while let Some(source) = sequence.next_element::<PackageSourceInput>()? {
+                if sources.len() >= MAX_SOURCES {
+                    return Err(de::Error::custom("source limit exceeded"));
+                }
+                diagnostic_count = diagnostic_count
+                    .checked_add(source.diagnostics)
+                    .ok_or_else(|| de::Error::custom("diagnostic count overflow"))?;
+                if diagnostic_count > MAX_DIAGNOSTICS_PER_DOCUMENT {
+                    return Err(de::Error::custom("document diagnostic limit exceeded"));
+                }
+                sources.push(source);
+            }
+            Ok(sources)
+        }
+    }
+    deserializer.deserialize_seq(PackageSourcesVisitor)
 }
 
 fn deserialize_packages<'de, D>(deserializer: D) -> Result<Vec<PackageInput>, D::Error>
@@ -343,11 +373,36 @@ where
     deserialize_bounded_vec::<_, _, MAX_PACKAGES_PER_DOCUMENT>(deserializer)
 }
 
-fn deserialize_diagnostics<'de, D>(deserializer: D) -> Result<Vec<PackageDiagnosticInput>, D::Error>
+fn deserialize_diagnostics<'de, D>(deserializer: D) -> Result<usize, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    deserialize_bounded_vec::<_, _, MAX_PACKAGES_PER_DOCUMENT>(deserializer)
+    struct DiagnosticCountVisitor;
+    impl<'de> serde::de::Visitor<'de> for DiagnosticCountVisitor {
+        type Value = usize;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a sequence with at most {MAX_DIAGNOSTICS_PER_DOCUMENT} diagnostics"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut count = 0usize;
+            while sequence.next_element::<PackageDiagnosticInput>()?.is_some() {
+                count += 1;
+                if count > MAX_DIAGNOSTICS_PER_DOCUMENT {
+                    return Err(de::Error::custom("diagnostic limit exceeded"));
+                }
+            }
+            Ok(count)
+        }
+    }
+    deserializer.deserialize_seq(DiagnosticCountVisitor)
 }
 
 fn deserialize_bounded_vec<'de, D, T, const LIMIT: usize>(
