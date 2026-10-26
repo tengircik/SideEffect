@@ -33,9 +33,9 @@ fn focused_help_covers_command_and_nested_inventory_topics() {
     #[cfg(target_os = "linux")]
     assert!(startup_help.contains("supported Linux"));
     #[cfg(windows)]
-    assert!(startup_help.contains("service configuration visible to the current user"));
+    assert!(startup_help.contains("boot/logon triggers in tasks visible to the current token"));
     #[cfg(windows)]
-    assert!(startup_help.contains("scheduled-task triggers are not checked"));
+    assert!(startup_help.contains("task actions/XML are not collected"));
 
     let packages = run(&["help", "inventory", "packages"]);
     assert!(packages.status.success());

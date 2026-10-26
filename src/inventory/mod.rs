@@ -83,6 +83,7 @@ pub use startup_legacy::{
 #[cfg(windows)]
 pub use startup_windows::{
     WindowsRegistryStartupEntry, WindowsRegistryStartupEvidence, WindowsRegistryView,
+    WindowsScheduledTaskStartupEntry, WindowsScheduledTaskStartupEvidence,
     WindowsServiceStartupEntry, WindowsServiceStartupEvidence, WindowsStartupDiagnostic,
     WindowsStartupFolderEntry, WindowsStartupFolderEvidence, WindowsStartupInventoryDocument,
     WindowsStartupSource, WindowsStartupStatus, collect_windows_startup,

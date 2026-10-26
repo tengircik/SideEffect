@@ -18,7 +18,7 @@ fn temporary_directory() -> std::path::PathBuf {
 }
 
 #[test]
-fn windows_startup_command_reports_services_and_leaves_tasks_unchecked() {
+fn windows_startup_command_reports_service_and_task_sources() {
     let directory = temporary_directory();
     let output = directory.join("startup.json");
     let run = || {
@@ -30,21 +30,22 @@ fn windows_startup_command_reports_services_and_leaves_tasks_unchecked() {
     };
 
     let first = run();
-    assert_eq!(
-        first.status.code(),
-        Some(2),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
-    );
     let bytes = fs::read(&output).unwrap();
     let document: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(document["schema"], "sideeffect.windows_startup_inventory");
-    assert_eq!(document["schema_version"], 2);
+    assert_eq!(document["schema_version"], 3);
     assert_eq!(document["platform"], "windows");
-    assert_eq!(document["status"], "partial");
+    match document["status"].as_str().unwrap() {
+        "complete" => assert_eq!(first.status.code(), Some(0)),
+        "partial" => assert_eq!(first.status.code(), Some(2)),
+        status => panic!(
+            "unexpected startup status {status:?}: {}",
+            String::from_utf8_lossy(&first.stderr)
+        ),
+    }
     assert_eq!(
         document["scope"],
-        "current_user_and_accessible_machine_run_keys_startup_folders_and_services"
+        "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks"
     );
     let sources = document["sources"].as_array().unwrap();
     for required in [
@@ -75,7 +76,14 @@ fn windows_startup_command_reports_services_and_leaves_tasks_unchecked() {
         .iter()
         .find(|source| source["id"] == "scheduled_task_triggers")
         .unwrap();
-    assert_eq!(scheduled_tasks["status"], "not_checked");
+    assert!(matches!(
+        scheduled_tasks["status"].as_str(),
+        Some("complete" | "partial")
+    ));
+    assert_eq!(
+        scheduled_tasks["entries_seen"].as_u64().unwrap(),
+        document["scheduled_task_entries"].as_array().unwrap().len() as u64
+    );
     for entry in document["service_entries"].as_array().unwrap() {
         assert!(entry["service_name"].is_string());
         assert!(entry["display_name"].is_string());
@@ -87,6 +95,19 @@ fn windows_startup_command_reports_services_and_leaves_tasks_unchecked() {
             entry["evidence"]["source"],
             "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW"
         );
+    }
+    let task_entries = document["scheduled_task_entries"].as_array().unwrap();
+    for entry in task_entries {
+        assert!(entry["task_path"].is_string());
+        assert!(matches!(
+            entry["trigger_type"].as_str(),
+            Some("boot" | "logon")
+        ));
+        assert!(entry["task_enabled"].is_null() || entry["task_enabled"].is_boolean());
+        assert!(entry["trigger_enabled"].is_null() || entry["trigger_enabled"].is_boolean());
+        assert!(entry["logon_user"].is_null() || entry["logon_user"].is_string());
+        assert!(entry["evidence"]["task_index"].is_number());
+        assert!(entry["evidence"]["trigger_index"].is_number());
     }
     for entry in document["registry_entries"].as_array().unwrap() {
         assert!(entry["command"].is_null() || entry["command"].is_string());

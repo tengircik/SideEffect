@@ -11,6 +11,15 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::ptr::null_mut;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+};
+use windows::Win32::System::TaskScheduler::{
+    ILogonTrigger, ITaskService, TASK_ENUM_HIDDEN, TASK_TRIGGER_BOOT, TASK_TRIGGER_LOGON,
+    TASK_TRIGGER_TYPE2, TaskScheduler,
+};
+use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_I4};
+use windows::core::{BSTR, HRESULT, Interface};
 
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
@@ -37,6 +46,14 @@ const MAX_SERVICE_ENTRIES: usize = 8_192;
 const MAX_SERVICE_STRING_UNITS: usize = 32_768;
 const MAX_AGGREGATE_SERVICE_STRING_UNITS: usize = 4 * 1024 * 1024;
 const MAX_SERVICE_DIAGNOSTICS: usize = 256;
+const MAX_TASK_FOLDER_DEPTH: usize = 16;
+const MAX_TASK_FOLDERS: usize = 1_024;
+const MAX_SCHEDULED_TASKS: usize = 8_192;
+const MAX_SCHEDULED_TASK_TRIGGERS: usize = 8_192;
+const MAX_TRIGGERS_PER_TASK: usize = 256;
+const MAX_TASK_STRING_UNITS: usize = 32_768;
+const MAX_AGGREGATE_TASK_STRING_UNITS: usize = 4 * 1024 * 1024;
+const MAX_TASK_DIAGNOSTICS: usize = 256;
 const SC_MANAGER_CONNECT: u32 = 0x0001;
 const SC_MANAGER_ENUMERATE_SERVICE: u32 = 0x0004;
 const SERVICE_QUERY_CONFIG: u32 = 0x0001;
@@ -203,10 +220,12 @@ pub enum WindowsRegistryView {
 pub struct WindowsStartupDiagnostic {
     pub code: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub value_index: Option<usize>,
+    pub item_index: Option<usize>,
     pub message: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub win32_error: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hresult: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -273,6 +292,24 @@ pub struct WindowsServiceStartupEvidence {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct WindowsScheduledTaskStartupEntry {
+    pub task_path: String,
+    pub task_enabled: Option<bool>,
+    pub trigger_type: &'static str,
+    pub trigger_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logon_user: Option<String>,
+    pub evidence: WindowsScheduledTaskStartupEvidence,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WindowsScheduledTaskStartupEvidence {
+    pub source: &'static str,
+    pub task_index: usize,
+    pub trigger_index: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct WindowsStartupSource {
     pub id: &'static str,
     pub status: WindowsStartupStatus,
@@ -303,6 +340,7 @@ pub struct WindowsStartupInventoryDocument {
     pub registry_entries: Vec<WindowsRegistryStartupEntry>,
     pub folder_entries: Vec<WindowsStartupFolderEntry>,
     pub service_entries: Vec<WindowsServiceStartupEntry>,
+    pub scheduled_task_entries: Vec<WindowsScheduledTaskStartupEntry>,
 }
 
 #[derive(Clone, Copy)]
@@ -442,6 +480,7 @@ pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
     let mut registry_entries = Vec::new();
     let mut folder_entries = Vec::new();
     let mut service_entries = Vec::new();
+    let mut scheduled_task_entries = Vec::new();
     let mut aggregate_registry_bytes = 0usize;
     let mut aggregate_registry_names = 0usize;
     let mut registry_values_checked = 0usize;
@@ -514,16 +553,9 @@ pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
     let (service_source, services) = collect_service_start_configuration(started);
     sources.push(service_source);
     service_entries.extend(services);
-    sources.push(source_result(
-        "scheduled_task_triggers",
-        WindowsStartupStatus::NotChecked,
-        0,
-        vec![diagnostic(
-            "scheduled_task_sources_not_implemented",
-            None,
-            "Windows scheduled-task boot/logon triggers are not checked by this adapter.",
-        )],
-    ));
+    let (task_source, tasks) = collect_scheduled_task_triggers(started);
+    sources.push(task_source);
+    scheduled_task_entries.extend(tasks);
     let status = if sources.iter().any(|source| {
         !matches!(
             source.status,
@@ -536,9 +568,9 @@ pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
     };
     WindowsStartupInventoryDocument {
         schema: "sideeffect.windows_startup_inventory",
-        schema_version: 2,
+        schema_version: 3,
         platform: "windows",
-        scope: "current_user_and_accessible_machine_run_keys_startup_folders_and_services",
+        scope: "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks",
         capture_started_at_unix_ms: started_at,
         capture_ended_at_unix_ms: now_ms(),
         status,
@@ -546,6 +578,7 @@ pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
         registry_entries,
         folder_entries,
         service_entries,
+        scheduled_task_entries,
     }
 }
 
@@ -950,6 +983,734 @@ fn collect_service_start_configuration(
         ),
         entries,
     )
+}
+
+struct ComApartment;
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        unsafe { CoUninitialize() };
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskStringError {
+    OverLimit,
+    MalformedUtf16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskCountError {
+    Negative,
+}
+
+fn collect_scheduled_task_triggers(
+    started: Instant,
+) -> (WindowsStartupSource, Vec<WindowsScheduledTaskStartupEntry>) {
+    let mut diagnostics = Vec::new();
+    let mut entries = Vec::new();
+    let mut status = WindowsStartupStatus::Complete;
+    let mut tasks_seen = 0usize;
+    let mut folders_seen = 0usize;
+    let mut aggregate_string_units = 0usize;
+    let mut trigger_row_limit_hit = false;
+
+    let init_result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    if init_result.is_err() {
+        return (
+            source_result(
+                "scheduled_task_triggers",
+                WindowsStartupStatus::Unavailable,
+                0,
+                vec![diagnostic_hresult(
+                    "task_scheduler_com_initialization_failed",
+                    None,
+                    "COM could not initialize the local Task Scheduler query apartment.",
+                    init_result,
+                )],
+            ),
+            entries,
+        );
+    }
+    let _apartment = ComApartment;
+    let service = match unsafe {
+        CoCreateInstance::<_, ITaskService>(&TaskScheduler, None, CLSCTX_INPROC_SERVER)
+    } {
+        Ok(service) => service,
+        Err(error) => {
+            return (
+                source_result(
+                    "scheduled_task_triggers",
+                    task_error_status(&error),
+                    0,
+                    vec![diagnostic_hresult(
+                        "task_scheduler_service_unavailable",
+                        None,
+                        "Windows could not create the local Task Scheduler COM service object.",
+                        error.code(),
+                    )],
+                ),
+                entries,
+            );
+        }
+    };
+    let empty = VARIANT::default();
+    if let Err(error) = unsafe { service.Connect(&empty, &empty, &empty, &empty) } {
+        return (
+            source_result(
+                "scheduled_task_triggers",
+                task_error_status(&error),
+                0,
+                vec![diagnostic_hresult(
+                    "task_scheduler_connection_failed",
+                    None,
+                    "Windows denied or failed connecting to the local Task Scheduler with the current user's token.",
+                    error.code(),
+                )],
+            ),
+            entries,
+        );
+    }
+    let root_path = BSTR::from("\\");
+    let root = match unsafe { service.GetFolder(&root_path) } {
+        Ok(root) => root,
+        Err(error) => {
+            return (
+                source_result(
+                    "scheduled_task_triggers",
+                    task_error_status(&error),
+                    0,
+                    vec![diagnostic_hresult(
+                        "task_scheduler_root_folder_unavailable",
+                        None,
+                        "Windows denied or failed opening the root folder of tasks visible to the current user.",
+                        error.code(),
+                    )],
+                ),
+                entries,
+            );
+        }
+    };
+
+    let mut pending_folders = vec![(root, 0usize)];
+    while let Some((folder, depth)) = pending_folders.pop() {
+        if elapsed(started) {
+            status = WindowsStartupStatus::Partial;
+            push_task_diagnostic(
+                &mut diagnostics,
+                diagnostic(
+                    "task_scheduler_scan_deadline_exceeded",
+                    None,
+                    "The shared startup inventory time limit was reached during scheduled-task enumeration.",
+                ),
+            );
+            break;
+        }
+        folders_seen += 1;
+        let tasks = match unsafe { folder.GetTasks(TASK_ENUM_HIDDEN.0) } {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                status = WindowsStartupStatus::Partial;
+                push_task_diagnostic(
+                    &mut diagnostics,
+                    diagnostic_hresult(
+                        if task_error_is_access_denied(&error) {
+                            "task_folder_access_denied"
+                        } else {
+                            "task_folder_enumeration_failed"
+                        },
+                        Some(folders_seen - 1),
+                        "Windows denied or failed enumerating tasks in a visible folder; that folder remains unknown.",
+                        error.code(),
+                    ),
+                );
+                continue;
+            }
+        };
+        let task_count = match unsafe { tasks.Count() } {
+            Ok(count) => count,
+            Err(error) => {
+                status = WindowsStartupStatus::Partial;
+                push_task_diagnostic(
+                    &mut diagnostics,
+                    diagnostic_hresult(
+                        "task_folder_count_failed",
+                        Some(folders_seen - 1),
+                        "Windows could not determine the number of tasks in a visible folder.",
+                        error.code(),
+                    ),
+                );
+                continue;
+            }
+        };
+        let remaining_tasks = MAX_SCHEDULED_TASKS.saturating_sub(tasks_seen);
+        let (tasks_to_read, task_limit_hit) = match bounded_task_count(task_count, remaining_tasks)
+        {
+            Ok(bound) => bound,
+            Err(_) => {
+                status = WindowsStartupStatus::Partial;
+                push_task_diagnostic(
+                    &mut diagnostics,
+                    diagnostic(
+                        "task_folder_count_malformed",
+                        Some(folders_seen - 1),
+                        "Windows returned a negative task count; that folder was not enumerated.",
+                    ),
+                );
+                continue;
+            }
+        };
+        for task_number in 1..=tasks_to_read {
+            if elapsed(started) {
+                status = WindowsStartupStatus::Partial;
+                push_task_diagnostic(
+                    &mut diagnostics,
+                    diagnostic(
+                        "task_scheduler_scan_deadline_exceeded",
+                        Some(tasks_seen),
+                        "The shared startup inventory time limit was reached while reading tasks.",
+                    ),
+                );
+                break;
+            }
+            let task_index = tasks_seen;
+            tasks_seen += 1;
+            let task_variant = one_based_task_index(task_number as i32);
+            let task = match unsafe { tasks.get_Item(&task_variant) } {
+                Ok(task) => task,
+                Err(error) => {
+                    status = WindowsStartupStatus::Partial;
+                    push_task_diagnostic(
+                        &mut diagnostics,
+                        diagnostic_hresult(
+                            if task_error_is_access_denied(&error) {
+                                "task_access_denied"
+                            } else {
+                                "task_read_failed"
+                            },
+                            Some(task_index),
+                            "Windows denied or failed reading a task visible in the folder count.",
+                            error.code(),
+                        ),
+                    );
+                    continue;
+                }
+            };
+            let definition = match unsafe { task.Definition() } {
+                Ok(definition) => definition,
+                Err(error) => {
+                    status = WindowsStartupStatus::Partial;
+                    push_task_diagnostic(
+                        &mut diagnostics,
+                        diagnostic_hresult(
+                            "task_definition_read_failed",
+                            Some(task_index),
+                            "Windows could not read a task definition; its startup triggers remain unknown.",
+                            error.code(),
+                        ),
+                    );
+                    continue;
+                }
+            };
+            let triggers = match unsafe { definition.Triggers() } {
+                Ok(triggers) => triggers,
+                Err(error) => {
+                    status = WindowsStartupStatus::Partial;
+                    push_task_diagnostic(
+                        &mut diagnostics,
+                        diagnostic_hresult(
+                            "task_trigger_collection_read_failed",
+                            Some(task_index),
+                            "Windows could not read a task's trigger collection.",
+                            error.code(),
+                        ),
+                    );
+                    continue;
+                }
+            };
+            let mut trigger_count = 0i32;
+            if let Err(error) = unsafe { triggers.Count(&mut trigger_count) } {
+                status = WindowsStartupStatus::Partial;
+                push_task_diagnostic(
+                    &mut diagnostics,
+                    diagnostic_hresult(
+                        "task_trigger_count_failed",
+                        Some(task_index),
+                        "Windows could not determine a task's trigger count.",
+                        error.code(),
+                    ),
+                );
+                continue;
+            }
+            let (triggers_to_read, trigger_limit_hit) = match bounded_task_count(
+                trigger_count,
+                MAX_TRIGGERS_PER_TASK,
+            ) {
+                Ok(bound) => bound,
+                Err(_) => {
+                    status = WindowsStartupStatus::Partial;
+                    push_task_diagnostic(
+                        &mut diagnostics,
+                        diagnostic(
+                            "task_trigger_count_malformed",
+                            Some(task_index),
+                            "Windows returned a negative trigger count; that task's triggers remain unknown.",
+                        ),
+                    );
+                    continue;
+                }
+            };
+            if trigger_limit_hit {
+                status = WindowsStartupStatus::Partial;
+                push_task_diagnostic(
+                    &mut diagnostics,
+                    diagnostic(
+                        "task_trigger_limit_exceeded",
+                        Some(task_index),
+                        "The per-task trigger limit was reached; remaining triggers were not checked.",
+                    ),
+                );
+            }
+            for trigger_number in 1..=triggers_to_read {
+                if elapsed(started) {
+                    status = WindowsStartupStatus::Partial;
+                    push_task_diagnostic(
+                        &mut diagnostics,
+                        diagnostic(
+                            "task_scheduler_scan_deadline_exceeded",
+                            Some(task_index),
+                            "The shared startup inventory time limit was reached while reading triggers.",
+                        ),
+                    );
+                    break;
+                }
+                let trigger_index = trigger_number - 1;
+                let trigger = match unsafe { triggers.get_Item(trigger_number as i32) } {
+                    Ok(trigger) => trigger,
+                    Err(error) => {
+                        status = WindowsStartupStatus::Partial;
+                        push_task_diagnostic(
+                            &mut diagnostics,
+                            diagnostic_hresult(
+                                if task_error_is_access_denied(&error) {
+                                    "task_trigger_access_denied"
+                                } else {
+                                    "task_trigger_read_failed"
+                                },
+                                Some(task_index),
+                                "Windows denied or failed reading a task trigger.",
+                                error.code(),
+                            ),
+                        );
+                        continue;
+                    }
+                };
+                let mut trigger_type = TASK_TRIGGER_TYPE2(0);
+                if let Err(error) = unsafe { trigger.Type(&mut trigger_type) } {
+                    status = WindowsStartupStatus::Partial;
+                    push_task_diagnostic(
+                        &mut diagnostics,
+                        diagnostic_hresult(
+                            "task_trigger_type_read_failed",
+                            Some(task_index),
+                            "Windows could not identify a trigger type; that trigger was omitted.",
+                            error.code(),
+                        ),
+                    );
+                    continue;
+                }
+                let Some(trigger_name) = scheduled_trigger_name(trigger_type) else {
+                    continue;
+                };
+                if entries.len() >= MAX_SCHEDULED_TASK_TRIGGERS {
+                    status = WindowsStartupStatus::Partial;
+                    trigger_row_limit_hit = true;
+                    push_task_diagnostic(
+                        &mut diagnostics,
+                        diagnostic(
+                            "task_trigger_row_limit_exceeded",
+                            Some(task_index),
+                            "The scheduled-task startup-row limit was reached; remaining triggers were not checked.",
+                        ),
+                    );
+                    break;
+                }
+                let task_path_bstr = match unsafe { task.Path() } {
+                    Ok(path) => path,
+                    Err(error) => {
+                        status = WindowsStartupStatus::Partial;
+                        push_task_diagnostic(
+                            &mut diagnostics,
+                            diagnostic_hresult(
+                                "task_path_read_failed",
+                                Some(task_index),
+                                "Windows could not read the registered task path; its trigger row was omitted.",
+                                error.code(),
+                            ),
+                        );
+                        continue;
+                    }
+                };
+                let task_path = match bounded_bstr_to_string(&task_path_bstr) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        status = WindowsStartupStatus::Partial;
+                        push_task_diagnostic(
+                            &mut diagnostics,
+                            diagnostic(
+                                "task_path_invalid_or_over_limit",
+                                Some(task_index),
+                                "A registered task path was malformed or over limit; its trigger row was omitted.",
+                            ),
+                        );
+                        continue;
+                    }
+                };
+                let task_enabled = match unsafe { task.Enabled() } {
+                    Ok(enabled) => Some(enabled.0 != 0),
+                    Err(error) => {
+                        status = WindowsStartupStatus::Partial;
+                        push_task_diagnostic(
+                            &mut diagnostics,
+                            diagnostic_hresult(
+                                "task_enabled_state_unknown",
+                                Some(task_index),
+                                "Windows could not read the task's enabled state; it is unknown.",
+                                error.code(),
+                            ),
+                        );
+                        None
+                    }
+                };
+                let mut trigger_enabled_value = windows::Win32::Foundation::VARIANT_BOOL(0);
+                let trigger_enabled = match unsafe { trigger.Enabled(&mut trigger_enabled_value) } {
+                    Ok(()) => Some(trigger_enabled_value.0 != 0),
+                    Err(error) => {
+                        status = WindowsStartupStatus::Partial;
+                        push_task_diagnostic(
+                            &mut diagnostics,
+                            diagnostic_hresult(
+                                "task_trigger_enabled_state_unknown",
+                                Some(task_index),
+                                "Windows could not read the trigger's enabled state; it is unknown.",
+                                error.code(),
+                            ),
+                        );
+                        None
+                    }
+                };
+                let logon_user = if trigger_name == "logon" {
+                    match trigger.cast::<ILogonTrigger>() {
+                        Ok(logon_trigger) => {
+                            let mut user = BSTR::default();
+                            match unsafe { logon_trigger.UserId(&mut user) } {
+                                Ok(()) => match bounded_bstr_to_string(&user) {
+                                    Ok(user) => Some(user),
+                                    Err(_) => {
+                                        status = WindowsStartupStatus::Partial;
+                                        push_task_diagnostic(
+                                            &mut diagnostics,
+                                            diagnostic(
+                                                "task_logon_user_invalid_or_over_limit",
+                                                Some(task_index),
+                                                "A logon trigger user identifier was malformed or over limit; its value is unknown.",
+                                            ),
+                                        );
+                                        None
+                                    }
+                                },
+                                Err(error) => {
+                                    status = WindowsStartupStatus::Partial;
+                                    push_task_diagnostic(
+                                        &mut diagnostics,
+                                        diagnostic_hresult(
+                                            "task_logon_user_read_failed",
+                                            Some(task_index),
+                                            "Windows could not read a logon trigger's optional user identifier.",
+                                            error.code(),
+                                        ),
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            status = WindowsStartupStatus::Partial;
+                            push_task_diagnostic(
+                                &mut diagnostics,
+                                diagnostic_hresult(
+                                    "task_logon_trigger_interface_unavailable",
+                                    Some(task_index),
+                                    "Windows could not query the logon-trigger interface; its user identifier is unknown.",
+                                    error.code(),
+                                ),
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let row_string_units = task_path.encode_utf16().count()
+                    + logon_user
+                        .as_ref()
+                        .map_or(0, |user| user.encode_utf16().count());
+                if aggregate_string_units.saturating_add(row_string_units)
+                    > MAX_AGGREGATE_TASK_STRING_UNITS
+                {
+                    status = WindowsStartupStatus::Partial;
+                    push_task_diagnostic(
+                        &mut diagnostics,
+                        diagnostic(
+                            "task_string_budget_exceeded",
+                            Some(task_index),
+                            "The aggregate scheduled-task string budget was reached; remaining triggers were not checked.",
+                        ),
+                    );
+                    break;
+                }
+                aggregate_string_units += row_string_units;
+                entries.push(WindowsScheduledTaskStartupEntry {
+                    task_path,
+                    task_enabled,
+                    trigger_type: trigger_name,
+                    trigger_enabled,
+                    logon_user,
+                    evidence: WindowsScheduledTaskStartupEvidence {
+                        source: "Task Scheduler IRegisteredTask/ITaskDefinition/ITrigger",
+                        task_index,
+                        trigger_index,
+                    },
+                });
+            }
+            if trigger_row_limit_hit {
+                break;
+            }
+        }
+        if trigger_row_limit_hit {
+            break;
+        }
+        if task_limit_hit || tasks_seen >= MAX_SCHEDULED_TASKS {
+            status = WindowsStartupStatus::Partial;
+            push_task_diagnostic(
+                &mut diagnostics,
+                diagnostic(
+                    "task_entry_limit_exceeded",
+                    None,
+                    "The scheduled-task entry limit was reached; remaining tasks and folders were not checked.",
+                ),
+            );
+            break;
+        }
+        if elapsed(started) {
+            status = WindowsStartupStatus::Partial;
+            push_task_diagnostic(
+                &mut diagnostics,
+                diagnostic(
+                    "task_scheduler_scan_deadline_exceeded",
+                    Some(folders_seen - 1),
+                    "The shared startup inventory time limit was reached before this folder's subfolders were checked.",
+                ),
+            );
+            break;
+        }
+        let child_folders = match unsafe { folder.GetFolders(0) } {
+            Ok(folders) => folders,
+            Err(error) => {
+                status = WindowsStartupStatus::Partial;
+                push_task_diagnostic(
+                    &mut diagnostics,
+                    diagnostic_hresult(
+                        if task_error_is_access_denied(&error) {
+                            "task_subfolder_access_denied"
+                        } else {
+                            "task_subfolder_enumeration_failed"
+                        },
+                        Some(folders_seen - 1),
+                        "Windows denied or failed enumerating subfolders; nested tasks remain unknown.",
+                        error.code(),
+                    ),
+                );
+                continue;
+            }
+        };
+        let child_count = match unsafe { child_folders.Count() } {
+            Ok(count) => count,
+            Err(error) => {
+                status = WindowsStartupStatus::Partial;
+                push_task_diagnostic(
+                    &mut diagnostics,
+                    diagnostic_hresult(
+                        "task_subfolder_count_failed",
+                        Some(folders_seen - 1),
+                        "Windows could not determine the number of subfolders.",
+                        error.code(),
+                    ),
+                );
+                continue;
+            }
+        };
+        let remaining_folders = MAX_TASK_FOLDERS
+            .saturating_sub(folders_seen)
+            .saturating_sub(pending_folders.len());
+        let (folders_to_read, folder_limit_hit) = match bounded_task_count(
+            child_count,
+            remaining_folders,
+        ) {
+            Ok(bound) => bound,
+            Err(_) => {
+                status = WindowsStartupStatus::Partial;
+                push_task_diagnostic(
+                    &mut diagnostics,
+                    diagnostic(
+                        "task_subfolder_count_malformed",
+                        Some(folders_seen - 1),
+                        "Windows returned a negative subfolder count; nested tasks remain unknown.",
+                    ),
+                );
+                continue;
+            }
+        };
+        if depth >= MAX_TASK_FOLDER_DEPTH && folders_to_read > 0 {
+            status = WindowsStartupStatus::Partial;
+            push_task_diagnostic(
+                &mut diagnostics,
+                diagnostic(
+                    "task_folder_depth_limit_exceeded",
+                    Some(folders_seen - 1),
+                    "The scheduled-task folder depth limit was reached; nested folders were not checked.",
+                ),
+            );
+            continue;
+        }
+        for child_number in 1..=folders_to_read {
+            if elapsed(started) {
+                status = WindowsStartupStatus::Partial;
+                push_task_diagnostic(
+                    &mut diagnostics,
+                    diagnostic(
+                        "task_scheduler_scan_deadline_exceeded",
+                        Some(folders_seen - 1),
+                        "The shared startup inventory time limit was reached while reading task subfolders.",
+                    ),
+                );
+                break;
+            }
+            let child_variant = one_based_task_index(child_number as i32);
+            match unsafe { child_folders.get_Item(&child_variant) } {
+                Ok(child) => pending_folders.push((child, depth + 1)),
+                Err(error) => {
+                    status = WindowsStartupStatus::Partial;
+                    push_task_diagnostic(
+                        &mut diagnostics,
+                        diagnostic_hresult(
+                            if task_error_is_access_denied(&error) {
+                                "task_subfolder_access_denied"
+                            } else {
+                                "task_subfolder_read_failed"
+                            },
+                            Some(folders_seen - 1),
+                            "Windows denied or failed reading a visible task subfolder.",
+                            error.code(),
+                        ),
+                    );
+                }
+            }
+        }
+        if folder_limit_hit {
+            status = WindowsStartupStatus::Partial;
+            push_task_diagnostic(
+                &mut diagnostics,
+                diagnostic(
+                    "task_folder_limit_exceeded",
+                    Some(folders_seen - 1),
+                    "The scheduled-task folder limit was reached; remaining folders were not checked.",
+                ),
+            );
+        }
+    }
+    (
+        source_result(
+            "scheduled_task_triggers",
+            status,
+            entries.len(),
+            diagnostics,
+        ),
+        entries,
+    )
+}
+
+fn scheduled_trigger_name(trigger_type: TASK_TRIGGER_TYPE2) -> Option<&'static str> {
+    match trigger_type {
+        TASK_TRIGGER_BOOT => Some("boot"),
+        TASK_TRIGGER_LOGON => Some("logon"),
+        _ => None,
+    }
+}
+
+fn bounded_task_count(count: i32, limit: usize) -> Result<(usize, bool), TaskCountError> {
+    if count < 0 {
+        return Err(TaskCountError::Negative);
+    }
+    let count = count as usize;
+    Ok((count.min(limit), count > limit))
+}
+
+fn bounded_bstr_to_string(value: &BSTR) -> Result<String, TaskStringError> {
+    if value.len() > MAX_TASK_STRING_UNITS {
+        return Err(TaskStringError::OverLimit);
+    }
+    String::from_utf16(value).map_err(|_| TaskStringError::MalformedUtf16)
+}
+
+fn one_based_task_index(index: i32) -> VARIANT {
+    let mut variant = VARIANT::default();
+    let inner = VARIANT_0_0 {
+        vt: VT_I4,
+        wReserved1: 0,
+        wReserved2: 0,
+        wReserved3: 0,
+        Anonymous: VARIANT_0_0_0 { lVal: index },
+    };
+    unsafe {
+        std::ptr::write(
+            std::ptr::addr_of_mut!(variant.Anonymous),
+            VARIANT_0 {
+                Anonymous: std::mem::ManuallyDrop::new(inner),
+            },
+        );
+    }
+    variant
+}
+
+fn task_error_is_access_denied(error: &windows::core::Error) -> bool {
+    error.code().0 as u32 == 0x8007_0005
+}
+
+fn task_error_status(error: &windows::core::Error) -> WindowsStartupStatus {
+    if task_error_is_access_denied(error) {
+        WindowsStartupStatus::Inaccessible
+    } else {
+        WindowsStartupStatus::Unavailable
+    }
+}
+
+fn push_task_diagnostic(
+    diagnostics: &mut Vec<WindowsStartupDiagnostic>,
+    item: WindowsStartupDiagnostic,
+) {
+    if diagnostics.len() < MAX_TASK_DIAGNOSTICS {
+        diagnostics.push(item);
+    } else if diagnostics
+        .last()
+        .is_some_and(|last| last.code != "task_diagnostics_limit_exceeded")
+    {
+        *diagnostics.last_mut().expect("diagnostic count is nonzero") = diagnostic(
+            "task_diagnostics_limit_exceeded",
+            None,
+            "Additional Task Scheduler diagnostics were omitted after the bounded diagnostic limit.",
+        );
+    }
 }
 
 fn push_service_diagnostic(
@@ -1650,28 +2411,45 @@ fn source_result_with_location(
 
 fn diagnostic(
     code: &'static str,
-    value_index: Option<usize>,
+    item_index: Option<usize>,
     message: &'static str,
 ) -> WindowsStartupDiagnostic {
     WindowsStartupDiagnostic {
         code,
-        value_index,
+        item_index,
         message,
         win32_error: None,
+        hresult: None,
     }
 }
 
 fn diagnostic_win32(
     code: &'static str,
-    value_index: Option<usize>,
+    item_index: Option<usize>,
     message: &'static str,
     win32_error: u32,
 ) -> WindowsStartupDiagnostic {
     WindowsStartupDiagnostic {
         code,
-        value_index,
+        item_index,
         message,
         win32_error: Some(win32_error),
+        hresult: None,
+    }
+}
+
+fn diagnostic_hresult(
+    code: &'static str,
+    item_index: Option<usize>,
+    message: &'static str,
+    hresult: HRESULT,
+) -> WindowsStartupDiagnostic {
+    WindowsStartupDiagnostic {
+        code,
+        item_index,
+        message,
+        win32_error: None,
+        hresult: Some(hresult.0 as u32),
     }
 }
 
@@ -1682,7 +2460,14 @@ fn wide_z(value: impl AsRef<OsStr>) -> Vec<u16> {
 }
 
 fn utf16_hex(units: &[u16]) -> String {
-    units.iter().map(|unit| format!("{unit:04x}")).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(units.len().saturating_mul(4));
+    for unit in units {
+        for shift in [12, 8, 4, 0] {
+            output.push(HEX[((unit >> shift) & 0x0f) as usize] as char);
+        }
+    }
+    output
 }
 
 #[cfg(test)]
@@ -1799,5 +2584,50 @@ mod tests {
             diagnostics.last().unwrap().code,
             "service_diagnostics_limit_exceeded"
         );
+    }
+
+    #[test]
+    fn scheduled_trigger_normalization_keeps_only_boot_and_logon() {
+        assert_eq!(scheduled_trigger_name(TASK_TRIGGER_BOOT), Some("boot"));
+        assert_eq!(scheduled_trigger_name(TASK_TRIGGER_LOGON), Some("logon"));
+        assert_eq!(scheduled_trigger_name(TASK_TRIGGER_TYPE2(0)), None);
+        assert_eq!(scheduled_trigger_name(TASK_TRIGGER_TYPE2(7)), None);
+    }
+
+    #[test]
+    fn task_collection_counts_are_clamped_and_negative_values_rejected() {
+        assert_eq!(bounded_task_count(3, 5), Ok((3, false)));
+        assert_eq!(bounded_task_count(8, 5), Ok((5, true)));
+        assert_eq!(bounded_task_count(0, 0), Ok((0, false)));
+        assert_eq!(bounded_task_count(-1, 5), Err(TaskCountError::Negative));
+    }
+
+    #[test]
+    fn task_strings_are_strict_and_bounded() {
+        assert_eq!(
+            bounded_bstr_to_string(&BSTR::from("\\Root\\Example")),
+            Ok("\\Root\\Example".to_string())
+        );
+        let malformed = BSTR::from_wide(&[0xd800]);
+        assert_eq!(
+            bounded_bstr_to_string(&malformed),
+            Err(TaskStringError::MalformedUtf16)
+        );
+        let oversized_units = vec![b'X' as u16; MAX_TASK_STRING_UNITS + 1];
+        let oversized = BSTR::from_wide(&oversized_units);
+        assert_eq!(
+            bounded_bstr_to_string(&oversized),
+            Err(TaskStringError::OverLimit)
+        );
+    }
+
+    #[test]
+    fn task_collection_indices_use_one_based_i4_variants() {
+        let variant = one_based_task_index(4);
+        unsafe {
+            let value = &*variant.Anonymous.Anonymous;
+            assert_eq!(value.vt, VT_I4);
+            assert_eq!(value.Anonymous.lVal, 4);
+        }
     }
 }

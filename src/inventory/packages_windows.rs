@@ -770,11 +770,24 @@ fn wide_z(value: impl AsRef<OsStr>) -> Vec<u16> {
 }
 
 fn utf16_hex(units: &[u16]) -> String {
-    units.iter().map(|unit| format!("{unit:04x}")).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(units.len().saturating_mul(4));
+    for unit in units {
+        for shift in [12, 8, 4, 0] {
+            output.push(HEX[((unit >> shift) & 0x0f) as usize] as char);
+        }
+    }
+    output
 }
 
 fn bytes_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 #[cfg(test)]
