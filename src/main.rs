@@ -34,6 +34,8 @@ use sideeffect::inventory::{ProcessInventoryStatus, collect_processes};
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{StartupInventoryStatus, collect_startup};
 #[cfg(windows)]
+use sideeffect::inventory::{WindowsPermissionStatus, collect_windows_permissions};
+#[cfg(windows)]
 use sideeffect::inventory::{WindowsProcessInventoryStatus, collect_windows_processes};
 #[cfg(windows)]
 use sideeffect::inventory::{WindowsSoftwareStatus, collect_windows_software};
@@ -498,10 +500,39 @@ fn inventory_permissions(output: &OsString, paths: &[OsString]) -> Result<ExitCo
             ExitCode::from(2)
         })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(not(target_os = "linux"), not(windows)))]
     {
         let _ = (output, paths);
-        Err("inventory permissions currently supports Linux paths only".to_owned())
+        Err("inventory permissions is not supported on this platform".to_owned())
+    }
+    #[cfg(windows)]
+    {
+        let paths = paths
+            .iter()
+            .map(Path::new)
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        let document = collect_windows_permissions(&paths);
+        let complete = document.status == WindowsPermissionStatus::Complete;
+        let mut json = CappedBuffer::new(MAX_REPORT_BYTES);
+        serde_json::to_writer(&mut json, &document).map_err(|error| {
+            format!("could not serialize Windows permission inventory within the {MAX_REPORT_BYTES} byte limit: {error}")
+        })?;
+        let published =
+            publish_private_windows_file(Path::new(output), &json.bytes, MAX_REPORT_BYTES)
+                .map_err(|error| {
+                    format!("could not publish private Windows permission inventory: {error}")
+                })?;
+        eprintln!(
+            "Saved a {} Windows explicit-path permission snapshot to {}. It retains the opened object's owner, group, DACL, and ACE evidence; the final reparse point is not followed, no SACL is requested, and effective access is not calculated.",
+            if complete { "complete" } else { "partial" },
+            terminal_safe_path(&published)
+        );
+        Ok(if complete {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(2)
+        })
     }
 }
 
@@ -784,7 +815,18 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             }
         }
         "inventory permissions" => {
-            "Usage: sideeffect inventory permissions --output FILE PATH...\nInspects only explicit Linux paths for metadata, supported POSIX ACLs, and file capabilities. It does not recurse or calculate effective access."
+            #[cfg(target_os = "linux")]
+            {
+                "Usage: sideeffect inventory permissions --output FILE PATH...\nInspects only explicit Linux paths for metadata, supported POSIX ACLs, and file capabilities. It does not recurse or calculate effective access."
+            }
+            #[cfg(windows)]
+            {
+                "Usage: sideeffect inventory permissions --output FILE PATH...\nInspects only explicit Windows paths. It reads owner, group, DACL, ordered ACEs, and metadata from the same handle, does not follow the final reparse point, does not request SACLs, and does not calculate effective access. No elevation is requested."
+            }
+            #[cfg(not(any(target_os = "linux", windows)))]
+            {
+                "Usage: sideeffect inventory permissions --output FILE PATH...\nPermission inventory is not supported on this platform."
+            }
         }
         "correlate-startup" => {
             "Usage: sideeffect correlate-startup STARTUP_INVENTORY.json TRACE\nFinds narrow exact-path candidate matches between supported saved startup configuration and successful exec evidence. A match does not prove that a hook caused or initiated execution."

@@ -9,6 +9,8 @@ mod packages;
 mod packages_windows;
 #[cfg(target_os = "linux")]
 mod permissions;
+#[cfg(windows)]
+mod permissions_windows;
 #[cfg(target_os = "linux")]
 mod processes;
 #[cfg(windows)]
@@ -48,6 +50,12 @@ pub use packages_windows::{
 pub use permissions::{
     AclEntry, AclObservation, AclStatus, AclTag, PermissionDiagnostic, PermissionInventoryDocument,
     PermissionInventoryStatus, PermissionObject, PermissionObjectStatus, collect_permissions,
+};
+#[cfg(windows)]
+pub use permissions_windows::{
+    WindowsAceEvidence, WindowsPermissionDiagnostic, WindowsPermissionInventoryDocument,
+    WindowsPermissionLimits, WindowsPermissionMetadata, WindowsPermissionObject,
+    WindowsPermissionStatus, WindowsSecurityDescriptorEvidence, collect_windows_permissions,
 };
 #[cfg(target_os = "linux")]
 pub use processes::{
