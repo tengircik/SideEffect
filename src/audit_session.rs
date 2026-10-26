@@ -67,6 +67,8 @@ pub enum SourceRole {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceStatus {
+    /// The selected collector produced all artifacts it declared for this
+    /// source. This does not establish exhaustive system coverage.
     Complete,
     Partial,
     Unknown,
@@ -190,6 +192,9 @@ impl AuditSessionManifest {
             }
             for code in &source.diagnostic_codes {
                 validate_code(code)?;
+            }
+            if source.role == SourceRole::Runtime && source.status == SourceStatus::Complete {
+                return Err(ValidationError::RuntimeCompletenessNotEstablished);
             }
 
             let expected = expected_artifacts(source.role, &source.platform)?;
@@ -369,6 +374,7 @@ pub enum ValidationError {
     AggregateSizeOutOfBounds,
     InvalidArtifactDigest,
     SessionStatusHidesIncompleteSource,
+    RuntimeCompletenessNotEstablished,
     ManifestTooLarge,
     InvalidManifestJson,
 }

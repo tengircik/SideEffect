@@ -145,7 +145,7 @@ The implemented Linux `sideeffect.startup_inventory` v2 aggregate combines bound
 
 **M9 exit criteria:** deterministic tests cover mixed successful/partial/unavailable sources, time-window provenance, size/count limits, malformed manifests, unknown schema versions, and publication safety. A session report makes each source interval and its non-atomic nature visible.
 
-**Current status:** the v1 manifest envelope and bounded Linux artifact contract are implemented in `src/audit_session.rs`. Parsing is capped at 512 KiB and validates source intervals/statuses, fixed artifact names and schemas, hashes, and aggregate artifact sizes. Session collection, artifact reading/hash verification, private staging, no-clobber directory publication, and CLI/report integration remain unimplemented; M9 is incomplete.
+**Current status:** the v1 manifest envelope and bounded Linux artifact contract are implemented in `src/audit_session.rs`. Parsing is capped at 512 KiB and validates source intervals/statuses, fixed artifact names and schemas, hashes, and aggregate artifact sizes. `complete` means the selected collector produced its declared artifacts, not exhaustive coverage; the existing runtime capture cannot be marked complete because its capture completeness is unknown. Session collection, artifact reading/hash verification, private staging, no-clobber directory publication, and CLI/report integration remain unimplemented; M9 is incomplete.
 
 ## Milestone 10 — Native Windows inventory and startup audit
 
