@@ -22,8 +22,13 @@ use windows_sys::Win32::System::Diagnostics::Etw::{
     StartTraceW, StopTraceW, SystemTraceControlGuid, WNODE_FLAG_TRACED_GUID,
 };
 
+#[path = "payload_decode.rs"]
+mod payload_decode;
+use payload_decode::decode_event_payload;
+pub use payload_decode::{DecodeStatus, DecodedProcessPayload};
+
 pub const WINDOWS_RUNTIME_CAPTURE_SCHEMA: &str = "sideeffect.windows_runtime_capture";
-pub const WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION: u32 = 1;
+pub const WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION: u32 = 2;
 pub const MAX_WINDOWS_RUNTIME_DURATION_SECONDS: u64 = 60;
 const MAX_EVENT_RECORDS: usize = 50_000;
 const MAX_EVENT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
@@ -138,10 +143,12 @@ pub struct NativeProcessEvent {
     /// the parent execution context, not the newly created process.
     pub header_process_id: u32,
     pub header_thread_id: u32,
+    pub header_flags: u16,
     /// ETW QPC timestamp ticks. No wall-clock conversion is claimed here.
     pub timestamp_qpc: i64,
     /// Exact bytes from EVENT_RECORD.UserData for this source event.
     pub raw_payload_hex: String,
+    pub payload_decoding: DecodedProcessPayload,
 }
 
 #[derive(Default)]
@@ -162,8 +169,10 @@ struct NativeProcessEventBytes {
     event_kind: &'static str,
     header_process_id: u32,
     header_thread_id: u32,
+    header_flags: u16,
     timestamp_qpc: i64,
     raw_payload: Vec<u8>,
+    payload_decoding: DecodedProcessPayload,
 }
 
 /// Run a selected command while collecting process start/end ETW records.
@@ -248,8 +257,10 @@ pub fn record_windows_process_capture(
             event_kind: event.event_kind,
             header_process_id: event.header_process_id,
             header_thread_id: event.header_thread_id,
+            header_flags: event.header_flags,
             timestamp_qpc: event.timestamp_qpc,
             raw_payload_hex: hex(&event.raw_payload),
+            payload_decoding: event.payload_decoding.clone(),
         });
     }
     drop(collector);
@@ -612,6 +623,7 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
         let bytes = unsafe { std::slice::from_raw_parts(event.UserData.cast::<u8>(), length) };
         payload.extend_from_slice(bytes);
     }
+    let payload_decoding = decode_event_payload(event);
     let state = unsafe { &*event.UserContext.cast::<Mutex<Collector>>() };
     let mut state = state
         .lock()
@@ -626,8 +638,10 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
             event_kind,
             header_process_id: header.ProcessId,
             header_thread_id: header.ThreadId,
+            header_flags: header.Flags,
             timestamp_qpc: header.TimeStamp,
             raw_payload: payload,
+            payload_decoding,
         },
     );
 }
@@ -644,7 +658,9 @@ fn append_event(state: &mut Collector, event: NativeProcessEventBytes) -> bool {
         state.limit_reached = true;
         return false;
     }
-    if event.event_kind == "unsupported_process_event" {
+    if event.event_kind == "unsupported_process_event"
+        || event.payload_decoding.status != DecodeStatus::Decoded
+    {
         state.malformed = true;
     }
     if state.events.try_reserve(1).is_err() {
@@ -720,6 +736,12 @@ fn classify_process_opcode(opcode: u8) -> &'static str {
     match u32::from(opcode) {
         EVENT_TRACE_TYPE_START => "process_start",
         EVENT_TRACE_TYPE_END => "process_end",
+        windows_sys::Win32::System::Diagnostics::Etw::EVENT_TRACE_TYPE_DC_START => {
+            "process_rundown_start"
+        }
+        windows_sys::Win32::System::Diagnostics::Etw::EVENT_TRACE_TYPE_DC_END => {
+            "process_rundown_end"
+        }
         _ => "unsupported_process_event",
     }
 }
@@ -737,6 +759,18 @@ mod tests {
         assert_eq!(
             classify_process_opcode(EVENT_TRACE_TYPE_END as u8),
             "process_end"
+        );
+        assert_eq!(
+            classify_process_opcode(
+                windows_sys::Win32::System::Diagnostics::Etw::EVENT_TRACE_TYPE_DC_START as u8
+            ),
+            "process_rundown_start"
+        );
+        assert_eq!(
+            classify_process_opcode(
+                windows_sys::Win32::System::Diagnostics::Etw::EVENT_TRACE_TYPE_DC_END as u8
+            ),
+            "process_rundown_end"
         );
         assert_eq!(classify_process_opcode(99), "unsupported_process_event");
     }
@@ -790,8 +824,14 @@ mod tests {
             event_kind: "process_start",
             header_process_id: 0,
             header_thread_id: 0,
+            header_flags:
+                windows_sys::Win32::System::Diagnostics::Etw::EVENT_HEADER_FLAG_64_BIT_HEADER as u16,
             timestamp_qpc: 0,
             raw_payload,
+            payload_decoding: DecodedProcessPayload::undecoded(
+                DecodeStatus::SchemaUnavailable,
+                "fixture_is_not_a_real_etw_decode",
+            ),
         };
         let mut state = Collector::default();
         for _ in 0..(MAX_EVENT_PAYLOAD_BYTES / MAX_EVENT_PAYLOAD_LENGTH) {

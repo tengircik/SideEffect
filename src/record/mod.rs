@@ -18,7 +18,8 @@ pub use paths::{AnchoredOutput, publish_private_file};
 pub use windows::publish_private_file as publish_private_windows_file;
 #[cfg(windows)]
 pub use windows_etw::{
-    CollectionStatus as WindowsRuntimeCollectionStatus, WindowsRuntimeCapture,
+    CollectionStatus as WindowsRuntimeCollectionStatus, DecodeStatus as WindowsRuntimeDecodeStatus,
+    DecodedProcessPayload as WindowsDecodedProcessPayload, WindowsRuntimeCapture,
     record_windows_process_capture,
 };
 

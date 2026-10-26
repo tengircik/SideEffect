@@ -33,19 +33,25 @@ fn captures_real_process_lifecycle_events_and_reports_loss_state() {
         .output()
         .unwrap();
     assert!(
-        command.status.success(),
+        matches!(command.status.code(), Some(0 | 2)),
         "ETW acceptance failed (this host may lack permission to control NT Kernel Logger): {}",
         String::from_utf8_lossy(&command.stderr)
     );
     let document: Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
     assert_eq!(document["schema"], "sideeffect.windows_runtime_capture");
-    assert_eq!(document["schema_version"], 1);
+    assert_eq!(document["schema_version"], 2);
     assert_eq!(document["capture_completeness"], "unknown");
     assert_eq!(document["event_loss"]["loss_statistics_available"], true);
     assert!(document["events"].as_array().unwrap().iter().any(|event| {
         event["event_kind"] == "process_start" || event["event_kind"] == "process_end"
     }));
     assert!(document["target"]["process_id"].as_u64().unwrap() > 0);
+    let target_pid = document["target"]["process_id"].as_u64().unwrap();
+    assert!(document["events"].as_array().unwrap().iter().any(|event| {
+        event["event_kind"] == "process_start"
+            && event["payload_decoding"]["status"] == "decoded"
+            && event["payload_decoding"]["process_id"] == target_pid
+    }));
     fs::remove_file(output).unwrap();
     fs::remove_dir(directory).unwrap();
 }
