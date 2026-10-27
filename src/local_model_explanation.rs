@@ -258,9 +258,11 @@ pub fn validate_model_explanation_output(
         if statement.text.trim().is_empty()
             || statement.text.len() > LOCAL_MODEL_EXPLANATION_MAX_TEXT_BYTES
             || statement.text.chars().any(char::is_control)
+            || contains_bidi_control(&statement.text)
         {
             return Err(
-                "local model returned an empty, oversized, or controlled statement".to_owned(),
+                "local model returned an empty, oversized, controlled, or bidirectional statement"
+                    .to_owned(),
             );
         }
         total_text_bytes = total_text_bytes.saturating_add(statement.text.len());
@@ -297,6 +299,15 @@ pub fn validate_model_explanation_output(
         }
     }
     Ok(parsed)
+}
+
+fn contains_bidi_control(value: &str) -> bool {
+    value.chars().any(|character| {
+        matches!(
+            character,
+            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        )
+    })
 }
 
 fn strip_runtime_suffix(output: &str) -> &str {
@@ -529,6 +540,19 @@ mod tests {
         let allowed = BTreeSet::from(["E001".to_owned()]);
         let controlled = br#"{"status":"answered","abstain_reason":null,"statements":[{"kind":"observation","text":"bad\u001b[31m","evidence_ids":["E001"]}]}"#;
         assert!(validate_model_explanation_output(controlled, &allowed).is_err());
+        for bidi in ['\u{061C}', '\u{200F}', '\u{202E}', '\u{2066}', '\u{2069}'] {
+            let bidi_output = serde_json::to_vec(&json!({
+                "status": "answered",
+                "abstain_reason": null,
+                "statements": [{
+                    "kind": "observation",
+                    "text": format!("Claim {bidi}with reordered display"),
+                    "evidence_ids": ["E001"]
+                }]
+            }))
+            .unwrap();
+            assert!(validate_model_explanation_output(&bidi_output, &allowed).is_err());
+        }
         let oversized = format!(
             "{{\"status\":\"answered\",\"abstain_reason\":null,\"statements\":[{{\"kind\":\"observation\",\"text\":\"{}\",\"evidence_ids\":[\"E001\"]}}]}}",
             "x".repeat(LOCAL_MODEL_EXPLANATION_MAX_TEXT_BYTES + 1)
