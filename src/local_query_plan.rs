@@ -18,7 +18,7 @@ use crate::model::{
 };
 use std::collections::BTreeMap;
 
-pub const LOCAL_QUERY_PLAN_SCHEMA_VERSION: u32 = 1;
+pub const LOCAL_QUERY_PLAN_SCHEMA_VERSION: u32 = 2;
 pub const MAX_LOCAL_QUERY_PLAN_BYTES: usize = 4 * 1024;
 pub const MAX_LOCAL_QUERY_RESULT_FACTS: usize = 48;
 pub const MAX_LOCAL_QUERY_RELATIONS: usize = 16;
@@ -26,13 +26,15 @@ pub const MAX_LOCAL_QUERY_SUPPORT_REFS_PER_RELATION: usize = 4;
 pub const MAX_LOCAL_QUERY_MATCHES: usize = MAX_LOCAL_QUERY_RESULT_FACTS + MAX_LOCAL_QUERY_RELATIONS;
 pub const MAX_LOCAL_QUERY_RESULT_BYTES: usize = 1024 * 1024;
 pub const MAX_LOCAL_QUERYABLE_FACTS_BYTES: usize = 64 * 1024;
-pub const LOCAL_QUERY_PLAN_MODEL_REPOSITORY: &str = "ggml-org/Qwen3.5-0.8B-GGUF";
-pub const LOCAL_QUERY_PLAN_MODEL_REVISION: &str = "9447f74101aeb4e93621884dfa36ee8effb8831b";
+pub const LOCAL_QUERY_PLAN_MODEL_REPOSITORY: &str = "gguf/Qwen3.5-2B-GGUF";
+pub const LOCAL_QUERY_PLAN_MODEL_REVISION: &str = "47f5192dcee31b32db0ba0acc04cccef89cb4b2c";
 pub const LOCAL_QUERY_PLAN_MODEL_SHA256: &str =
-    "57d1997790d1744fba5b40a7317df71ea5e2acee28c47e78f0cce39c0703f8cf";
+    "9a3d0aa6c920f096441139b6a254542da855223fdad06855ea00c6c087fd713d";
 pub const LOCAL_QUERY_PLAN_RUNTIME_REVISION: &str = "19cce6919992fdffd92e0ac152caaf1e2b8f254e";
 pub const LOCAL_QUERY_PLAN_RUNTIME_VERSION: &str = "0.7.0-dev (build 11938, commit 19cce6919)";
-pub const LOCAL_QUERY_PLAN_MAX_MODEL_BYTES: u64 = 576 * 1024 * 1024;
+pub const LOCAL_QUERY_PLAN_MAX_MODEL_BYTES: u64 = 1_610_612_736;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const LOCAL_QUERY_PLAN_ADDRESS_SPACE_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const LOCAL_QUERY_PLAN_MAX_QUESTION_BYTES: usize = 2048;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const LOCAL_QUERY_PLAN_MAX_OUTPUT_BYTES: usize = 16 * 1024;
@@ -244,41 +246,162 @@ pub struct LocalQueryResult {
 /// JSON Schema for constrained decoding. Semantic cross-field rules are
 /// enforced again by [`validate_query_plan`] after generation.
 pub fn local_query_plan_schema() -> Value {
-    let nullable = |schema: Value| json!({ "anyOf": [schema, { "type": "null" }] });
-    json!({
-        "type": "object",
-        "properties": {
-            "decision": { "type": "string", "enum": ["filter", "abstain"] },
-            "abstain_reason": nullable(json!({
+    fn scalar_schema(field: &str) -> Value {
+        match field {
+            "syscall" => json!({ "type": "string", "maxLength": MAX_SYSCALL_NAME_BYTES }),
+            "outcome" => json!({
                 "type": "string",
-                "enum": ["ambiguous", "unsupported_scope", "insufficient_evidence"]
-            })),
-            "entity": nullable(json!({
-                "type": "string",
-                "enum": ["syscall_result", "process_relation"]
-            })),
-            "filters": {
-                "type": "object",
-                "properties": {
-                    "syscall": nullable(json!({ "type": "string", "maxLength": MAX_SYSCALL_NAME_BYTES })),
-                    "outcome": nullable(json!({
-                        "type": "string",
-                        "enum": ["success", "failure", "in_progress", "unknown"]
-                    })),
-                    "observed_errno": nullable(json!({ "type": "string", "maxLength": MAX_ERRNO_NAME_BYTES })),
-                    "lexical_path_exact": nullable(json!({ "type": "string", "maxLength": MAX_LEXICAL_PATH_BYTES })),
-                    "process_id": nullable(json!({ "type": "integer", "minimum": 1, "maximum": u32::MAX })),
-                    "caller_task_id": nullable(json!({ "type": "integer", "minimum": 1, "maximum": u32::MAX })),
-                    "child_pid": nullable(json!({ "type": "integer", "minimum": 1, "maximum": u32::MAX })),
-                    "relation_type": nullable(json!({ "type": "string", "maxLength": MAX_RELATION_TYPE_BYTES }))
-                },
-                "required": ["syscall", "outcome", "observed_errno", "lexical_path_exact", "process_id", "caller_task_id", "child_pid", "relation_type"],
-                "additionalProperties": false
+                "enum": ["success", "failure", "in_progress", "unknown"]
+            }),
+            "observed_errno" => json!({ "type": "string", "maxLength": MAX_ERRNO_NAME_BYTES }),
+            "lexical_path_exact" => {
+                json!({ "type": "string", "maxLength": MAX_LEXICAL_PATH_BYTES })
+            }
+            "process_id" | "caller_task_id" | "child_pid" => json!({
+                "type": "integer", "minimum": 1, "maximum": u32::MAX
+            }),
+            "relation_type" => json!({ "type": "string", "maxLength": MAX_RELATION_TYPE_BYTES }),
+            _ => unreachable!("query schema field names are fixed internally"),
+        }
+    }
+
+    fn nullable(schema: Value) -> Value {
+        json!({ "anyOf": [schema, { "type": "null" }] })
+    }
+
+    fn exact_null() -> Value {
+        json!({ "const": null })
+    }
+
+    fn strict_object(properties: serde_json::Map<String, Value>) -> Value {
+        json!({
+            "type": "object",
+            "properties": properties,
+            "required": [
+                "syscall", "outcome", "observed_errno", "lexical_path_exact",
+                "process_id", "caller_task_id", "child_pid", "relation_type"
+            ],
+            "additionalProperties": false
+        })
+    }
+
+    fn filter_union(alternatives: &[&str], irrelevant: &[&str], shared_nullable: &[&str]) -> Value {
+        // Partition on the first non-null entity predicate. This keeps the
+        // alternatives disjoint while allowing any later predicates to join
+        // the same exact-AND plan.
+        let branches = alternatives
+            .iter()
+            .enumerate()
+            .map(|(selected_index, _selected)| {
+                let mut properties = serde_json::Map::new();
+                for field in [
+                    "syscall",
+                    "outcome",
+                    "observed_errno",
+                    "lexical_path_exact",
+                    "process_id",
+                    "caller_task_id",
+                    "child_pid",
+                    "relation_type",
+                ] {
+                    let value = if irrelevant.contains(&field) {
+                        exact_null()
+                    } else if shared_nullable.contains(&field) {
+                        nullable(scalar_schema(field))
+                    } else if let Some(field_index) =
+                        alternatives.iter().position(|name| *name == field)
+                    {
+                        if field_index < selected_index {
+                            exact_null()
+                        } else if field_index == selected_index {
+                            scalar_schema(field)
+                        } else {
+                            nullable(scalar_schema(field))
+                        }
+                    } else {
+                        exact_null()
+                    };
+                    properties.insert(field.to_owned(), value);
+                }
+                strict_object(properties)
+            })
+            .collect::<Vec<_>>();
+        json!({ "anyOf": branches })
+    }
+
+    fn root_branch(decision: &str, abstain_reason: Value, entity: Value, filters: Value) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "decision": { "const": decision },
+                "abstain_reason": abstain_reason,
+                "entity": entity,
+                "filters": filters,
+                "combine": { "const": "all" }
             },
-            "combine": { "type": "string", "enum": ["all"] }
-        },
-        "required": ["decision", "abstain_reason", "entity", "filters", "combine"],
-        "additionalProperties": false
+            "required": ["decision", "abstain_reason", "entity", "filters", "combine"],
+            "additionalProperties": false
+        })
+    }
+
+    let abstain_filters = {
+        let mut properties = serde_json::Map::new();
+        for field in [
+            "syscall",
+            "outcome",
+            "observed_errno",
+            "lexical_path_exact",
+            "process_id",
+            "caller_task_id",
+            "child_pid",
+            "relation_type",
+        ] {
+            properties.insert(field.to_owned(), exact_null());
+        }
+        strict_object(properties)
+    };
+    let abstain_reason = json!({
+        "type": "string",
+        "enum": ["ambiguous", "unsupported_scope", "insufficient_evidence"]
+    });
+    let syscall_filters = filter_union(
+        &[
+            "syscall",
+            "outcome",
+            "observed_errno",
+            "lexical_path_exact",
+            "process_id",
+        ],
+        &["caller_task_id", "child_pid", "relation_type"],
+        &[],
+    );
+    let relation_filters = filter_union(
+        &["process_id", "caller_task_id", "child_pid", "relation_type"],
+        &["syscall", "outcome", "observed_errno", "lexical_path_exact"],
+        &[],
+    );
+
+    json!({
+        "anyOf": [
+            root_branch(
+                "abstain",
+                abstain_reason,
+                exact_null(),
+                abstain_filters,
+            ),
+            root_branch(
+                "filter",
+                exact_null(),
+                json!({ "const": "syscall_result" }),
+                syscall_filters,
+            ),
+            root_branch(
+                "filter",
+                exact_null(),
+                json!({ "const": "process_relation" }),
+                relation_filters,
+            ),
+        ]
     })
 }
 
@@ -966,7 +1089,8 @@ pub fn analyze_query_plan_bytes(
     confirmed_request_sha256: &str,
 ) -> Result<LocalQueryPlanAnalysis, String> {
     use crate::local_model_runtime::{
-        TempDirectory, create_private_temp_dir, run_bounded, write_private_file,
+        TempDirectory, create_private_temp_dir, run_bounded, run_bounded_with_address_space_limit,
+        write_private_file,
     };
     use std::ffi::OsString;
 
@@ -1055,12 +1179,13 @@ pub fn analyze_query_plan_bytes(
     .into_iter()
     .map(OsString::from)
     .collect::<Vec<_>>();
-    let result = run_bounded(
+    let result = run_bounded_with_address_space_limit(
         &runtime,
         &runtime_arguments,
         Some(&temporary),
         LOCAL_QUERY_PLAN_TIMEOUT_SECONDS,
         LOCAL_QUERY_PLAN_MAX_OUTPUT_BYTES,
+        LOCAL_QUERY_PLAN_ADDRESS_SPACE_LIMIT_BYTES,
     )?;
     if result.stdout.truncated || result.stderr.truncated {
         return Err("local runtime exceeded its bounded output limit".to_owned());
@@ -1169,6 +1294,15 @@ mod preview_tests {
         assert_eq!(preview.trace_sha256, crate::local_model::sha256_hex(TRACE));
         assert_eq!(preview.schema, "sideeffect.local_query_plan_preview");
         assert_eq!(preview.model_repository, LOCAL_QUERY_PLAN_MODEL_REPOSITORY);
+        assert_eq!(
+            preview.model_repository_revision,
+            "47f5192dcee31b32db0ba0acc04cccef89cb4b2c"
+        );
+        assert_eq!(
+            preview.model_sha256,
+            "9a3d0aa6c920f096441139b6a254542da855223fdad06855ea00c6c087fd713d"
+        );
+        assert_eq!(LOCAL_QUERY_PLAN_MAX_MODEL_BYTES, 1_610_612_736);
     }
 
     #[test]
@@ -1410,19 +1544,114 @@ mod tests {
     #[test]
     fn schema_requires_all_fields_and_only_supported_filter_values() {
         let schema = local_query_plan_schema();
-        assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(
-            schema["properties"]["filters"]["additionalProperties"],
-            false
-        );
-        assert_eq!(
-            schema["properties"]["filters"]["required"]
-                .as_array()
-                .unwrap()
-                .len(),
-            8
-        );
-        assert_eq!(schema["properties"]["combine"]["enum"][0], "all");
+        assert_eq!(LOCAL_QUERY_PLAN_SCHEMA_VERSION, 2);
+        let root = schema["anyOf"].as_array().unwrap();
+        assert_eq!(root.len(), 3);
+        let root_required = ["decision", "abstain_reason", "entity", "filters", "combine"];
+        let filter_fields = [
+            "syscall",
+            "outcome",
+            "observed_errno",
+            "lexical_path_exact",
+            "process_id",
+            "caller_task_id",
+            "child_pid",
+            "relation_type",
+        ];
+        for branch in root {
+            assert_eq!(branch["type"], "object");
+            assert_eq!(branch["additionalProperties"], false);
+            assert_eq!(
+                branch["required"].as_array().unwrap().len(),
+                root_required.len()
+            );
+            for required in root_required {
+                assert!(
+                    branch["required"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!(required))
+                );
+            }
+        }
+
+        let abstain = &root[0];
+        assert_eq!(abstain["properties"]["decision"]["const"], "abstain");
+        assert_eq!(abstain["properties"]["entity"]["const"], Value::Null);
+        assert_eq!(abstain["properties"]["combine"]["const"], "all");
+        let abstain_filters = &abstain["properties"]["filters"];
+        assert_eq!(abstain_filters["type"], "object");
+        assert_eq!(abstain_filters["additionalProperties"], false);
+        assert_eq!(abstain_filters["required"].as_array().unwrap().len(), 8);
+        for field in filter_fields {
+            assert_eq!(abstain_filters["properties"][field]["const"], Value::Null);
+        }
+
+        for (branch_index, entity, alternatives, irrelevant) in [
+            (
+                1,
+                "syscall_result",
+                &[
+                    "syscall",
+                    "outcome",
+                    "observed_errno",
+                    "lexical_path_exact",
+                    "process_id",
+                ][..],
+                &["caller_task_id", "child_pid", "relation_type"][..],
+            ),
+            (
+                2,
+                "process_relation",
+                &["process_id", "caller_task_id", "child_pid", "relation_type"][..],
+                &["syscall", "outcome", "observed_errno", "lexical_path_exact"][..],
+            ),
+        ] {
+            let branch = &root[branch_index];
+            assert_eq!(branch["properties"]["decision"]["const"], "filter");
+            assert_eq!(branch["properties"]["entity"]["const"], entity);
+            assert_eq!(branch["properties"]["abstain_reason"]["const"], Value::Null);
+            assert_eq!(branch["properties"]["combine"]["const"], "all");
+            let union = branch["properties"]["filters"]["anyOf"].as_array().unwrap();
+            assert_eq!(union.len(), alternatives.len());
+            for (alternative_index, alternative) in union.iter().enumerate() {
+                assert_eq!(alternative["type"], "object");
+                assert_eq!(alternative["additionalProperties"], false);
+                assert_eq!(alternative["required"].as_array().unwrap().len(), 8);
+                for field in filter_fields {
+                    assert!(
+                        alternative["required"]
+                            .as_array()
+                            .unwrap()
+                            .contains(&json!(field))
+                    );
+                    assert!(alternative["properties"].get(field).is_some());
+                }
+                for field in irrelevant {
+                    assert_eq!(alternative["properties"][field]["const"], Value::Null);
+                }
+                // The first non-null predicate partitions this union: all
+                // earlier fields are null and this field is non-nullable.
+                for earlier in &alternatives[..alternative_index] {
+                    assert_eq!(alternative["properties"][earlier]["const"], Value::Null);
+                }
+                assert!(
+                    alternative["properties"][alternatives[alternative_index]]["type"].is_string()
+                );
+            }
+            // Each pair differs at the earlier branch's selected field: its
+            // own branch requires a value, while the later branch requires null.
+            for left in 0..union.len() {
+                for right in (left + 1)..union.len() {
+                    let distinguishing_field = alternatives[left];
+                    assert!(union[left]["properties"][distinguishing_field]["type"].is_string());
+                    assert_eq!(
+                        union[right]["properties"][distinguishing_field]["const"],
+                        Value::Null
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -54,8 +54,8 @@ fn query_preview_keeps_trace_facts_out_of_model_prompt_and_links_sources() {
     );
     let preview: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(preview["schema"], "sideeffect.local_query_plan_preview");
-    assert_eq!(preview["schema_version"], 1);
-    assert_eq!(preview["model_repository"], "ggml-org/Qwen3.5-0.8B-GGUF");
+    assert_eq!(preview["schema_version"], 2);
+    assert_eq!(preview["model_repository"], "gguf/Qwen3.5-2B-GGUF");
     assert_eq!(preview["trace_sha256"].as_str().unwrap().len(), 64);
     assert_eq!(preview["request_sha256"].as_str().unwrap().len(), 64);
     let prompt: serde_json::Value =

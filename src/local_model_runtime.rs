@@ -8,6 +8,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
 #[cfg(target_os = "linux")]
+const DEFAULT_ADDRESS_SPACE_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_ADDRESS_SPACE_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+#[cfg(target_os = "linux")]
 pub struct BoundedPipe {
     pub bytes: Vec<u8>,
     pub truncated: bool,
@@ -116,6 +121,32 @@ pub fn run_bounded(
     timeout_seconds: u64,
     output_limit: usize,
 ) -> Result<BoundedCommandOutput, String> {
+    run_bounded_with_address_space_limit(
+        program,
+        arguments,
+        working_directory,
+        timeout_seconds,
+        output_limit,
+        DEFAULT_ADDRESS_SPACE_LIMIT_BYTES,
+    )
+}
+
+/// Run a subprocess with the same restrictions as [`run_bounded`], allowing
+/// only the address-space ceiling to be selected up to the reviewed 4 GiB cap.
+#[cfg(target_os = "linux")]
+pub fn run_bounded_with_address_space_limit(
+    program: &Path,
+    arguments: &[std::ffi::OsString],
+    working_directory: Option<&Path>,
+    timeout_seconds: u64,
+    output_limit: usize,
+    address_space_limit_bytes: u64,
+) -> Result<BoundedCommandOutput, String> {
+    if address_space_limit_bytes == 0 || address_space_limit_bytes > MAX_ADDRESS_SPACE_LIMIT_BYTES {
+        return Err(format!(
+            "local runtime address-space limit must be between 1 and {MAX_ADDRESS_SPACE_LIMIT_BYTES} bytes"
+        ));
+    }
     let mut command = Command::new(program);
     command
         .env_clear()
@@ -126,7 +157,11 @@ pub fn run_bounded(
     if let Some(directory) = working_directory {
         command.current_dir(directory);
     }
-    set_child_limits(&mut command)?;
+    if address_space_limit_bytes == DEFAULT_ADDRESS_SPACE_LIMIT_BYTES {
+        set_child_limits(&mut command)?;
+    } else {
+        set_child_limits_with_address_space_limit(&mut command, address_space_limit_bytes)?;
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
     let mut child = command
         .spawn()
@@ -218,20 +253,34 @@ pub fn run_bounded(
 
 #[cfg(target_os = "linux")]
 pub fn set_child_limits(command: &mut Command) -> Result<(), String> {
+    set_child_limits_with_address_space_limit(command, DEFAULT_ADDRESS_SPACE_LIMIT_BYTES)
+}
+
+#[cfg(target_os = "linux")]
+fn set_child_limits_with_address_space_limit(
+    command: &mut Command,
+    address_space_limit_bytes: u64,
+) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
+
+    if address_space_limit_bytes == 0 || address_space_limit_bytes > MAX_ADDRESS_SPACE_LIMIT_BYTES {
+        return Err(format!(
+            "local runtime address-space limit must be between 1 and {MAX_ADDRESS_SPACE_LIMIT_BYTES} bytes"
+        ));
+    }
+    let address_space_limit = libc::rlim_t::try_from(address_space_limit_bytes).map_err(|_| {
+        "requested address-space limit is not representable by this platform".to_owned()
+    })?;
 
     // This is defense in depth for the pinned local runtime, not a sandbox.
     // The runtime inherits these limits and a seccomp filter that denies network
     // sockets, io_uring, privilege changes, and unneeded persistence channels.
     unsafe {
         command.process_group(0);
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             let limits = [
                 (libc::RLIMIT_CPU, 120 as libc::rlim_t),
-                (
-                    libc::RLIMIT_AS,
-                    (2_u64 * 1024 * 1024 * 1024) as libc::rlim_t,
-                ),
+                (libc::RLIMIT_AS, address_space_limit),
                 (libc::RLIMIT_FSIZE, 0 as libc::rlim_t),
                 (libc::RLIMIT_CORE, 0 as libc::rlim_t),
                 (libc::RLIMIT_NOFILE, 64 as libc::rlim_t),
@@ -403,20 +452,67 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 mod tests {
-    use super::run_bounded;
+    use super::{run_bounded, run_bounded_with_address_space_limit};
     use std::ffi::OsString;
     use std::path::Path;
 
-    #[test]
-    fn seccomp_denies_inet_and_unix_socket_creation() {
+    fn python() -> &'static Path {
         let python = Path::new("/usr/bin/python3");
         assert!(
             python.is_file(),
             "Linux CI installs python3 for runtime checks"
         );
+        python
+    }
+
+    #[test]
+    fn existing_bounded_api_keeps_the_two_gibibyte_address_space_limit() {
+        let script = "import resource\nprint(resource.getrlimit(resource.RLIMIT_AS)[0])";
+        let arguments = [OsString::from("-c"), OsString::from(script)];
+        let output = run_bounded(python(), &arguments, None, 10, 1024).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.bytes, b"2147483648\n");
+    }
+
+    #[test]
+    fn requested_four_gibibyte_limit_keeps_seccomp_network_denial() {
+        let script = "import resource,socket\nprint(resource.getrlimit(resource.RLIMIT_AS)[0])\ntry:\n socket.socket(socket.AF_INET,socket.SOCK_STREAM)\nexcept PermissionError:\n print('network-blocked')\nelse:\n raise SystemExit(17)";
+        let arguments = [OsString::from("-c"), OsString::from(script)];
+        let output = run_bounded_with_address_space_limit(
+            python(),
+            &arguments,
+            None,
+            10,
+            1024,
+            4 * 1024 * 1024 * 1024,
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert!(!output.stdout.truncated);
+        assert_eq!(output.stdout.bytes, b"4294967296\nnetwork-blocked\n");
+    }
+
+    #[test]
+    fn configurable_address_space_limit_rejects_values_above_four_gibibytes() {
+        let arguments: [OsString; 0] = [];
+        let error = run_bounded_with_address_space_limit(
+            python(),
+            &arguments,
+            None,
+            10,
+            1024,
+            4 * 1024 * 1024 * 1024 + 1,
+        )
+        .err()
+        .expect("a limit above the cap must be rejected before spawn");
+        assert!(error.contains("address-space limit"));
+    }
+
+    #[test]
+    fn seccomp_denies_inet_and_unix_socket_creation() {
         let script = "import socket\nfor family in (socket.AF_INET, socket.AF_INET6, socket.AF_UNIX):\n try:\n  socket.socket(family, socket.SOCK_STREAM)\n except PermissionError:\n  continue\n else:\n  raise SystemExit(17)\nprint('blocked')";
         let arguments = [OsString::from("-c"), OsString::from(script)];
-        let output = run_bounded(python, &arguments, None, 10, 1024).unwrap();
+        let output = run_bounded(python(), &arguments, None, 10, 1024).unwrap();
         assert!(output.status.success());
         assert!(!output.stdout.truncated);
         assert_eq!(output.stdout.bytes, b"blocked\n");

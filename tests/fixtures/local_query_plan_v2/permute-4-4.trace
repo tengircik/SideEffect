@@ -1,0 +1,4 @@
+[pid 4400] 1710000300.000004 fork() = 4401
+[pid 4400] 1710000300.000001 connect(7, {sa_family=AF_INET, sin_port=htons(9446), sin_addr=inet_addr("192.0.2.84")}, 16) = -1 ECONNREFUSED (Connection refused)
+[pid 4400] 1710000300.000002 openat2(AT_FDCWD, "/usr/share/dione/catalog.db", {flags=O_RDONLY}, 24) = 9
+[pid 4400] 1710000300.000003 execveat(AT_FDCWD, "/opt/dione/bin/catalog", ["catalog"], 0x0, 0) = 0

@@ -1,0 +1,4 @@
+[pid 3300] 1710000200.000003 connect(6, {sa_family=AF_INET, sin_port=htons(9445), sin_addr=inet_addr("192.0.2.83")}, 16) = 0
+[pid 3300] 1710000200.000004 clone3({flags=CLONE_VM|SIGCHLD, exit_signal=SIGCHLD}, 88) = 3301
+[pid 3300] 1710000200.000001 openat(AT_FDCWD, "/var/cache/celeste/index.lock", O_RDWR) = -1 ENOENT (No such file or directory)
+[pid 3300] 1710000200.000002 execve("/usr/lib/celeste/indexer", ["indexer"], 0x0) = 0
