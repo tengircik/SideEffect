@@ -79,6 +79,12 @@ python3 scripts/evaluate_local_query_plan.py \
 
 The evaluator does not silently accept a candidate result, fallback to a deterministic answer, or upload its report. Check the report for exact pins, repository provenance, all per-case outcomes, error counts, latency, and the registered gate before changing the release status.
 
-## Current validation boundary
+## Full candidate run — 2026-10-27
 
-The corpus and static evaluator checks are registered. The Rust preview/query code is under implementation and review. No query-plan model inference has been performed for this candidate. Therefore the model remains a no-go for release until the full registered evaluation passes and its report is reviewed. The pre-existing single-evidence model experiment remains a separate failed candidate; its results do not count for this query-plan design.
+The pinned Qwen3.5-0.8B candidate was run across all 100 cases from clean commit `42fa08d3c6e83fc787ef6e94acabb20662214069`, using the registered evaluator SHA-256 `6f6242d496a7dbc2640904e0491c6da8bb40f006d7097fdb5b94e79263763064`, corpus SHA-256 above, the pinned llama.cpp build, and the pinned model file.
+
+**Result: failed; do not release this model candidate.** All 100 model responses were rejected by SideEffect validation (0/100 schema-and-semantics-valid plans). Consequently, answerable exact plan/result accuracy was 0%, versus 78.57% for the fixed lexical baseline; all five permutation groups failed. The model's p95 latency was 8.045 seconds, maximum sampled process-tree RSS was 1,047,364 KiB, and no runtime timeout occurred. The invalid-output rate alone fails the 100% validity gate, and the quality metrics fail independently. The report's zero accepted executions on required abstentions is not evidence of safe abstention behavior because no model plan was accepted.
+
+A bounded diagnostic reproduction for a supported question returned an abstention with `entity` still set to `syscall_result` and all filters null. The strict Rust cross-field validator correctly rejected this inconsistent plan. The raw diagnostic was run only against a synthetic fixture. Do not weaken validation to accept inconsistent plans. A future candidate may evaluate a schema with mutually exclusive filter/abstain branches or another model, but it must be developed against separate development examples and rerun against this unchanged corpus; do not tune on or relax the frozen gate using these test results.
+
+The report was saved outside the repository during evaluation. No real capture, model weight, runtime binary, or generated report was added to Git. This result supersedes the “full model run remains outstanding” status for the Qwen3.5-0.8B query-plan candidate. The pre-existing single-evidence model experiment remains a separate failed candidate; its results do not count for this query-plan design.
