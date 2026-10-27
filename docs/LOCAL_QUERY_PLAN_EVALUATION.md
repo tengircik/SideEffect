@@ -41,6 +41,8 @@ The candidate must achieve all of these in one clean, digest-pinned run:
 
 Timeouts, invalid output, and runtime failures count as failures, not abstentions. Do not relax the gate to fit a candidate. Passing establishes results only for this synthetic corpus and does not establish usefulness on actual user traces.
 
+The evaluator reports plan accuracy and result-set accuracy separately. Plan accuracy requires an exact match with the case's expected query plan. Result-set accuracy compares the returned semantic rows with the rows selected by that case's frozen expected plan over the validated preview facts; it is independent of plan identity. The lexical baseline uses the same result-row comparison, and its plan-signature accuracy is recorded separately. This prevents equivalent or different plans from being counted as correct results solely because their JSON matches (or fails to match) the expected plan. Required abstentions and no-match plans retain their separate false-filter and exact-plan checks.
+
 Resource limits are 1.5 GiB for the model file, 4 GiB address space, 120 seconds wall/CPU time, 16 KiB model output, 128 KiB corpus, and no automatic network access. The evaluator reports process-tree RSS as a sampled peak where available, not as a precise peak measurement. GPU inference has not been integrated into the SideEffect command or its sandboxed Linux runtime; CUDA measurements below are separate development experiments.
 
 ## GPU implementation direction

@@ -172,6 +172,33 @@ class RustContractTests(unittest.TestCase):
 
 
 class FailureAndAggregationTests(unittest.TestCase):
+    def test_result_accuracy_compares_semantic_rows_separately_from_plan_accuracy(self) -> None:
+        expected_filters = {field: None for field in EVALUATOR.FILTER_FIELDS}
+        expected_filters["syscall"] = "openat2"
+        expected_filters["outcome"] = "failure"
+        expected_plan = {
+            "decision": "filter", "abstain_reason": None,
+            "entity": "syscall_result", "filters": expected_filters, "combine": "all",
+        }
+        alternative_filters = {field: None for field in EVALUATOR.FILTER_FIELDS}
+        alternative_filters["outcome"] = "failure"
+        alternative_plan = {
+            "decision": "filter", "abstain_reason": None,
+            "entity": "syscall_result", "filters": alternative_filters, "combine": "all",
+        }
+        facts = {
+            "E001": {
+                "entity": "syscall_result",
+                "fact": {"syscall": "openat2", "outcome": "failure", "process_id": 12},
+            },
+        }
+        case = {"expected_plan": expected_plan}
+        alternative_ids = EVALUATOR.plan_match_ids(alternative_plan, facts)
+
+        self.assertNotEqual(alternative_plan, expected_plan)
+        self.assertTrue(EVALUATOR.result_set_exact_match(alternative_ids, case, facts))
+        self.assertFalse(EVALUATOR.result_set_exact_match([], case, facts))
+
     def test_expected_plan_is_checked_against_fixture_match_behavior(self) -> None:
         filters = {field: None for field in EVALUATOR.FILTER_FIELDS}
         filters["syscall"] = "openat2"

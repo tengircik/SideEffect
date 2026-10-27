@@ -912,6 +912,16 @@ def rows_equal(actual: list[dict[str, Any]], expected: list[dict[str, Any]]) -> 
     return canonical(actual) == canonical(expected)
 
 
+def result_set_exact_match(
+    actual_ids: list[str],
+    case: dict[str, Any],
+    facts: dict[str, dict[str, Any]],
+) -> bool:
+    """Compare returned semantic rows with rows selected by the frozen expected plan."""
+    expected_ids = plan_match_ids(case["expected_plan"], facts)
+    return rows_equal(semantic_rows(actual_ids, facts), semantic_rows(expected_ids, facts))
+
+
 def expected_rows_match(actual: list[dict[str, Any]], expected: list[dict[str, Any]]) -> bool:
     """Compare exact row multiplicity while allowing corpus rows to project facts."""
     projected = []
@@ -1362,11 +1372,13 @@ def main() -> int:
                 preview = _decode_json(preview_result.stdout, "model-query-preview")
                 _validate_preview(preview, case, trace_bytes)
                 facts = facts_with_ids(preview)
-                validate_expected_fact_matches(case, facts)
+                expected_ids = validate_expected_fact_matches(case, facts)
+                expected_rows = semantic_rows(expected_ids, facts)
                 case_baseline = baseline_plan(case["question"])
                 baseline_ids = plan_match_ids(case_baseline, facts)
                 baseline_rows = semantic_rows(baseline_ids, facts)
-                baseline_correct = (
+                baseline_result_correct = result_set_exact_match(baseline_ids, case, facts)
+                baseline_plan_correct = (
                     public_plan_signature(case_baseline)
                     == public_plan_signature(case["expected_plan"])
                 )
@@ -1387,11 +1399,13 @@ def main() -> int:
                 "request_sha256": preview["request_sha256"],
                 "preview_trace_sha256": preview["trace_sha256"],
                 "expected_plan": case["expected_plan"],
+                "expected_semantic_rows": expected_rows,
                 "class": case["class"],
                 "expected_behavior": case["expected_behavior"],
                 "baseline_plan": case_baseline,
+                "baseline_plan_exact_match": baseline_plan_correct,
                 "baseline_semantic_rows": baseline_rows,
-                "baseline_exact_match": baseline_correct,
+                "baseline_result_exact_match": baseline_result_correct,
             }
             if args.preview_only:
                 preview_cache.append({"case": case, "preview": preview, "facts": facts, "record": record})
@@ -1467,11 +1481,7 @@ def main() -> int:
             plan_exact = plan == case["expected_plan"]
             execution_status = case_expected_execution(case)
             deterministic_consistent = deterministic_ids == returned_ids
-            expected_result_correct = (
-                plan_exact
-                and analysis["execution_status"] == execution_status
-                and deterministic_consistent
-            )
+            expected_result_correct = result_set_exact_match(returned_ids, case, facts)
             record.update({
                 "status": status,
                 "elapsed_seconds": round(elapsed, 3),
@@ -1516,10 +1526,16 @@ def main() -> int:
         class_accuracy = per_answerable_class_accuracy(answerable, classes)
         answerable_correct = sum(case.get("result_exact_match") is True for case in answerable)
         answerable_plan_correct = sum(case.get("plan_exact_match") is True for case in answerable)
-        baseline_correct = sum(case.get("baseline_exact_match") is True for case in answerable)
+        baseline_correct = sum(
+            case.get("baseline_result_exact_match") is True for case in answerable
+        )
+        baseline_plan_correct = sum(
+            case.get("baseline_plan_exact_match") is True for case in answerable
+        )
         exact_accuracy = answerable_correct / len(answerable) if answerable else 0.0
         exact_plan_accuracy = answerable_plan_correct / len(answerable) if answerable else 0.0
         baseline_accuracy = baseline_correct / len(answerable) if answerable else 0.0
+        baseline_plan_accuracy = baseline_plan_correct / len(answerable) if answerable else 0.0
         abstentions = [case for case in cases if case_must_abstain(case)]
         false_filters = sum(case.get("false_filter_on_must_abstain") is True for case in cases)
         false_filter_rate = false_filters / len(abstentions) if abstentions else 0.0
@@ -1566,6 +1582,7 @@ def main() -> int:
             "no_match_exact_plan_accuracy": no_match_plan_accuracy,
             "answerable_accuracy_gain_over_baseline": exact_accuracy - baseline_accuracy,
             "baseline_answerable_exact_result_accuracy": baseline_accuracy,
+            "baseline_answerable_exact_plan_accuracy": baseline_plan_accuracy,
             "per_answerable_class_accuracy": class_accuracy,
             "false_filters_on_must_abstain": false_filters,
             "false_filter_rate_on_must_abstain": false_filter_rate,
@@ -1637,7 +1654,7 @@ def main() -> int:
             "criteria": criteria,
             "metrics": metrics,
             "acceptance": acceptance,
-            "baseline_description": "Frozen lexical baseline recognizes exact supported syscall names, fixed outcome synonyms, strict errno tokens, absolute path literals, explicit process relation language, and task/process IDs. It uses the same exact deterministic matcher as candidate plans; paraphrases outside those lexical rules are not inferred.",
+            "baseline_description": "Frozen lexical baseline recognizes exact supported syscall names, fixed outcome synonyms, strict errno tokens, absolute path literals, explicit process relation language, and task/process IDs. Result accuracy compares semantic rows returned by that plan with rows selected by the fixture's expected plan; plan-signature accuracy is recorded separately. Paraphrases outside the frozen lexical rules are not inferred.",
             "cases": cases,
         }
         _emit(report, args.report, repository)
