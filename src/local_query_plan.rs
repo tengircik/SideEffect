@@ -311,12 +311,10 @@ pub fn local_query_plan_schema() -> Value {
                     } else if let Some(field_index) =
                         alternatives.iter().position(|name| *name == field)
                     {
-                        if field_index < selected_index {
-                            exact_null()
-                        } else if field_index == selected_index {
-                            scalar_schema(field)
-                        } else {
-                            nullable(scalar_schema(field))
+                        match field_index.cmp(&selected_index) {
+                            std::cmp::Ordering::Less => exact_null(),
+                            std::cmp::Ordering::Equal => scalar_schema(field),
+                            std::cmp::Ordering::Greater => nullable(scalar_schema(field)),
                         }
                     } else {
                         exact_null()
@@ -1242,10 +1240,10 @@ fn strip_query_runtime_suffix(output: &[u8]) -> &[u8] {
         return output;
     };
     let text = text.trim_end();
-    if let Some(index) = text.rfind("[end of text]")
-        && text[index + "[end of text]".len()..].trim().is_empty()
-    {
-        return text[..index].trim_end().as_bytes();
+    if let Some(index) = text.rfind("[end of text]") {
+        if text[index + "[end of text]".len()..].trim().is_empty() {
+            return text[..index].trim_end().as_bytes();
+        }
     }
     text.as_bytes()
 }
