@@ -45,6 +45,31 @@ fn run_preview_with_question(question: &str, trace: &TempTrace) -> std::process:
         .unwrap()
 }
 
+fn collect_evidence_ids(
+    value: &serde_json::Value,
+    output: &mut std::collections::BTreeSet<String>,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(id) = object
+                .get("evidence_id")
+                .and_then(serde_json::Value::as_str)
+            {
+                output.insert(id.to_owned());
+            }
+            for child in object.values() {
+                collect_evidence_ids(child, output);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                collect_evidence_ids(child, output);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[test]
 fn preview_digest_covers_only_the_bounded_typed_request() {
     let first = TempTrace::with_contents(
@@ -93,7 +118,7 @@ fn partial_parse_is_visible_and_uses_partial_exit_status() {
 }
 
 #[test]
-fn preregistered_synthetic_corpus_builds_expected_bounded_candidates() {
+fn preregistered_synthetic_corpus_keeps_all_evidence_available_to_the_model() {
     let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/local_model_synthetic");
     let corpus: serde_json::Value =
@@ -124,15 +149,40 @@ fn preregistered_synthetic_corpus_builds_expected_bounded_candidates() {
             "unexpected parse state for {}",
             case["id"]
         );
+        let candidates = preview["output_schema"]["properties"]["evidence_ids"]["items"]["enum"]
+            .as_array()
+            .unwrap();
+        let mut summary_ids = std::collections::BTreeSet::new();
+        collect_evidence_ids(&preview["evidence_summary"], &mut summary_ids);
+        let candidate_ids = candidates
+            .iter()
+            .map(|candidate| {
+                candidate
+                    .as_str()
+                    .expect("candidate evidence ID is a string")
+                    .to_owned()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
-            preview["output_schema"]["properties"]["evidence_ids"]["items"]["enum"],
-            case["candidate_evidence_ids"],
-            "unexpected candidate IDs for {}",
+            candidate_ids, summary_ids,
+            "model schema must expose all bounded evidence for {}",
             case["id"]
         );
-        if case["id"] == "multiple_failure_targeted_syscall" {
-            let prompt = preview["prompt"].as_str().unwrap();
-            assert!(prompt.find("E002").unwrap() < prompt.find("E001").unwrap());
+        for candidate in candidates {
+            let id = candidate
+                .as_str()
+                .expect("candidate evidence ID is a string");
+            assert!(
+                summary_ids.contains(id),
+                "unknown candidate {id} for {}",
+                case["id"]
+            );
+        }
+        if case["id"] == "ambiguous_duplicate_failures" {
+            assert!(
+                candidates.len() > 1,
+                "ambiguous case must not be narrowed before inference"
+            );
         }
     }
 }

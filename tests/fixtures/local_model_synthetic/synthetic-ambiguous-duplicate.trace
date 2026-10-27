@@ -1,0 +1,3 @@
+[pid 730] 1700000000.000001 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("203.0.113.8")}, 16) = -1 ECONNREFUSED (Connection refused)
+[pid 730] 1700000000.000002 connect(4, {sa_family=AF_INET, sin_port=htons(8443), sin_addr=inet_addr("203.0.113.9")}, 16) = -1 ECONNREFUSED (Connection refused)
+[pid 730] 1700000000.000003 +++ exited with 0 +++

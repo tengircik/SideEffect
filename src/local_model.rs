@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(target_os = "linux")]
 use std::io::{Read, Write};
 use std::path::Path;
@@ -23,6 +23,7 @@ pub const RUNTIME_VERSION_PREFIX: &str = "version: 6000 (4762ad731)";
 const MAX_MODEL_FACTS: usize = 48;
 const MAX_MODEL_RELATIONS: usize = 16;
 const MAX_REFERENCES_PER_SIDE: usize = 4;
+const MAX_MODEL_PATH_HINT_BYTES: usize = 256;
 const MAX_MODEL_QUESTION_BYTES: usize = 2048;
 const MAX_LOCAL_REQUEST_BYTES: usize = 32 * 1024;
 const MAX_MODEL_OUTPUT_BYTES: usize = 16 * 1024;
@@ -88,6 +89,14 @@ struct ModelPromptFacts<'a> {
     process_relations: Vec<Value>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ModelPathHintStatus {
+    Included,
+    NotDerived,
+    OmittedLimit,
+}
+
 /// Build the exact bounded request for preview without launching a model.
 pub fn preview_trace_bytes(bytes: &[u8], question: &str) -> Result<LocalModelPreview, String> {
     if bytes.len() > MAX_TRACE_BYTES {
@@ -115,13 +124,12 @@ pub fn preview_trace_document(
         return Err("no supported evidence references are available for local analysis".to_owned());
     }
 
-    let prompt_facts = model_prompt_facts(&evidence_summary, question);
-    let evidence_ids = eligible_evidence_ids(&evidence_summary, question, &all_evidence_ids);
+    let prompt_facts = model_prompt_facts(&evidence_summary, document, question);
     let facts = serde_json::to_string(&prompt_facts)
         .map_err(|error| format!("could not encode bounded facts: {error}"))?;
     let system_prompt = INSTRUCTIONS.to_owned();
     let prompt = facts;
-    let output_schema = output_schema(&evidence_ids);
+    let output_schema = output_schema(&all_evidence_ids);
     let digest_material = serde_json::to_vec(&RequestDigest {
         model_sha256: MODEL_SHA256,
         model_repository_revision: MODEL_REPOSITORY_REVISION,
@@ -140,7 +148,7 @@ pub fn preview_trace_document(
 
     Ok(LocalModelPreview {
         schema: "sideeffect.local_model_preview",
-        schema_version: 3,
+        schema_version: LOCAL_MODEL_SCHEMA_VERSION,
         model_sha256: MODEL_SHA256,
         model_repository_revision: MODEL_REPOSITORY_REVISION,
         runtime_source_revision: RUNTIME_REVISION,
@@ -169,40 +177,76 @@ fn validate_question(question: &str) -> Result<&str, String> {
     Ok(question)
 }
 
-fn model_prompt_facts<'a>(evidence_summary: &Value, question: &'a str) -> ModelPromptFacts<'a> {
-    let mentioned_syscalls = mentioned_syscalls(evidence_summary, question);
-    let mut results = evidence_summary
+fn model_prompt_facts<'a>(
+    evidence_summary: &Value,
+    document: &crate::model::TraceDocument,
+    question: &'a str,
+) -> ModelPromptFacts<'a> {
+    let records_by_evidence = document
+        .records
+        .iter()
+        .map(|record| {
+            (
+                (
+                    record.evidence.line_number,
+                    record.evidence.byte_offset,
+                    record.evidence.byte_length,
+                ),
+                record,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let results = evidence_summary
         .get("result_facts")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .map(|fact| {
-            json!({
+            let mut prompt_fact = json!({
                 "evidence_id": fact.get("evidence").and_then(|evidence| evidence.get("evidence_id")),
                 "syscall": fact.get("syscall"),
                 "outcome": fact.get("outcome")
-            })
+            });
+            let record = fact
+                .get("evidence")
+                .and_then(evidence_tuple)
+                .and_then(|key| records_by_evidence.get(&key).copied())
+                .filter(|record| {
+                    Some(record.syscall.as_deref().unwrap_or_default())
+                        == fact.get("syscall").and_then(Value::as_str)
+                });
+
+            if let Some(record) = record {
+                if matches!(fact.get("outcome").and_then(Value::as_str), Some("failure" | "in_progress")) {
+                    if let Some(errno) = record
+                        .raw_result
+                        .as_deref()
+                        .and_then(crate::trace::strace::parse_linux_errno_result)
+                    {
+                        prompt_fact["observed_errno"] = Value::String(errno.to_owned());
+                    }
+                }
+            }
+            if matches!(fact.get("syscall").and_then(Value::as_str), Some("openat" | "openat2")) {
+                let status = match record.and_then(|record| record.lexical_path_hint.as_ref()) {
+                    Some(hint)
+                        if hint.path.len() <= MAX_MODEL_PATH_HINT_BYTES && hint.path.is_ascii() =>
+                    {
+                        prompt_fact["lexical_path_hint"] = json!({
+                            "path": hint.path,
+                            "basis": hint.basis,
+                            "trust": "untrusted_lexical_hint"
+                        });
+                        ModelPathHintStatus::Included
+                    }
+                    Some(_) => ModelPathHintStatus::OmittedLimit,
+                    None => ModelPathHintStatus::NotDerived,
+                };
+                prompt_fact["lexical_path_hint_status"] = json!(status);
+                }
+            prompt_fact
         })
         .collect::<Vec<_>>();
-    if asks_for_failure(question) {
-        results.retain(|fact| {
-            matches!(
-                fact.get("outcome").and_then(Value::as_str),
-                Some("failure" | "in_progress")
-            )
-        });
-    }
-    results.sort_by_key(|fact| {
-        let syscall = fact.get("syscall").and_then(Value::as_str);
-        let syscall_rank =
-            usize::from(!syscall.is_some_and(|name| mentioned_syscalls.contains(name)));
-        let outcome_rank = match fact.get("outcome").and_then(Value::as_str) {
-            Some("failure") => 0,
-            Some("in_progress") => 1,
-            _ => 2,
-        };
-        (syscall_rank, outcome_rank)
-    });
     let relations = evidence_summary
         .get("process_relations")
         .and_then(Value::as_array)
@@ -215,72 +259,12 @@ fn model_prompt_facts<'a>(evidence_summary: &Value, question: &'a str) -> ModelP
     }
 }
 
-fn mentioned_syscalls(summary: &Value, question: &str) -> BTreeSet<String> {
-    let lowercase = question.to_ascii_lowercase();
-    let question_words = lowercase
-        .split_whitespace()
-        .map(|word| word.trim_matches(|character: char| !character.is_ascii_alphanumeric()))
-        .collect::<BTreeSet<_>>();
-    summary
-        .get("result_facts")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|fact| fact.get("syscall").and_then(Value::as_str))
-        .filter(|syscall| question_words.contains(syscall))
-        .map(str::to_owned)
-        .collect()
-}
-
-fn asks_for_failure(question: &str) -> bool {
-    let lowercase = question.to_ascii_lowercase();
-    let words = lowercase
-        .split_whitespace()
-        .map(|word| {
-            word.trim_matches(|character: char| {
-                !character.is_ascii_alphanumeric() && character != '\''
-            })
-        })
-        .collect::<Vec<_>>();
-    let negations = [
-        "not", "never", "no", "without", "didn't", "doesn't", "isn't", "wasn't", "weren't",
-        "cannot", "can't",
-    ];
-    words.iter().enumerate().any(|(index, word)| {
-        let failure_term = word.starts_with("fail")
-            || word.starts_with("error")
-            || *word == "denied"
-            || *word == "unsuccessful";
-        let nearby_negation = words[index.saturating_sub(2)..index]
-            .iter()
-            .chain(words[index + 1..(index + 3).min(words.len())].iter())
-            .any(|word| negations.contains(word));
-        failure_term && !nearby_negation
-    })
-}
-
-fn eligible_evidence_ids(summary: &Value, question: &str, all_ids: &[String]) -> Vec<String> {
-    if !asks_for_failure(question) {
-        return all_ids.to_vec();
-    }
-    summary
-        .get("result_facts")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|fact| {
-            matches!(
-                fact.get("outcome").and_then(Value::as_str),
-                Some("failure" | "in_progress")
-            )
-        })
-        .filter_map(|fact| {
-            fact.get("evidence")
-                .and_then(|evidence| evidence.get("evidence_id"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .collect()
+fn evidence_tuple(evidence: &Value) -> Option<(u64, u64, u64)> {
+    Some((
+        evidence.get("line_number")?.as_u64()?,
+        evidence.get("byte_offset")?.as_u64()?,
+        evidence.get("byte_length")?.as_u64()?,
+    ))
 }
 
 /// Validate model text strictly and check every citation against this request.
@@ -336,6 +320,7 @@ fn strip_runtime_suffix(output: &str) -> &str {
 }
 
 const MAX_SELECTED_EVIDENCE_IDS: usize = 1;
+const LOCAL_MODEL_SCHEMA_VERSION: u32 = 5;
 
 fn output_schema(evidence_ids: &[String]) -> Value {
     let evidence_id_schema = json!({ "type": "string", "enum": evidence_ids });
@@ -353,6 +338,24 @@ fn output_schema(evidence_ids: &[String]) -> Value {
         "required": ["evidence_ids"],
         "additionalProperties": false
     })
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn analysis_from_preview(
+    preview: LocalModelPreview,
+    selection: ModelEvidenceSelection,
+) -> LocalModelAnalysis {
+    LocalModelAnalysis {
+        schema: "sideeffect.local_model_analysis",
+        schema_version: LOCAL_MODEL_SCHEMA_VERSION,
+        selection_label: "model_selected_single_evidence_for_human_review_not_verified_findings",
+        request_sha256: preview.request_sha256,
+        model_sha256: MODEL_SHA256,
+        model_repository_revision: MODEL_REPOSITORY_REVISION,
+        runtime_source_revision: RUNTIME_REVISION,
+        evidence_summary: preview.evidence_summary,
+        selection,
+    }
 }
 
 fn apply_model_fact_limits(summary: &mut Value) {
@@ -561,17 +564,7 @@ pub fn analyze_trace_bytes(
         .map(str::to_owned)
         .collect();
     let selection = validate_model_output(&stdout.bytes, &allowed)?;
-    Ok(LocalModelAnalysis {
-        schema: "sideeffect.local_model_analysis",
-        schema_version: 3,
-        selection_label: "model_selected_single_evidence_for_human_review_not_verified_findings",
-        request_sha256: preview.request_sha256,
-        model_sha256: MODEL_SHA256,
-        model_repository_revision: MODEL_REPOSITORY_REVISION,
-        runtime_source_revision: RUNTIME_REVISION,
-        evidence_summary: preview.evidence_summary,
-        selection,
-    })
+    Ok(analysis_from_preview(preview, selection))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -684,6 +677,9 @@ mod tests {
         let first = preview_trace_bytes(TRACE, QUESTION).unwrap();
         let second = preview_trace_bytes(TRACE, QUESTION).unwrap();
         assert_eq!(first.request_sha256, second.request_sha256);
+        assert_eq!(first.schema, "sideeffect.local_model_preview");
+        assert_eq!(first.schema_version, 5);
+        assert_eq!(serde_json::to_value(&first).unwrap()["schema_version"], 5);
         assert_eq!(first.model_sha256, MODEL_SHA256);
         assert_eq!(first.model_repository_revision, MODEL_REPOSITORY_REVISION);
         assert_eq!(first.runtime_source_revision, RUNTIME_REVISION);
@@ -710,6 +706,22 @@ mod tests {
         assert!(!serialized.contains("E003"));
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(schema["properties"]["evidence_ids"]["maxItems"], 1);
+    }
+
+    #[test]
+    fn analysis_output_uses_schema_version_five() {
+        let preview = preview_trace_bytes(TRACE, QUESTION).unwrap();
+        let analysis = super::analysis_from_preview(
+            preview,
+            super::ModelEvidenceSelection {
+                evidence_ids: Vec::new(),
+            },
+        );
+        let emitted: serde_json::Value = serde_json::to_value(&analysis).unwrap();
+
+        assert_eq!(analysis.schema, "sideeffect.local_model_analysis");
+        assert_eq!(analysis.schema_version, 5);
+        assert_eq!(emitted["schema_version"], 5);
     }
 
     #[test]
@@ -747,51 +759,87 @@ mod tests {
     }
 
     #[test]
-    fn failure_question_limits_prompt_and_citations_to_failed_results() {
-        let trace = b"100 connect(3, {sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr(\"127.0.0.1\")}, 16) = 0\n100 connect(3, {sa_family=AF_INET, sin_port=htons(81), sin_addr=inet_addr(\"127.0.0.1\")}, 16) = -1 ECONNREFUSED (Connection refused)\n";
-        let preview = preview_trace_bytes(trace, "Which observed syscall failed?").unwrap();
-        assert!(preview.prompt.contains("\"evidence_id\":\"E002\""));
-        assert!(!preview.prompt.contains("\"evidence_id\":\"E001\""));
+    fn prompt_adds_path_hints_and_errno_only_to_their_matching_evidence_rows() {
+        let trace = b"100 openat(AT_FDCWD, \"/tmp/missing\", O_RDONLY) = -1 ENOENT (No such file or directory)\n101 connect(3, {sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr(\"127.0.0.1\")}, 16) = -1 ECONNREFUSED (Connection refused)\n102 openat2(AT_FDCWD, \"/tmp/present\", {flags=O_RDONLY}, 24) = 3\n103 connect(3, {sa_family=AF_INET, sin_port=htons(81), sin_addr=inet_addr(\"127.0.0.1\")}, 16) = -1 EINPROGRESS (Operation now in progress)\n";
+        let preview = preview_trace_bytes(trace, "Which syscall failed?").unwrap();
+        let prompt: serde_json::Value = serde_json::from_str(&preview.prompt).unwrap();
+        let facts = prompt["observed_syscall_results"].as_array().unwrap();
+
+        assert_eq!(facts.len(), 4);
+        assert_eq!(facts[0]["evidence_id"], "E001");
+        assert_eq!(facts[0]["syscall"], "openat");
+        assert_eq!(facts[0]["observed_errno"], "ENOENT");
+        assert_eq!(facts[0]["lexical_path_hint"]["path"], "/tmp/missing");
+        assert_eq!(facts[0]["lexical_path_hint_status"], "included");
         assert_eq!(
-            preview.output_schema["properties"]["evidence_ids"]["items"]["enum"],
-            json!(["E002"])
+            facts[0]["lexical_path_hint"]["trust"],
+            "untrusted_lexical_hint"
         );
-        let allowed = BTreeSet::from(["E002".to_owned()]);
-        assert!(validate_model_output(br#"{"evidence_ids":["E002"]}"#, &allowed).is_ok());
-        assert!(validate_model_output(br#"{"evidence_ids":["E001"]}"#, &allowed).is_err());
+        assert_eq!(facts[1]["evidence_id"], "E002");
+        assert_eq!(facts[1]["syscall"], "connect");
+        assert_eq!(facts[1]["observed_errno"], "ECONNREFUSED");
+        assert!(facts[1].get("lexical_path_hint").is_none());
+        assert_eq!(facts[3]["evidence_id"], "E004");
+        assert_eq!(facts[3]["outcome"], "in_progress");
+        assert_eq!(facts[3]["observed_errno"], "EINPROGRESS");
     }
 
     #[test]
-    fn question_named_syscall_is_prioritized_in_model_facts() {
-        let trace = b"100 openat(AT_FDCWD, \"/tmp/missing\", O_RDONLY) = -1 ENOENT (No such file or directory)\n101 connect(3, {sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr(\"127.0.0.1\")}, 16) = -1 ECONNREFUSED (Connection refused)\n";
-        let preview = preview_trace_bytes(trace, "Which connect syscall failed?").unwrap();
-        assert!(preview.prompt.find("E002").unwrap() < preview.prompt.find("E001").unwrap());
-        assert_eq!(
-            preview.output_schema["properties"]["evidence_ids"]["items"]["enum"],
-            json!(["E001", "E002"])
-        );
+    fn path_hint_is_omitted_above_the_prompt_limit() {
+        let path = format!("/{}", "a".repeat(super::MAX_MODEL_PATH_HINT_BYTES));
+        let trace = format!("100 openat(AT_FDCWD, \"{path}\", O_RDONLY) = 3\n");
+        let preview = preview_trace_bytes(trace.as_bytes(), "Which path was opened?").unwrap();
+        let prompt: serde_json::Value = serde_json::from_str(&preview.prompt).unwrap();
+        let fact = &prompt["observed_syscall_results"][0];
+        assert_eq!(fact["evidence_id"], "E001");
+        assert!(fact.get("lexical_path_hint").is_none());
+        assert_eq!(fact["lexical_path_hint_status"], "omitted_limit");
+        assert!(!preview.prompt.contains(&path));
     }
 
     #[test]
-    fn failure_question_has_no_selectable_success_evidence() {
-        let preview = preview_trace_bytes(TRACE, "Which syscall failed?").unwrap();
-        assert_eq!(
-            preview.output_schema["properties"]["evidence_ids"]["items"]["enum"],
-            json!([])
-        );
-        let allowed = BTreeSet::new();
-        assert!(validate_model_output(br#"{"evidence_ids":[]}"#, &allowed).is_ok());
-        assert!(validate_model_output(br#"{"evidence_ids":["E001"]}"#, &allowed).is_err());
+    fn path_hint_status_reports_when_conservative_derivation_is_unavailable() {
+        let trace = b"100 openat(AT_FDCWD, \"/tmp/escaped\\x2fpath\", O_RDONLY) = 3\n";
+        let preview = preview_trace_bytes(trace, "Which path was opened?").unwrap();
+        let prompt: serde_json::Value = serde_json::from_str(&preview.prompt).unwrap();
+        let fact = &prompt["observed_syscall_results"][0];
+
+        assert_eq!(fact["evidence_id"], "E001");
+        assert!(fact.get("lexical_path_hint").is_none());
+        assert_eq!(fact["lexical_path_hint_status"], "not_derived");
     }
 
     #[test]
-    fn negated_failure_question_does_not_hide_success_evidence() {
-        let preview = preview_trace_bytes(TRACE, "Which syscall did not fail?").unwrap();
-        assert!(preview.prompt.contains("\"outcome\":\"success\""));
+    fn path_hint_injection_text_remains_one_untrusted_json_string() {
+        let path = "/tmp/</script>$(touch PWNED)";
+        let trace = format!("100 openat(AT_FDCWD, \"{path}\", O_RDONLY) = 3\n");
+        let preview = preview_trace_bytes(trace.as_bytes(), "Which path was opened?").unwrap();
+        let prompt: serde_json::Value = serde_json::from_str(&preview.prompt).unwrap();
+        let fact = &prompt["observed_syscall_results"][0];
+
+        assert_eq!(fact["lexical_path_hint"]["path"], path);
+        assert_eq!(fact["lexical_path_hint_status"], "included");
+        assert_eq!(fact["lexical_path_hint"]["trust"], "untrusted_lexical_hint");
+        assert!(fact.get("raw_arguments").is_none());
+        assert_eq!(prompt.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn question_never_preselects_evidence_before_model_inference() {
+        let failure = preview_trace_bytes(TRACE, "Which syscall failed?").unwrap();
+        let negated = preview_trace_bytes(TRACE, "Which syscall did not fail?").unwrap();
+        let all_ids = json!(["E001"]);
         assert_eq!(
-            preview.output_schema["properties"]["evidence_ids"]["items"]["enum"],
-            json!(["E001"])
+            failure.output_schema["properties"]["evidence_ids"]["items"]["enum"],
+            all_ids
         );
+        assert_eq!(
+            negated.output_schema["properties"]["evidence_ids"]["items"]["enum"],
+            all_ids
+        );
+        assert!(failure.prompt.contains("\"outcome\":\"success\""));
+        assert!(negated.prompt.contains("\"outcome\":\"success\""));
+        assert_ne!(failure.request_sha256, negated.request_sha256);
     }
 
     #[test]

@@ -22,5 +22,7 @@
 *.swp
 *.tmp
 *.bak
+__pycache__/
+*.py[cod]
 Thumbs.db
 Desktop.ini

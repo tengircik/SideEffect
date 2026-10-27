@@ -1,0 +1,4 @@
+[pid 700] 1700000000.000001 clone(child_stack=NULL, flags=SIGCHLD) = 701
+[pid 701] 1700000000.000002 openat(AT_FDCWD</>, "/var/run/synthetic/child-missing.sock", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+[pid 701] 1700000000.000003 +++ exited with 0 +++
+[pid 700] 1700000000.000004 +++ exited with 0 +++

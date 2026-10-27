@@ -638,7 +638,7 @@ fn parse_open_fd_result(raw_result: &str) -> bool {
         && number.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn parse_linux_errno_result(raw_result: &str) -> Option<&str> {
+pub(crate) fn parse_linux_errno_result(raw_result: &str) -> Option<&str> {
     let error = raw_result.strip_prefix("-1 ")?;
     let (errno, message) = error.split_once(' ')?;
     if !is_linux_errno(errno)
@@ -653,7 +653,7 @@ fn parse_linux_errno_result(raw_result: &str) -> Option<&str> {
     Some(errno)
 }
 
-fn is_linux_errno(value: &str) -> bool {
+pub(crate) fn is_linux_errno(value: &str) -> bool {
     matches!(
         value,
         "EPERM"
@@ -962,7 +962,29 @@ fn continuation_diagnostic(
 
 #[cfg(test)]
 mod scanner_tests {
-    use super::scan_angle_annotation;
+    use super::{parse_linux_errno_result, scan_angle_annotation};
+
+    #[test]
+    fn linux_errno_parser_accepts_only_recognized_well_formed_results() {
+        assert_eq!(
+            parse_linux_errno_result("-1 ENOENT (No such file or directory)"),
+            Some("ENOENT")
+        );
+        assert_eq!(
+            parse_linux_errno_result("-1 EINPROGRESS (Operation now in progress)"),
+            Some("EINPROGRESS")
+        );
+        for malformed in [
+            "-1 EFAKE (Failure)",
+            "-1 ENOENT",
+            "-1 ENOENT ()",
+            "-1 ENOENT (Failure) trailing",
+            "-1 ENOENT (Failure\nignored)",
+            "-2 ENOENT (Failure)",
+        ] {
+            assert_eq!(parse_linux_errno_result(malformed), None, "{malformed}");
+        }
+    }
 
     #[test]
     fn unterminated_angle_annotation_scan_is_bounded_by_record_length() {

@@ -1,0 +1,9 @@
+[pid 700] 1700000000.000001 execve("/usr/bin/synthetic-worker", ["synthetic-worker"], 0x0) = 0
+[pid 700] 1700000000.000002 openat(AT_FDCWD</>, "/etc/synthetic/settings.conf", O_RDONLY|O_CLOEXEC) = 3</etc/synthetic/settings.conf>
+[pid 700] 1700000000.000003 openat(AT_FDCWD</>, "/var/lib/synthetic/cache.db", O_RDONLY|O_CLOEXEC) = -1 EACCES (Permission denied)
+[pid 700] 1700000000.000004 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("203.0.113.8")}, 16) = -1 ECONNREFUSED (Connection refused)
+[pid 700] 1700000000.000005 openat(AT_FDCWD</>, "/var/run/synthetic/missing.sock", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+[pid 700] 1700000000.000006 openat(AT_FDCWD</>, "/var/run/synthetic/missing.conf", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+[pid 700] 1700000000.000007 connect(3, {sa_family=AF_INET, sin_port=htons(8443), sin_addr=inet_addr("203.0.113.9")}, 16) = -1 EINPROGRESS (Operation now in progress)
+[pid 700] 1700000000.000008 openat(AT_FDCWD</>, "/tmp/synthetic-ready", O_RDONLY|O_CLOEXEC) = 4</tmp/synthetic-ready>
+[pid 700] 1700000000.000009 +++ exited with 0 +++

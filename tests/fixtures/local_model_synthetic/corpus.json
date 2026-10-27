@@ -1,118 +1,581 @@
 {
   "schema": "sideeffect.local_model_evaluation_corpus",
-  "schema_version": 1,
+  "schema_version": 4,
   "status": "preregistered_synthetic_cases",
+  "selection_limit": 1,
+  "acceptance_criteria": {
+    "minimum_answerable_accuracy_gain": 0.1,
+    "maximum_false_selection_rate": 0.0,
+    "maximum_p95_latency_seconds": 30
+  },
   "cases": [
     {
-      "id": "failure_first",
-      "trace": "synthetic-failure-first.trace",
-      "question": "Which observed syscall failed?",
-      "expected_evidence_ids": [
-        "E001"
-      ],
-      "outcome_priority_baseline": [
-        "E001"
-      ],
-      "candidate_evidence_ids": [
-        "E001"
-      ]
-    },
-    {
-      "id": "failure_middle",
-      "trace": "synthetic-failure-middle.trace",
-      "question": "Which observed syscall failed?",
-      "expected_evidence_ids": [
-        "E024"
-      ],
-      "outcome_priority_baseline": [
-        "E024"
-      ],
-      "candidate_evidence_ids": [
-        "E024"
-      ]
-    },
-    {
-      "id": "failure_last",
-      "trace": "synthetic-failure-last.trace",
-      "question": "Which observed syscall failed?",
-      "expected_evidence_ids": [
-        "E048"
-      ],
-      "outcome_priority_baseline": [
-        "E048"
-      ],
-      "candidate_evidence_ids": [
-        "E048"
-      ]
-    },
-    {
-      "id": "success_only_failure_question",
-      "trace": "synthetic-success-only.trace",
-      "question": "Which syscall failed?",
-      "expected_evidence_ids": [],
-      "outcome_priority_baseline": [],
-      "candidate_evidence_ids": []
-    },
-    {
-      "id": "multiple_failure_targeted_syscall",
-      "trace": "synthetic-multiple-failures.trace",
+      "id": "failure_connect_exact_syscall",
+      "trace": "synthetic-semantic-forward.trace",
       "question": "Which connect syscall failed?",
-      "expected_evidence_ids": [
-        "E002"
-      ],
-      "outcome_priority_baseline": [
-        "E001"
-      ],
-      "candidate_evidence_ids": [
-        "E001",
-        "E002"
-      ]
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "syscall": "connect",
+          "outcome": "failure"
+        }
+      }
     },
     {
-      "id": "duplicate_failed_connections",
-      "trace": "synthetic-duplicate-failures.trace",
-      "question": "Which connect operation failed?",
-      "expected_evidence_ids": [
-        "E001",
-        "E002"
-      ],
-      "outcome_priority_baseline": [
-        "E001"
-      ],
-      "candidate_evidence_ids": [
-        "E001",
-        "E002"
-      ]
+      "id": "success_execve_exact_outcome",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which execve syscall succeeded?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "syscall": "execve",
+          "outcome": "success"
+        }
+      }
     },
     {
-      "id": "partial_failure_trace",
-      "trace": "synthetic-partial-failure.trace",
-      "question": "Which syscall failed?",
-      "expected_evidence_ids": [
-        "E001"
-      ],
-      "outcome_priority_baseline": [
-        "E001"
-      ],
-      "expected_parse_status": "partial",
-      "candidate_evidence_ids": [
-        "E001"
-      ]
+      "id": "errno_enoent",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which operation returned ENOENT for /var/run/synthetic/missing.sock?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "observed_errno": "ENOENT",
+          "lexical_path_hint": "/var/run/synthetic/missing.sock"
+        }
+      }
     },
     {
-      "id": "successful_syscall_query",
-      "trace": "synthetic-success-query.trace",
-      "question": "Which syscall succeeded?",
-      "expected_evidence_ids": [
-        "E002"
-      ],
-      "outcome_priority_baseline": [
-        "E001"
-      ],
-      "candidate_evidence_ids": [
-        "E001",
-        "E002"
-      ]
+      "id": "lexical_path_config",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which observed operation referenced /etc/synthetic/settings.conf?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "lexical_path_hint": "/etc/synthetic/settings.conf"
+        }
+      }
+    },
+    {
+      "id": "path_and_failure",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which operation failed for /var/lib/synthetic/cache.db?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "outcome": "failure",
+          "lexical_path_hint": "/var/lib/synthetic/cache.db"
+        }
+      }
+    },
+    {
+      "id": "failure_openat",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which openat syscall failed for /var/lib/synthetic/cache.db?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "syscall": "openat",
+          "outcome": "failure",
+          "lexical_path_hint": "/var/lib/synthetic/cache.db"
+        }
+      }
+    },
+    {
+      "id": "success_openat",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which openat syscall succeeded for /etc/synthetic/settings.conf?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "syscall": "openat",
+          "outcome": "success",
+          "lexical_path_hint": "/etc/synthetic/settings.conf"
+        }
+      }
+    },
+    {
+      "id": "wrong_errno_abstain",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which operation returned EBADF?",
+      "expected_target": null
+    },
+    {
+      "id": "no_failed_execve_abstain",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which execve syscall failed?",
+      "expected_target": null
+    },
+    {
+      "id": "failure_position_first",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which connect syscall failed?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "syscall": "connect",
+          "outcome": "failure"
+        }
+      },
+      "permutation_group": "same_facts_source_order"
+    },
+    {
+      "id": "failure_position_last",
+      "trace": "synthetic-semantic-reverse.trace",
+      "question": "Which connect syscall failed?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "syscall": "connect",
+          "outcome": "failure"
+        }
+      },
+      "permutation_group": "same_facts_source_order"
+    },
+    {
+      "id": "errno_position_first",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which operation returned ENOENT for /var/run/synthetic/missing.sock?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "observed_errno": "ENOENT",
+          "lexical_path_hint": "/var/run/synthetic/missing.sock"
+        }
+      },
+      "permutation_group": "errno_source_order"
+    },
+    {
+      "id": "errno_position_last",
+      "trace": "synthetic-semantic-reverse.trace",
+      "question": "Which operation returned ENOENT for /var/run/synthetic/missing.sock?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "observed_errno": "ENOENT",
+          "lexical_path_hint": "/var/run/synthetic/missing.sock"
+        }
+      },
+      "permutation_group": "errno_source_order"
+    },
+    {
+      "id": "path_position_first",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which observed operation referenced /etc/synthetic/settings.conf?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "lexical_path_hint": "/etc/synthetic/settings.conf"
+        }
+      },
+      "permutation_group": "path_source_order"
+    },
+    {
+      "id": "path_position_last",
+      "trace": "synthetic-semantic-reverse.trace",
+      "question": "Which observed operation referenced /etc/synthetic/settings.conf?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "lexical_path_hint": "/etc/synthetic/settings.conf"
+        }
+      },
+      "permutation_group": "path_source_order"
+    },
+    {
+      "id": "partial_known_errno",
+      "trace": "synthetic-semantic-partial.trace",
+      "question": "Which operation returned ENOENT?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "observed_errno": "ENOENT"
+        }
+      },
+      "expected_parse_status": "partial"
+    },
+    {
+      "id": "partial_missing_eacces_abstain",
+      "trace": "synthetic-semantic-partial.trace",
+      "question": "Which operation returned EACCES?",
+      "expected_target": null,
+      "expected_parse_status": "partial"
+    },
+    {
+      "id": "process_child_relation",
+      "trace": "synthetic-process-relation.trace",
+      "question": "Which child process was created by task 700?",
+      "expected_target": {
+        "kind": "process_relation",
+        "match": {
+          "caller_task_id": 700,
+          "child_pid": 701
+        }
+      }
+    },
+    {
+      "id": "process_child_targeted",
+      "trace": "synthetic-process-relation.trace",
+      "question": "Which child PID is linked to caller task 700?",
+      "expected_target": {
+        "kind": "process_relation",
+        "match": {
+          "caller_task_id": 700,
+          "child_pid": 701
+        }
+      }
+    },
+    {
+      "id": "unknown_child_relation_abstain",
+      "trace": "synthetic-process-relation.trace",
+      "question": "Which child process was created by task 999?",
+      "expected_target": null
+    },
+    {
+      "id": "relation_trace_errno",
+      "trace": "synthetic-process-relation.trace",
+      "question": "Which openat operation returned ENOENT?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "syscall": "openat",
+          "observed_errno": "ENOENT"
+        }
+      }
+    },
+    {
+      "id": "plain_missing_file",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which file was missing at /var/run/synthetic/missing.conf?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "observed_errno": "ENOENT",
+          "lexical_path_hint": "/var/run/synthetic/missing.conf"
+        }
+      }
+    },
+    {
+      "id": "plain_permission_denied",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which file operation was denied permission to access?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "observed_errno": "EACCES"
+        }
+      }
+    },
+    {
+      "id": "plain_connection_refused",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which connection was refused?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "observed_errno": "ECONNREFUSED"
+        }
+      }
+    },
+    {
+      "id": "plain_connection_pending",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which connection is still pending?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "observed_errno": "EINPROGRESS"
+        }
+      }
+    },
+    {
+      "id": "root_cause_unobserved",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Why did the service fail?",
+      "expected_target": null
+    },
+    {
+      "id": "long_path_value_omitted",
+      "trace": "synthetic-long-path.trace",
+      "question": "Which path was opened?",
+      "expected_target": null,
+      "expected_path_hint_status": "omitted_limit"
+    },
+    {
+      "id": "ambiguous_duplicate_failures",
+      "trace": "synthetic-ambiguous-duplicate.trace",
+      "question": "Which connect syscall failed?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "syscall": "connect",
+          "outcome": "failure"
+        },
+        "allow_multiple_matches": true
+      }
+    },
+    {
+      "id": "plain_process_task_relation",
+      "trace": "synthetic-process-relation.trace",
+      "question": "Which process did task 700 launch?",
+      "expected_target": {
+        "kind": "process_relation",
+        "match": {
+          "caller_task_id": 700,
+          "child_pid": 701
+        }
+      }
+    },
+    {
+      "id": "failure_position_perm_a",
+      "trace": "synthetic-semantic-permute-a.trace",
+      "question": "Which connect syscall failed?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "syscall": "connect",
+          "outcome": "failure"
+        }
+      },
+      "permutation_group": "same_facts_source_order"
+    },
+    {
+      "id": "errno_position_perm_a",
+      "trace": "synthetic-semantic-permute-a.trace",
+      "question": "Which operation returned ENOENT for /var/run/synthetic/missing.sock?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "observed_errno": "ENOENT",
+          "lexical_path_hint": "/var/run/synthetic/missing.sock"
+        }
+      },
+      "permutation_group": "errno_source_order"
+    },
+    {
+      "id": "path_position_perm_a",
+      "trace": "synthetic-semantic-permute-a.trace",
+      "question": "Which observed operation referenced /etc/synthetic/settings.conf?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "lexical_path_hint": "/etc/synthetic/settings.conf"
+        }
+      },
+      "permutation_group": "path_source_order"
+    },
+    {
+      "id": "failure_position_perm_b",
+      "trace": "synthetic-semantic-permute-b.trace",
+      "question": "Which connect syscall failed?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "syscall": "connect",
+          "outcome": "failure"
+        }
+      },
+      "permutation_group": "same_facts_source_order"
+    },
+    {
+      "id": "errno_position_perm_b",
+      "trace": "synthetic-semantic-permute-b.trace",
+      "question": "Which operation returned ENOENT for /var/run/synthetic/missing.sock?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "observed_errno": "ENOENT",
+          "lexical_path_hint": "/var/run/synthetic/missing.sock"
+        }
+      },
+      "permutation_group": "errno_source_order"
+    },
+    {
+      "id": "path_position_perm_b",
+      "trace": "synthetic-semantic-permute-b.trace",
+      "question": "Which observed operation referenced /etc/synthetic/settings.conf?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "lexical_path_hint": "/etc/synthetic/settings.conf"
+        }
+      },
+      "permutation_group": "path_source_order"
+    },
+    {
+      "id": "semantic_access_controls",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which file operation was prevented by its access controls?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "syscall": "openat",
+          "observed_errno": "EACCES",
+          "lexical_path_hint": "/var/lib/synthetic/cache.db"
+        }
+      }
+    },
+    {
+      "id": "semantic_destination_rejected",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which outbound request did its destination decline?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "syscall": "connect",
+          "observed_errno": "ECONNREFUSED"
+        }
+      }
+    },
+    {
+      "id": "semantic_connection_unfinished",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which attempt had not finished establishing its connection?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "syscall": "connect",
+          "observed_errno": "EINPROGRESS"
+        }
+      }
+    },
+    {
+      "id": "semantic_settings_loaded",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which configuration item did the process load into an open file descriptor?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "syscall": "openat",
+          "outcome": "success",
+          "lexical_path_hint": "/etc/synthetic/settings.conf"
+        }
+      }
+    },
+    {
+      "id": "semantic_cache_object_unavailable",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "What cache object could the application not access?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "syscall": "openat",
+          "observed_errno": "EACCES",
+          "lexical_path_hint": "/var/lib/synthetic/cache.db"
+        }
+      }
+    },
+    {
+      "id": "semantic_worker_launched",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which executable did the trace successfully launch?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "syscall": "execve",
+          "outcome": "success"
+        }
+      }
+    },
+    {
+      "id": "semantic_process_created",
+      "trace": "synthetic-process-relation.trace",
+      "question": "What new process was created by the caller task?",
+      "expected_target": {
+        "kind": "process_relation",
+        "match": {
+          "caller_task_id": 700,
+          "child_pid": 701
+        }
+      }
+    },
+    {
+      "id": "semantic_outbound_rejected",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which outbound call was rejected by its destination?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "syscall": "connect",
+          "observed_errno": "ECONNREFUSED"
+        }
+      }
+    },
+    {
+      "id": "semantic_configuration_opened",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "What did the worker open from its configuration location?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "syscall": "openat",
+          "outcome": "success",
+          "lexical_path_hint": "/etc/synthetic/settings.conf"
+        }
+      }
+    },
+    {
+      "id": "semantic_kernel_connect_pending",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which connection was still being completed by the kernel?",
+      "expected_target": {
+        "kind": "syscall_result",
+        "match": {
+          "syscall": "connect",
+          "observed_errno": "EINPROGRESS"
+        }
+      }
+    },
+    {
+      "id": "unanswerable_root_cause_connection",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "What caused the worker service to lose network access?",
+      "expected_target": null
+    },
+    {
+      "id": "unanswerable_path_not_observed",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which operation touched /opt/synthetic/private.ini?",
+      "expected_target": null
+    },
+    {
+      "id": "unanswerable_successful_execve_failure",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which execve call failed to start the worker?",
+      "expected_target": null
+    },
+    {
+      "id": "unanswerable_unknown_errno",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Which operation returned EIO?",
+      "expected_target": null
+    },
+    {
+      "id": "unanswerable_unknown_caller_task",
+      "trace": "synthetic-process-relation.trace",
+      "question": "Which child process was created by caller task 999?",
+      "expected_target": null
+    },
+    {
+      "id": "unanswerable_network_cause",
+      "trace": "synthetic-semantic-forward.trace",
+      "question": "Why did the remote service reject the request?",
+      "expected_target": null
     }
-  ]
+  ],
+  "permutation_group_sizes": {
+    "same_facts_source_order": 4,
+    "errno_source_order": 4,
+    "path_source_order": 4
+  },
+  "trace_sha256": {
+    "synthetic-ambiguous-duplicate.trace": "7ffa5ade3a3e1885521c8354ed323c585b2371fc5bd28126a1a43629d0cde3be",
+    "synthetic-long-path.trace": "075082faff2f5ec67b3610b5c64350584cdfcc2238fd8c5fed45e463fd401b8d",
+    "synthetic-process-relation.trace": "ca52819dd618f7bdda80a45a3b2b44919bf3a375b0fdc3160a7d1823061c0b89",
+    "synthetic-semantic-forward.trace": "35872905c5d8e764f69978a022a8a24b8d2ee6066066dff3c766f069efa663b8",
+    "synthetic-semantic-partial.trace": "1cf3abadb0047cdc19a85aa6c3f00a0148cb4da379a7c38006c480936fea5acf",
+    "synthetic-semantic-permute-a.trace": "058c307b8ea096a9e3555abce51adcbd133cceb34af33d741f8594ec9a5d79ee",
+    "synthetic-semantic-permute-b.trace": "72fa49acafba49ec2d21f66d2148a694d1897352953ed8979d4a72377b6654f3",
+    "synthetic-semantic-reverse.trace": "b2bfd56c4994e73e00bc1c3f96c47a91fcb6ecfad1fa68110b4265f3b09d981c"
+  }
 }
