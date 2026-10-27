@@ -62,6 +62,8 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect explain --inventory-diff <before.json> <after.json>\n\
        sideeffect model-preview --question <question> <strace-trace-file>\n\
        sideeffect model-analyze --question <question> --runtime <llama-cli> --model <model.gguf> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
+       sideeffect model-explain-preview --question <question> --backend auto|cpu|cuda <strace-trace-file>\n\
+       sideeffect model-explain --question <question> --backend auto|cpu|cuda --runtime <llama-completion> --model <model.gguf> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect model-query-preview --question <question> <strace-trace-file>\n\
        sideeffect model-query --question <question> --runtime <llama-completion> --model <model.gguf> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect correlate-startup <startup-inventory.json> <strace-trace-file>\n\
@@ -125,6 +127,41 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             if command == "model-query-preview" && question_flag == "--question" =>
         {
             model_query_preview_file(question, path)
+        }
+        [
+            command,
+            question_flag,
+            question,
+            backend_flag,
+            backend,
+            path,
+        ] if command == "model-explain-preview"
+            && question_flag == "--question"
+            && backend_flag == "--backend" =>
+        {
+            model_explanation_preview_file(question, backend, path)
+        }
+        [
+            command,
+            question_flag,
+            question,
+            backend_flag,
+            backend,
+            runtime_flag,
+            runtime,
+            model_flag,
+            model,
+            confirm_flag,
+            digest,
+            trace,
+        ] if command == "model-explain"
+            && question_flag == "--question"
+            && backend_flag == "--backend"
+            && runtime_flag == "--runtime"
+            && model_flag == "--model"
+            && confirm_flag == "--confirm-sha256" =>
+        {
+            model_explanation_file(question, backend, runtime, model, digest, trace)
         }
         [
             command,
@@ -1079,6 +1116,12 @@ Collects selected Linux inventory sources into one local, private session direct
         "model-analyze" => {
             "Usage: sideeffect model-analyze --question QUESTION --runtime LLAMA_CLI --model MODEL.gguf --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the pinned optional local model on Linux x86_64 after explicit digest confirmation. It does not download weights or upload evidence. The model may select at most one source evidence ID as an unverified hint; it can be wrong and is not a finding. See docs/LOCAL_MODEL_EVALUATION.md."
         }
+        "model-explain-preview" => {
+            "Usage: sideeffect model-explain-preview --question QUESTION --backend auto|cpu|cuda TRACE\nPreviews the bounded typed evidence and coverage fields that an evidence-grounded local model would receive. Review the exact prompt and digest before inference. 'auto' prefers a supported GPU and otherwise reports CPU use; it does not silently fall back after a GPU failure. This command does not run a model."
+        }
+        "model-explain" => {
+            "Usage: sideeffect model-explain --question QUESTION --backend auto|cpu|cuda --runtime LLAMA_COMPLETION --model MODEL.gguf --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the pinned local explanation model after confirmation of the exact evidence preview. The model receives bounded typed evidence and coverage; every generated statement must cite a source evidence ID and remains unverified. 'auto' prefers CUDA when the pinned runtime reports a device; CUDA errors do not silently fall back to CPU. SideEffect does not upload data or auto-download a model. The selected runtime is executable code that must be trusted separately; see docs/LOCAL_MODEL_EXPLANATION_EVALUATION.md."
+        }
         "model-query-preview" => {
             "Usage: sideeffect model-query-preview --question QUESTION TRACE\nPreviews the bounded local query request and typed evidence facts. Queryable facts are shown for review but are not sent to the model. Review this exact question, scope, and digest before optional local inference. Partial input exits with status 2."
         }
@@ -1380,6 +1423,36 @@ fn model_query_preview_file(question: &OsString, path: &OsString) -> Result<Exit
     })
 }
 
+fn model_explanation_preview_file(
+    question: &OsString,
+    backend: &OsString,
+    path: &OsString,
+) -> Result<ExitCode, String> {
+    let question = question
+        .to_str()
+        .ok_or("local model question must be valid UTF-8")?;
+    let backend = match backend.to_str() {
+        Some("auto") => sideeffect::local_model_explanation::ExplanationBackendPreference::Auto,
+        Some("cpu") => sideeffect::local_model_explanation::ExplanationBackendPreference::Cpu,
+        Some("cuda") => sideeffect::local_model_explanation::ExplanationBackendPreference::Cuda,
+        _ => return Err("model explanation backend must be auto, cpu, or cuda".to_owned()),
+    };
+    let bytes = read_bounded(path)?;
+    let preview = sideeffect::local_model_explanation::preview_model_explanation_bytes(
+        &bytes, question, backend,
+    )?;
+    let partial = preview.evidence_summary["parse_status"] == "partial";
+    write_json(
+        &preview,
+        "local evidence-grounded model explanation preview",
+    )?;
+    Ok(if partial {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
 fn model_query_file(
     question: &OsString,
     runtime: &OsString,
@@ -1410,6 +1483,53 @@ fn model_query_file(
     )?;
     let partial = analysis.coverage["parse_status"] == "partial";
     write_json(&analysis, "local query-plan analysis")?;
+    Ok(if partial {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn model_explanation_file(
+    question: &OsString,
+    backend: &OsString,
+    runtime: &OsString,
+    model: &OsString,
+    digest: &OsString,
+    trace: &OsString,
+) -> Result<ExitCode, String> {
+    let question = question
+        .to_str()
+        .ok_or("local model question must be valid UTF-8")?;
+    let backend = match backend.to_str() {
+        Some("auto") => sideeffect::local_model_explanation::ExplanationBackendPreference::Auto,
+        Some("cpu") => sideeffect::local_model_explanation::ExplanationBackendPreference::Cpu,
+        Some("cuda") => sideeffect::local_model_explanation::ExplanationBackendPreference::Cuda,
+        _ => return Err("model explanation backend must be auto, cpu, or cuda".to_owned()),
+    };
+    let Some(digest) = digest.to_str() else {
+        return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
+    }
+    let bytes = read_bounded(trace)?;
+    let analysis = sideeffect::local_model_explanation_runtime::analyze_model_explanation_bytes(
+        &bytes,
+        question,
+        backend,
+        Path::new(runtime),
+        Path::new(model),
+        digest,
+    )?;
+    let partial = analysis.evidence_summary["parse_status"] == "partial"
+        || analysis.interpretation.status
+            != sideeffect::local_model_explanation::ExplanationStatus::Answered;
+    write_json(&analysis, "local evidence-grounded model explanation")?;
     Ok(if partial {
         ExitCode::from(2)
     } else {

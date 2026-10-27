@@ -187,6 +187,8 @@ Rust is the implementation stack for the core CLI, parser, schema, diff engine, 
 
 Linux x86_64 remains the full capture target. Native Windows software, process, selected-path permission, and bounded startup-configuration slices are available without WSL2; native Windows runtime capture has only a process-only ETW prototype and has no file/network collection or runtime readers yet. Existing WSL2 environments may be used as Linux environments; they do not count as native Windows runtime coverage.
 
+The separate `model-explain` path includes the selected bounded typed facts and coverage metadata in the prompt, and validates strict generated statements against a schema and exact preview evidence-ID set. It can summarize the supplied facts but cannot establish causation, root cause, safety, effective permissions, or complete coverage. Native Windows uses a suspended process assigned to a Job Object before it resumes, bounded host-process resources, a private temporary model copy, and explicit CUDA offload detection. The Job Object is not GPU-memory isolation and does not deny networking; the selected runtime executable and loaded libraries remain trusted-code dependencies. This candidate has no semantic quality pass and is not release-approved. See `docs/LOCAL_MODEL_EXPLANATION_EVALUATION.md`.
+
 ## Validation strategy
 
 Future implementation must include meaningful automated tests before release:

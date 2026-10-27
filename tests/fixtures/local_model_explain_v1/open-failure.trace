@@ -1,0 +1,1 @@
+303 10.200000 openat(AT_FDCWD, "/etc/sideeffect-example.conf", O_RDONLY) = -1 EACCES (Permission denied)

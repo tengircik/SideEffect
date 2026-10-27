@@ -217,6 +217,33 @@ fn model_prompt_facts<'a>(
                 });
 
             if let Some(record) = record {
+                if matches!(
+                    fact.get("syscall").and_then(Value::as_str),
+                    Some("execve" | "execveat")
+                ) {
+                    let syscall = fact
+                        .get("syscall")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let executable_path = record.raw_arguments.as_deref().and_then(|arguments| {
+                        crate::trace::derive_executable_path_hint(syscall, arguments)
+                    });
+                    let status = match executable_path {
+                        Some(path)
+                            if path.len() <= MAX_MODEL_PATH_HINT_BYTES && path.is_ascii() =>
+                        {
+                            prompt_fact["executable_path_hint"] = json!({
+                                "path": path,
+                                "basis": "execve_path_argument",
+                                "trust": "untrusted_lexical_hint"
+                            });
+                            ModelPathHintStatus::Included
+                        }
+                        Some(_) => ModelPathHintStatus::OmittedLimit,
+                        None => ModelPathHintStatus::NotDerived,
+                    };
+                    prompt_fact["executable_path_hint_status"] = json!(status);
+                }
                 if matches!(fact.get("outcome").and_then(Value::as_str), Some("failure" | "in_progress")) {
                     if let Some(errno) = record
                         .raw_result
@@ -698,6 +725,7 @@ mod tests {
         assert!(first.prompt.starts_with("{\"user_question\":\""));
         assert!(first.prompt.contains("\"syscall\":\"execve\""));
         assert!(first.prompt.contains("\"outcome\":\"success\""));
+        assert!(first.prompt.contains("\"executable_path_hint\":{\"basis\":\"execve_path_argument\",\"path\":\"/usr/bin/printf\",\"trust\":\"untrusted_lexical_hint\"}"));
         assert!(!first.prompt.contains("parse_status"));
         assert!(!first.prompt.contains("capture_completeness"));
         assert!(!first.prompt.contains("recognized_successful_return"));
@@ -786,6 +814,7 @@ mod tests {
         assert_eq!(facts[1]["syscall"], "connect");
         assert_eq!(facts[1]["observed_errno"], "ECONNREFUSED");
         assert!(facts[1].get("lexical_path_hint").is_none());
+        assert!(facts[1].get("executable_path_hint").is_none());
         assert_eq!(facts[3]["evidence_id"], "E004");
         assert_eq!(facts[3]["outcome"], "in_progress");
         assert_eq!(facts[3]["observed_errno"], "EINPROGRESS");

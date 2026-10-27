@@ -1,0 +1,2 @@
+808 10.000000 execve("/usr/bin/sideeffect-worker", ["sideeffect-worker"], 0x0) = 0
+808 10.100000 totally unsupported pseudo-record

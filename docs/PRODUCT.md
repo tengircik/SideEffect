@@ -113,6 +113,8 @@ The first release may observe connection-related syscalls. It must distinguish a
 
 These are acceptance targets for future implementation and tests, not claims about the current repository.
 
+The separate `model-explain-preview` / `model-explain` development flow gives an opt-in local model bounded typed syscall-result evidence and explicit coverage/unknown metadata, then validates every generated statement's citations against the exact reviewed preview. It runs on Linux x86_64 and native Windows; Windows can select CUDA and reports verified layer offload. This structural check does not validate statement meaning. The selected llama.cpp executable runs as the current user and is not sandboxed; Windows Job Objects do not cap GPU memory or block network access. This workflow remains an experimental M8 candidate with no passed semantic release gate. See [the explanation setup and evaluation record](LOCAL_MODEL_EXPLANATION_EVALUATION.md).
+
 ## Cross-platform release gate
 
 Before calling SideEffect 1.0 cross-platform, a native Windows user must be able to take a useful software/process/selected-path-permission/startup snapshot, record a bounded runtime window, inspect its evidence, compare two runs, and export a readable offline report using the same high-level workflow available on Linux. Reports must state Windows-specific source scope, privilege requirements, event loss, and unknowns. Windows CI and a real Windows integration run are required; parser fixtures or WSL2 runs alone do not satisfy this gate. A clearly labeled Linux-only preview may precede this work.
