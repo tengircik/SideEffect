@@ -430,13 +430,13 @@ fn audit_command(arguments: &[OsString]) -> Result<ExitCode, String> {
                 "Warning: the session directory was published, but syncing its parent directory failed; persistence across sudden power loss is uncertain."
             );
         }
-        return Ok(
+        Ok(
             if result.manifest.status == sideeffect::audit_session::SessionStatus::Complete {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(2)
             },
-        );
+        )
     }
     #[cfg(windows)]
     {
@@ -1139,11 +1139,11 @@ fn inspect_session_with_format(format: &OsString, path: &OsString) -> Result<Exi
             }
             _ => unreachable!("format was checked above"),
         }
-        return Ok(if partial {
+        Ok(if partial {
             ExitCode::from(2)
         } else {
             ExitCode::SUCCESS
-        });
+        })
     }
     #[cfg(windows)]
     {
