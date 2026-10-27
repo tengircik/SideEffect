@@ -2,7 +2,7 @@
 
 **Status:** M8 preview; not a release endorsement. This feature is opt-in and runs only on Linux x86_64. SideEffect does not bundle or automatically download weights or a runtime, and sends no evidence to a hosted service.
 
-**Reviewed on:** 2026-10-26.
+**Reviewed on:** 2026-10-27.
 
 ## Reviewed inputs
 
@@ -70,6 +70,10 @@ The fixture files and preregistered expectations are under [`tests/fixtures/loca
 ## Preregistered acceptance gate
 
 Corpus version 3's attempted 29-case gate is invalidated: its candidate filter preselected most answers, forced abstentions, and its RSS measurement wrapped SideEffect rather than the inference child. No result from that gate is evidence of model quality. The replacement corpus freezes 51 cases (15 answerable natural-language variations, 12 unanswerable cases, the prior coverage cases, and source-order controls) against the full-evidence schema version 5. Its SHA-256 is 3ce5920da93503d0c1ccdee3fa65b5078433a2d91397a52acb7bd33806c7ca1f. The evaluation helper bounds corpus metadata at 64 KiB/128 cases and each child output stream at 1 MiB. It reports wall time; memory enforcement is provided by the runtime's address-space limit and is not represented as measured peak RSS. The preregistered gate requires valid output, at least a 10 percentage-point answerable-accuracy gain over a declared lexical baseline, zero false selections on unanswerable questions, all four source-order permutations in each required group to select the correct semantic target, and p95 model-run latency no greater than 30 seconds. The corpus pins the SHA-256 of every fixture, and the evaluator requires a clean Git worktree and records the commit and evaluator-script SHA-256 with every result. The evaluator also pins the corpus digest, criteria, case count, and required permutation groups. Passing synthetic criteria still does not establish real-world accuracy or justify a safety claim.
+
+### Full-evidence result (2026-10-27)
+
+The pinned Qwen3-0.6B candidate was run through the guarded SideEffect path on all 51 preregistered fixtures at clean commit `037d54616af60baf8ba0a105074ca03993519b1a`. The evaluator SHA-256 was `34e3e3b53e3bff03a440e3feb3388f44363e4ea810714d866b51cb1fdbe2727e`; corpus and per-trace SHA-256 values are recorded in the machine-readable evaluation output. All 51 outputs were schema-valid, but only 7/39 answerable cases were correct (17.9%) versus 29/39 (74.4%) for the lexical baseline, a −56.4 percentage-point difference. The model selected evidence on all 12 unanswerable cases (100% false-selection rate), and none of the required permutation groups passed. Mean inference wall time was 4.431 seconds and p95 was 5.319 seconds on this WSL2 host. Peak RSS was not measured; the guarded runtime's 2 GiB address-space limit remained active. The model missed the usefulness gate decisively. Keep this feature experimental and do not recommend it for release or decisions; deterministic evidence lookup is the useful path today. Any future model candidate or prompt change must be evaluated as a new, provenance-pinned run against the same frozen criteria before changing that status.
 
 Do not pass server, repository, URL, tools, or hosted API options to another runtime. The supported command checks for the reviewed llama.cpp version and exact model hash. Native Windows analysis is not supported; WSL2 can be used by users who already have it, but does not constitute native Windows support.
 
