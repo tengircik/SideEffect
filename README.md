@@ -66,6 +66,18 @@ This writes the aggregate `sideeffect.startup_inventory` v2 schema. It combines 
 
 All discovered commands, scripts, and directives are inert values. SideEffect does not execute or shell-parse them, resolve their runtime effects, evaluate startup applicability, or establish that an entry is active or will run. A systemd unit file or enablement symlink is not proof of runtime activation; cron content is not proof that cron is running or a job executed; SysV files and links do not establish that SysV init is active. These are curated common locations, not exhaustive startup inventory. Component scans use bounded directories, entries, files, per-file/aggregate bytes, lines, line length, and time; any inaccessible, unsupported, malformed, or limit-affected source is marked partial. Non-UTF-8 source path bytes are preserved alongside display paths where supported.
 
+## Collect a Linux audit session
+
+```sh
+sideeffect audit --output ./audit-session \
+  --packages --processes --startup \
+  --permission ./some/file --permission ./some/directory
+```
+
+This runs only the selected, read-only Linux inventory sources and stores their existing JSON schemas as `packages.json`, `processes.json`, `startup.json`, and/or `permissions.json`, alongside `session.json`. The manifest records each source's scope, interval, status, selected key limits, diagnostic codes, artifact size, schema version, and SHA-256. The directory is staged privately and published atomically without replacing an existing destination. Session directories use mode `0700`; files use mode `0600`. Partial sources remain in the session and make the command exit with status `2`.
+
+Sources run as separate observations across a best-effort time window. This is not an atomic snapshot, and a `complete` session means only that each selected collector produced its declared artifact; it does not mean exhaustive system coverage. Runtime capture and native Windows sessions are not included yet. Session files can contain sensitive paths, software names, account and process data, and configuration evidence. Review the local artifacts before sharing; SideEffect does not redact, upload, or automatically delete them.
+
 ## Discover a bounded set of Windows startup entries
 
 ```powershell

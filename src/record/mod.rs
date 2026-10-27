@@ -13,7 +13,7 @@ pub use command::build_strace_command;
 #[cfg(target_os = "linux")]
 pub(crate) use command::build_strace_command_for;
 #[cfg(target_os = "linux")]
-pub use paths::{AnchoredOutput, publish_private_file};
+pub use paths::{AnchoredOutput, SessionOutput, publish_private_file};
 #[cfg(windows)]
 pub use windows::publish_private_file as publish_private_windows_file;
 #[cfg(windows)]

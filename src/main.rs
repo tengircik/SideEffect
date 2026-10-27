@@ -15,6 +15,8 @@ use serde::Deserialize;
 use serde::Serialize;
 #[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "linux")]
+use sideeffect::audit_session_linux::{AuditOptions, collect_and_publish};
 use sideeffect::diff::compare_traces;
 use sideeffect::explain::{explain_diff, explain_trace};
 #[cfg(target_os = "linux")]
@@ -64,6 +66,7 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect inventory processes --output <new-inventory.json>\n\
        sideeffect inventory startup --output <new-inventory.json>\n\
        sideeffect inventory permissions --output <new-inventory.json> <path>...\n\
+       sideeffect audit --output <new-session-directory> [--packages] [--processes] [--startup] [--permission <path>]...\n\
        sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect record --trace <new-trace-file> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect help [command [subcommand]]\n       sideeffect version\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. On Linux, inventory packages reads available local dpkg, RPM, pacman, and APK databases; on Windows, it reads selected current-user and machine-wide Uninstall registry entries. Both are bounded source snapshots and can miss unregistered software. Windows does not use Win32_Product or launch uninstall commands. On Linux, inventory processes reads bounded numeric /proc status entries and executable-link identities; on Windows, it reads a Tool Help snapshot and queries accessible image paths. Neither adapter reads command lines or promises atomic or exhaustive coverage. On Linux, inventory startup discovers curated sources; on Windows, it inventories selected Run/RunOnce values, Startup folders, and visible service configuration and boot/logon triggers in tasks visible to the current token. Task actions and XML are not collected. Neither platform establishes that a configured entry ran. Inventory permissions inspects only explicit Linux paths and records ownership/type/mode, supported POSIX ACLs, and Linux file-capability xattrs; it never follows the final path symlink or calculates effective access. Record follows a selected command's traced descendants and may enforce a requested wall-clock limit; this is observation, not isolation or a safety check.";
 
 fn main() -> ExitCode {
@@ -314,8 +317,102 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             record_bundle_with_duration_command(output, program, target_args, None)
         }
         [command, ..] if command == "record" => Err(USAGE.to_owned()),
+        [command, args @ ..] if command == "audit" => audit_command(args),
         [command, ..] if command == "inventory" => Err(USAGE.to_owned()),
         _ => Err(USAGE.to_owned()),
+    }
+}
+
+fn audit_command(arguments: &[OsString]) -> Result<ExitCode, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut destination: Option<&OsString> = None;
+        let mut options = AuditOptions::default();
+        let mut selected = std::collections::HashSet::new();
+        let mut index = 0;
+        while index < arguments.len() {
+            let argument = &arguments[index];
+            if argument == "--output" {
+                if destination.is_some() || index + 1 >= arguments.len() {
+                    return Err("audit requires exactly one --output DIRECTORY".to_owned());
+                }
+                destination = Some(&arguments[index + 1]);
+                index += 2;
+                continue;
+            }
+            if argument == "--packages" {
+                if !selected.insert("packages") {
+                    return Err("audit source --packages was specified more than once".to_owned());
+                }
+                options.packages = true;
+                index += 1;
+                continue;
+            }
+            if argument == "--processes" {
+                if !selected.insert("processes") {
+                    return Err("audit source --processes was specified more than once".to_owned());
+                }
+                options.processes = true;
+                index += 1;
+                continue;
+            }
+            if argument == "--startup" {
+                if !selected.insert("startup") {
+                    return Err("audit source --startup was specified more than once".to_owned());
+                }
+                options.startup = true;
+                index += 1;
+                continue;
+            }
+            if argument == "--permission" {
+                let Some(path) = arguments.get(index + 1) else {
+                    return Err("audit --permission requires a path".to_owned());
+                };
+                options.permission_paths.push(Path::new(path).to_path_buf());
+                index += 2;
+                continue;
+            }
+            return Err(format!(
+                "unsupported audit argument: {}",
+                terminal_safe_path(Path::new(argument))
+            ));
+        }
+        let destination =
+            destination.ok_or_else(|| "audit requires --output DIRECTORY".to_owned())?;
+        let result = collect_and_publish(Path::new(destination), &options)?;
+        let state = match result.manifest.status {
+            sideeffect::audit_session::SessionStatus::Complete => "complete",
+            sideeffect::audit_session::SessionStatus::Partial => "partial",
+        };
+        eprintln!(
+            "Published a {state} best-effort Linux audit session to {} ({} sources, {}–{} Unix milliseconds). Each source was collected in its own interval; this is not an atomic snapshot. Review the local artifacts before sharing.",
+            terminal_safe_path(&result.path),
+            result.manifest.sources.len(),
+            result.manifest.started_at_unix_ms,
+            result.manifest.ended_at_unix_ms
+        );
+        if !result.parent_sync_confirmed {
+            eprintln!(
+                "Warning: the session directory was published, but syncing its parent directory failed; persistence across sudden power loss is uncertain."
+            );
+        }
+        return Ok(
+            if result.manifest.status == sideeffect::audit_session::SessionStatus::Complete {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(2)
+            },
+        );
+    }
+    #[cfg(windows)]
+    {
+        let _ = arguments;
+        Err("audit sessions are not yet supported on Windows; native Windows source contracts and private directory publication remain incomplete".to_owned())
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = arguments;
+        Err("audit sessions are not supported on this platform".to_owned())
     }
 }
 
@@ -840,6 +937,21 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
     }
 
     let text = match topic.as_str() {
+        "audit" => {
+            #[cfg(target_os = "linux")]
+            {
+                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages] [--processes] [--startup] [--permission PATH]...
+Collects selected Linux inventory sources into one local, private session directory. Each source has its own interval; the session is not an atomic snapshot. Permission paths must be explicitly selected. Partial sources are preserved and cause exit status 2. Runtime capture and Windows sessions are not yet included."
+            }
+            #[cfg(windows)]
+            {
+                "Audit sessions are not yet supported on Windows."
+            }
+            #[cfg(not(any(target_os = "linux", windows)))]
+            {
+                "Audit sessions are not supported on this platform."
+            }
+        }
         "inspect" => {
             "Usage: sideeffect inspect [--format json|text] TRACE\n       sideeffect inspect [--format json|text] --bundle DIR\nReads bounded local strace evidence. It never runs the represented command. JSON is the default; text output escapes terminal controls. Partial parses are labeled and exit with status 2."
         }

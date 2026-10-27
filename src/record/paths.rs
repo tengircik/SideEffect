@@ -13,6 +13,16 @@ const BUNDLE_TRACE_NAME: &[u8] = b"trace.strace";
 const MANIFEST_NAME: &[u8] = b"run.json";
 const REPORT_NAME: &[u8] = b"report.html";
 const PRIVATE_FILE_NAME: &[u8] = b"private-output";
+const SESSION_ARTIFACT_NAMES: [&[u8]; 4] = [
+    b"packages.json",
+    b"processes.json",
+    b"startup.json",
+    b"permissions.json",
+];
+const SESSION_MANIFEST_NAME: &[u8] = b"session.json";
+const SESSION_MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
+const SESSION_MAX_MANIFEST_BYTES: usize = 512 * 1024;
+const SESSION_MAX_TOTAL_BYTES: usize = 128 * 1024 * 1024;
 const STAGE_PREFIX: &[u8] = b".sideeffect-capture-";
 static NEXT_STAGE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -38,6 +48,347 @@ pub struct AnchoredOutput {
     bundle: bool,
     bundle_published: bool,
     published: bool,
+}
+
+/// Anchored private staging for a bounded audit-session directory.
+///
+/// Only the four fixed source artifact names and `session.json` are accepted. Source artifacts
+/// must be written before the manifest, which is the final file added to the staged directory.
+#[derive(Debug)]
+pub struct SessionOutput {
+    parent_dir: File,
+    parent_path_at_prepare: PathBuf,
+    destination_name: OsString,
+    stage_dir: File,
+    stage_name: OsString,
+    stage_device: libc::dev_t,
+    stage_inode: libc::ino_t,
+    artifact_identities: [Option<(libc::dev_t, libc::ino_t)>; 4],
+    manifest_identity: Option<(libc::dev_t, libc::ino_t)>,
+    total_bytes: usize,
+    file_limit: usize,
+    total_limit: usize,
+    manifest_written: bool,
+    published: bool,
+}
+
+impl SessionOutput {
+    /// Prepare a private sibling staging directory for a published session directory.
+    pub fn prepare(destination: &Path) -> io::Result<Self> {
+        Self::prepare_with_limits(
+            destination,
+            SESSION_MAX_ARTIFACT_BYTES,
+            SESSION_MAX_TOTAL_BYTES,
+        )
+    }
+
+    fn prepare_with_limits(
+        destination: &Path,
+        file_limit: usize,
+        total_limit: usize,
+    ) -> io::Result<Self> {
+        if file_limit > SESSION_MAX_ARTIFACT_BYTES || total_limit > SESSION_MAX_TOTAL_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "requested session limits exceed the built-in safety caps",
+            ));
+        }
+        let destination_name = destination
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "destination must name a directory",
+                )
+            })?
+            .to_os_string();
+        let parent_request = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent_path = fs::canonicalize(parent_request)?;
+        let parent_dir = open_directory(&parent_path)?;
+        ensure_private_output_parent_trusted(&parent_dir)?;
+        ensure_destination_absent(parent_dir.as_raw_fd(), &destination_name)?;
+        let (stage_name, stage_dir, stage_stat) = create_stage_directory(&parent_dir)?;
+
+        Ok(Self {
+            parent_dir,
+            parent_path_at_prepare: parent_path,
+            destination_name,
+            stage_dir,
+            stage_name,
+            stage_device: stage_stat.st_dev,
+            stage_inode: stage_stat.st_ino,
+            artifact_identities: [None; 4],
+            manifest_identity: None,
+            total_bytes: 0,
+            file_limit,
+            total_limit,
+            manifest_written: false,
+            published: false,
+        })
+    }
+
+    #[cfg(test)]
+    fn stage_path_for_test(&self) -> PathBuf {
+        self.parent_path_at_prepare.join(&self.stage_name)
+    }
+
+    /// Write one source artifact to its fixed allowlisted name.
+    pub fn write_artifact(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        if self.manifest_written {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session manifest must be written last",
+            ));
+        }
+        let index = SESSION_ARTIFACT_NAMES
+            .iter()
+            .position(|allowed| *allowed == name.as_bytes())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unsupported session artifact name",
+                )
+            })?;
+        if self.artifact_identities[index].is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "session artifact has already been written",
+            ));
+        }
+        let identity = self.write_fixed_file(name.as_bytes(), bytes, self.file_limit)?;
+        self.artifact_identities[index] = Some(identity);
+        Ok(())
+    }
+
+    /// Write `session.json` after source artifacts. It cannot be replaced or written twice.
+    pub fn write_manifest(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.manifest_written {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "session manifest has already been written",
+            ));
+        }
+        if self.artifact_identities.iter().all(Option::is_none) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "at least one source artifact is required before the session manifest",
+            ));
+        }
+        let identity =
+            self.write_fixed_file(SESSION_MANIFEST_NAME, bytes, SESSION_MAX_MANIFEST_BYTES)?;
+        self.manifest_identity = Some(identity);
+        self.manifest_written = true;
+        Ok(())
+    }
+
+    /// Atomically publish the complete session directory without replacing a destination.
+    /// Returns the published path and whether syncing the parent directory succeeded.
+    pub fn publish(&mut self) -> io::Result<(PathBuf, bool)> {
+        if self.published {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "session has already been published",
+            ));
+        }
+        let Some((manifest_device, manifest_inode)) = self.manifest_identity else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session manifest has not been written",
+            ));
+        };
+        if self.artifact_identities.iter().all(Option::is_none) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "at least one source artifact is required",
+            ));
+        }
+        verify_named_directory(
+            self.parent_dir.as_raw_fd(),
+            &self.stage_name,
+            self.stage_device,
+            self.stage_inode,
+        )?;
+        let mut verified_total = 0usize;
+        for (name, identity) in SESSION_ARTIFACT_NAMES.iter().zip(self.artifact_identities) {
+            if let Some(identity) = identity {
+                verified_total = verified_total
+                    .checked_add(verify_session_file(
+                        self.stage_dir.as_raw_fd(),
+                        name,
+                        identity,
+                        self.file_limit,
+                    )?)
+                    .ok_or_else(|| io::Error::other("session total size overflow"))?;
+            }
+        }
+        verified_total = verified_total
+            .checked_add(verify_session_file(
+                self.stage_dir.as_raw_fd(),
+                SESSION_MANIFEST_NAME,
+                (manifest_device, manifest_inode),
+                SESSION_MAX_MANIFEST_BYTES,
+            )?)
+            .ok_or_else(|| io::Error::other("session total size overflow"))?;
+        if verified_total != self.total_bytes
+            || verified_total > self.total_limit
+            || !has_exact_session_entries(self.stage_dir.as_raw_fd(), &self.artifact_identities)
+        {
+            return Err(io::Error::other(
+                "session staging directory contains unexpected entries or identities",
+            ));
+        }
+        self.stage_dir.sync_all()?;
+        let stage_name = c_name(self.stage_name.as_os_str().as_bytes())?;
+        let destination_name = c_name(self.destination_name.as_os_str().as_bytes())?;
+        // Both names are single components relative to held directory descriptors.
+        if unsafe {
+            libc::renameat2(
+                self.parent_dir.as_raw_fd(),
+                stage_name.as_ptr(),
+                self.parent_dir.as_raw_fd(),
+                destination_name.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        self.published = true;
+        let parent_sync_confirmed = self.parent_dir.sync_all().is_ok();
+        let current_parent = read_fd_path(self.parent_dir.as_raw_fd())
+            .unwrap_or_else(|_| self.parent_path_at_prepare.clone());
+        Ok((
+            current_parent.join(&self.destination_name),
+            parent_sync_confirmed,
+        ))
+    }
+
+    fn write_fixed_file(
+        &mut self,
+        name: &[u8],
+        bytes: &[u8],
+        per_file_limit: usize,
+    ) -> io::Result<(libc::dev_t, libc::ino_t)> {
+        if bytes.len() > per_file_limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "session file exceeds the {per_file_limit} byte limit ({} bytes provided)",
+                    bytes.len()
+                ),
+            ));
+        }
+        let total = self.total_bytes.checked_add(bytes.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "session total size overflow")
+        })?;
+        if total > self.total_limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("session exceeds the {} byte total limit", self.total_limit),
+            ));
+        }
+        let c_name = c_name(name)?;
+        // SAFETY: stage_dir is held; the fixed allowlisted name is opened without following or replacing entries.
+        let fd = unsafe {
+            libc::openat(
+                self.stage_dir.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a new owned descriptor.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let stat = stat_fd(file.as_raw_fd())?;
+        if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG
+            || stat.st_uid != unsafe { libc::geteuid() }
+            || !named_entry_matches(self.stage_dir.as_raw_fd(), name, stat.st_dev, stat.st_ino)
+        {
+            return Err(io::Error::other(
+                "created session staging entry is not a current-user regular file",
+            ));
+        }
+        let write_result = (|| {
+            if stat.st_mode & 0o777 != 0o600
+                && unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            file.write_all(bytes)?;
+            file.flush()?;
+            file.sync_all()?;
+            let after_write = stat_fd(file.as_raw_fd())?;
+            if after_write.st_dev != stat.st_dev
+                || after_write.st_ino != stat.st_ino
+                || after_write.st_size < 0
+                || after_write.st_size as usize != bytes.len()
+            {
+                return Err(io::Error::other(
+                    "session staging file identity or length changed while writing",
+                ));
+            }
+            if !named_entry_matches(self.stage_dir.as_raw_fd(), name, stat.st_dev, stat.st_ino) {
+                return Err(io::Error::other(
+                    "session staging entry was replaced while writing",
+                ));
+            }
+            Ok(())
+        })();
+        drop(file);
+        if let Err(error) = write_result {
+            unlink_entry_if_same(self.stage_dir.as_raw_fd(), name, stat.st_dev, stat.st_ino);
+            return Err(error);
+        }
+        self.total_bytes = total;
+        Ok((stat.st_dev, stat.st_ino))
+    }
+}
+
+impl Drop for SessionOutput {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        for (name, identity) in SESSION_ARTIFACT_NAMES.iter().zip(self.artifact_identities) {
+            if let Some((device, inode)) = identity {
+                unlink_entry_if_same(self.stage_dir.as_raw_fd(), name, device, inode);
+            }
+        }
+        if let Some((device, inode)) = self.manifest_identity {
+            unlink_entry_if_same(
+                self.stage_dir.as_raw_fd(),
+                SESSION_MANIFEST_NAME,
+                device,
+                inode,
+            );
+        }
+        if verify_named_directory(
+            self.parent_dir.as_raw_fd(),
+            &self.stage_name,
+            self.stage_device,
+            self.stage_inode,
+        )
+        .is_ok()
+        {
+            if let Ok(name) = c_name(self.stage_name.as_os_str().as_bytes()) {
+                // Remove only the verified empty staging directory; never recurse into entries.
+                unsafe {
+                    libc::unlinkat(
+                        self.parent_dir.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::AT_REMOVEDIR,
+                    );
+                }
+            }
+        }
+    }
 }
 
 impl AnchoredOutput {
@@ -448,6 +799,78 @@ pub fn publish_private_file(
     file.sync_all()?;
     drop(file);
     output.publish_private_file()
+}
+
+// Test helper for exercising the session writer through one publication call.
+#[cfg(test)]
+fn publish_private_session(
+    destination: &Path,
+    artifacts: &[(&str, &[u8])],
+    manifest: &[u8],
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+) -> io::Result<(PathBuf, bool)> {
+    if max_file_bytes > SESSION_MAX_ARTIFACT_BYTES || max_total_bytes > SESSION_MAX_TOTAL_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "requested session limits exceed the built-in safety caps",
+        ));
+    }
+    if artifacts.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "at least one source artifact is required",
+        ));
+    }
+    let mut total = manifest.len();
+    let mut seen = [false; 4];
+    for (name, bytes) in artifacts {
+        if bytes.len() > max_file_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("session artifact exceeds the {max_file_bytes} byte requested limit"),
+            ));
+        }
+        total = total.checked_add(bytes.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "session total size overflow")
+        })?;
+        // Validate fixed names and duplicates before creating staging state.
+        let Some(index) = SESSION_ARTIFACT_NAMES
+            .iter()
+            .position(|allowed| *allowed == name.as_bytes())
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported session artifact name",
+            ));
+        };
+        if seen[index] {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "session artifact has been listed more than once",
+            ));
+        }
+        seen[index] = true;
+    }
+    if total > max_total_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("session exceeds the {max_total_bytes} byte requested total limit"),
+        ));
+    }
+    if manifest.len() > SESSION_MAX_MANIFEST_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("session manifest exceeds the {SESSION_MAX_MANIFEST_BYTES} byte limit"),
+        ));
+    }
+    let mut output =
+        SessionOutput::prepare_with_limits(destination, max_file_bytes, max_total_bytes)?;
+    for (name, bytes) in artifacts {
+        output.write_artifact(name, bytes)?;
+    }
+    output.write_manifest(manifest)?;
+    output.publish()
 }
 
 fn publish_entry<F>(
@@ -904,6 +1327,110 @@ fn named_entry_matches(dir_fd: i32, name: &[u8], device: libc::dev_t, inode: lib
         .unwrap_or(false)
 }
 
+fn verify_session_file(
+    dir_fd: i32,
+    name: &[u8],
+    identity: (libc::dev_t, libc::ino_t),
+    limit: usize,
+) -> io::Result<usize> {
+    let stat = stat_named_entry(dir_fd, name)?;
+    if stat.st_dev != identity.0
+        || stat.st_ino != identity.1
+        || (stat.st_mode & libc::S_IFMT) != libc::S_IFREG
+        || stat.st_uid != unsafe { libc::geteuid() }
+        || stat.st_mode & 0o777 != 0o600
+        || stat.st_size < 0
+    {
+        return Err(io::Error::other(
+            "session staging file identity, type, owner, or mode changed before publication",
+        ));
+    }
+    let size = usize::try_from(stat.st_size)
+        .map_err(|_| io::Error::other("session staging file size is not representable"))?;
+    if size > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session staging file exceeds its size limit",
+        ));
+    }
+    Ok(size)
+}
+
+fn unlink_entry_if_same(dir_fd: i32, name: &[u8], device: libc::dev_t, inode: libc::ino_t) {
+    if named_entry_matches(dir_fd, name, device, inode) {
+        if let Ok(name) = c_name(name) {
+            // SAFETY: the entry was checked against the held inode; unlinkat removes the entry
+            // itself and does not follow a replacement symlink.
+            unsafe {
+                libc::unlinkat(dir_fd, name.as_ptr(), 0);
+            }
+        }
+    }
+}
+
+fn has_exact_session_entries(
+    directory_fd: i32,
+    artifacts: &[Option<(libc::dev_t, libc::ino_t)>; 4],
+) -> bool {
+    let duplicate = unsafe { libc::fcntl(directory_fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return false;
+    }
+    let directory = unsafe { libc::fdopendir(duplicate) };
+    if directory.is_null() {
+        unsafe { libc::close(duplicate) };
+        return false;
+    }
+    let expected_count = artifacts
+        .iter()
+        .filter(|identity| identity.is_some())
+        .count()
+        + 1;
+    let mut seen_artifacts = [false; 4];
+    let mut saw_manifest = false;
+    let mut count = 0usize;
+    loop {
+        unsafe { *libc::__errno_location() = 0 };
+        let entry = unsafe { libc::readdir(directory) };
+        if entry.is_null() {
+            let read_error = unsafe { *libc::__errno_location() };
+            unsafe { libc::closedir(directory) };
+            return read_error == 0
+                && count == expected_count
+                && saw_manifest
+                && artifacts
+                    .iter()
+                    .enumerate()
+                    .all(|(index, id)| id.is_none() || seen_artifacts[index]);
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        count += 1;
+        if count > expected_count {
+            unsafe { libc::closedir(directory) };
+            return false;
+        }
+        if name == SESSION_MANIFEST_NAME {
+            saw_manifest = true;
+            continue;
+        }
+        match SESSION_ARTIFACT_NAMES
+            .iter()
+            .position(|candidate| *candidate == name)
+        {
+            Some(index) if artifacts[index].is_some() && !seen_artifacts[index] => {
+                seen_artifacts[index] = true
+            }
+            _ => {
+                unsafe { libc::closedir(directory) };
+                return false;
+            }
+        }
+    }
+}
+
 fn stat_fd(fd: i32) -> io::Result<libc::stat> {
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: stat is writable and fd is a held descriptor.
@@ -923,7 +1450,10 @@ fn c_name(name: &[u8]) -> io::Result<CString> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnchoredOutput, REPORT_NAME, TRACE_NAME, publish_entry, publish_private_file};
+    use super::{
+        AnchoredOutput, REPORT_NAME, SessionOutput, TRACE_NAME, publish_entry,
+        publish_private_file, publish_private_session,
+    };
     use std::fs;
     use std::io::{self, Write};
     use std::os::fd::AsRawFd;
@@ -1487,5 +2017,153 @@ mod tests {
         fs::remove_file(marker).unwrap();
         drop(output);
         assert!(!stage.exists());
+    }
+
+    #[test]
+    fn session_publishes_private_exact_fixed_layout() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("session");
+        let artifacts = [
+            ("packages.json", b"packages".as_slice()),
+            ("processes.json", b"processes".as_slice()),
+        ];
+        let (published, parent_sync) =
+            publish_private_session(&destination, &artifacts, b"manifest", 1024, 4096).unwrap();
+        assert!(parent_sync);
+        assert_eq!(published, destination);
+        assert_eq!(
+            fs::read(published.join("packages.json")).unwrap(),
+            b"packages"
+        );
+        assert_eq!(
+            fs::read(published.join("processes.json")).unwrap(),
+            b"processes"
+        );
+        assert_eq!(
+            fs::read(published.join("session.json")).unwrap(),
+            b"manifest"
+        );
+        assert_eq!(fs::read_dir(&published).unwrap().count(), 3);
+        assert_eq!(
+            fs::metadata(&published).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for entry in fs::read_dir(&published).unwrap() {
+            assert_eq!(
+                entry.unwrap().metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn session_rejects_names_limits_and_destination_collisions() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("session");
+        assert_eq!(
+            publish_private_session(&destination, &[("../session.json", b"x")], b"m", 10, 20)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            publish_private_session(
+                &destination,
+                &[("packages.json", b"oversized")],
+                b"m",
+                4,
+                20
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(!destination.exists());
+        fs::create_dir(&destination).unwrap();
+        assert_eq!(
+            SessionOutput::prepare(&destination).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        let target = directory.0.join("target");
+        fs::write(&target, b"keep").unwrap();
+        let link = directory.0.join("linked-session");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(
+            SessionOutput::prepare(&link).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn session_rejects_unprotected_parent_directory() {
+        let directory = TestDirectory::new();
+        fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(
+            SessionOutput::prepare(&directory.0.join("session"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+        fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn session_size_bounds_and_failed_staging_cleanup_are_enforced() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("session");
+        let mut output = SessionOutput::prepare_with_limits(&destination, 4, 8).unwrap();
+        let stage = output.stage_path_for_test();
+        output.write_artifact("packages.json", b"1234").unwrap();
+        assert_eq!(
+            output
+                .write_artifact("processes.json", b"12345")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        drop(output);
+        assert!(!stage.exists());
+        assert!(!destination.exists());
+
+        assert_eq!(
+            publish_private_session(
+                &destination,
+                &[("packages.json", b"123"), ("processes.json", b"456")],
+                b"manifest",
+                3,
+                8
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(!destination.exists());
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn session_refuses_unexpected_entries_and_preserves_them() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("session");
+        let mut output = SessionOutput::prepare(&destination).unwrap();
+        output.write_artifact("startup.json", b"startup").unwrap();
+        output.write_manifest(b"manifest").unwrap();
+        let stage = output.stage_path_for_test();
+        let marker = stage.join("unowned-marker");
+        fs::write(&marker, b"preserve").unwrap();
+        assert!(
+            output
+                .publish()
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected entries")
+        );
+        drop(output);
+        assert_eq!(fs::read(&marker).unwrap(), b"preserve");
+        assert!(!destination.exists());
+        fs::remove_file(marker).unwrap();
+        fs::remove_dir(stage).unwrap();
     }
 }

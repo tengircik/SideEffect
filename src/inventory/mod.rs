@@ -48,8 +48,10 @@ pub use packages_windows::{
 };
 #[cfg(target_os = "linux")]
 pub use permissions::{
-    AclEntry, AclObservation, AclStatus, AclTag, PermissionDiagnostic, PermissionInventoryDocument,
-    PermissionInventoryStatus, PermissionObject, PermissionObjectStatus, collect_permissions,
+    AclEntry, AclObservation, AclStatus, AclTag, MAX_ACL_XATTR_BYTES, MAX_CAPABILITY_XATTR_BYTES,
+    MAX_PERMISSION_PATHS, MAX_PERMISSION_TOTAL_ACL_BYTES, MAX_PERMISSION_TOTAL_CAPABILITY_BYTES,
+    PermissionDiagnostic, PermissionInventoryDocument, PermissionInventoryStatus, PermissionObject,
+    PermissionObjectStatus, collect_permissions,
 };
 #[cfg(windows)]
 pub use permissions_windows::{
@@ -59,9 +61,10 @@ pub use permissions_windows::{
 };
 #[cfg(target_os = "linux")]
 pub use processes::{
-    ProcessDiagnostic, ProcessEvidence, ProcessExecutableEvidence, ProcessExecutableLink,
-    ProcessExecutableLinkStatus, ProcessInventoryDocument, ProcessInventorySource,
-    ProcessInventoryStatus, ProcessRow, collect_processes, collect_processes_from,
+    MAX_AGGREGATE_STATUS_BYTES, MAX_PROCESS_DIRECTORIES, ProcessDiagnostic, ProcessEvidence,
+    ProcessExecutableEvidence, ProcessExecutableLink, ProcessExecutableLinkStatus,
+    ProcessInventoryDocument, ProcessInventorySource, ProcessInventoryStatus, ProcessRow,
+    collect_processes, collect_processes_from,
 };
 #[cfg(windows)]
 pub use processes_windows::{
@@ -72,8 +75,8 @@ pub use processes_windows::{
 #[cfg(target_os = "linux")]
 pub use startup::{
     Directory as StartupDirectory, Entry as XdgStartupEntry, KeyEvidence as StartupKeyEvidence,
-    StartupInventoryDocument, Status as StartupInventoryStatus, XdgAutostartInventory,
-    collect_startup, collect_startup_from,
+    MAX_STARTUP_DIRECTORIES, MAX_STARTUP_FILES, MAX_STARTUP_TOTAL_BYTES, StartupInventoryDocument,
+    Status as StartupInventoryStatus, XdgAutostartInventory, collect_startup, collect_startup_from,
 };
 #[cfg(target_os = "linux")]
 pub use startup_legacy::{

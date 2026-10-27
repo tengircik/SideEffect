@@ -378,3 +378,124 @@ pub enum ValidationError {
     ManifestTooLarge,
     InvalidManifestJson,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, AppliedLimit, ArtifactKind,
+        AuditSessionManifest, AuditSessionSource, IntervalSemantics, SessionArtifactRef,
+        SessionStatus, SourceRole, SourceStatus, parse_manifest,
+    };
+
+    fn valid_manifest() -> AuditSessionManifest {
+        AuditSessionManifest {
+            schema: AUDIT_SESSION_SCHEMA.to_owned(),
+            schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+            platform: "linux".to_owned(),
+            architecture: "x86_64".to_owned(),
+            started_at_unix_ms: 1000,
+            ended_at_unix_ms: 1002,
+            interval_semantics: IntervalSemantics::BestEffortNonAtomic,
+            status: SessionStatus::Complete,
+            sources: vec![AuditSessionSource {
+                role: SourceRole::Packages,
+                platform: "linux".to_owned(),
+                scope: "available package databases".to_owned(),
+                started_at_unix_ms: 1000,
+                ended_at_unix_ms: 1001,
+                status: SourceStatus::Complete,
+                applied_limits: vec![AppliedLimit {
+                    code: "max_inventory_rows".to_owned(),
+                    value: 200_000,
+                }],
+                diagnostic_codes: Vec::new(),
+                artifacts: vec![SessionArtifactRef {
+                    kind: ArtifactKind::Packages,
+                    path: "packages.json".to_owned(),
+                    schema: "sideeffect.inventory".to_owned(),
+                    schema_version: 2,
+                    byte_length: 1,
+                    sha256: "0".repeat(64),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn parser_accepts_a_bounded_complete_manifest() {
+        let bytes = serde_json::to_vec(&valid_manifest()).unwrap();
+        let parsed = parse_manifest(&bytes).unwrap();
+        assert_eq!(parsed.session_id, "0123456789abcdef0123456789abcdef");
+        assert_eq!(parsed.sources[0].artifacts[0].path, "packages.json");
+    }
+
+    #[test]
+    fn parser_rejects_unknown_schema_versions_and_unknown_fields() {
+        let mut manifest = valid_manifest();
+        manifest.schema_version += 1;
+        assert_eq!(
+            manifest.validate(),
+            Err(super::ValidationError::InvalidSchema)
+        );
+
+        let bytes =
+            br#"{"schema":"sideeffect.audit_session","schema_version":1,"unexpected":true}"#;
+        assert_eq!(
+            parse_manifest(bytes),
+            Err(super::ValidationError::InvalidManifestJson)
+        );
+    }
+
+    #[test]
+    fn incomplete_source_cannot_be_hidden_by_a_complete_session() {
+        let mut manifest = valid_manifest();
+        manifest.sources[0].status = SourceStatus::Partial;
+        assert_eq!(
+            manifest.validate(),
+            Err(super::ValidationError::SessionStatusHidesIncompleteSource)
+        );
+        manifest.status = SessionStatus::Partial;
+        assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn partial_session_can_preserve_an_unavailable_selected_source_without_artifact() {
+        let mut manifest = valid_manifest();
+        manifest.status = SessionStatus::Partial;
+        manifest.sources.push(AuditSessionSource {
+            role: SourceRole::Processes,
+            platform: "linux".to_owned(),
+            scope: "visible procfs entries".to_owned(),
+            started_at_unix_ms: 1001,
+            ended_at_unix_ms: 1002,
+            status: SourceStatus::Unavailable,
+            applied_limits: Vec::new(),
+            diagnostic_codes: vec!["procfs_unavailable".to_owned()],
+            artifacts: Vec::new(),
+        });
+
+        assert!(manifest.validate().is_ok());
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        assert_eq!(parse_manifest(&bytes).unwrap(), manifest);
+    }
+
+    #[test]
+    fn source_intervals_must_fit_inside_the_non_atomic_session_window() {
+        let mut manifest = valid_manifest();
+        manifest.sources[0].ended_at_unix_ms = manifest.ended_at_unix_ms + 1;
+        assert_eq!(
+            manifest.validate(),
+            Err(super::ValidationError::SourceOutsideSessionInterval)
+        );
+    }
+
+    #[test]
+    fn oversized_manifest_is_rejected_before_json_parsing() {
+        let bytes = vec![b' '; super::MAX_AUDIT_SESSION_MANIFEST_BYTES + 1];
+        assert_eq!(
+            parse_manifest(&bytes),
+            Err(super::ValidationError::ManifestTooLarge)
+        );
+    }
+}
