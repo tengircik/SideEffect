@@ -43,6 +43,10 @@ Timeouts, invalid output, and runtime failures count as failures, not abstention
 
 Resource limits are 1.5 GiB for the model file, 4 GiB address space, 120 seconds wall/CPU time, 16 KiB model output, 128 KiB corpus, and no automatic network access. The evaluator reports process-tree RSS as a sampled peak where available, not as a precise peak measurement. GPU inference has not been integrated into the SideEffect command or its sandboxed Linux runtime; CUDA measurements below are separate development experiments.
 
+## GPU implementation direction
+
+If a local model candidate first passes the frozen usefulness gate, prefer GPU acceleration on hardware and a backend that SideEffect can support and validate. Keep a clearly reported CPU fallback for systems without a supported accelerator. The command must report which backend actually ran and any resource-limit or fallback outcome; it must never silently claim GPU execution. GPU support must preserve explicit user opt-in, offline behavior, strict plan validation, and bounded execution. Define and validate accelerator-memory behavior for each supported backend before claiming that its resource use is bounded. GPU availability or speed does not change the model-quality gate, and this direction is not an implemented feature or a release claim.
+
 ## Reproduction
 
 Build the pinned llama.cpp revision locally with the completion binary and without network support. Obtain the pinned GGUF file from its upstream repository outside this checkout and verify its SHA-256. SideEffect never performs these actions automatically. Do not put model weights or captures in Git.
