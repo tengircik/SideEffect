@@ -1030,6 +1030,22 @@ def distribution(samples: list[float]) -> dict[str, int | float | None]:
             "p95_seconds": round(ordered[index], 3), "max_seconds": round(ordered[-1], 3)}
 
 
+def per_answerable_class_accuracy(
+    answerable: list[dict[str, Any]], classes: list[str]
+) -> dict[str, float]:
+    """Treat invalid or missing model outputs as incorrect for their class."""
+    accuracy: dict[str, float] = {}
+    for class_name in classes:
+        class_cases = [case for case in answerable if case["answerable_class"] == class_name]
+        accuracy[class_name] = (
+            sum(case.get("result_exact_match") is True for case in class_cases)
+            / len(class_cases)
+            if class_cases
+            else 0.0
+        )
+    return accuracy
+
+
 def _pin_runtime(runtime: Path) -> str:
     result, _ = run_bounded([str(runtime), "--version"], timeout=10)
     version = (result.stdout + result.stderr).decode("utf-8", errors="replace").strip()
@@ -1253,11 +1269,7 @@ def main() -> int:
         valid = [case for case in cases if case["status"] == "valid_output"]
         answerable = [case for case in cases if case["answerable_class"] is not None]
         classes = sorted(ANSWERABLE_CLASSES & {case["answerable_class"] for case in answerable})
-        class_accuracy = {
-            class_name: sum(case["result_exact_match"] for case in answerable if case["answerable_class"] == class_name)
-            / sum(case["answerable_class"] == class_name for case in answerable)
-            for class_name in classes
-        }
+        class_accuracy = per_answerable_class_accuracy(answerable, classes)
         answerable_correct = sum(case.get("result_exact_match") is True for case in answerable)
         answerable_plan_correct = sum(case.get("plan_exact_match") is True for case in answerable)
         baseline_correct = sum(case.get("baseline_exact_match") is True for case in answerable)
