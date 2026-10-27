@@ -76,6 +76,14 @@ sideeffect audit --output ./audit-session \
 
 This runs only the selected, read-only Linux inventory sources and stores their existing JSON schemas as `packages.json`, `processes.json`, `startup.json`, and/or `permissions.json`, alongside `session.json`. The manifest records each source's scope, interval, status, selected key limits, diagnostic codes, artifact size, schema version, and SHA-256. The directory is staged privately and published atomically without replacing an existing destination. Session directories use mode `0700`; files use mode `0600`. Partial sources remain in the session and make the command exit with status `2`.
 
+Review a session after verifying its manifest and artifact files:
+
+```sh
+sideeffect inspect --format text --session ./audit-session
+```
+
+Session review reports source scopes, statuses, time windows, selected limits, diagnostics, and verified artifact metadata without printing inventory rows. JSON is available with `--format json` and uses the `sideeffect.audit_session_review` v1 schema. The reader rejects symlinks, unexpected entries, unsupported artifact schema/version headers, changed bytes, and directories or files that grant group/other access. It checks JSON syntax and the declared schema/version header; this is not full semantic validation of each inventory schema. SHA-256 matching checks consistency with the local manifest; it does not authenticate who produced the session.
+
 Sources run as separate observations across a best-effort time window. This is not an atomic snapshot, and a `complete` session means only that each selected collector produced its declared artifact; it does not mean exhaustive system coverage. Runtime capture and native Windows sessions are not included yet. Session files can contain sensitive paths, software names, account and process data, and configuration evidence. Review the local artifacts before sharing; SideEffect does not redact, upload, or automatically delete them.
 
 ## Discover a bounded set of Windows startup entries

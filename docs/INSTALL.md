@@ -127,7 +127,15 @@ This writes bounded `sideeffect.startup_correlation` v1 JSON to stdout. Inventor
 
 Specify one or more source selectors: `--packages`, `--processes`, `--startup`, and repeated `--permission PATH` options. Permission inspection is limited to the paths you name. The command does not record runtime activity. It stores each selected inventory in its native JSON schema beside a `session.json` manifest with per-source scope, timestamps, status, selected key limits, diagnostics, artifact length, schema, and SHA-256. Collections run over a best-effort interval, not an atomic system snapshot. Partial artifacts are retained and cause exit status `2`.
 
-The complete directory is built in a private sibling staging directory and atomically published without overwriting an existing destination. The session directory is mode `0700`; its files are mode `0600`. Artifacts can contain sensitive system and user data. There is no automatic redaction, upload, or deletion. Windows session collection and session artifact reading/hash verification are not implemented yet.
+The complete directory is built in a private sibling staging directory and atomically published without overwriting an existing destination. The session directory is mode `0700`; its files are mode `0600`. Artifacts can contain sensitive system and user data. There is no automatic redaction, upload, or deletion. Windows session collection and inspection are not supported yet.
+
+To verify and review the session metadata:
+
+```sh
+./target/release/sideeffect inspect --format text --session ./audit-session
+```
+
+The reader requires a current-user-owned private directory and private regular files, rejects symlinks and unlisted entries, checks bounded JSON syntax and declared schema/version headers, and verifies every declared artifact's length and SHA-256 before writing a review. It does not fully validate each inventory artifact's domain schema or print raw inventory rows. Use `--format json` for the versioned `sideeffect.audit_session_review` v1 output. A hash match does not authenticate the session producer. Partial sessions are still reviewable and return exit status `2`.
 
 ## Record a command on Linux
 

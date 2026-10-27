@@ -1,6 +1,8 @@
 pub mod audit_session;
 #[cfg(target_os = "linux")]
 pub mod audit_session_linux;
+#[cfg(target_os = "linux")]
+pub mod audit_session_reader_linux;
 pub mod diff;
 pub mod explain;
 mod fingerprint;

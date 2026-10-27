@@ -127,6 +127,54 @@ fn audit_cli_publishes_private_session_with_verified_source_intervals_and_hashes
         2
     };
     assert_eq!(result.status.code(), Some(expected_exit));
+
+    for format in ["json", "text"] {
+        let reviewed = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+            .arg("inspect")
+            .arg("--format")
+            .arg(format)
+            .arg("--session")
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert_eq!(reviewed.status.code(), Some(expected_exit));
+        assert!(reviewed.stderr.is_empty());
+        if format == "json" {
+            let review: serde_json::Value = serde_json::from_slice(&reviewed.stdout).unwrap();
+            assert_eq!(review["schema"], "sideeffect.audit_session_review");
+            assert_eq!(review["authenticity"], "not_established");
+            assert_eq!(review["sources"].as_array().unwrap().len(), 4);
+            assert_eq!(
+                review["sources"][0]["artifacts"][0]["integrity"],
+                "length_and_sha256_match_local_bytes"
+            );
+        } else {
+            assert!(reviewed.stdout.is_ascii());
+            let text = String::from_utf8(reviewed.stdout).unwrap();
+            assert!(text.contains("SideEffect audit session review"));
+            assert!(text.contains("no atomic system snapshot is claimed"));
+            assert!(text.contains("hashes do not authenticate the source"));
+            assert!(text.contains("Verified artifacts:"));
+        }
+    }
+
+    fs::write(output.join("packages.json"), b"tampered").unwrap();
+    fs::set_permissions(
+        output.join("packages.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let rejected = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("inspect")
+        .arg("--session")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("audit session verification failed")
+    );
 }
 
 #[test]

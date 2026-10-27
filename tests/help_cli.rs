@@ -15,6 +15,7 @@ fn help_command_and_flag_show_command_list() {
         let text = String::from_utf8_lossy(&output.stdout);
         assert!(text.contains("sideeffect help [command [subcommand]]"));
         assert!(text.contains("sideeffect model-preview"));
+        assert!(text.contains("--session <audit-session-directory>"));
     }
 }
 
@@ -28,6 +29,10 @@ fn focused_help_covers_command_and_nested_inventory_topics() {
     #[cfg(windows)]
     assert!(record_help.contains("system-wide process events"));
     assert!(record_help.contains("not isolation") || record_help.contains("not a safety check"));
+
+    let inspect = run(&["inspect", "--help"]);
+    assert!(inspect.status.success());
+    assert!(String::from_utf8_lossy(&inspect.stdout).contains("--session DIR"));
 
     let startup = run(&["help", "inventory", "startup"]);
     assert!(startup.status.success());

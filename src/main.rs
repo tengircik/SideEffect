@@ -56,7 +56,7 @@ use sideeffect::record::publish_private_windows_file;
 use sideeffect::startup_correlation::correlate_startup_bytes;
 use sideeffect::trace::strace::parse_trace_bytes;
 
-const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect inspect [--format json|text] --bundle <run-bundle-directory>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff --bundles [--format json|text] <baseline-bundle> <candidate-bundle>\n       sideeffect diff --bundles --format html --output <report.html> <baseline-bundle> <candidate-bundle>\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect inventory packages --output <new-inventory.json>\n\
+const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect inspect [--format json|text] --bundle <run-bundle-directory>\n       sideeffect inspect [--format json|text] --session <audit-session-directory>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff --bundles [--format json|text] <baseline-bundle> <candidate-bundle>\n       sideeffect diff --bundles --format html --output <report.html> <baseline-bundle> <candidate-bundle>\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect inventory packages --output <new-inventory.json>\n\
        sideeffect explain <strace-trace-file>\n\
        sideeffect explain --diff <baseline-trace> <candidate-trace>\n\
        sideeffect explain --inventory-diff <before.json> <after.json>\n\
@@ -103,6 +103,14 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         }
         [command, subcommand, flag] if flag == "--help" || flag == "-h" => {
             command_help(&[command.clone(), subcommand.clone()])
+        }
+        [command, flag, path] if command == "inspect" && flag == "--session" => {
+            inspect_session_with_format(&OsString::from("json"), path)
+        }
+        [command, format_flag, format, session_flag, path]
+            if command == "inspect" && format_flag == "--format" && session_flag == "--session" =>
+        {
+            inspect_session_with_format(format, path)
         }
         [command, path] if command == "inspect" => inspect(path),
         [command, path] if command == "explain" => explain_trace_file(path),
@@ -953,7 +961,7 @@ Collects selected Linux inventory sources into one local, private session direct
             }
         }
         "inspect" => {
-            "Usage: sideeffect inspect [--format json|text] TRACE\n       sideeffect inspect [--format json|text] --bundle DIR\nReads bounded local strace evidence. It never runs the represented command. JSON is the default; text output escapes terminal controls. Partial parses are labeled and exit with status 2."
+            "Usage: sideeffect inspect [--format json|text] TRACE\n       sideeffect inspect [--format json|text] --bundle DIR\n       sideeffect inspect [--format json|text] --session DIR\nReads bounded local strace evidence, a validated run bundle, or a verified Linux audit session. It never runs represented commands. JSON is the default; text output escapes terminal controls and user-influenced scope text. Session inspection checks the manifest, private file layout, artifact schemas, byte lengths, and SHA-256 values; hashes do not authenticate the source. Partial input is labeled and exits with status 2."
         }
         "diff" => {
             "Usage: sideeffect diff [--format json|text] LEFT RIGHT\n       sideeffect diff --format html --output REPORT.html LEFT RIGHT\n       sideeffect diff --bundles [--format json|text] LEFT_DIR RIGHT_DIR\nCompares complete parsed observations. HTML reports are available on Linux and are static, offline, and private. Trace values may be sensitive."
@@ -1053,6 +1061,68 @@ Collects selected Linux inventory sources into one local, private session direct
 
 fn inspect(path: &OsString) -> Result<ExitCode, String> {
     inspect_with_format(&OsString::from("json"), path)
+}
+
+fn inspect_session_with_format(format: &OsString, path: &OsString) -> Result<ExitCode, String> {
+    if !matches!(format.to_str(), Some("json" | "text")) {
+        return Err("inspect format must be either 'json' or 'text'".to_owned());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let session =
+            sideeffect::audit_session_reader_linux::read_verified_session(Path::new(path))
+                .map_err(|error| format!("audit session verification failed: {error}"))?;
+        let partial =
+            session.manifest().status == sideeffect::audit_session::SessionStatus::Partial;
+        match format.to_str() {
+            Some("json") => {
+                let mut output = CappedBuffer::new(MAX_REPORT_BYTES);
+                sideeffect::format::write_audit_session_json(session.manifest(), &mut output)
+                    .map_err(|error| {
+                        if output.exceeded {
+                            format!("audit session review exceeds the {MAX_REPORT_BYTES} byte output limit")
+                        } else {
+                            format!("could not serialize audit session review: {error}")
+                        }
+                    })?;
+                output.write_all(b"\n").map_err(|_| {
+                    format!("audit session review exceeds the {MAX_REPORT_BYTES} byte output limit")
+                })?;
+                write_buffer(&output, "audit session review")?;
+            }
+            Some("text") => {
+                let mut output = CappedBuffer::new(MAX_REPORT_BYTES);
+                sideeffect::format::write_audit_session_text(session.manifest(), &mut output)
+                    .map_err(|error| {
+                        if output.exceeded {
+                            format!("audit session review exceeds the {MAX_REPORT_BYTES} byte output limit")
+                        } else {
+                            format!("could not render audit session review: {error}")
+                        }
+                    })?;
+                output.write_all(b"\n").map_err(|_| {
+                    format!("audit session review exceeds the {MAX_REPORT_BYTES} byte output limit")
+                })?;
+                write_buffer(&output, "audit session review")?;
+            }
+            _ => unreachable!("format was checked above"),
+        }
+        return Ok(if partial {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
+    #[cfg(windows)]
+    {
+        let _ = path;
+        Err("audit-session inspection is not yet supported on Windows".to_owned())
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = path;
+        Err("audit-session inspection is not supported on this platform".to_owned())
+    }
 }
 
 fn correlate_startup(startup_path: &OsString, trace_path: &OsString) -> Result<ExitCode, String> {
