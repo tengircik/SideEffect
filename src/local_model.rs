@@ -161,7 +161,7 @@ pub fn preview_trace_document(
     })
 }
 
-fn validate_question(question: &str) -> Result<&str, String> {
+pub(crate) fn validate_question(question: &str) -> Result<&str, String> {
     let question = question.trim();
     if question.is_empty() {
         return Err("local model question must not be empty".to_owned());
@@ -358,7 +358,7 @@ fn analysis_from_preview(
     }
 }
 
-fn apply_model_fact_limits(summary: &mut Value) {
+pub(crate) fn apply_model_fact_limits(summary: &mut Value) {
     let Some(object) = summary.as_object_mut() else {
         return;
     };
@@ -415,7 +415,7 @@ fn add_unknown(object: &mut serde_json::Map<String, Value>, unknown: &str) {
     }
 }
 
-fn add_evidence_ids(value: &mut Value, evidence_ids: &mut Vec<String>) {
+pub(crate) fn add_evidence_ids(value: &mut Value, evidence_ids: &mut Vec<String>) {
     match value {
         Value::Object(object) => {
             let is_reference = ["line_number", "byte_offset", "byte_length"]
@@ -439,7 +439,7 @@ fn add_evidence_ids(value: &mut Value, evidence_ids: &mut Vec<String>) {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut text = String::with_capacity(64);
     for byte in digest {
@@ -586,7 +586,10 @@ pub fn analyze_trace_bytes(
 }
 
 #[cfg(target_os = "linux")]
-fn canonical_regular_file(path: &Path, description: &str) -> Result<std::path::PathBuf, String> {
+pub(crate) fn canonical_regular_file(
+    path: &Path,
+    description: &str,
+) -> Result<std::path::PathBuf, String> {
     let canonical = path
         .canonicalize()
         .map_err(|error| format!("could not resolve local {description} path: {error}"))?;
@@ -599,7 +602,7 @@ fn canonical_regular_file(path: &Path, description: &str) -> Result<std::path::P
 }
 
 #[cfg(target_os = "linux")]
-fn copy_verified_model(
+pub(crate) fn copy_verified_model(
     source: &Path,
     destination: &Path,
     expected_sha256: &str,
@@ -615,7 +618,9 @@ fn copy_verified_model(
         .len()
         > limit
     {
-        return Err("selected model file exceeds the 512 MiB limit".to_owned());
+        return Err(format!(
+            "selected model file exceeds the {limit} byte limit"
+        ));
     }
     let mut reader = file.take(limit + 1);
     let mut output = std::fs::OpenOptions::new()
@@ -636,7 +641,9 @@ fn copy_verified_model(
         }
         copied = copied.saturating_add(read as u64);
         if copied > limit {
-            return Err("selected model file exceeds the 512 MiB limit".to_owned());
+            return Err(format!(
+                "selected model file exceeds the {limit} byte limit"
+            ));
         }
         hasher.update(&buffer[..read]);
         output
@@ -651,7 +658,7 @@ fn copy_verified_model(
     }
     if text != expected_sha256 {
         return Err(format!(
-            "the selected model hash is not the reviewed Qwen3-0.6B Q4_0 file ({expected_sha256})"
+            "the selected model hash does not match the reviewed model ({expected_sha256})"
         ));
     }
     Ok(())

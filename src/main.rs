@@ -62,6 +62,8 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect explain --inventory-diff <before.json> <after.json>\n\
        sideeffect model-preview --question <question> <strace-trace-file>\n\
        sideeffect model-analyze --question <question> --runtime <llama-cli> --model <model.gguf> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
+       sideeffect model-query-preview --question <question> <strace-trace-file>\n\
+       sideeffect model-query --question <question> --runtime <llama-completion> --model <model.gguf> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect correlate-startup <startup-inventory.json> <strace-trace-file>\n\
        sideeffect inventory processes --output <new-inventory.json>\n\
        sideeffect inventory startup --output <new-inventory.json>\n\
@@ -119,6 +121,11 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         {
             model_preview_file(question, path)
         }
+        [command, question_flag, question, path]
+            if command == "model-query-preview" && question_flag == "--question" =>
+        {
+            model_query_preview_file(question, path)
+        }
         [
             command,
             question_flag,
@@ -137,6 +144,25 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             && confirm_flag == "--confirm-sha256" =>
         {
             model_analyze_file(question, runtime, model, digest, trace)
+        }
+        [
+            command,
+            question_flag,
+            question,
+            runtime_flag,
+            runtime,
+            model_flag,
+            model,
+            confirm_flag,
+            digest,
+            trace,
+        ] if command == "model-query"
+            && question_flag == "--question"
+            && runtime_flag == "--runtime"
+            && model_flag == "--model"
+            && confirm_flag == "--confirm-sha256" =>
+        {
+            model_query_file(question, runtime, model, digest, trace)
         }
         [command, diff_flag, left, right] if command == "explain" && diff_flag == "--diff" => {
             explain_diff_files(left, right)
@@ -1053,6 +1079,12 @@ Collects selected Linux inventory sources into one local, private session direct
         "model-analyze" => {
             "Usage: sideeffect model-analyze --question QUESTION --runtime LLAMA_CLI --model MODEL.gguf --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the pinned optional local model on Linux x86_64 after explicit digest confirmation. It does not download weights or upload evidence. The model may select at most one source evidence ID as an unverified hint; it can be wrong and is not a finding. See docs/LOCAL_MODEL_EVALUATION.md."
         }
+        "model-query-preview" => {
+            "Usage: sideeffect model-query-preview --question QUESTION TRACE\nPreviews the bounded local query request and typed evidence facts. Queryable facts are shown for review but are not sent to the model. Review this exact question, scope, and digest before optional local inference. Partial input exits with status 2."
+        }
+        "model-query" => {
+            "Usage: sideeffect model-query --question QUESTION --runtime LLAMA_COMPLETION --model MODEL.gguf --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the pinned optional local query model on Linux x86_64 only after explicit preview-digest confirmation. It executes only validated exact-match AND filters over observed typed facts, never commands or model-authored expressions. No model is downloaded or evidence uploaded. Model results are unverified review aids. See docs/LOCAL_QUERY_PLAN_EVALUATION.md."
+        }
         _ => return Err(format!("unknown help topic: {topic}\n\n{USAGE}")),
     };
     println!("{text}");
@@ -1326,6 +1358,58 @@ fn model_preview_file(question: &OsString, path: &OsString) -> Result<ExitCode, 
     let preview = sideeffect::local_model::preview_trace_bytes(&bytes, question)?;
     let partial = preview.evidence_summary["parse_status"] == "partial";
     write_json(&preview, "local model request preview")?;
+    Ok(if partial {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn model_query_preview_file(question: &OsString, path: &OsString) -> Result<ExitCode, String> {
+    let question = question
+        .to_str()
+        .ok_or("local query question must be valid UTF-8")?;
+    let bytes = read_bounded(path)?;
+    let preview = sideeffect::local_query_plan::preview_query_plan_bytes(&bytes, question)?;
+    let partial = preview.evidence_summary["parse_status"] == "partial";
+    write_json(&preview, "local query-plan preview")?;
+    Ok(if partial {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn model_query_file(
+    question: &OsString,
+    runtime: &OsString,
+    model: &OsString,
+    digest: &OsString,
+    trace: &OsString,
+) -> Result<ExitCode, String> {
+    let question = question
+        .to_str()
+        .ok_or("local query question must be valid UTF-8")?;
+    let Some(digest) = digest.to_str() else {
+        return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
+    }
+    let bytes = read_bounded(trace)?;
+    let analysis = sideeffect::local_query_plan::analyze_query_plan_bytes(
+        &bytes,
+        question,
+        Path::new(runtime),
+        Path::new(model),
+        digest,
+    )?;
+    let partial = analysis.coverage["parse_status"] == "partial";
+    write_json(&analysis, "local query-plan analysis")?;
     Ok(if partial {
         ExitCode::from(2)
     } else {

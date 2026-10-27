@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::trace::LexicalPathHint;
 
@@ -26,7 +26,7 @@ pub enum TraceRecordKind {
 
 /// A conservative interpretation of the observed result for selected syscalls.
 /// This describes only the syscall result text, not a higher-level effect.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyscallOutcome {
     Success,

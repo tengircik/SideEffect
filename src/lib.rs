@@ -12,6 +12,7 @@ pub mod limits;
 pub mod local_model;
 #[cfg(target_os = "linux")]
 mod local_model_runtime;
+pub mod local_query_plan;
 pub mod model;
 pub mod record;
 pub mod startup_correlation;
