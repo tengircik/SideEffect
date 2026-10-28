@@ -1,0 +1,4 @@
+[pid 64503] execve("/usr/libexec/heliowick/parcel-agent", ["parcel-agent"], 0x0) = 0
+[pid 64504] clone(child_stack=NULL, flags=SIGCHLD) = 64505
+[pid 64501] openat(AT_FDCWD, "/srv/heliowick/parcel/manifest.cbor", O_RDONLY) = -1 EACCES (Permission denied)
+[pid 64502] connect(13, {sa_family=AF_INET, sin_port=htons(26180), sin_addr=inet_addr("192.0.2.201")}, 16) = -1 ECONNREFUSED (Connection refused)

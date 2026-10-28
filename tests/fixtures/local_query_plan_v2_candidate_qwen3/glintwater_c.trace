@@ -1,0 +1,6 @@
+[pid 64341] execve("/usr/bin/atlas-watch", ["atlas-watch"], 0x0) = 0
+[pid 64342] execve("/usr/bin/atlas-index", ["atlas-index"], 0x0) = 0
+[pid 64343] openat2(AT_FDCWD, "/var/lib/atlas-watch/state.snap", {flags=O_RDONLY}, 8) = 8
+[pid 64344] openat2(AT_FDCWD, "/var/lib/atlas-watch/queue.snap", {flags=O_RDONLY}, 8) = -1 EIO (Input/output error)
+[pid 64345] connect(7, {sa_family=AF_INET, sin_port=htons(19021), sin_addr=inet_addr("203.0.113.92")}, 16) = -1 EHOSTUNREACH (No route to host)
+[pid 64346] clone(child_stack=NULL, flags=SIGCHLD) = 64347

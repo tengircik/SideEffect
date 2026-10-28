@@ -1,0 +1,6 @@
+[pid 64231] openat(AT_FDCWD, "/srv/orbitvale/archive/ledger.db", O_RDWR) = -1 ENOENT (No such file or directory)
+[pid 64232] openat(AT_FDCWD, "/srv/orbitvale/archive/catalog.db", O_RDONLY) = 5
+[pid 64233] openat(AT_FDCWD, "/srv/orbitvale/archive/lease.db", O_RDONLY) = -1 EROFS (Read-only file system)
+[pid 64234] execve("/usr/local/libexec/mesh-sync", ["mesh-sync"], 0x0) = 0
+[pid 64235] connect(4, {sa_family=AF_INET, sin_port=htons(17651), sin_addr=inet_addr("198.51.100.26")}, 16) = -1 ETIMEDOUT (Connection timed out)
+[pid 64236] clone3({flags=CLONE_VM|CLONE_VFORK, exit_signal=SIGCHLD}, 88) = 64237
