@@ -12,7 +12,7 @@ The six traces (`copperveil_a.trace` through `copperveil_d.trace`, `siltwarden.t
 
 ## Candidate prompt reference
 
-The intended prompt for a later OLMo-2-0425-1B-Instruct run is the existing [`experimental two-shot prompt`](../local_query_plan_v2_confirmation/experimental-two-shot-system-prompt.txt), pinned in `corpus.json` at 2,683 bytes and SHA-256 `ef343d6996d9bd0fc0e881224374fa78ca574d1ab5826a65b86e1e9505025ef1`. It is referenced without copying or editing. The preview-only validation below does not load or execute that prompt; it verifies SideEffect's current request construction and checks that the product preview prompt contains only the question and fixed supported scope. No model was run.
+The candidate prompt is the existing [`experimental two-shot prompt`](../local_query_plan_v2_confirmation/experimental-two-shot-system-prompt.txt), pinned in `corpus.json` at 2,683 bytes and SHA-256 `ef343d6996d9bd0fc0e881224374fa78ca574d1ab5826a65b86e1e9505025ef1`. It is referenced without copying or editing. The preview-only validation below does not load or execute that prompt; it verifies SideEffect's current request construction and checks that the product preview prompt contains only the question and fixed supported scope. Subsequent model results are recorded separately.
 
 ## Validation
 
@@ -40,3 +40,8 @@ Hashes cover each file's exact bytes. The corpus records each trace's status, by
 | `siltwarden.trace` | 770 | `e0462981783d6fbde850b0374389c6826d9df544b9c12aca9bf253aeb57d2e57` |
 | `quincet.trace` | 626 | `380001116e6a34d18c7e9f3966402b9b67cf42d9388011a5d93453133b6c8d0f` |
 | `validate_corpus.py` | 10,486 | `7ecd6eb188808942fa0fa4291ded81d7ae8f2b3d5dab6b1df482d57419f7791f` |
+| `model_run_report.json` | 62,796 | `62b4ac63b23254e6c3dc35227c2ea275b53b042fe82a932632d841203deb6b6f` |
+
+## Candidate result
+
+The one-time OLMo-2 Q8_0 GPU evaluation failed the confirmation checks: 7/24 exact plans and 15/24 exact result sets, versus 22/24 for the fixed lexical baseline. The model generated filters for all 16 cases that required abstention. This synthetic result is a no-go and not a release gate; see [the full per-case report](model_run_report.json).
