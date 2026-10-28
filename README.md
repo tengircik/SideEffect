@@ -244,6 +244,12 @@ The broader product goal is a user-triggered, local audit on Linux and Windows. 
 
 The current capture feature is an observation aid, not a sandbox, malware detector, exhaustive computer audit, or safety verdict. A syscall attempt does not necessarily mean it succeeded, and event proximity does not prove causation. See [SECURITY.md](SECURITY.md).
 
+### Data retention and deletion
+
+SideEffect publishes persistent artifacts only at the output path you select. Traces, bundles, inventories, sessions, and reports remain there after the command exits until you delete them; SideEffect does not automatically redact or delete them. Review each artifact before sharing because it may contain paths, software names, process data, arguments, endpoints, or configuration evidence. Private file permissions do not encrypt the contents.
+
+Delete an individual file through your file manager or a command-line tool using its exact path. For example, on Linux use `rm -- ./run.trace`; on Windows PowerShell use `Remove-Item -LiteralPath .\run.trace`. To delete a bundle or session directory, select that exact directory in your file manager. Ordinary deletion does not guarantee secure erasure: filesystem snapshots, backups, or storage-device behavior may retain recoverable copies.
+
 ## Documentation
 
 - [Build and install from source](docs/INSTALL.md)
