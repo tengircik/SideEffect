@@ -57,6 +57,127 @@ fn windows_session_publishes_and_inspects_selected_source_with_private_acl() {
 }
 
 #[test]
+fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() {
+    let root = temp_dir();
+    let selected_path = root.join("selected.txt");
+    fs::write(&selected_path, b"synthetic permission target").unwrap();
+    let session = root.join("all-inventories");
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&session)
+        .arg("--packages")
+        .arg("--processes")
+        .arg("--startup")
+        .arg("--permission")
+        .arg(&selected_path)
+        .output()
+        .unwrap();
+    assert!(
+        published(&output),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for file in [
+        "software.windows.json",
+        "processes.windows.json",
+        "permissions.windows.json",
+        "startup.windows.json",
+        "session.json",
+    ] {
+        assert!(session.join(file).is_file(), "missing {file}");
+    }
+
+    let inspect = cli(&[
+        "inspect",
+        "--format",
+        "json",
+        "--session",
+        session.to_str().unwrap(),
+    ]);
+    assert!(
+        published(&inspect),
+        "{}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let review: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(review["platform"], "windows");
+    for (role, expected_scope) in [
+        ("packages", "bounded uninstall-registry registrations"),
+        (
+            "processes",
+            "visible Tool Help process snapshot and permitted image paths",
+        ),
+        (
+            "permissions",
+            "explicit caller-selected paths only; no recursion or effective-access evaluation",
+        ),
+        (
+            "startup",
+            "selected Run/RunOnce, Startup folders, services, and visible boot/logon scheduled tasks",
+        ),
+    ] {
+        let source = review["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["role"] == role)
+            .unwrap_or_else(|| panic!("missing {role} source in session review"));
+        assert_eq!(source["scope"], expected_scope);
+        assert!(source["started_at_unix_ms"].as_u64().is_some());
+        assert!(source["ended_at_unix_ms"].as_u64().is_some());
+        assert_eq!(source["artifacts"].as_array().unwrap().len(), 1);
+    }
+    assert_eq!(review["sources"].as_array().unwrap().len(), 4);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn windows_session_keeps_a_missing_selected_path_visible_as_not_applicable() {
+    let root = temp_dir();
+    let missing_path = root.join("does-not-exist.txt");
+    let session = root.join("partial");
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&session)
+        .arg("--processes")
+        .arg("--permission")
+        .arg(&missing_path)
+        .output()
+        .unwrap();
+    assert!(published(&output));
+
+    let inspect = cli(&[
+        "inspect",
+        "--format",
+        "json",
+        "--session",
+        session.to_str().unwrap(),
+    ]);
+    assert!(published(&inspect));
+    let review: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(review["status"], "partial");
+    let permissions = review["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["role"] == "permissions")
+        .unwrap();
+    assert_eq!(permissions["status"], "not_applicable");
+    assert_eq!(permissions["artifacts"].as_array().unwrap().len(), 1);
+    assert!(session.join("permissions.windows.json").is_file());
+    assert!(
+        permissions["diagnostic_codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|code| code == "source_not_present")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn windows_runtime_is_explicitly_unsupported_and_session_is_partial() {
     let root = temp_dir();
     let session = root.join("audit");
