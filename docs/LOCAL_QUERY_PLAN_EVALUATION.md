@@ -55,6 +55,21 @@ The pinned Qwen3.5-2B Q4_K_M candidate (1,312,164,352 bytes; SHA-256 `9a3d0aa6c9
 
 Resource limits are 1.5 GiB for the model file, 4 GiB address space, 120 seconds wall/CPU time, 16 KiB model output, 128 KiB corpus, and no automatic network access. The evaluator reports process-tree RSS as a sampled peak where available, not as a precise peak measurement. GPU inference has not been integrated into the SideEffect command or its sandboxed Linux runtime; CUDA measurements below are separate development experiments.
 
+### Schema and prompt development experiment — 2026-10-28
+
+After the full-gate failure, the generation schema was tightened so `syscall`, `observed_errno`, and `relation_type` use the same closed values as the Rust validator. The Rust validator remains authoritative and unchanged in behavior. This prevents a constrained decoder from emitting empty or unsupported selector strings that the application would reject.
+
+A separate, synthetic development-only corpus of 32 cases (20 answerable, 12 required abstentions; corpus SHA-256 `7c8fdd8d478db815b2d7a878efba69a2bc15199deda38372af444f12790435e6`) was checked through the real Linux `model-query-preview` command for all 32 cases, including expected fixture matches. It uses two newly authored synthetic traces and is not the frozen holdout. A 2x2 prompt/schema experiment then used the pinned Qwen3.5-2B model and llama.cpp build on a Windows RTX 3060. A direct `nvidia-smi` memory sample during a separate bounded inference rose from 740 MiB to 2,607 MiB, confirming GPU allocation for that probe; this did not measure an isolated peak or establish product GPU support.
+
+| Prompt and generation schema | Strictly valid plans | Exact answerable plans | Exact answerable result sets | Accepted filters on required abstentions |
+| --- | ---: | ---: | ---: | ---: |
+| Current prompt, closed selector enums | 32/32 | 0/20 | 3/20 | 0/12 |
+| Two-example prompt, closed selector enums | 32/32 | 4/20 | 8/20 | 0/12 |
+| Current prompt, open selector strings | 0/32 | 0/20 | 0/20 | 0/12 |
+| Two-example prompt, open selector strings | 31/32 | 4/20 | 8/20 | 0/12 |
+
+The open-string schema weakened decoder constraints and produced outputs rejected by the strict Rust validator; those invalid outputs are not counted as accepted false filters. The closed-enum schema is retained as an alignment and validity correction, but the prompt candidate is not adopted: its 20% exact-plan and 40% exact-result scores are far below the registered 85% thresholds, and it has not been run through the frozen gate. The zero accepted false-filter count is only a small synthetic development result, not a safety guarantee. This experiment is not a release-gate run and does not establish behavior on real captures. Preserve the frozen corpus, gate, and M8 no-go status.
+
 ## GPU implementation direction
 
 If a local model candidate first passes the frozen usefulness gate, prefer GPU acceleration on hardware and a backend that SideEffect can support and validate. Keep a clearly reported CPU fallback for systems without a supported accelerator. The command must report which backend actually ran and any resource-limit or fallback outcome; it must never silently claim GPU execution. GPU support must preserve explicit user opt-in, offline behavior, strict plan validation, and bounded execution. Define and validate accelerator-memory behavior for each supported backend before claiming that its resource use is bounded. GPU availability or speed does not change the model-quality gate, and this direction is not an implemented feature or a release claim.

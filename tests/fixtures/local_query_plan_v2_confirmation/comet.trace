@@ -1,0 +1,7 @@
+[pid 8101] 1723000000.000001 openat(AT_FDCWD, "/var/cache/comet/index.sqlite", {flags=O_RDWR}, 3) = -1 ENOSPC (No space left on device)
+[pid 8101] 1723000000.000002 openat2(AT_FDCWD, "/usr/share/comet/policy.json", {flags=O_RDONLY}, 4) = 4
+[pid 8102] 1723000000.000003 connect(5, {sa_family=AF_INET, sin_port=htons(9444), sin_addr=inet_addr("198.51.100.17")}, 16) = -1 ETIMEDOUT (Connection timed out)
+[pid 8103] 1723000000.000004 execve("/usr/local/sbin/comet-worker", ["comet-worker"], 0x0) = 0
+[pid 8104] 1723000000.000005 clone(child_stack=NULL, flags=SIGCHLD) = 8105
+[pid 8106] 1723000000.000006 execveat(AT_FDCWD, "/usr/libexec/comet-refresh", ["comet-refresh"], 0x0, 0) = -1 EACCES (Permission denied)
+[pid 8107] 1723000000.000007 connect(8, {sa_family=AF_INET, sin_port=htons(9445), sin_addr=inet_addr("198.51.100.18")}, 16) = -1 EINPROGRESS (Operation now in progress)

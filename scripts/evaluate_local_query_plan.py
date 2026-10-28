@@ -36,6 +36,7 @@ MODEL_TIMEOUT_SECONDS = 120
 EXPECTED_CORPUS_SHA256 = "cdd73fe2a9847a7c78f40ba1f63496ee23b65cac303d7fc423013536333dbdea"
 CORPUS_RELATIVE_PATH = Path("tests/fixtures/local_query_plan_v2/corpus.json")
 RUST_QUERY_PLAN_SOURCE = Path(__file__).resolve().parents[1] / "src" / "local_query_plan.rs"
+RUST_STRACE_SOURCE = Path(__file__).resolve().parents[1] / "src" / "trace" / "strace.rs"
 MAX_RUST_CONTRACT_SOURCE_BYTES = 1024 * 1024
 
 
@@ -43,6 +44,13 @@ def _rust_contract_source() -> str:
     raw = RUST_QUERY_PLAN_SOURCE.read_bytes()
     if len(raw) > MAX_RUST_CONTRACT_SOURCE_BYTES:
         raise RuntimeError("Rust query-plan contract source exceeds its read limit")
+    return raw.decode("utf-8", errors="strict")
+
+
+def _rust_source(path: Path) -> str:
+    raw = path.read_bytes()
+    if len(raw) > MAX_RUST_CONTRACT_SOURCE_BYTES:
+        raise RuntimeError(f"Rust contract source exceeds its read limit: {path.name}")
     return raw.decode("utf-8", errors="strict")
 
 
@@ -71,7 +79,31 @@ def _rust_integer_constant(source: str, name: str, type_name: str) -> int:
     return value
 
 
+def _rust_string_array_constant(source: str, name: str) -> list[str]:
+    matches = re.findall(
+        rf"(?:pub(?:\(crate\))?\s+)?const {re.escape(name)}:[^=]+?=\s*&?\[(.*?)\];",
+        source,
+        re.DOTALL,
+    )
+    if len(matches) != 1:
+        raise RuntimeError(f"Rust string-array constant {name} is missing or ambiguous")
+    values = re.findall(r'"([^"\r\n]*)"', matches[0])
+    if not values or len(values) != len(set(values)):
+        raise RuntimeError(f"Rust string-array constant {name} is empty or has duplicates")
+    return values
+
+
 _RUST_CONTRACT_SOURCE = _rust_contract_source()
+_RUST_STRACE_SOURCE = _rust_source(RUST_STRACE_SOURCE)
+EXPECTED_QUERY_SYSCALLS = _rust_string_array_constant(
+    _RUST_CONTRACT_SOURCE, "LOCAL_QUERY_SYSCALLS"
+)
+EXPECTED_QUERY_RELATION_TYPES = _rust_string_array_constant(
+    _RUST_CONTRACT_SOURCE, "LOCAL_QUERY_RELATION_TYPES"
+)
+EXPECTED_QUERY_ERRNOS = _rust_string_array_constant(
+    _RUST_STRACE_SOURCE, "LINUX_ERRNO_NAMES"
+)
 EXPECTED_SCHEMA_VERSION = _rust_integer_constant(
     _RUST_CONTRACT_SOURCE, "LOCAL_QUERY_PLAN_SCHEMA_VERSION", "u32"
 )
@@ -951,17 +983,17 @@ def expected_output_schema() -> dict[str, Any]:
 
     def scalar(field: str) -> dict[str, Any]:
         if field == "syscall":
-            return {"type": "string", "maxLength": 32}
+            return {"type": "string", "enum": EXPECTED_QUERY_SYSCALLS, "maxLength": 32}
         if field == "outcome":
             return {"type": "string", "enum": ["success", "failure", "in_progress", "unknown"]}
         if field == "observed_errno":
-            return {"type": "string", "maxLength": 32}
+            return {"type": "string", "enum": EXPECTED_QUERY_ERRNOS, "maxLength": 32}
         if field == "lexical_path_exact":
             return {"type": "string", "maxLength": 256}
         if field in {"process_id", "caller_task_id", "child_pid"}:
             return {"type": "integer", "minimum": 1, "maximum": 4294967295}
         if field == "relation_type":
-            return {"type": "string", "maxLength": 16}
+            return {"type": "string", "enum": EXPECTED_QUERY_RELATION_TYPES, "maxLength": 16}
         raise AssertionError(f"unexpected query filter field {field}")
 
     def strict_filter_object(properties: dict[str, Any]) -> dict[str, Any]:

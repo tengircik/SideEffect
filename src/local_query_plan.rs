@@ -47,6 +47,8 @@ const MAX_SYSCALL_NAME_BYTES: usize = 32;
 const MAX_ERRNO_NAME_BYTES: usize = 32;
 const MAX_RELATION_TYPE_BYTES: usize = 16;
 const MAX_LEXICAL_PATH_BYTES: usize = 256;
+const LOCAL_QUERY_SYSCALLS: [&str; 5] = ["execve", "execveat", "openat", "openat2", "connect"];
+const LOCAL_QUERY_RELATION_TYPES: [&str; 4] = ["fork", "vfork", "clone", "clone3"];
 
 /// Deserialize wrapper that requires a JSON key to be present even when its
 /// value is `null`. Plain `Option<T>` fields allow missing keys in Serde.
@@ -248,19 +250,31 @@ pub struct LocalQueryResult {
 pub fn local_query_plan_schema() -> Value {
     fn scalar_schema(field: &str) -> Value {
         match field {
-            "syscall" => json!({ "type": "string", "maxLength": MAX_SYSCALL_NAME_BYTES }),
+            "syscall" => json!({
+                "type": "string",
+                "enum": LOCAL_QUERY_SYSCALLS,
+                "maxLength": MAX_SYSCALL_NAME_BYTES
+            }),
             "outcome" => json!({
                 "type": "string",
                 "enum": ["success", "failure", "in_progress", "unknown"]
             }),
-            "observed_errno" => json!({ "type": "string", "maxLength": MAX_ERRNO_NAME_BYTES }),
+            "observed_errno" => json!({
+                "type": "string",
+                "enum": crate::trace::strace::LINUX_ERRNO_NAMES,
+                "maxLength": MAX_ERRNO_NAME_BYTES
+            }),
             "lexical_path_exact" => {
                 json!({ "type": "string", "maxLength": MAX_LEXICAL_PATH_BYTES })
             }
             "process_id" | "caller_task_id" | "child_pid" => json!({
                 "type": "integer", "minimum": 1, "maximum": u32::MAX
             }),
-            "relation_type" => json!({ "type": "string", "maxLength": MAX_RELATION_TYPE_BYTES }),
+            "relation_type" => json!({
+                "type": "string",
+                "enum": LOCAL_QUERY_RELATION_TYPES,
+                "maxLength": MAX_RELATION_TYPE_BYTES
+            }),
             _ => unreachable!("query schema field names are fixed internally"),
         }
     }
@@ -809,15 +823,11 @@ fn observed_errno(source: &TraceRecord) -> Option<&str> {
 }
 
 fn valid_syscall_name(value: &str) -> bool {
-    value.len() <= MAX_SYSCALL_NAME_BYTES
-        && matches!(
-            value,
-            "execve" | "execveat" | "openat" | "openat2" | "connect"
-        )
+    value.len() <= MAX_SYSCALL_NAME_BYTES && LOCAL_QUERY_SYSCALLS.contains(&value)
 }
 
 fn valid_relation_type(value: &str) -> bool {
-    value.len() <= MAX_RELATION_TYPE_BYTES && matches!(value, "fork" | "vfork" | "clone" | "clone3")
+    value.len() <= MAX_RELATION_TYPE_BYTES && LOCAL_QUERY_RELATION_TYPES.contains(&value)
 }
 
 fn valid_lexical_path(value: &str) -> bool {
@@ -1022,9 +1032,9 @@ pub fn preview_query_plan_bytes(
         user_question: question,
         supported_query_scope: QueryPromptScope {
             entities: ["syscall_result", "process_relation"],
-            syscalls: ["execve", "execveat", "openat", "openat2", "connect"],
+            syscalls: LOCAL_QUERY_SYSCALLS,
             outcomes: ["success", "failure", "in_progress", "unknown"],
-            relation_types: ["fork", "vfork", "clone", "clone3"],
+            relation_types: LOCAL_QUERY_RELATION_TYPES,
             filters: [
                 "syscall",
                 "outcome",
@@ -1585,6 +1595,19 @@ mod tests {
             assert_eq!(abstain_filters["properties"][field]["const"], Value::Null);
         }
 
+        assert_eq!(
+            root[1]["properties"]["filters"]["anyOf"][0]["properties"]["syscall"]["enum"],
+            json!(LOCAL_QUERY_SYSCALLS)
+        );
+        assert_eq!(
+            root[1]["properties"]["filters"]["anyOf"][2]["properties"]["observed_errno"]["enum"],
+            json!(crate::trace::strace::LINUX_ERRNO_NAMES)
+        );
+        assert_eq!(
+            root[2]["properties"]["filters"]["anyOf"][3]["properties"]["relation_type"]["enum"],
+            json!(LOCAL_QUERY_RELATION_TYPES)
+        );
+
         for (branch_index, entity, alternatives, irrelevant) in [
             (
                 1,
@@ -1650,6 +1673,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn query_schema_enums_and_validator_reject_empty_selector_values() {
+        let invalid_syscall = filter_plan(
+            QueryEntity::SyscallResult,
+            QueryFilters {
+                syscall: RequiredNullable::some(String::new()),
+                ..empty_filters()
+            },
+        );
+        assert!(validate_plan(&invalid_syscall).is_err());
+
+        let invalid_relation = filter_plan(
+            QueryEntity::ProcessRelation,
+            QueryFilters {
+                relation_type: RequiredNullable::some(String::new()),
+                ..empty_filters()
+            },
+        );
+        assert!(validate_plan(&invalid_relation).is_err());
     }
 
     #[test]
