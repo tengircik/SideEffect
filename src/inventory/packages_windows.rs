@@ -251,16 +251,7 @@ pub fn collect_windows_software() -> WindowsSoftwareInventoryDocument {
         sources.push(source_document);
     }
 
-    let status = if sources.iter().any(|source| {
-        !matches!(
-            source.status,
-            WindowsSoftwareStatus::Complete | WindowsSoftwareStatus::NotPresent
-        )
-    }) {
-        WindowsSoftwareStatus::Partial
-    } else {
-        WindowsSoftwareStatus::Complete
-    };
+    let status = inventory_status(&sources);
 
     WindowsSoftwareInventoryDocument {
         schema: "sideeffect.windows_software_inventory",
@@ -620,7 +611,7 @@ fn read_values(
         }
         let size = size as usize;
         let remaining = aggregate_remaining.saturating_sub(bytes_read);
-        if size > per_value_limit || size > remaining {
+        if !value_data_fits(size, per_value_limit, remaining) {
             diagnostics.push(diagnostic(
                 "registration_value_data_limit_exceeded",
                 Some(registration_index),
@@ -670,38 +661,60 @@ fn read_values(
         }
         data.truncate(actual_size);
         bytes_read = bytes_read.saturating_add(actual_size);
-        let (type_name, text) = decode_value_text(value_type, &data);
-        if type_name == "unsupported" {
+        let (value, diagnostic_code) = decode_registry_value(name, value_type, &data);
+        if let Some(code) = diagnostic_code {
+            let message = match code {
+                "registration_value_type_unsupported" => {
+                    "A selected registration value had a non-string type; exact bytes were retained without interpretation."
+                }
+                "registration_value_malformed_length" => {
+                    "A selected string registry value had an odd byte length; exact bytes were retained without a display string."
+                }
+                _ => {
+                    "A selected string registry value contained invalid UTF-16; exact bytes were retained without a display string."
+                }
+            };
             diagnostics.push(diagnostic(
-                "registration_value_type_unsupported",
+                code,
                 Some(registration_index),
                 Some(name),
-                "A selected registration value had a non-string type; exact bytes were retained without interpretation.",
-            ));
-        } else if matches!(value_type, REG_SZ | REG_EXPAND_SZ) && data.len() % 2 != 0 {
-            diagnostics.push(diagnostic(
-                "registration_value_malformed_length",
-                Some(registration_index),
-                Some(name),
-                "A selected string registry value had an odd byte length; exact bytes were retained without a display string.",
-            ));
-        } else if text.is_none() && matches!(value_type, REG_SZ | REG_EXPAND_SZ) {
-            diagnostics.push(diagnostic(
-                "registration_value_malformed_utf16",
-                Some(registration_index),
-                Some(name),
-                "A selected string registry value contained invalid UTF-16; exact bytes were retained without a display string.",
+                message,
             ));
         }
-        values.push(WindowsRegistryValue {
+        values.push(value);
+    }
+    (values, diagnostics, bytes_read)
+}
+
+fn value_data_fits(size: usize, per_value_limit: usize, aggregate_remaining: usize) -> bool {
+    size <= per_value_limit && size <= aggregate_remaining
+}
+
+fn decode_registry_value(
+    name: &'static str,
+    value_type: u32,
+    data: &[u8],
+) -> (WindowsRegistryValue, Option<&'static str>) {
+    let (type_name, text) = decode_value_text(value_type, data);
+    let diagnostic_code = if type_name == "unsupported" {
+        Some("registration_value_type_unsupported")
+    } else if matches!(value_type, REG_SZ | REG_EXPAND_SZ) && data.len() % 2 != 0 {
+        Some("registration_value_malformed_length")
+    } else if text.is_none() && matches!(value_type, REG_SZ | REG_EXPAND_SZ) {
+        Some("registration_value_malformed_utf16")
+    } else {
+        None
+    };
+    (
+        WindowsRegistryValue {
             name,
             registry_type: value_type,
             type_name,
             text,
-            raw_data_hex: bytes_hex(&data),
-        });
-    }
-    (values, diagnostics, bytes_read)
+            raw_data_hex: bytes_hex(data),
+        },
+        diagnostic_code,
+    )
 }
 
 fn decode_value_text(value_type: u32, data: &[u8]) -> (&'static str, Option<String>) {
@@ -738,6 +751,19 @@ fn source_result(
         registry_key: UNINSTALL_KEY,
         registry_view: source.view,
         diagnostics,
+    }
+}
+
+fn inventory_status(sources: &[WindowsSoftwareSource]) -> WindowsSoftwareStatus {
+    if sources.iter().any(|source| {
+        !matches!(
+            source.status,
+            WindowsSoftwareStatus::Complete | WindowsSoftwareStatus::NotPresent
+        )
+    }) {
+        WindowsSoftwareStatus::Partial
+    } else {
+        WindowsSoftwareStatus::Complete
     }
 }
 
@@ -817,11 +843,47 @@ mod tests {
 
     #[test]
     fn malformed_and_non_string_values_are_not_guessed() {
-        assert_eq!(decode_value_text(REG_SZ, &[0x41]), ("REG_SZ", None));
-        assert_eq!(decode_value_text(REG_SZ, &[0x00, 0xd8]), ("REG_SZ", None));
-        assert_eq!(decode_value_text(4, &[1, 2, 3, 4]), ("unsupported", None));
+        let (odd_length, odd_diagnostic) = decode_registry_value("DisplayName", REG_SZ, &[0x41]);
+        assert_eq!(odd_length.text, None);
+        assert_eq!(odd_length.raw_data_hex, "41");
+        assert_eq!(odd_diagnostic, Some("registration_value_malformed_length"));
+
+        let (invalid_utf16, utf16_diagnostic) =
+            decode_registry_value("DisplayName", REG_SZ, &[0x00, 0xd8]);
+        assert_eq!(invalid_utf16.text, None);
+        assert_eq!(invalid_utf16.raw_data_hex, "00d8");
+        assert_eq!(utf16_diagnostic, Some("registration_value_malformed_utf16"));
+
+        let (unsupported, unsupported_diagnostic) =
+            decode_registry_value("DisplayName", 4, &[1, 2, 3, 4]);
+        assert_eq!(unsupported.text, None);
+        assert_eq!(unsupported.raw_data_hex, "01020304");
+        assert_eq!(
+            unsupported_diagnostic,
+            Some("registration_value_type_unsupported")
+        );
         assert_eq!(bytes_hex(&[0, 255]), "00ff");
         assert_eq!(utf16_hex(&[0xd800]), "d800");
+    }
+
+    #[test]
+    fn registry_value_size_limits_accept_boundary_and_reject_one_byte_over() {
+        let limit = MAX_VALUE_DATA_BYTES;
+        assert!(value_data_fits(limit, limit, limit));
+        assert!(!value_data_fits(limit + 1, limit, limit + 1));
+        assert!(!value_data_fits(limit, limit, limit - 1));
+    }
+
+    #[test]
+    fn uninstall_commands_are_preserved_as_literal_unexpanded_data() {
+        let command = r#"%SystemRoot%\System32\uninstall.exe /quiet"#;
+        let bytes = utf16_bytes(command);
+        for name in ["UninstallString", "QuietUninstallString"] {
+            let (value, diagnostic) = decode_registry_value(name, REG_EXPAND_SZ, &bytes);
+            assert_eq!(diagnostic, None);
+            assert_eq!(value.text.as_deref(), Some(command));
+            assert_eq!(value.raw_data_hex, bytes_hex(&bytes));
+        }
     }
 
     #[test]
@@ -851,5 +913,36 @@ mod tests {
             WindowsSoftwareStatus::NotPresent
         );
         assert_eq!(source_open_status(1234), WindowsSoftwareStatus::Error);
+    }
+
+    #[test]
+    fn inaccessible_registry_source_makes_inventory_partial() {
+        let inaccessible = source_result(
+            REGISTRY_SOURCES[2],
+            WindowsSoftwareStatus::Inaccessible,
+            0,
+            vec![diagnostic(
+                "uninstall_key_unavailable",
+                None,
+                None,
+                "Windows could not open this uninstall registry view.",
+            )],
+        );
+        assert_eq!(inaccessible.status, WindowsSoftwareStatus::Inaccessible);
+        assert_eq!(
+            inaccessible.diagnostics[0].code,
+            "uninstall_key_unavailable"
+        );
+
+        let present_but_missing = source_result(
+            REGISTRY_SOURCES[0],
+            WindowsSoftwareStatus::NotPresent,
+            0,
+            Vec::new(),
+        );
+        assert_eq!(
+            inventory_status(&[present_but_missing, inaccessible]),
+            WindowsSoftwareStatus::Partial
+        );
     }
 }
