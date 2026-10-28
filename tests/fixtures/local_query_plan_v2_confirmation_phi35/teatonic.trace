@@ -1,0 +1,7 @@
+[pid 83521] openat(AT_FDCWD, "/usr/share/teatonic/lang/grammar.bin", {flags=O_RDONLY}, 3) = 4
+[pid 83522] openat(AT_FDCWD, "/usr/share/teatonic/lang/rare.dat", {flags=O_RDONLY}, 3) = -1 ENOMSG (No message of desired type)
+[pid 83523] clone(child_stack=NULL, flags=SIGCHLD) = 83524
+[pid 83525] vfork() = 83526
+[pid 83527] execveat(AT_FDCWD, "/opt/teatonic/bin/tokenizer", ["tokenizer"], 0x0, 0) = 0
+[pid 83528] connect(25, {sa_family=AF_INET, sin_port=htons(24443), sin_addr=inet_addr("192.0.2.247")}, 16) = -1 ECONNRESET (Connection reset by peer)
+[pid 83529] openat2(AT_FDCWD, "/var/cache/teatonic/plan/e1x.snap", {flags=O_RDONLY}, 8) = 8
