@@ -425,7 +425,10 @@ fn current_user_security_descriptor() -> io::Result<LocalAllocation> {
             "Windows returned an invalid SID string",
         )
     })?;
-    let sddl = format!("D:P(A;;GA;;;{sid})");
+    // Pin the object owner to the token's user SID. Elevated runners may have a
+    // different default owner (for example the Administrators group); the
+    // private DACL alone does not guarantee that the creator's user SID owns it.
+    let sddl = format!("O:{sid}D:P(A;;GA;;;{sid})");
     let sddl = wide_z(OsStr::new(&sddl))?;
     let mut descriptor = null_mut();
     if unsafe {

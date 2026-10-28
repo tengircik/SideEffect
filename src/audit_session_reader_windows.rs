@@ -551,7 +551,7 @@ mod tests {
     use crate::audit_session::{ArtifactKind, SessionArtifactRef};
 
     #[test]
-    fn reader_accepts_the_publisher_dacl() {
+    fn publisher_owner_is_the_current_user_and_reader_accepts_its_private_dacl() {
         let root =
             std::env::temp_dir().join(format!("sideeffect-session-acl-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -560,6 +560,7 @@ mod tests {
         let files = [("session.json", b"fixture".as_slice())];
         crate::record::publish_private_windows_directory(&destination, &files, 1024).unwrap();
         assert!(owner_only_acl(&destination).unwrap());
+        assert!(owner_only_acl(&destination.join("session.json")).unwrap());
         std::fs::remove_dir_all(root).unwrap();
     }
 
