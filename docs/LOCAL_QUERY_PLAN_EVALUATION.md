@@ -4,7 +4,7 @@
 
 ## Select a query model
 
-On Linux x86_64, inspect the pinned candidates and their explicit no-go quality status with `sideeffect model list`, then use `sideeffect model show ID` for one entry. The catalog currently contains query-plan models only. To install a listed candidate, run `sideeffect model install ID`, review its pinned source, revision, exact size, license terms, platform scope, and evaluation note, then type exactly `ACCEPT <license-id>`. This acceptance is saved locally against that model ID, revision, license ID, and terms URL before the HTTPS request. It may remain saved if the transfer fails or is cancelled. Downloads are size-capped, SHA-256 checked, staged in the private per-user model store, and published without replacing an existing file. The manager does not install or select the runtime.
+On Linux x86_64, inspect the pinned query-plan candidates and their explicit no-go quality status with `sideeffect model list`, then use `sideeffect model show ID` for one entry. To install and select a listed candidate in one guided step, run `sideeffect model setup ID`, review its pinned source, revision, exact size, license terms, platform scope, and evaluation note, then type exactly `ACCEPT <license-id>`. Alternatively, `sideeffect model install ID` downloads without selecting. License acceptance is saved locally against that model ID, revision, license ID, and terms URL before the HTTPS request. It may remain saved if the transfer fails or is cancelled. Downloads are size-capped, SHA-256 checked, staged in the private per-user model store, and published without replacing an existing file. The manager does not install the runtime.
 
 ```sh
 sideeffect model list
