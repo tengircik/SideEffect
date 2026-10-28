@@ -1,0 +1,4 @@
+[pid 52864] clone(child_stack=NULL, flags=SIGCHLD) = 52865
+[pid 52861] openat2(AT_FDCWD, "/var/opt/copperveil/vault/reef.db", {flags=O_RDWR}, 7) = -1 EROFS (Read-only file system)
+[pid 52862] connect(14, {sa_family=AF_INET, sin_port=htons(11443), sin_addr=inet_addr("192.0.2.252")}, 16) = -1 EHOSTUNREACH (No route to host)
+[pid 52863] execve("/opt/copperveil/bin/archivist", ["archivist"], 0x0) = 0

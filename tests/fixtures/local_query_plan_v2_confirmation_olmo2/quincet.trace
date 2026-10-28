@@ -1,0 +1,7 @@
+[pid 74021] openat(AT_FDCWD, "/usr/share/quincet/tables/glyph.map", {flags=O_RDONLY}, 3) = 5
+[pid 74022] openat(AT_FDCWD, "/usr/share/quincet/tables/optional.map", {flags=O_RDONLY}, 3) = -1 ENODATA (No data available)
+[pid 74023] clone(child_stack=NULL, flags=SIGCHLD) = 74024
+[pid 74025] vfork() = 74026
+[pid 74027] execveat(AT_FDCWD, "/opt/quincet/bin/glyphd", ["glyphd"], 0x0, 0) = 0
+[pid 74028] connect(10, {sa_family=AF_INET, sin_port=htons(15443), sin_addr=inet_addr("203.0.113.252")}, 16) = -1 ECONNREFUSED (Connection refused)
+[pid 74029] openat2(AT_FDCWD, "/var/lib/quincet/catalog/v3.snap", {flags=O_RDONLY}, 3) = 4
