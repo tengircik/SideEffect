@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import json
 import os
 import re
 import signal
+import stat
 import statistics
 import subprocess
 import sys
@@ -36,6 +38,7 @@ REGISTERED_PERMUTATION_GROUP_SIZES = {
     "path_source_order": 4,
 }
 MAX_TRACE_FIXTURE_BYTES = 32 * 1024 * 1024
+MAX_MODEL_BYTES = 512 * 1024 * 1024
 EXPECTED_MODEL_SHA256 = "da2572f16c06133561ce56accaa822216f2391ef4d37fba427801cd6736417d4"
 EXPECTED_MODEL_REPOSITORY_REVISION = "a41486f827d17edd055fe6b3b0ba3f8d427c0519"
 EXPECTED_RUNTIME_SOURCE_REVISION = "4762ad7316dcdec20016ab5985fb46a27902204d"
@@ -46,6 +49,31 @@ class OutputLimitExceeded(RuntimeError):
     """A child exceeded the evaluator's bounded stdout/stderr capture."""
 
 
+def verify_model_candidate(path: Path) -> Path:
+    """Verify the exact pinned model through a no-follow bounded file handle."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_MODEL_BYTES:
+            raise ValueError("model candidate must be a bounded regular file")
+        hasher = hashlib.sha256()
+        total = 0
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                total += len(chunk)
+                if total > MAX_MODEL_BYTES:
+                    raise ValueError("model candidate exceeds the evaluator's file-size limit")
+                hasher.update(chunk)
+        if hasher.hexdigest() != EXPECTED_MODEL_SHA256:
+            raise ValueError("model file SHA-256 does not match the evaluator's pinned candidate")
+        return path.absolute()
+    finally:
+        os.close(descriptor)
+
+
 @dataclass
 class RunResult:
     returncode: int
@@ -53,7 +81,7 @@ class RunResult:
     stderr: str
 
 
-def run(arguments: list[str], timeout: int = 30) -> RunResult:
+def run(arguments: list[str], timeout: int = 30, *, env: dict[str, str] | None = None) -> RunResult:
     process = subprocess.Popen(
         arguments,
         stdin=subprocess.DEVNULL,
@@ -61,6 +89,7 @@ def run(arguments: list[str], timeout: int = 30) -> RunResult:
         stderr=subprocess.PIPE,
         text=False,
         shell=False,
+        env=env,
         start_new_session=os.name == "posix",
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
     )
@@ -392,7 +421,7 @@ def valid_selection(
         or analysis.get("schema_version") != EXPECTED_SCHEMA_VERSION
         or analysis.get("request_sha256") != request_sha256
         or analysis.get("model_sha256") != EXPECTED_MODEL_SHA256
-        or analysis.get("model_repository_revision") != EXPECTED_MODEL_REPOSITORY_REVISION
+        or analysis.get("model_repository_revision") != "user-provided"
         or analysis.get("runtime_source_revision") != EXPECTED_RUNTIME_SOURCE_REVISION
         or analysis.get("selection_label") != EXPECTED_SELECTION_LABEL
     ):
@@ -424,7 +453,7 @@ def validate_preview(preview: Any) -> dict[str, Any]:
         preview.get("schema") != "sideeffect.local_model_preview"
         or preview.get("schema_version") != EXPECTED_SCHEMA_VERSION
         or preview.get("model_sha256") != EXPECTED_MODEL_SHA256
-        or preview.get("model_repository_revision") != EXPECTED_MODEL_REPOSITORY_REVISION
+        or preview.get("model_repository_revision") != "user-provided"
         or preview.get("runtime_source_revision") != EXPECTED_RUNTIME_SOURCE_REVISION
         or not isinstance(preview.get("request_sha256"), str)
         or not re.fullmatch(r"[0-9a-f]{64}", preview["request_sha256"])
@@ -653,8 +682,33 @@ def main() -> int:
         provenance = repository_provenance(repository, require_clean=not args.preview_only)
         root, corpus = load_corpus(args.corpus, enforce_preregistered=True)
         fixture_dir, trace_paths = prepare_verified_fixtures(root, corpus)
+        atexit.register(fixture_dir.cleanup)
+        model_path = verify_model_candidate(args.model)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         parser.error(f"cannot read corpus: {error}")
+
+    model_store = tempfile.TemporaryDirectory(prefix="sideeffect-eval-model-store-")
+    atexit.register(model_store.cleanup)
+    sideeffect_env = os.environ.copy()
+    sideeffect_env["XDG_DATA_HOME"] = model_store.name
+    try:
+        registered = run(
+            [str(args.sideeffect), "model", "add", "--name", "Pinned evaluation candidate",
+             "--path", str(model_path), "--for", "evidence"],
+            env=sideeffect_env,
+        )
+        if registered.returncode != 0:
+            raise ValueError(f"could not register pinned evaluation model: {registered.stderr.strip()}")
+        model_id = f"custom-{EXPECTED_MODEL_SHA256[:16]}"
+        selected = run(
+            [str(args.sideeffect), "model", "select", "evidence", model_id],
+            env=sideeffect_env,
+        )
+        if selected.returncode != 0:
+            raise ValueError(f"could not select pinned evaluation model: {selected.stderr.strip()}")
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        model_store.cleanup()
+        parser.error(str(error))
 
     outcomes: list[dict[str, Any]] = []
     preview_results: list[dict[str, Any]] = []
@@ -663,7 +717,8 @@ def main() -> int:
 
         try:
             preview_result = run(
-                [str(args.sideeffect), "model-preview", "--question", case["question"], str(trace)]
+                [str(args.sideeffect), "model-preview", "--question", case["question"], str(trace)],
+                env=sideeffect_env,
             )
         except (OutputLimitExceeded, subprocess.TimeoutExpired) as error:
             print(f"{case['id']}: preview process exceeded its output/time bound: {error}", file=sys.stderr)
@@ -729,10 +784,11 @@ def main() -> int:
             analysis_result = run(
                 [
                     str(args.sideeffect), "model-analyze", "--question", case["question"],
-                    "--runtime", str(args.runtime), "--model", str(args.model),
+                    "--runtime", str(args.runtime),
                     "--confirm-sha256", digest, str(trace),
                 ],
                 timeout=150,
+                env=sideeffect_env,
             )
             elapsed = time.perf_counter() - started
         except subprocess.TimeoutExpired:
@@ -803,6 +859,7 @@ def main() -> int:
             )
         )
         fixture_dir.cleanup()
+        model_store.cleanup()
         return 0
 
     total = len(outcomes)
@@ -880,6 +937,7 @@ def main() -> int:
         )
     )
     fixture_dir.cleanup()
+    model_store.cleanup()
     return 0 if all(value is True for value in acceptance.values() if isinstance(value, bool)) else 2
 
 

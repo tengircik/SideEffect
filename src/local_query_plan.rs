@@ -933,10 +933,16 @@ pub struct LocalQueryPlanPreview {
     pub schema_version: u32,
     pub question: String,
     pub request_sha256: String,
-    pub model_repository: &'static str,
-    pub model_sha256: &'static str,
-    pub model_repository_revision: &'static str,
+    pub model_id: String,
+    pub model_repository: String,
+    pub model_sha256: String,
+    pub model_source: crate::model_manager::ModelSource,
+    pub license_id: Option<String>,
+    pub license_status: &'static str,
+    pub evaluation_status: crate::model_manager::EvaluationStatus,
+    pub model_repository_revision: String,
     pub runtime_source_revision: &'static str,
+    pub backend: &'static str,
     pub trace_sha256: String,
     pub system_prompt: &'static str,
     /// JSON string sent to the model; it contains only the question and fixed scope.
@@ -953,9 +959,15 @@ pub struct LocalQueryPlanAnalysis {
     pub schema: &'static str,
     pub schema_version: u32,
     pub request_sha256: String,
-    pub model_sha256: &'static str,
-    pub model_repository_revision: &'static str,
+    pub model_id: String,
+    pub model_sha256: String,
+    pub model_source: crate::model_manager::ModelSource,
+    pub license_id: Option<String>,
+    pub license_status: &'static str,
+    pub evaluation_status: crate::model_manager::EvaluationStatus,
+    pub model_repository_revision: String,
     pub runtime_source_revision: &'static str,
+    pub backend: &'static str,
     pub execution_status: QueryExecutionStatus,
     pub query_plan: LocalQueryPlan,
     pub matched_evidence: Vec<MatchedEvidence>,
@@ -982,11 +994,17 @@ struct QueryPreviewDigest<'a> {
     schema: &'static str,
     schema_version: u32,
     trace_sha256: &'a str,
-    model_repository: &'static str,
-    model_sha256: &'static str,
-    model_repository_revision: &'static str,
+    model_id: &'a str,
+    model_repository: &'a str,
+    model_sha256: &'a str,
+    model_source: &'a crate::model_manager::ModelSource,
+    license_id: &'a Option<String>,
+    license_status: &'static str,
+    evaluation_status: crate::model_manager::EvaluationStatus,
+    model_repository_revision: &'a str,
     runtime_source_revision: &'static str,
     runtime_version: &'static str,
+    backend: &'static str,
     system_prompt: &'static str,
     prompt: &'a str,
     output_schema: &'a Value,
@@ -997,6 +1015,15 @@ pub fn preview_query_plan_bytes(
     trace_bytes: &[u8],
     question: &str,
 ) -> Result<LocalQueryPlanPreview, String> {
+    preview_query_plan_bytes_for_model(trace_bytes, question, &pinned_query_model())
+}
+
+pub fn preview_query_plan_bytes_for_model(
+    trace_bytes: &[u8],
+    question: &str,
+    model: &crate::model_manager::ResolvedModel,
+) -> Result<LocalQueryPlanPreview, String> {
+    crate::local_model::validate_resolved_model(model, LOCAL_QUERY_PLAN_MAX_MODEL_BYTES)?;
     if trace_bytes.len() > crate::limits::MAX_TRACE_BYTES {
         return Err(format!(
             "trace input exceeds the {} byte limit",
@@ -1050,15 +1077,41 @@ pub fn preview_query_plan_bytes(
     .map_err(|_| "could not encode the fixed local query prompt".to_owned())?;
     let output_schema = local_query_plan_schema();
     let trace_sha256 = crate::local_model::sha256_hex(trace_bytes);
+    let (model_repository, model_repository_revision) = match &model.source {
+        crate::model_manager::ModelSource::Catalog {
+            repository,
+            revision,
+            ..
+        } => (repository.clone(), revision.clone()),
+        crate::model_manager::ModelSource::UserProvided => {
+            ("user-provided".to_owned(), "user-provided".to_owned())
+        }
+    };
+    let license_status = if model.license_id.is_some() {
+        match &model.source {
+            crate::model_manager::ModelSource::Catalog { .. } => {
+                "catalog_declared_not_legal_advice"
+            }
+            crate::model_manager::ModelSource::UserProvided => "user_provided_unverified",
+        }
+    } else {
+        "not_provided"
+    };
     let digest_material = serde_json::to_vec(&QueryPreviewDigest {
         schema: "sideeffect.local_query_plan_preview",
         schema_version: LOCAL_QUERY_PLAN_SCHEMA_VERSION,
         trace_sha256: &trace_sha256,
-        model_repository: LOCAL_QUERY_PLAN_MODEL_REPOSITORY,
-        model_sha256: LOCAL_QUERY_PLAN_MODEL_SHA256,
-        model_repository_revision: LOCAL_QUERY_PLAN_MODEL_REVISION,
+        model_id: &model.id,
+        model_repository: &model_repository,
+        model_sha256: &model.sha256,
+        model_source: &model.source,
+        license_id: &model.license_id,
+        license_status,
+        evaluation_status: model.evaluation,
+        model_repository_revision: &model_repository_revision,
         runtime_source_revision: LOCAL_QUERY_PLAN_RUNTIME_REVISION,
         runtime_version: LOCAL_QUERY_PLAN_RUNTIME_VERSION,
+        backend: "cpu",
         system_prompt: LOCAL_QUERY_PLAN_SYSTEM_PROMPT,
         prompt: &prompt,
         output_schema: &output_schema,
@@ -1071,10 +1124,16 @@ pub fn preview_query_plan_bytes(
         schema_version: LOCAL_QUERY_PLAN_SCHEMA_VERSION,
         question: question.to_owned(),
         request_sha256,
-        model_repository: LOCAL_QUERY_PLAN_MODEL_REPOSITORY,
-        model_sha256: LOCAL_QUERY_PLAN_MODEL_SHA256,
-        model_repository_revision: LOCAL_QUERY_PLAN_MODEL_REVISION,
+        model_id: model.id.clone(),
+        model_repository,
+        model_sha256: model.sha256.clone(),
+        model_source: model.source.clone(),
+        license_id: model.license_id.clone(),
+        license_status,
+        evaluation_status: model.evaluation,
+        model_repository_revision,
         runtime_source_revision: LOCAL_QUERY_PLAN_RUNTIME_REVISION,
+        backend: "cpu",
         trace_sha256,
         system_prompt: LOCAL_QUERY_PLAN_SYSTEM_PROMPT,
         prompt,
@@ -1083,6 +1142,24 @@ pub fn preview_query_plan_bytes(
         queryable_facts,
         coverage,
     })
+}
+
+fn pinned_query_model() -> crate::model_manager::ResolvedModel {
+    crate::model_manager::ResolvedModel {
+        id: "pinned-query-plan".to_owned(),
+        name: "Pinned query-plan model".to_owned(),
+        path: std::path::PathBuf::new(),
+        size_bytes: LOCAL_QUERY_PLAN_MAX_MODEL_BYTES,
+        sha256: LOCAL_QUERY_PLAN_MODEL_SHA256.to_owned(),
+        source: crate::model_manager::ModelSource::Catalog {
+            repository: LOCAL_QUERY_PLAN_MODEL_REPOSITORY.to_owned(),
+            revision: LOCAL_QUERY_PLAN_MODEL_REVISION.to_owned(),
+            filename: "model.gguf".to_owned(),
+        },
+        license_id: Some("Apache-2.0".to_owned()),
+        evaluation: crate::model_manager::EvaluationStatus::FailedTriage,
+        recommended: false,
+    }
 }
 
 /// Run pinned local inference only after the caller confirms the exact preview
@@ -1096,13 +1173,50 @@ pub fn analyze_query_plan_bytes(
     model_path: &Path,
     confirmed_request_sha256: &str,
 ) -> Result<LocalQueryPlanAnalysis, String> {
+    analyze_query_plan_bytes_with_model(
+        trace_bytes,
+        question,
+        runtime_path,
+        model_path,
+        &pinned_query_model(),
+        confirmed_request_sha256,
+    )
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn analyze_query_plan_bytes_for_model(
+    trace_bytes: &[u8],
+    question: &str,
+    runtime_path: &Path,
+    model: &crate::model_manager::ResolvedModel,
+    confirmed_request_sha256: &str,
+) -> Result<LocalQueryPlanAnalysis, String> {
+    analyze_query_plan_bytes_with_model(
+        trace_bytes,
+        question,
+        runtime_path,
+        &model.path,
+        model,
+        confirmed_request_sha256,
+    )
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn analyze_query_plan_bytes_with_model(
+    trace_bytes: &[u8],
+    question: &str,
+    runtime_path: &Path,
+    model_path: &Path,
+    selected_model: &crate::model_manager::ResolvedModel,
+    confirmed_request_sha256: &str,
+) -> Result<LocalQueryPlanAnalysis, String> {
     use crate::local_model_runtime::{
         TempDirectory, create_private_temp_dir, run_bounded, run_bounded_with_address_space_limit,
         write_private_file,
     };
     use std::ffi::OsString;
 
-    let preview = preview_query_plan_bytes(trace_bytes, question)?;
+    let preview = preview_query_plan_bytes_for_model(trace_bytes, question, selected_model)?;
     if confirmed_request_sha256 != preview.request_sha256 {
         return Err(format!(
             "preview digest mismatch; review the query-plan preview and confirm its request_sha256 ({})",
@@ -1142,9 +1256,17 @@ pub fn analyze_query_plan_bytes(
     crate::local_model::copy_verified_model(
         &model,
         &staged_model,
-        LOCAL_QUERY_PLAN_MODEL_SHA256,
+        &preview.model_sha256,
         LOCAL_QUERY_PLAN_MAX_MODEL_BYTES,
     )?;
+    if selected_model.id != "pinned-query-plan"
+        && std::fs::metadata(&staged_model)
+            .map_err(|error| format!("could not verify staged model size: {error}"))?
+            .len()
+            != selected_model.size_bytes
+    {
+        return Err("selected local model size changed after selection".to_owned());
+    }
     let schema_path = temporary.join("query-plan-schema.json");
     let schema_bytes = serde_json::to_vec(&preview.output_schema)
         .map_err(|_| "could not encode local query-plan schema".to_owned())?;
@@ -1216,9 +1338,15 @@ pub fn analyze_query_plan_bytes(
         schema: "sideeffect.local_query_plan_analysis",
         schema_version: LOCAL_QUERY_PLAN_SCHEMA_VERSION,
         request_sha256: preview.request_sha256,
-        model_sha256: LOCAL_QUERY_PLAN_MODEL_SHA256,
-        model_repository_revision: LOCAL_QUERY_PLAN_MODEL_REVISION,
+        model_id: preview.model_id,
+        model_sha256: preview.model_sha256,
+        model_source: preview.model_source,
+        license_id: preview.license_id,
+        license_status: preview.license_status,
+        evaluation_status: preview.evaluation_status,
+        model_repository_revision: preview.model_repository_revision,
         runtime_source_revision: LOCAL_QUERY_PLAN_RUNTIME_REVISION,
+        backend: "cpu",
         execution_status: result.execution_status,
         query_plan: result.query_plan,
         matched_evidence: result.matched_evidence,
@@ -1234,7 +1362,44 @@ pub fn analyze_query_plan_bytes(
     _model_path: &Path,
     confirmed_request_sha256: &str,
 ) -> Result<LocalQueryPlanAnalysis, String> {
-    let preview = preview_query_plan_bytes(trace_bytes, question)?;
+    analyze_query_plan_bytes_with_model(
+        trace_bytes,
+        question,
+        _runtime_path,
+        _model_path,
+        &pinned_query_model(),
+        confirmed_request_sha256,
+    )
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub fn analyze_query_plan_bytes_for_model(
+    trace_bytes: &[u8],
+    question: &str,
+    runtime_path: &Path,
+    model: &crate::model_manager::ResolvedModel,
+    confirmed_request_sha256: &str,
+) -> Result<LocalQueryPlanAnalysis, String> {
+    analyze_query_plan_bytes_with_model(
+        trace_bytes,
+        question,
+        runtime_path,
+        &model.path,
+        model,
+        confirmed_request_sha256,
+    )
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn analyze_query_plan_bytes_with_model(
+    trace_bytes: &[u8],
+    question: &str,
+    _runtime_path: &Path,
+    _model_path: &Path,
+    selected_model: &crate::model_manager::ResolvedModel,
+    confirmed_request_sha256: &str,
+) -> Result<LocalQueryPlanAnalysis, String> {
+    let preview = preview_query_plan_bytes_for_model(trace_bytes, question, selected_model)?;
     if confirmed_request_sha256 != preview.request_sha256 {
         return Err(format!(
             "preview digest mismatch; review the query-plan preview and confirm its request_sha256 ({})",

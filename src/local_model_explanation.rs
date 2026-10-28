@@ -54,12 +54,19 @@ pub struct LocalModelExplanationPreview {
     pub question: String,
     pub request_sha256: String,
     pub backend_preference: ExplanationBackendPreference,
-    pub model_repository: &'static str,
-    pub model_revision: &'static str,
-    pub model_filename: &'static str,
+    pub model_id: String,
+    pub model_repository: String,
+    pub model_revision: String,
+    pub model_filename: String,
     pub model_size_bytes: u64,
-    pub model_sha256: &'static str,
+    pub model_sha256: String,
+    pub model_source: crate::model_manager::ModelSource,
+    pub license_id: Option<String>,
+    pub license_status: &'static str,
+    pub evaluation_status: crate::model_manager::EvaluationStatus,
     pub runtime_source_revision: &'static str,
+    pub runtime_version: &'static str,
+    pub backend: &'static str,
     pub system_prompt: &'static str,
     /// Exact UTF-8 JSON user message sent to the local model after confirmation.
     pub prompt: String,
@@ -131,12 +138,19 @@ struct DigestMaterial<'a> {
     trace_sha256: String,
     question: &'a str,
     backend_preference: ExplanationBackendPreference,
-    model_repository: &'static str,
-    model_revision: &'static str,
-    model_filename: &'static str,
+    model_id: &'a str,
+    model_repository: &'a str,
+    model_revision: &'a str,
+    model_filename: &'a str,
     model_size_bytes: u64,
-    model_sha256: &'static str,
+    model_sha256: &'a str,
+    model_source: &'a crate::model_manager::ModelSource,
+    license_id: &'a Option<String>,
+    license_status: &'static str,
+    evaluation_status: crate::model_manager::EvaluationStatus,
     runtime_source_revision: &'static str,
+    runtime_version: &'static str,
+    backend: &'static str,
     system_prompt: &'static str,
     prompt: &'a str,
     output_schema: &'a Value,
@@ -151,9 +165,16 @@ pub struct LocalModelExplanation {
     pub backend_used: &'static str,
     pub backend_status: &'static str,
     pub runtime_containment_note: &'static str,
-    pub model_sha256: &'static str,
-    pub model_revision: &'static str,
+    pub model_id: String,
+    pub model_sha256: String,
+    pub model_source: crate::model_manager::ModelSource,
+    pub license_id: Option<String>,
+    pub license_status: &'static str,
+    pub evaluation_status: crate::model_manager::EvaluationStatus,
+    pub model_revision: String,
     pub runtime_source_revision: &'static str,
+    pub runtime_version: &'static str,
+    pub backend: &'static str,
     pub evidence_summary: Value,
     pub interpretation: LocalModelExplanationOutput,
 }
@@ -164,6 +185,21 @@ pub fn preview_model_explanation_bytes(
     question: &str,
     backend_preference: ExplanationBackendPreference,
 ) -> Result<LocalModelExplanationPreview, String> {
+    preview_model_explanation_bytes_for_model(
+        trace_bytes,
+        question,
+        backend_preference,
+        &pinned_explanation_model(),
+    )
+}
+
+pub fn preview_model_explanation_bytes_for_model(
+    trace_bytes: &[u8],
+    question: &str,
+    backend_preference: ExplanationBackendPreference,
+    model: &crate::model_manager::ResolvedModel,
+) -> Result<LocalModelExplanationPreview, String> {
+    crate::local_model::validate_resolved_model(model, EXPLANATION_MODEL_SIZE_BYTES)?;
     if trace_bytes.len() > crate::limits::MAX_TRACE_BYTES {
         return Err(format!(
             "trace input exceeds the {} byte limit",
@@ -193,18 +229,47 @@ pub fn preview_model_explanation_bytes(
     }
     let evidence_ids = allowed_evidence_ids(&source_preview)?;
     let output_schema = explanation_output_schema(&evidence_ids);
+    let (model_repository, model_revision, model_filename) = match &model.source {
+        crate::model_manager::ModelSource::Catalog {
+            repository,
+            revision,
+            filename,
+        } => (repository.clone(), revision.clone(), filename.clone()),
+        crate::model_manager::ModelSource::UserProvided => (
+            "user-provided".to_owned(),
+            "user-provided".to_owned(),
+            "user-provided".to_owned(),
+        ),
+    };
+    let license_status = if model.license_id.is_some() {
+        match &model.source {
+            crate::model_manager::ModelSource::Catalog { .. } => {
+                "catalog_declared_not_legal_advice"
+            }
+            crate::model_manager::ModelSource::UserProvided => "user_provided_unverified",
+        }
+    } else {
+        "not_provided"
+    };
     let digest_material = serde_json::to_vec(&DigestMaterial {
         schema: "sideeffect.local_model_explanation_preview",
         schema_version: LOCAL_MODEL_EXPLANATION_SCHEMA_VERSION,
         trace_sha256: sha256_hex(trace_bytes),
         question,
         backend_preference,
-        model_repository: EXPLANATION_MODEL_REPOSITORY,
-        model_revision: EXPLANATION_MODEL_REVISION,
-        model_filename: EXPLANATION_MODEL_FILENAME,
-        model_size_bytes: EXPLANATION_MODEL_SIZE_BYTES,
-        model_sha256: EXPLANATION_MODEL_SHA256,
+        model_id: &model.id,
+        model_repository: &model_repository,
+        model_revision: &model_revision,
+        model_filename: &model_filename,
+        model_size_bytes: model.size_bytes,
+        model_sha256: &model.sha256,
+        model_source: &model.source,
+        license_id: &model.license_id,
+        license_status,
+        evaluation_status: model.evaluation,
         runtime_source_revision: EXPLANATION_RUNTIME_REVISION,
+        runtime_version: "llama.cpp b6000",
+        backend: backend_preference.as_str(),
         system_prompt: SYSTEM_PROMPT,
         prompt: &prompt,
         output_schema: &output_schema,
@@ -218,17 +283,42 @@ pub fn preview_model_explanation_bytes(
         question: question.to_owned(),
         request_sha256,
         backend_preference,
-        model_repository: EXPLANATION_MODEL_REPOSITORY,
-        model_revision: EXPLANATION_MODEL_REVISION,
-        model_filename: EXPLANATION_MODEL_FILENAME,
-        model_size_bytes: EXPLANATION_MODEL_SIZE_BYTES,
-        model_sha256: EXPLANATION_MODEL_SHA256,
+        model_id: model.id.clone(),
+        model_repository,
+        model_revision,
+        model_filename,
+        model_size_bytes: model.size_bytes,
+        model_sha256: model.sha256.clone(),
+        model_source: model.source.clone(),
+        license_id: model.license_id.clone(),
+        license_status,
+        evaluation_status: model.evaluation,
         runtime_source_revision: EXPLANATION_RUNTIME_REVISION,
+        runtime_version: "llama.cpp b6000",
+        backend: backend_preference.as_str(),
         system_prompt: SYSTEM_PROMPT,
         prompt,
         output_schema,
         evidence_summary: source_preview.evidence_summary,
     })
+}
+
+fn pinned_explanation_model() -> crate::model_manager::ResolvedModel {
+    crate::model_manager::ResolvedModel {
+        id: "pinned-evidence-explanation".to_owned(),
+        name: "Pinned evidence explanation model".to_owned(),
+        path: std::path::PathBuf::new(),
+        size_bytes: EXPLANATION_MODEL_SIZE_BYTES,
+        sha256: EXPLANATION_MODEL_SHA256.to_owned(),
+        source: crate::model_manager::ModelSource::Catalog {
+            repository: EXPLANATION_MODEL_REPOSITORY.to_owned(),
+            revision: EXPLANATION_MODEL_REVISION.to_owned(),
+            filename: EXPLANATION_MODEL_FILENAME.to_owned(),
+        },
+        license_id: Some("Apache-2.0".to_owned()),
+        evaluation: crate::model_manager::EvaluationStatus::NotAssessed,
+        recommended: false,
+    }
 }
 
 /// Strictly validate output structure, bounds, cross-field consistency, and citations.

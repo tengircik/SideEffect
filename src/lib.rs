@@ -15,6 +15,8 @@ pub mod local_model_explanation_runtime;
 pub(crate) mod local_model_runtime;
 pub mod local_query_plan;
 pub mod model;
+pub mod model_installer;
+pub mod model_manager;
 pub mod record;
 pub mod startup_correlation;
 pub mod trace;

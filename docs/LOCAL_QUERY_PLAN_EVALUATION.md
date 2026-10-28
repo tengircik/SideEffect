@@ -2,6 +2,23 @@
 
 **Status: experimental and not release-approved.** This is a separately gated M8 experiment. No model candidate has passed the frozen v2 usefulness gate. This is not a claim that local model analysis is useful or accurate on real captures. The model-query command is currently implemented only for Linux x86_64; GPU model experiments below were run separately on Windows and do not establish native Windows product support.
 
+## Select a query model
+
+On Linux x86_64, inspect the pinned candidates and their explicit no-go quality status with `sideeffect model list`, then use `sideeffect model show ID` for one entry. The catalog currently contains query-plan models only. To install a listed candidate, run `sideeffect model install ID`, review its pinned source, revision, exact size, license terms, platform scope, and evaluation note, then type exactly `ACCEPT <license-id>`. This acceptance is saved locally against that model ID, revision, license ID, and terms URL before the HTTPS request. It may remain saved if the transfer fails or is cancelled. Downloads are size-capped, SHA-256 checked, staged in the private per-user model store, and published without replacing an existing file. The manager does not install or select the runtime.
+
+```sh
+sideeffect model list
+sideeffect model show query-qwen3-1.7b-q4-k-m
+sideeffect model install query-qwen3-1.7b-q4-k-m
+sideeffect model select query query-qwen3-1.7b-q4-k-m
+sideeffect model-query-preview --question "Find failed connect calls." TRACE
+sideeffect model-query --question "Find failed connect calls." \
+  --runtime /path/to/llama-completion \
+  --confirm-sha256 REVIEWED_PREVIEW_SHA256 TRACE
+```
+
+All catalog candidates have failed at least one quality check and are not recommendations. A custom GGUF may be registered with `sideeffect model add --name NAME --path FILE --for query [--license ID]`; the license string is user-provided and not verified. The file must fit the query task's 1,610,612,736-byte cap. Model registration and selection are user-initiated. The `model-query` inference path remains Linux x86_64 only; WSL2 is a Linux environment and does not establish native Windows support. A selected model's ID/hash, source and revision or user-provided marker, license/evaluation status, and pinned runtime/backend metadata appear in the preview/output and are bound to `request_sha256`; selecting a different model requires a new preview and digest confirmation.
+
 ## What it does
 
 The model translates one reviewed English question into a strict JSON query plan. SideEffect validates the plan and applies exact equality filters joined by AND to a bounded set of typed syscall-result or process-relation facts. Every match carries its source evidence reference. The model cannot write commands, shell expressions, arbitrary predicates, prose, safety verdicts, root-cause claims, effective-permission claims, or completeness claims. A zero-row result means only that no matching record appears in the bounded input.
@@ -13,12 +30,12 @@ The preview separates four things:
 - `coverage` / `evidence_summary`: deterministic parser and capture limitations;
 - `request_sha256`: binds the trace bytes, question and scope, system prompt, schema, and pinned model/runtime metadata.
 
-Inspect the exact preview locally before passing its digest to `model-query`. Trace paths and other evidence may be sensitive. Nothing is uploaded, no model is downloaded, and the runtime is executable code that must be obtained and trusted separately. Linux limits, the private temporary workspace, offline runtime mode, and network-denial filter are defense in depth, not a sandbox.
+Inspect the exact preview locally before passing its digest to `model-query`. Trace paths and other evidence may be sensitive. Nothing is uploaded. Model weights are downloaded only by the explicit `model install` command after license confirmation; inference does not download models. The runtime is executable code that must be obtained and trusted separately. Linux limits, the private temporary workspace, offline runtime mode, and network-denial filter are defense in depth, not a sandbox.
 
 ## Current contract, candidate pin, and corpus
 
 - Query-plan schema: version 2
-- In-code development model pin: `gguf/Qwen3.5-2B-GGUF`, revision `47f5192dcee31b32db0ba0acc04cccef89cb4b2c`
+- Historical in-code development pin: `gguf/Qwen3.5-2B-GGUF`, revision `47f5192dcee31b32db0ba0acc04cccef89cb4b2c`. Runtime selection now uses the per-task model registry; a preview reports the actual selected identity.
 - Model file: `qwen3.5-2b-Q4_K_M.gguf`, 1,312,164,352 bytes, SHA-256 `9a3d0aa6c920f096441139b6a254542da855223fdad06855ea00c6c087fd713d`
 - llama.cpp source revision: `19cce6919992fdffd92e0ac152caaf1e2b8f254e`
 - Reported runtime version: `0.7.0-dev (build 11938, commit 19cce6919)`
@@ -135,25 +152,21 @@ python3 scripts/evaluate_local_query_plan.py \
 Run a single reviewed request manually if desired:
 
 ```sh
+# Register an already obtained local GGUF and use the ID printed by model add.
+sideeffect model add --name "Query model" --path /path/to/model.gguf --for query --license LICENSE-ID
+sideeffect model select query custom-MODEL_ID
 sideeffect model-query-preview --question "Which observed syscall failed?" TRACE
 sideeffect model-query \
   --question "Which observed syscall failed?" \
   --runtime "$PWD/llama.cpp/build/bin/llama-completion" \
-  --model "$HOME/.cache/sideeffect/models/qwen3.5-2b-Q4_K_M.gguf" \
   --confirm-sha256 REVIEWED_REQUEST_SHA256 TRACE
 ```
 
-The full evaluator requires a clean repository state so that candidate code, corpus, evaluator, and fixtures have stable provenance. Save its report outside the repository:
+`model add` records the current file hash and returns a stable `custom-...` ID; replace `custom-MODEL_ID` with that exact printed value. A license label supplied for a local model is not verified by SideEffect. Catalog installation uses `model install ID` and its separate explicit license prompt; the current catalog candidates are not quality recommendations.
 
-```sh
-python3 scripts/evaluate_local_query_plan.py \
-  --sideeffect ./target/release/sideeffect \
-  --runtime "$PWD/llama.cpp/build/bin/llama-completion" \
-  --model "$HOME/.cache/sideeffect/models/qwen3.5-2b-Q4_K_M.gguf" \
-  --report "$HOME/sideeffect-local-query-plan-report.json"
-```
+The evaluator registers the pinned candidate and selects its deterministic custom ID in a private temporary `XDG_DATA_HOME`; it does not modify the user's model registry. Preview and analysis subprocesses use the current selected-model CLI, and the evaluator checks the candidate's pinned size and SHA-256. Existing candidate reports below are historical measurements; they do not validate the updated adapter or establish new model quality. Preview-only mode still creates an isolated model selection so previews bind to the same exact candidate identity.
 
-The evaluator does not silently accept a candidate result, fallback to a deterministic answer, or upload its report. Check the report for exact pins, repository provenance, all per-case outcomes, error counts, latency, and the registered gate before changing the release status.
+After the adapter is aligned, run the full evaluator from a clean repository state and save its report outside the repository. The evaluator must receive the same selected local model and runtime used by the preview. It must not silently accept a candidate result, fall back to a deterministic answer, or upload its report. Check exact pins, repository provenance, all per-case outcomes, error counts, latency, and the registered gate before changing the release status.
 
 ## Full candidate run — 2026-10-27
 

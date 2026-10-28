@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import collections
 import hashlib
 import json
@@ -276,7 +277,9 @@ def sample_process_tree_rss(root_pid: int) -> tuple[int | None, str | None]:
     return total, None
 
 
-def run_bounded(arguments: list[str], timeout: int) -> tuple[RunResult, float]:
+def run_bounded(
+    arguments: list[str], timeout: int, *, env: dict[str, str] | None = None
+) -> tuple[RunResult, float]:
     """Run an argv vector without a shell, with bounded pipes and process cleanup."""
     started = time.perf_counter()
     process = subprocess.Popen(
@@ -285,6 +288,7 @@ def run_bounded(arguments: list[str], timeout: int) -> tuple[RunResult, float]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         shell=False,
+        env=env,
         start_new_session=os.name == "posix",
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
     )
@@ -1087,9 +1091,9 @@ def _validate_preview(
         or preview.get("schema_version") != EXPECTED_SCHEMA_VERSION
         or preview.get("question") != case["question"]
         or not _valid_sha256(preview.get("request_sha256"))
-        or preview.get("model_repository") != EXPECTED_MODEL_REPOSITORY
+        or preview.get("model_repository") != "user-provided"
         or preview.get("model_sha256") != EXPECTED_MODEL_SHA256
-        or preview.get("model_repository_revision") != EXPECTED_MODEL_REPOSITORY_REVISION
+        or preview.get("model_repository_revision") != "user-provided"
         or preview.get("runtime_source_revision") != EXPECTED_RUNTIME_SOURCE_REVISION
         or preview.get("trace_sha256") != hashlib.sha256(trace_bytes).hexdigest()
         or preview.get("system_prompt") != EXPECTED_SYSTEM_PROMPT
@@ -1167,7 +1171,7 @@ def validate_analysis(
         or analysis.get("schema_version") != EXPECTED_SCHEMA_VERSION
         or analysis.get("request_sha256") != preview["request_sha256"]
         or analysis.get("model_sha256") != EXPECTED_MODEL_SHA256
-        or analysis.get("model_repository_revision") != EXPECTED_MODEL_REPOSITORY_REVISION
+        or analysis.get("model_repository_revision") != "user-provided"
         or analysis.get("runtime_source_revision") != EXPECTED_RUNTIME_SOURCE_REVISION
         or analysis.get("execution_status") not in {"executed", "not_executed"}
         or analysis.get("coverage") != preview.get("evidence_summary")
@@ -1367,12 +1371,15 @@ def main() -> int:
     corpus_path = repository / CORPUS_RELATIVE_PATH
     if not args.sideeffect.is_file() or args.sideeffect.is_symlink():
         parser.error("--sideeffect must name a regular non-symlink executable")
-    if not args.preview_only and (args.runtime is None or args.model is None):
-        parser.error("--runtime and --model are required for a full model run")
+    if args.model is None:
+        parser.error("--model is required to bind previews to the pinned model identity")
+    if not args.preview_only and args.runtime is None:
+        parser.error("--runtime is required for a full model run")
     try:
         provenance = repository_provenance(repository, require_clean=not args.preview_only)
         fixture_root, corpus, corpus_sha256 = load_corpus(corpus_path, require_registered_digest=not args.preview_only)
         fixture_temp, trace_paths = prepare_fixtures(fixture_root, corpus)
+        atexit.register(fixture_temp.cleanup)
         model_digest = None
         model_size = None
         runtime_version = None
@@ -1382,6 +1389,33 @@ def main() -> int:
                 raise ValueError("runtime must be a regular non-symlink executable")
             runtime_version = _pin_runtime(args.runtime)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
+        parser.error(str(error))
+
+    model_store = tempfile.TemporaryDirectory(prefix="sideeffect-query-eval-model-store-")
+    atexit.register(model_store.cleanup)
+    sideeffect_env = os.environ.copy()
+    sideeffect_env["XDG_DATA_HOME"] = model_store.name
+    try:
+        if args.preview_only:
+            model_digest, model_size = verify_model_candidate(args.model)
+        registration, _ = run_bounded(
+            [str(args.sideeffect), "model", "add", "--name", "Pinned query-plan evaluation candidate",
+             "--path", str(args.model.absolute()), "--for", "query"],
+            timeout=30,
+            env=sideeffect_env,
+        )
+        if registration.returncode != 0:
+            raise ValueError(f"could not register pinned evaluation model: {registration.stderr.decode('utf-8', 'replace').strip()}")
+        model_id = f"custom-{EXPECTED_MODEL_SHA256[:16]}"
+        selection, _ = run_bounded(
+            [str(args.sideeffect), "model", "select", "query", model_id],
+            timeout=30,
+            env=sideeffect_env,
+        )
+        if selection.returncode != 0:
+            raise ValueError(f"could not select pinned evaluation model: {selection.stderr.decode('utf-8', 'replace').strip()}")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        model_store.cleanup()
         parser.error(str(error))
 
     cases: list[dict[str, Any]] = []
@@ -1395,6 +1429,7 @@ def main() -> int:
                 preview_result, preview_elapsed = run_bounded(
                     [str(args.sideeffect), "model-query-preview", "--question", case["question"], str(trace)],
                     timeout=PREVIEW_TIMEOUT_SECONDS,
+                    env=sideeffect_env,
                 )
                 if preview_result.returncode not in (0, 2):
                     raise ValueError(
@@ -1454,9 +1489,10 @@ def main() -> int:
             try:
                 result, elapsed = run_bounded(
                     [str(args.sideeffect), "model-query", "--question", case["question"],
-                     "--runtime", str(args.runtime), "--model", str(args.model),
+                     "--runtime", str(args.runtime),
                      "--confirm-sha256", preview["request_sha256"], str(trace)],
                     timeout=MODEL_TIMEOUT_SECONDS,
+                    env=sideeffect_env,
                 )
                 model_latencies.append(elapsed)
                 sampled_peak_rss_kib = result.sampled_process_tree_peak_rss_kib
@@ -1550,6 +1586,7 @@ def main() -> int:
                 "cases": [item["record"] for item in preview_cache],
             }
             _emit(report, args.report, repository)
+            model_store.cleanup()
             return 0
 
         valid = [case for case in cases if case["status"] == "valid_output"]
@@ -1693,6 +1730,7 @@ def main() -> int:
         return 0 if all(acceptance.values()) else 2
     finally:
         fixture_temp.cleanup()
+        model_store.cleanup()
 
 
 def _emit(report: dict[str, Any], path: Path | None, repository: Path) -> None:

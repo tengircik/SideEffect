@@ -47,6 +47,7 @@ use sideeffect::inventory::{WindowsStartupStatus, collect_windows_startup};
 use sideeffect::limits::MAX_BUNDLE_MANIFEST_BYTES;
 use sideeffect::limits::{MAX_REPORT_BYTES, MAX_TRACE_BYTES, ParseLimits};
 use sideeffect::model::{BundleCaptureContext, ParseCompleteness, TraceDiff, TraceRecordKind};
+use sideeffect::model_manager::{EvaluationStatus, ModelTask, ResolvedModel};
 #[cfg(target_os = "linux")]
 use sideeffect::record::AnchoredOutput;
 #[cfg(target_os = "linux")]
@@ -61,11 +62,12 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect explain --diff <baseline-trace> <candidate-trace>\n\
        sideeffect explain --inventory-diff <before.json> <after.json>\n\
        sideeffect model-preview --question <question> <strace-trace-file>\n\
-       sideeffect model-analyze --question <question> --runtime <llama-cli> --model <model.gguf> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
+       sideeffect model-analyze --question <question> --runtime <llama-cli> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect model-explain-preview --question <question> --backend auto|cpu|cuda <strace-trace-file>\n\
-       sideeffect model-explain --question <question> --backend auto|cpu|cuda --runtime <llama-completion> --model <model.gguf> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
+       sideeffect model-explain --question <question> --backend auto|cpu|cuda --runtime <llama-completion> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect model-query-preview --question <question> <strace-trace-file>\n\
-       sideeffect model-query --question <question> --runtime <llama-completion> --model <model.gguf> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
+       sideeffect model-query --question <question> --runtime <llama-completion> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
+       sideeffect model list | show <id> | install <id> | setup <id> | add | select <task> <id> | remove <id>\n\
        sideeffect correlate-startup <startup-inventory.json> <strace-trace-file>\n\
        sideeffect inventory processes --output <new-inventory.json>\n\
        sideeffect inventory startup --output <new-inventory.json>\n\
@@ -108,6 +110,21 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         [command, subcommand, flag] if flag == "--help" || flag == "-h" => {
             command_help(&[command.clone(), subcommand.clone()])
         }
+        [command, operation] if command == "model" && operation == "list" => model_list(),
+        [command, operation, id] if command == "model" && operation == "show" => model_show(id),
+        [command, operation, id] if command == "model" && operation == "install" => {
+            model_install(id, false)
+        }
+        [command, operation, id] if command == "model" && operation == "setup" => {
+            model_install(id, true)
+        }
+        [command, operation, task, id] if command == "model" && operation == "select" => {
+            model_select(task, id)
+        }
+        [command, operation, id] if command == "model" && operation == "remove" => model_remove(id),
+        [command, operation, arguments @ ..] if command == "model" && operation == "add" => {
+            model_add(arguments)
+        }
         [command, flag, path] if command == "inspect" && flag == "--session" => {
             inspect_session_with_format(&OsString::from("json"), path)
         }
@@ -149,8 +166,6 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             backend,
             runtime_flag,
             runtime,
-            model_flag,
-            model,
             confirm_flag,
             digest,
             trace,
@@ -158,10 +173,9 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             && question_flag == "--question"
             && backend_flag == "--backend"
             && runtime_flag == "--runtime"
-            && model_flag == "--model"
             && confirm_flag == "--confirm-sha256" =>
         {
-            model_explanation_file(question, backend, runtime, model, digest, trace)
+            model_explanation_file(question, backend, runtime, digest, trace)
         }
         [
             command,
@@ -169,18 +183,15 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             question,
             runtime_flag,
             runtime,
-            model_flag,
-            model,
             confirm_flag,
             digest,
             trace,
         ] if command == "model-analyze"
             && question_flag == "--question"
             && runtime_flag == "--runtime"
-            && model_flag == "--model"
             && confirm_flag == "--confirm-sha256" =>
         {
-            model_analyze_file(question, runtime, model, digest, trace)
+            model_analyze_file(question, runtime, digest, trace)
         }
         [
             command,
@@ -188,18 +199,15 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             question,
             runtime_flag,
             runtime,
-            model_flag,
-            model,
             confirm_flag,
             digest,
             trace,
         ] if command == "model-query"
             && question_flag == "--question"
             && runtime_flag == "--runtime"
-            && model_flag == "--model"
             && confirm_flag == "--confirm-sha256" =>
         {
-            model_query_file(question, runtime, model, digest, trace)
+            model_query_file(question, runtime, digest, trace)
         }
         [command, diff_flag, left, right] if command == "explain" && diff_flag == "--diff" => {
             explain_diff_files(left, right)
@@ -1110,23 +1118,41 @@ Collects selected Linux inventory sources into one local, private session direct
         "correlate-startup" => {
             "Usage: sideeffect correlate-startup STARTUP_INVENTORY.json TRACE\nFinds narrow exact-path candidate matches between supported saved startup configuration and successful exec evidence. A match does not prove that a hook caused or initiated execution."
         }
-        "model" | "model-preview" => {
-            "Usage: sideeffect model-preview --question QUESTION TRACE\nPreviews the bounded typed facts, question, JSON schema, and request digest. Review this exact request before confirming local analysis. Partial parsing is visible and exits with status 2."
+        "model" => {
+            "Usage: sideeffect model list\n       sideeffect model show ID\n       sideeffect model install ID\n       sideeffect model setup ID\n       sideeffect model add --name NAME --path FILE --for evidence|explanation|query [--license ID]\n       sideeffect model select evidence|explanation|query ID\n       sideeffect model remove ID\n\nLists pinned catalog candidates and user-provided models. Catalog evaluation status is shown separately from runtime compatibility. Installing a catalog model requires explicit license acceptance; analysis never downloads weights implicitly. The setup command installs and selects the catalog model for its declared task. Registering a local model records its size and SHA-256, but does not verify task compatibility, licensing, or quality. Removing a custom registration leaves the model file untouched. Select a model for its task before running a model preview."
+        }
+        "model setup" => {
+            "Usage: sideeffect model setup MODEL_ID\nShows the catalog license and model evaluation status, downloads the exact pinned file after explicit typed acceptance, verifies its size and SHA-256, then selects it for its declared task. The local inference runtime is installed or built separately and its path is still supplied to analysis commands."
+        }
+        "model list" => {
+            "Usage: sideeffect model list\nLists pinned catalog candidates, installation status, task, license, exact size, evaluation status, and selected model per task. Every listed model's SHA-256 is rechecked before use."
+        }
+        "model add" => {
+            "Usage: sideeffect model add --name NAME --path FILE --for evidence|explanation|query[,TASK...] [--license ID]\nRegisters an existing local GGUF by bounded size and SHA-256. The path and optional license ID are user-provided metadata; task compatibility and answer quality are not verified. The model remains opt-in and unreviewed until selected."
+        }
+        "model select" => {
+            "Usage: sideeffect model select evidence|explanation|query MODEL_ID\nSelects a registered or installed model for one analysis task. The exact model identity is included in each preview digest and checked again before inference."
+        }
+        "model remove" => {
+            "Usage: sideeffect model remove MODEL_ID\nFor a catalog model, requires typing the exact ID and removes only that verified catalog file plus task selections. For a user-provided model, removes only its registration; the original file is left untouched."
+        }
+        "model-preview" => {
+            "Usage: sideeffect model-preview --question QUESTION TRACE\nPreviews the bounded typed facts, selected evidence model identity, JSON schema, and request digest. Select and install a model first with the model commands. Review this exact request before confirming local analysis. Partial parsing is visible and exits with status 2."
         }
         "model-analyze" => {
-            "Usage: sideeffect model-analyze --question QUESTION --runtime LLAMA_CLI --model MODEL.gguf --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the pinned optional local model on Linux x86_64 after explicit digest confirmation. It does not download weights or upload evidence. The model may select at most one source evidence ID as an unverified hint; it can be wrong and is not a finding. See docs/LOCAL_MODEL_EVALUATION.md."
+            "Usage: sideeffect model-analyze --question QUESTION --runtime LLAMA_CLI --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the selected local evidence model on Linux x86_64 after explicit digest confirmation. The model may select at most one source evidence ID as an unverified hint; it can be wrong and is not a finding. SideEffect does not upload evidence. See docs/LOCAL_MODEL_EVALUATION.md."
         }
         "model-explain-preview" => {
-            "Usage: sideeffect model-explain-preview --question QUESTION --backend auto|cpu|cuda TRACE\nPreviews the bounded typed evidence and coverage fields that an evidence-grounded local model would receive. Review the exact prompt and digest before inference. 'auto' prefers a supported GPU and otherwise reports CPU use; it does not silently fall back after a GPU failure. This command does not run a model."
+            "Usage: sideeffect model-explain-preview --question QUESTION --backend auto|cpu|cuda TRACE\nPreviews the bounded typed evidence, coverage, and selected explanation model identity. Review the exact prompt and digest before inference. 'auto' prefers a supported GPU and otherwise reports CPU use; it does not silently fall back after a GPU failure. This command does not run a model."
         }
         "model-explain" => {
-            "Usage: sideeffect model-explain --question QUESTION --backend auto|cpu|cuda --runtime LLAMA_COMPLETION --model MODEL.gguf --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the pinned local explanation model after confirmation of the exact evidence preview. The model receives bounded typed evidence and coverage; every generated statement must cite a source evidence ID and remains unverified. 'auto' prefers CUDA when the pinned runtime reports a device; CUDA errors do not silently fall back to CPU. SideEffect does not upload data or auto-download a model. The selected runtime is executable code that must be trusted separately; see docs/LOCAL_MODEL_EXPLANATION_EVALUATION.md."
+            "Usage: sideeffect model-explain --question QUESTION --backend auto|cpu|cuda --runtime LLAMA_COMPLETION --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the selected local explanation model after confirmation of the exact evidence preview. The model receives bounded typed evidence and coverage; every generated statement must cite a source evidence ID and remains unverified. 'auto' prefers CUDA when the pinned runtime reports a device; CUDA errors do not silently fall back to CPU. SideEffect does not upload data or auto-download a model during analysis. The selected runtime is executable code that must be trusted separately; see docs/LOCAL_MODEL_EXPLANATION_EVALUATION.md."
         }
         "model-query-preview" => {
-            "Usage: sideeffect model-query-preview --question QUESTION TRACE\nPreviews the bounded local query request and typed evidence facts. Queryable facts are shown for review but are not sent to the model. Review this exact question, scope, and digest before optional local inference. Partial input exits with status 2."
+            "Usage: sideeffect model-query-preview --question QUESTION TRACE\nPreviews the bounded local query request, selected model identity, and typed evidence facts. Queryable facts are shown for review but are not sent to the model. Review this exact question, scope, and digest before optional local inference. Partial input exits with status 2."
         }
         "model-query" => {
-            "Usage: sideeffect model-query --question QUESTION --runtime LLAMA_COMPLETION --model MODEL.gguf --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the pinned optional local query model on Linux x86_64 only after explicit preview-digest confirmation. It executes only validated exact-match AND filters over observed typed facts, never commands or model-authored expressions. No model is downloaded or evidence uploaded. Model results are unverified review aids. See docs/LOCAL_QUERY_PLAN_EVALUATION.md."
+            "Usage: sideeffect model-query --question QUESTION --runtime LLAMA_COMPLETION --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the selected optional local query model on Linux x86_64 only after explicit preview-digest confirmation. It executes only validated exact-match AND filters over observed typed facts, never commands or model-authored expressions. No model is downloaded during analysis or evidence uploaded. Model results are unverified review aids. See docs/LOCAL_QUERY_PLAN_EVALUATION.md."
         }
         _ => return Err(format!("unknown help topic: {topic}\n\n{USAGE}")),
     };
@@ -1398,7 +1424,8 @@ fn model_preview_file(question: &OsString, path: &OsString) -> Result<ExitCode, 
         .to_str()
         .ok_or("local model question must be valid UTF-8")?;
     let bytes = read_bounded(path)?;
-    let preview = sideeffect::local_model::preview_trace_bytes(&bytes, question)?;
+    let model = selected_model(ModelTask::EvidenceSelection)?;
+    let preview = sideeffect::local_model::preview_trace_bytes_for_model(&bytes, question, &model)?;
     let partial = preview.evidence_summary["parse_status"] == "partial";
     write_json(&preview, "local model request preview")?;
     Ok(if partial {
@@ -1413,7 +1440,9 @@ fn model_query_preview_file(question: &OsString, path: &OsString) -> Result<Exit
         .to_str()
         .ok_or("local query question must be valid UTF-8")?;
     let bytes = read_bounded(path)?;
-    let preview = sideeffect::local_query_plan::preview_query_plan_bytes(&bytes, question)?;
+    let model = selected_model(ModelTask::QueryPlan)?;
+    let preview =
+        sideeffect::local_query_plan::preview_query_plan_bytes_for_model(&bytes, question, &model)?;
     let partial = preview.evidence_summary["parse_status"] == "partial";
     write_json(&preview, "local query-plan preview")?;
     Ok(if partial {
@@ -1438,8 +1467,9 @@ fn model_explanation_preview_file(
         _ => return Err("model explanation backend must be auto, cpu, or cuda".to_owned()),
     };
     let bytes = read_bounded(path)?;
-    let preview = sideeffect::local_model_explanation::preview_model_explanation_bytes(
-        &bytes, question, backend,
+    let model = selected_model(ModelTask::Explanation)?;
+    let preview = sideeffect::local_model_explanation::preview_model_explanation_bytes_for_model(
+        &bytes, question, backend, &model,
     )?;
     let partial = preview.evidence_summary["parse_status"] == "partial";
     write_json(
@@ -1456,7 +1486,6 @@ fn model_explanation_preview_file(
 fn model_query_file(
     question: &OsString,
     runtime: &OsString,
-    model: &OsString,
     digest: &OsString,
     trace: &OsString,
 ) -> Result<ExitCode, String> {
@@ -1474,11 +1503,12 @@ fn model_query_file(
         return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
     }
     let bytes = read_bounded(trace)?;
-    let analysis = sideeffect::local_query_plan::analyze_query_plan_bytes(
+    let model = selected_model(ModelTask::QueryPlan)?;
+    let analysis = sideeffect::local_query_plan::analyze_query_plan_bytes_for_model(
         &bytes,
         question,
         Path::new(runtime),
-        Path::new(model),
+        &model,
         digest,
     )?;
     let partial = analysis.coverage["parse_status"] == "partial";
@@ -1494,7 +1524,6 @@ fn model_explanation_file(
     question: &OsString,
     backend: &OsString,
     runtime: &OsString,
-    model: &OsString,
     digest: &OsString,
     trace: &OsString,
 ) -> Result<ExitCode, String> {
@@ -1518,14 +1547,16 @@ fn model_explanation_file(
         return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
     }
     let bytes = read_bounded(trace)?;
-    let analysis = sideeffect::local_model_explanation_runtime::analyze_model_explanation_bytes(
-        &bytes,
-        question,
-        backend,
-        Path::new(runtime),
-        Path::new(model),
-        digest,
-    )?;
+    let model = selected_model(ModelTask::Explanation)?;
+    let analysis =
+        sideeffect::local_model_explanation_runtime::analyze_model_explanation_bytes_for_model(
+            &bytes,
+            question,
+            backend,
+            Path::new(runtime),
+            &model,
+            digest,
+        )?;
     let partial = analysis.evidence_summary["parse_status"] == "partial"
         || analysis.interpretation.status
             != sideeffect::local_model_explanation::ExplanationStatus::Answered;
@@ -1540,7 +1571,6 @@ fn model_explanation_file(
 fn model_analyze_file(
     question: &OsString,
     runtime: &OsString,
-    model: &OsString,
     digest: &OsString,
     trace: &OsString,
 ) -> Result<ExitCode, String> {
@@ -1558,11 +1588,12 @@ fn model_analyze_file(
         return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
     }
     let bytes = read_bounded(trace)?;
-    let analysis = sideeffect::local_model::analyze_trace_bytes(
+    let model = selected_model(ModelTask::EvidenceSelection)?;
+    let analysis = sideeffect::local_model::analyze_trace_bytes_for_model(
         &bytes,
         question,
         Path::new(runtime),
-        Path::new(model),
+        &model,
         digest,
     )?;
     let partial = analysis.evidence_summary["parse_status"] == "partial";
@@ -1572,6 +1603,428 @@ fn model_analyze_file(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn selected_model(task: ModelTask) -> Result<ResolvedModel, String> {
+    if !model_task_supported_here(task) {
+        return Err(format!(
+            "local model task '{}' is not supported on this platform",
+            model_task_label(task)
+        ));
+    }
+    sideeffect::model_manager::load_registry()?.selected(task)
+}
+
+fn model_list() -> Result<ExitCode, String> {
+    use sideeffect::model_manager::{CATALOG, model_store_directory};
+
+    let registry = sideeffect::model_manager::load_registry()?;
+    println!("Pinned catalog (runtime compatibility is separate from model quality):");
+    let model_directory = model_store_directory()?.join("models");
+    for model in CATALOG {
+        let path = model_directory.join(model.filename);
+        let installed = match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && metadata.len() == model.size_bytes
+                    && !metadata.file_type().is_symlink() =>
+            {
+                "installed; SHA-256 is rechecked before use"
+            }
+            Ok(_) => "present but does not match the pinned file metadata",
+            Err(error) if error.kind() == io::ErrorKind::NotFound => "not installed",
+            Err(_) => "installation status unavailable",
+        };
+        let selected = registry
+            .selected_by_task
+            .get(&model.task)
+            .is_some_and(|id| id == model.id);
+        let license_accepted = registry.accepted_licenses.iter().any(|accepted| {
+            accepted.model_id == model.id
+                && accepted.revision == model.revision
+                && accepted.license_id == model.license_id
+                && accepted.license_url == model.license_url
+        });
+        println!(
+            "- {} — {}\n  task: {}; platform: {}; size: {}; license: {} ({})\n  evaluation: {}; source: {} @ {}\n  license accepted: {}; status: {}{}",
+            model.id,
+            terminal_safe_text(model.name),
+            model_task_label(model.task),
+            model_task_platform(model.task),
+            human_file_size(model.size_bytes),
+            model.license_id,
+            model.license_url,
+            evaluation_status_label(model.evaluation),
+            model.repository,
+            model.revision,
+            license_accepted,
+            installed,
+            if selected { "; selected" } else { "" }
+        );
+    }
+    if registry.custom_models.is_empty() {
+        println!("No user-provided models are registered.");
+    } else {
+        println!("User-provided models (unreviewed):");
+        for model in &registry.custom_models {
+            let tasks = model
+                .tasks
+                .iter()
+                .map(|task| model_task_label(*task))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "- {} — {}\n  tasks: {}; size: {}; SHA-256: {}\n  license: {}; evaluation: not assessed{}",
+                model.id,
+                terminal_safe_text(&model.name),
+                tasks,
+                human_file_size(model.size_bytes),
+                model.sha256,
+                model
+                    .license_id
+                    .as_deref()
+                    .map(terminal_safe_text)
+                    .unwrap_or_else(|| "not provided".to_owned()),
+                if model.path.exists() {
+                    ""
+                } else {
+                    " (registered file is missing; selection will fail)"
+                }
+            );
+        }
+    }
+    for task in [
+        ModelTask::EvidenceSelection,
+        ModelTask::Explanation,
+        ModelTask::QueryPlan,
+    ] {
+        println!(
+            "Selected for {}: {}",
+            model_task_label(task),
+            registry
+                .selected_by_task
+                .get(&task)
+                .map(String::as_str)
+                .unwrap_or("none")
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn model_show(id: &OsString) -> Result<ExitCode, String> {
+    let id = id.to_str().ok_or("model ID must be valid UTF-8")?;
+    let registry = sideeffect::model_manager::load_registry()?;
+    if let Some(model) = sideeffect::model_manager::catalog_model(id) {
+        let path = sideeffect::model_manager::model_store_directory()?
+            .join("models")
+            .join(model.filename);
+        let installation = match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.len() == model.size_bytes =>
+            {
+                "file size matches catalog; SHA-256 is rechecked before use"
+            }
+            Ok(_) => "present but not the pinned size or file type",
+            Err(error) if error.kind() == io::ErrorKind::NotFound => "not installed",
+            Err(_) => "installation status unavailable",
+        };
+        let value = serde_json::json!({
+            "catalog_entry": model,
+            "installation_status": installation,
+            "license_terms_url": model.license_url,
+            "recommended_for_accuracy": false,
+        });
+        write_json(&value, "model catalog entry")?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let model = registry
+        .custom_models
+        .iter()
+        .find(|model| model.id == id)
+        .ok_or_else(|| "model ID is not present in the catalog or user registry".to_owned())?;
+    write_json(model, "registered user-provided model")?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn model_install(id: &OsString, select_after_install: bool) -> Result<ExitCode, String> {
+    let id = id.to_str().ok_or("model ID must be valid UTF-8")?;
+    let model = sideeffect::model_manager::catalog_model(id).ok_or_else(|| {
+        "model ID is not in the pinned catalog; install accepts catalog IDs only".to_owned()
+    })?;
+    println!("Model: {}", terminal_safe_text(model.name));
+    println!(
+        "Source: {} at revision {}",
+        model.repository, model.revision
+    );
+    println!(
+        "File: {} ({})",
+        model.filename,
+        human_file_size(model.size_bytes)
+    );
+    println!("License: {}", model.license_id);
+    println!("Review license terms at: {}", model.license_url);
+    println!("Platform support: {}", model_task_platform(model.task));
+    println!("Evaluation: {}", evaluation_status_label(model.evaluation));
+    println!(
+        "Evaluation note: {}",
+        terminal_safe_text(model.evaluation_note)
+    );
+    if !model_task_supported_here(model.task) {
+        return Err("this model task is not supported on the current platform".to_owned());
+    }
+    println!(
+        "This download sends no trace or prompt data. It contacts Hugging Face hosts only to fetch the pinned model file."
+    );
+    print!(
+        "After reviewing the linked terms, type ACCEPT {} to continue: ",
+        model.license_id
+    );
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("could not display license confirmation prompt: {error}"))?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| format!("could not read license confirmation: {error}"))?;
+    if answer.trim() != format!("ACCEPT {}", model.license_id) {
+        return Err("model download cancelled; license acceptance was not confirmed".to_owned());
+    }
+    let mut last_reported = 0_u64;
+    let receipt = sideeffect::model_installer::install_catalog_model(
+        id,
+        model.license_id,
+        model.license_url,
+        true,
+        |progress| {
+            if progress.received_bytes == progress.expected_bytes
+                || progress.received_bytes.saturating_sub(last_reported) >= 64 * 1024 * 1024
+            {
+                last_reported = progress.received_bytes;
+                print!(
+                    "\rDownloaded {} of {}",
+                    human_file_size(progress.received_bytes),
+                    human_file_size(progress.expected_bytes)
+                );
+                io::stdout().flush().is_ok()
+            } else {
+                true
+            }
+        },
+    )?;
+    if select_after_install {
+        let mut registry = sideeffect::model_manager::load_registry()?;
+        registry.resolve(id, model.task)?;
+        registry.select(model.task, id)?;
+        sideeffect::model_manager::save_registry(&registry)?;
+        println!(
+            "\nInstalled and selected {} for {} ({} bytes, SHA-256 {}).",
+            receipt.id,
+            model_task_label(model.task),
+            receipt.size_bytes,
+            receipt.sha256
+        );
+    } else {
+        println!(
+            "\nInstalled {} ({} bytes, SHA-256 {}). Select it with `sideeffect model select {} {}` before analysis.",
+            receipt.id,
+            receipt.size_bytes,
+            receipt.sha256,
+            match model.task {
+                ModelTask::EvidenceSelection => "evidence",
+                ModelTask::Explanation => "explanation",
+                ModelTask::QueryPlan => "query",
+            },
+            receipt.id
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn model_add(arguments: &[OsString]) -> Result<ExitCode, String> {
+    let mut name = None;
+    let mut path = None;
+    let mut tasks = Vec::new();
+    let mut license = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let option = arguments[index]
+            .to_str()
+            .ok_or("model registration option must be valid UTF-8")?;
+        let value = arguments
+            .get(index + 1)
+            .ok_or_else(|| format!("missing value for model registration option {option}"))?;
+        match option {
+            "--name" => {
+                name = Some(
+                    value
+                        .to_str()
+                        .ok_or("model name must be valid UTF-8")?
+                        .to_owned(),
+                );
+            }
+            "--path" => path = Some(Path::new(value).to_path_buf()),
+            "--for" => {
+                let value = value
+                    .to_str()
+                    .ok_or("model task list must be valid UTF-8")?;
+                for task in value.split(',') {
+                    let task = parse_model_task(task)?;
+                    if !tasks.contains(&task) {
+                        tasks.push(task);
+                    }
+                }
+            }
+            "--license" => {
+                license = Some(
+                    value
+                        .to_str()
+                        .ok_or("model license ID must be valid UTF-8")?
+                        .to_owned(),
+                );
+            }
+            _ => return Err(format!("unknown model registration option: {option}")),
+        }
+        index += 2;
+    }
+    let name = name.ok_or("model add requires --name NAME")?;
+    let path = path.ok_or("model add requires --path FILE")?;
+    if tasks.iter().any(|task| !model_task_supported_here(*task)) {
+        return Err(
+            "one or more requested model tasks are not supported on this platform".to_owned(),
+        );
+    }
+    let mut registry = sideeffect::model_manager::load_registry()?;
+    let id = registry.register_custom(&name, &path, license.as_deref(), tasks)?;
+    sideeffect::model_manager::save_registry(&registry)?;
+    println!(
+        "Registered {} as {}. It is user-provided and unreviewed; its SHA-256 will be rechecked before use.",
+        terminal_safe_path(&path),
+        id
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn model_select(task: &OsString, id: &OsString) -> Result<ExitCode, String> {
+    let task = parse_model_task(task.to_str().ok_or("model task must be valid UTF-8")?)?;
+    if !model_task_supported_here(task) {
+        return Err(format!(
+            "local model task '{}' is not supported on this platform",
+            model_task_label(task)
+        ));
+    }
+    let id = id.to_str().ok_or("model ID must be valid UTF-8")?;
+    let mut registry = sideeffect::model_manager::load_registry()?;
+    // Resolve before changing persistent selection. This checks installation,
+    // current file bounds, and its digest for catalog and custom models.
+    let model = registry.resolve(id, task)?;
+    registry.select(task, id)?;
+    sideeffect::model_manager::save_registry(&registry)?;
+    println!(
+        "Selected {} for {}. Evaluation status: {}; this does not certify answer quality.",
+        model.id,
+        model_task_label(task),
+        evaluation_status_label(model.evaluation)
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn model_remove(id: &OsString) -> Result<ExitCode, String> {
+    let id = id.to_str().ok_or("model ID must be valid UTF-8")?;
+    if sideeffect::model_manager::catalog_model(id).is_some() {
+        println!("This will delete the installed, hash-verified catalog model file for {id}.");
+        print!("Type DELETE {id} to confirm: ");
+        io::stdout()
+            .flush()
+            .map_err(|error| format!("could not display model removal prompt: {error}"))?;
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .map_err(|error| format!("could not read model removal confirmation: {error}"))?;
+        if answer.trim() != format!("DELETE {id}") {
+            return Err("model removal cancelled".to_owned());
+        }
+        let path = sideeffect::model_installer::remove_catalog_model(id, true)?;
+        println!(
+            "Removed verified catalog model {}.",
+            terminal_safe_path(&path)
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut registry = sideeffect::model_manager::load_registry()?;
+    registry.unregister(id)?;
+    sideeffect::model_manager::save_registry(&registry)?;
+    println!("Unregistered {id}. The model file was left untouched.");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn parse_model_task(task: &str) -> Result<ModelTask, String> {
+    match task {
+        "evidence" | "evidence-selection" => Ok(ModelTask::EvidenceSelection),
+        "explanation" => Ok(ModelTask::Explanation),
+        "query" | "query-plan" => Ok(ModelTask::QueryPlan),
+        _ => Err("model task must be evidence, explanation, or query".to_owned()),
+    }
+}
+
+fn model_task_label(task: ModelTask) -> &'static str {
+    match task {
+        ModelTask::EvidenceSelection => "evidence selection",
+        ModelTask::Explanation => "explanation",
+        ModelTask::QueryPlan => "query plan",
+    }
+}
+
+fn model_task_platform(task: ModelTask) -> &'static str {
+    match task {
+        ModelTask::EvidenceSelection | ModelTask::QueryPlan => "Linux x86_64 only",
+        ModelTask::Explanation => "Linux x86_64 and native Windows",
+    }
+}
+
+fn model_task_supported_here(task: ModelTask) -> bool {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let _ = task;
+        true
+    }
+    #[cfg(windows)]
+    {
+        task == ModelTask::Explanation
+    }
+    #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), windows)))]
+    {
+        let _ = task;
+        false
+    }
+}
+
+fn evaluation_status_label(status: EvaluationStatus) -> &'static str {
+    match status {
+        EvaluationStatus::FailedTriage => "failed a triage check; not recommended",
+        EvaluationStatus::FailedFrozenGate => "failed the frozen evaluation gate; not recommended",
+        EvaluationStatus::FailedDevelopmentCheck => "failed a development check; not recommended",
+        EvaluationStatus::NotAssessed => "not assessed; not recommended",
+    }
+}
+
+fn human_file_size(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    format!("{} MiB ({bytes} bytes)", bytes.div_ceil(MIB))
+}
+
+fn terminal_safe_text(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut escaped = String::new();
+    for character in value.chars() {
+        if character.is_ascii() && !character.is_control() && character != '\\' {
+            escaped.push(character);
+        } else {
+            let _ = write!(escaped, "\\u{{{:x}}}", character as u32);
+        }
+    }
+    escaped
 }
 
 fn inspect_bundle_with_format(format: &OsString, path: &OsString) -> Result<ExitCode, String> {

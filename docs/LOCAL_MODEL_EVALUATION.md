@@ -1,12 +1,12 @@
 # Optional local model analysis
 
-**Status:** M8 preview; not a release endorsement. This feature is opt-in and runs only on Linux x86_64. SideEffect does not bundle or automatically download weights or a runtime, and sends no evidence to a hosted service.
+**Status:** M8 preview; not a release endorsement. This feature is opt-in and runs only on Linux x86_64. SideEffect does not bundle weights or a runtime, and analysis does not automatically download weights or send evidence to a hosted service. The Linux x86_64 catalog includes `evidence-qwen2.5-0.5b-q4-0`, a 428,730,208-byte Apache-2.0 GGUF candidate. It failed its frozen gate (9/39 answerable selections and false selections on all 12 unanswerable cases) and is not recommended. No model has a positive quality recommendation.
 
 **Reviewed on:** 2026-10-27.
 
-## Reviewed inputs
+## Historical evidence-selection candidate
 
-- Model: `ggml-org/Qwen3-0.6B-GGUF`, file `Qwen3-0.6B-Q4_0.gguf`.
+- Historical model candidate: `ggml-org/Qwen3-0.6B-GGUF`, file `Qwen3-0.6B-Q4_0.gguf`. It is not a downloadable catalog entry or a positive quality recommendation.
 - Model repository revision: `a41486f827d17edd055fe6b3b0ba3f8d427c0519`.
 - Model SHA-256: `da2572f16c06133561ce56accaa822216f2391ef4d37fba427801cd6736417d4`.
 - Runtime: llama.cpp version `6000`, source revision `4762ad7316dcdec20016ab5985fb46a27902204d`.
@@ -17,8 +17,9 @@ Primary references: [Qwen GGUF file](https://huggingface.co/ggml-org/Qwen3-0.6B-
 
 ## Data flow and limits
 
-1. `sideeffect model-preview --question QUESTION TRACE` strictly parses the local trace and prints the exact bounded typed event facts, question, separate system/user prompt messages, JSON output schema, model/runtime pins, and `request_sha256` for review. The schema exposes all evidence IDs in the bounded summary; question wording does not filter or reorder the model's choices. For selected `openat`/`openat2` rows, the request may include the parser's conservative lexical path hint when it is ASCII and at most 256 bytes. Each row reports `lexical_path_hint_status` as `included`, `not_derived`, or `omitted_limit`; an omitted path value is not silently treated as complete evidence. The path is untrusted, potentially sensitive, and not canonical or filesystem-resolved. For strictly recognized failure or in-progress results, the request may include the observed Linux errno name (for example, `ENOENT`); it does not include the raw result or message. Inspect the exact request and deterministic summary before confirming. The digest covers both messages, both revisions, and the schema. It omits raw arguments, raw results, raw lines, free-form parser diagnostics, capture metadata, and local input paths. Partial parsing remains visible and exits with status 2.
-2. `sideeffect model-analyze --question QUESTION` requires the same trace, question, and exact preview digest copied by the user. A changed request is rejected before the runtime starts. The model receives the same bounded syscall result facts, eligible lexical path hints and observed errno names, and direct process relations shown in the preview; it does not receive raw traces, diffs, package/process/startup/permission inventories, or capture metadata. The model may choose at most one evidence ID from the full preview enum or abstain. This allows evaluation to measure actual model selection rather than deterministic answer preselection.
+1. Install and select the catalog candidate with `sideeffect model install evidence-qwen2.5-0.5b-q4-0`, review its Apache-2.0 terms and type the exact `ACCEPT Apache-2.0` response, then run `sideeffect model select evidence evidence-qwen2.5-0.5b-q4-0`. Alternatively, register a local GGUF using the [model management commands](INSTALL.md#optional-local-model-setup). The catalog candidate and the historical Qwen3-0.6B candidate are not quality recommendations. A custom model's license and task compatibility are user-provided/unverified metadata. The model file size is capped at 512 MiB for this task.
+2. `sideeffect model-preview --question QUESTION TRACE` strictly parses the local trace and prints the exact bounded typed event facts, question, separate system/user prompt messages, JSON output schema, selected model/runtime identity, and `request_sha256` for review. The schema exposes all evidence IDs in the bounded summary; question wording does not filter or reorder the model's choices. For selected `openat`/`openat2` rows, the request may include the parser's conservative lexical path hint when it is ASCII and at most 256 bytes. Each row reports `lexical_path_hint_status` as `included`, `not_derived`, or `omitted_limit`; an omitted path value is not silently treated as complete evidence. The path is untrusted, potentially sensitive, and not canonical or filesystem-resolved. For strictly recognized failure or in-progress results, the request may include the observed Linux errno name (for example, `ENOENT`); it does not include the raw result or message. Inspect the exact request and deterministic summary before confirming. The digest binds both messages, the selected model ID/SHA-256/source or user-provided marker/license/evaluation status, runtime/backend pins, and schema. It omits raw arguments, raw results, raw lines, free-form parser diagnostics, capture metadata, and local input paths. Partial parsing remains visible and exits with status 2.
+3. `sideeffect model-analyze --question QUESTION` requires the same trace, question, and exact preview digest copied by the user. A changed request or model selection is rejected before the runtime starts. The selected model is copied into private staging while its SHA-256 and size are rechecked; the runtime receives the verified staged copy. The model receives the same bounded syscall result facts, eligible lexical path hints and observed errno names, and direct process relations shown in the preview; it does not receive raw traces, diffs, package/process/startup/permission inventories, or capture metadata. The model may choose at most one evidence ID from the full preview enum or abstain. This allows evaluation to measure actual model selection rather than deterministic answer preselection.
 3. The program streams the selected model into a private mode-0600 temporary file while hashing it, then gives llama.cpp that verified copy. A private temporary JSON schema is also created for the run. The child environment is cleared, inference uses a private working directory and offline one-shot mode, and CPU, address-space, file-size, core-dump, file-descriptor, wall-clock, and output limits apply. A Linux seccomp filter denies socket syscalls and `io_uring_setup`; it rejects non-x86_64 and x32 syscall ABIs. The runtime is still an executable attack surface and this is defense in depth, not a sandbox. It can read or alter files accessible to the user; provide only a trusted locally built runtime and a verified model.
 4. SideEffect independently parses the model output, rejects unknown fields and malformed/duplicate/unknown evidence IDs, and accepts at most one ID already present in the request. The output label is `model_selected_single_evidence_for_human_review_not_verified_findings`; the deterministic evidence summary remains present beside it. A valid ID establishes only that the cited record was included in the request, not that it answers the question. The model cannot emit factual prose in this schema. Invalid or malformed output is rejected.
 
@@ -28,7 +29,7 @@ The seccomp network-denial behavior was exercised under WSL2 with a Linux x86_64
 
 ## Reproducible local setup for Linux x86_64
 
-The project does not run these downloads or build steps automatically. Obtain the files from the pinned upstream locations, check them, and keep them outside the repository. Example commands:
+The project does not build the runtime automatically. Obtain the runtime from the pinned source, verify the source revision, and keep all runtime artifacts outside the repository. The evidence model is not in the downloadable catalog: obtain a GGUF through a source and license you review, verify its SHA-256, and keep it outside the repository. This example uses the historical evaluation model and does not endorse its quality:
 
 ```sh
 git clone https://github.com/ggml-org/llama.cpp.git
@@ -37,12 +38,21 @@ cmake -S llama.cpp -B llama.cpp/build \
   -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF
 cmake --build llama.cpp/build --target llama-cli --parallel 2
 
-mkdir -p "$HOME/.cache/sideeffect/models"
-curl -L --fail --output "$HOME/.cache/sideeffect/models/Qwen3-0.6B-Q4_0.gguf" \
+mkdir -p "$HOME/.local/share/SideEffect/imports"
+curl -L --fail --output "$HOME/.local/share/SideEffect/imports/Qwen3-0.6B-Q4_0.gguf" \
   'https://huggingface.co/ggml-org/Qwen3-0.6B-GGUF/resolve/a41486f827d17edd055fe6b3b0ba3f8d427c0519/Qwen3-0.6B-Q4_0.gguf'
 printf '%s  %s\n' \
   da2572f16c06133561ce56accaa822216f2391ef4d37fba427801cd6736417d4 \
-  "$HOME/.cache/sideeffect/models/Qwen3-0.6B-Q4_0.gguf" | sha256sum --check
+  "$HOME/.local/share/SideEffect/imports/Qwen3-0.6B-Q4_0.gguf" | sha256sum --check
+```
+
+The command above is a manual user download, not SideEffect's catalog installer. Do not place model weights in the Git checkout. Register and select the local file (the ID below is derived from the shown SHA-256 prefix):
+
+```sh
+sideeffect model add --name "Qwen3-0.6B Q4_0" \
+  --path "$HOME/.local/share/SideEffect/imports/Qwen3-0.6B-Q4_0.gguf" \
+  --for evidence --license Apache-2.0
+sideeffect model select evidence custom-da2572f16c061335
 ```
 
 Then inspect the request and run only after reviewing it:
@@ -52,18 +62,10 @@ sideeffect model-preview --question "Which observed syscall failed?" TRACE
 sideeffect model-analyze \
   --question "Which observed syscall failed?" \
   --runtime "$PWD/llama.cpp/build/bin/llama-cli" \
-  --model "$HOME/.cache/sideeffect/models/Qwen3-0.6B-Q4_0.gguf" \
   --confirm-sha256 REVIEWED_REQUEST_SHA256 TRACE
 ```
 
-To replay the preregistered synthetic evaluation corpus, use the interactive helper below. It displays each exact typed request and output schema, derives expected evidence references from semantic criteria against that exact preview, reports a question-aware deterministic selection from the same typed facts, and requires you to enter that request's full SHA-256 digest before invoking the local model. Invalid output and timeouts are not scored as abstentions. The report includes answer and false-selection-on-abstention metrics and latency distributions. It does not auto-confirm requests or download dependencies.
-
-```sh
-python3 scripts/evaluate_local_model.py \
-  --sideeffect ./target/release/sideeffect \
-  --runtime "$PWD/llama.cpp/build/bin/llama-cli" \
-  --model "$HOME/.cache/sideeffect/models/Qwen3-0.6B-Q4_0.gguf"
-```
+The preregistered synthetic evaluation helper registers the pinned candidate and selects its deterministic custom ID in a private temporary `XDG_DATA_HOME`. Its analysis subprocesses use the selected-model CLI without changing the user's model registry. The helper checks the candidate's bounded file size and exact SHA-256 before registration. Existing measurements below are historical; they do not validate this updated CLI adapter or establish new model quality.
 
 The fixture files and preregistered expectations are under [`tests/fixtures/local_model_synthetic`](../tests/fixtures/local_model_synthetic/README.md). They are synthetic test data, not captures from a user's machine.
 
@@ -91,7 +93,7 @@ Do not pass server, repository, URL, tools, or hosted API options to another run
 - The official [Qwen2.5-0.5B-Instruct-GGUF model card](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/tree/9217f5db79a29953eb74d5343926648285ec7e67) describes a 0.49B-parameter instruction-tuned model and declares Apache-2.0. Its Q4_0 file at revision `9217f5db79a29953eb74d5343926648285ec7e67` was 428,730,208 bytes with SHA-256 `7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed`. Direct offline llama.cpp probes with the exact SideEffect prompt/schema returned E001–E003 for failure positions 1, 24, and 48, catching only the first-position failure. These comparison runs did not use SideEffect's model-hash gate or seccomp wrapper and this model is not configured by the application.
 - The 1.7B comparison file was fetched from the official [ggml-org Qwen3-1.7B GGUF repository](https://huggingface.co/ggml-org/Qwen3-1.7B-GGUF/tree/daeb8e2d528a760970442092f6bf1e55c3b659eb). Its pinned revision was `daeb8e2d528a760970442092f6bf1e55c3b659eb`, file SHA-256 was `d2387ca2dbfee2ffabce7120d3770dadca0b293052bc2f0e138fdc940d9bc7b5`, and size was about 1.28 GB. It was used only for this local evaluation and is not the configured SideEffect model.
 - The instruction-tuned comparison used the [HuggingFaceTB SmolLM2-1.7B-Instruct model](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct) quantized as [SmolLM2-1.7B-Instruct-Q4_K_M.gguf](https://huggingface.co/bartowski/SmolLM2-1.7B-Instruct-GGUF/blob/1f03464768bfcc0319fc50da8ff5fb20b6417ba2/SmolLM2-1.7B-Instruct-Q4_K_M.gguf). The quantization repository revision was `1f03464768bfcc0319fc50da8ff5fb20b6417ba2`, file SHA-256 was `77665ea4815999596525c636fbeb56ba8b080b46ae85efef4f0d986a139834d7`, and size was about 1.06 GB. It was used only for this local evaluation and is not the configured SideEffect model.
-- A guarded trial of the Qwen3-1.7B Q4_K_M candidate exceeded the application's 2 GiB address-space limit on all three test cases (about 1.97 GiB peak RSS before the runtime failed). It is not configured; the Qwen3-0.6B model remains the supported model.
+- A guarded trial of the Qwen3-1.7B Q4_K_M candidate exceeded the application's 2 GiB address-space limit on all three test cases (about 1.97 GiB peak RSS before the runtime failed). This larger candidate was not configured. The Qwen3-0.6B identity above is only a historical evidence-selection candidate; its measured position sensitivity and lack of demonstrated value over deterministic selection mean it is not recommended for answer quality.
 - Network denial was tested for IPv4, IPv6, and Unix socket creation with the runtime subprocess filter active. This is not a proof of complete isolation.
 - The earlier three-position probes used a broader candidate list and exposed order sensitivity. The current implementation narrows failure-question candidates and prioritizes a syscall named by the question. The expanded result below supersedes those exploratory accuracy figures but does not erase them.
 

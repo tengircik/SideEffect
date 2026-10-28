@@ -26,10 +26,65 @@ pub fn analyze_model_explanation_bytes(
     model_path: &Path,
     confirmed_request_sha256: &str,
 ) -> Result<LocalModelExplanation, String> {
-    let preview = crate::local_model_explanation::preview_model_explanation_bytes(
+    let selected = crate::model_manager::ResolvedModel {
+        id: "pinned-evidence-explanation".to_owned(),
+        name: "Pinned evidence explanation model".to_owned(),
+        path: model_path.to_path_buf(),
+        size_bytes: EXPLANATION_MODEL_SIZE_BYTES,
+        sha256: EXPLANATION_MODEL_SHA256.to_owned(),
+        source: crate::model_manager::ModelSource::Catalog {
+            repository: crate::local_model_explanation::EXPLANATION_MODEL_REPOSITORY.to_owned(),
+            revision: crate::local_model_explanation::EXPLANATION_MODEL_REVISION.to_owned(),
+            filename: crate::local_model_explanation::EXPLANATION_MODEL_FILENAME.to_owned(),
+        },
+        license_id: Some("Apache-2.0".to_owned()),
+        evaluation: crate::model_manager::EvaluationStatus::NotAssessed,
+        recommended: false,
+    };
+    analyze_model_explanation_bytes_with_model(
         trace_bytes,
         question,
         backend_preference,
+        runtime_path,
+        model_path,
+        &selected,
+        confirmed_request_sha256,
+    )
+}
+
+pub fn analyze_model_explanation_bytes_for_model(
+    trace_bytes: &[u8],
+    question: &str,
+    backend_preference: ExplanationBackendPreference,
+    runtime_path: &Path,
+    model: &crate::model_manager::ResolvedModel,
+    confirmed_request_sha256: &str,
+) -> Result<LocalModelExplanation, String> {
+    analyze_model_explanation_bytes_with_model(
+        trace_bytes,
+        question,
+        backend_preference,
+        runtime_path,
+        &model.path,
+        model,
+        confirmed_request_sha256,
+    )
+}
+
+fn analyze_model_explanation_bytes_with_model(
+    trace_bytes: &[u8],
+    question: &str,
+    backend_preference: ExplanationBackendPreference,
+    runtime_path: &Path,
+    model_path: &Path,
+    model: &crate::model_manager::ResolvedModel,
+    confirmed_request_sha256: &str,
+) -> Result<LocalModelExplanation, String> {
+    let preview = crate::local_model_explanation::preview_model_explanation_bytes_for_model(
+        trace_bytes,
+        question,
+        backend_preference,
+        model,
     )?;
     if confirmed_request_sha256 != preview.request_sha256 {
         return Err(format!(
@@ -82,8 +137,8 @@ fn run_linux(
     copy_verified_model(
         &model,
         &staged_model,
-        EXPLANATION_MODEL_SHA256,
-        EXPLANATION_MODEL_SIZE_BYTES,
+        &preview.model_sha256,
+        preview.model_size_bytes,
     )?;
     verify_staged_model_size(&staged_model)?;
     let (prompt_path, system_prompt_path, schema_path) =
@@ -154,8 +209,8 @@ fn run_windows(
     copy_verified_model_windows(
         &model,
         &staged_model,
-        EXPLANATION_MODEL_SHA256,
-        EXPLANATION_MODEL_SIZE_BYTES,
+        &preview.model_sha256,
+        preview.model_size_bytes,
     )?;
     verify_staged_model_size(&staged_model)?;
     let (prompt_path, system_prompt_path, schema_path) =
@@ -342,8 +397,8 @@ fn verify_staged_model_size(path: &Path) -> Result<(), String> {
     let size = std::fs::metadata(path)
         .map_err(|error| format!("could not verify staged model size: {error}"))?
         .len();
-    if size != EXPLANATION_MODEL_SIZE_BYTES {
-        return Err("selected model does not match the pinned model size".to_owned());
+    if size == 0 || size > EXPLANATION_MODEL_SIZE_BYTES {
+        return Err("selected model exceeds the existing model size limit".to_owned());
     }
     Ok(())
 }
@@ -403,9 +458,16 @@ fn finish_inference<O: RuntimeOutputView>(
         backend_used: if use_cuda { "cuda" } else { "cpu" },
         backend_status,
         runtime_containment_note: result.containment_note(),
-        model_sha256: EXPLANATION_MODEL_SHA256,
-        model_revision: crate::local_model_explanation::EXPLANATION_MODEL_REVISION,
+        model_id: preview.model_id,
+        model_sha256: preview.model_sha256,
+        model_source: preview.model_source,
+        license_id: preview.license_id,
+        license_status: preview.license_status,
+        evaluation_status: preview.evaluation_status,
+        model_revision: preview.model_revision,
         runtime_source_revision: EXPLANATION_RUNTIME_REVISION,
+        runtime_version: preview.runtime_version,
+        backend: preview.backend,
         evidence_summary: preview.evidence_summary,
         interpretation,
     })

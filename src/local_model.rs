@@ -38,9 +38,15 @@ const INSTRUCTIONS: &str = "Select one evidence ID that best answers the user qu
 pub struct LocalModelPreview {
     pub schema: &'static str,
     pub schema_version: u32,
-    pub model_sha256: &'static str,
-    pub model_repository_revision: &'static str,
+    pub model_id: String,
+    pub model_sha256: String,
+    pub model_source: crate::model_manager::ModelSource,
+    pub license_id: Option<String>,
+    pub license_status: &'static str,
+    pub evaluation_status: crate::model_manager::EvaluationStatus,
+    pub model_repository_revision: String,
     pub runtime_source_revision: &'static str,
+    pub backend: &'static str,
     /// Digest covers both prompt messages, the output schema, model hash, and runtime revision.
     pub request_sha256: String,
     pub question: String,
@@ -58,9 +64,15 @@ pub struct LocalModelAnalysis {
     pub schema_version: u32,
     pub selection_label: &'static str,
     pub request_sha256: String,
-    pub model_sha256: &'static str,
-    pub model_repository_revision: &'static str,
+    pub model_id: String,
+    pub model_sha256: String,
+    pub model_source: crate::model_manager::ModelSource,
+    pub license_id: Option<String>,
+    pub license_status: &'static str,
+    pub evaluation_status: crate::model_manager::EvaluationStatus,
+    pub model_repository_revision: String,
     pub runtime_source_revision: &'static str,
+    pub backend: &'static str,
     pub evidence_summary: Value,
     pub selection: ModelEvidenceSelection,
 }
@@ -73,9 +85,15 @@ pub struct ModelEvidenceSelection {
 
 #[derive(Serialize)]
 struct RequestDigest<'a> {
-    model_sha256: &'static str,
-    model_repository_revision: &'static str,
+    model_id: &'a str,
+    model_sha256: &'a str,
+    model_source: &'a crate::model_manager::ModelSource,
+    license_id: &'a Option<String>,
+    license_status: &'static str,
+    evaluation_status: crate::model_manager::EvaluationStatus,
+    model_repository_revision: &'a str,
     runtime_source_revision: &'static str,
+    backend: &'static str,
     system_prompt: &'a str,
     prompt: &'a str,
     output_schema: &'a Value,
@@ -109,10 +127,63 @@ pub fn preview_trace_bytes(bytes: &[u8], question: &str) -> Result<LocalModelPre
     preview_trace_document(&document, question)
 }
 
+/// Build a bounded preview for a user-selected model without loading or
+/// executing the model runtime.
+pub fn preview_trace_bytes_for_model(
+    bytes: &[u8],
+    question: &str,
+    model: &crate::model_manager::ResolvedModel,
+) -> Result<LocalModelPreview, String> {
+    if bytes.len() > MAX_TRACE_BYTES {
+        return Err(format!(
+            "trace input exceeds the {MAX_TRACE_BYTES} byte limit"
+        ));
+    }
+    let document = parse_trace_bytes(bytes, ParseLimits::default())
+        .map_err(|error| format!("could not parse trace for local-model preview: {error}"))?;
+    preview_trace_document_for_model(&document, question, model)
+}
+
+/// Build a bounded preview for a user-selected model from a parsed trace.
+pub fn preview_trace_document_for_model(
+    document: &crate::model::TraceDocument,
+    question: &str,
+    model: &crate::model_manager::ResolvedModel,
+) -> Result<LocalModelPreview, String> {
+    build_preview(document, question, model)
+}
+
 pub fn preview_trace_document(
     document: &crate::model::TraceDocument,
     question: &str,
 ) -> Result<LocalModelPreview, String> {
+    build_preview(document, question, &pinned_model())
+}
+
+fn pinned_model() -> crate::model_manager::ResolvedModel {
+    crate::model_manager::ResolvedModel {
+        id: "pinned-evidence-selection".to_owned(),
+        name: "Pinned evidence selection model".to_owned(),
+        path: std::path::PathBuf::new(),
+        size_bytes: 512 * 1024 * 1024,
+        sha256: MODEL_SHA256.to_owned(),
+        source: crate::model_manager::ModelSource::Catalog {
+            repository: "ggml-org/Qwen3-0.6B-GGUF".to_owned(),
+            revision: MODEL_REPOSITORY_REVISION.to_owned(),
+            filename: "Qwen3-0.6B-Q4_0.gguf".to_owned(),
+        },
+        license_id: Some("Apache-2.0".to_owned()),
+        evaluation: crate::model_manager::EvaluationStatus::FailedTriage,
+        recommended: false,
+    }
+}
+
+fn build_preview(
+    document: &crate::model::TraceDocument,
+    question: &str,
+    model: &crate::model_manager::ResolvedModel,
+) -> Result<LocalModelPreview, String> {
+    validate_resolved_model(model, 512 * 1024 * 1024)?;
     let question = validate_question(question)?;
     let mut evidence_summary = serde_json::to_value(explain_trace(document))
         .map_err(|error| format!("could not serialize deterministic explanation: {error}"))?;
@@ -130,10 +201,30 @@ pub fn preview_trace_document(
     let system_prompt = INSTRUCTIONS.to_owned();
     let prompt = facts;
     let output_schema = output_schema(&all_evidence_ids);
+    let model_repository_revision = match &model.source {
+        crate::model_manager::ModelSource::Catalog { revision, .. } => revision.clone(),
+        crate::model_manager::ModelSource::UserProvided => "user-provided".to_owned(),
+    };
+    let license_status = if model.license_id.is_some() {
+        match model.source {
+            crate::model_manager::ModelSource::Catalog { .. } => {
+                "catalog_declared_not_legal_advice"
+            }
+            crate::model_manager::ModelSource::UserProvided => "user_provided_unverified",
+        }
+    } else {
+        "not_provided"
+    };
     let digest_material = serde_json::to_vec(&RequestDigest {
-        model_sha256: MODEL_SHA256,
-        model_repository_revision: MODEL_REPOSITORY_REVISION,
+        model_id: &model.id,
+        model_sha256: &model.sha256,
+        model_source: &model.source,
+        license_id: &model.license_id,
+        license_status,
+        evaluation_status: model.evaluation,
+        model_repository_revision: &model_repository_revision,
         runtime_source_revision: RUNTIME_REVISION,
+        backend: "cpu",
         system_prompt: &system_prompt,
         prompt: &prompt,
         output_schema: &output_schema,
@@ -149,9 +240,15 @@ pub fn preview_trace_document(
     Ok(LocalModelPreview {
         schema: "sideeffect.local_model_preview",
         schema_version: LOCAL_MODEL_SCHEMA_VERSION,
-        model_sha256: MODEL_SHA256,
-        model_repository_revision: MODEL_REPOSITORY_REVISION,
+        model_id: model.id.clone(),
+        model_sha256: model.sha256.clone(),
+        model_source: model.source.clone(),
+        license_id: model.license_id.clone(),
+        license_status,
+        evaluation_status: model.evaluation,
+        model_repository_revision,
         runtime_source_revision: RUNTIME_REVISION,
+        backend: "cpu",
         request_sha256,
         question: question.to_owned(),
         system_prompt,
@@ -175,6 +272,49 @@ pub(crate) fn validate_question(question: &str) -> Result<&str, String> {
         return Err("local model question must not contain control characters".to_owned());
     }
     Ok(question)
+}
+
+pub(crate) fn validate_resolved_model(
+    model: &crate::model_manager::ResolvedModel,
+    max_bytes: u64,
+) -> Result<(), String> {
+    if model.id.is_empty()
+        || model.id.len() > crate::model_manager::MAX_MODEL_NAME_BYTES
+        || model.id.chars().any(char::is_control)
+    {
+        return Err("selected model ID is invalid or exceeds its size limit".to_owned());
+    }
+    if model.size_bytes == 0 || model.size_bytes > max_bytes {
+        return Err(format!("selected model exceeds the {max_bytes} byte limit"));
+    }
+    if model.sha256.len() != 64
+        || !model
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(
+            "selected model SHA-256 must be 64 lowercase hexadecimal characters".to_owned(),
+        );
+    }
+    if model.license_id.as_ref().is_some_and(|license| {
+        license.is_empty() || license.len() > 128 || license.chars().any(char::is_control)
+    }) {
+        return Err("selected model license identifier is invalid".to_owned());
+    }
+    if let crate::model_manager::ModelSource::Catalog {
+        repository,
+        revision,
+        filename,
+    } = &model.source
+    {
+        if [repository, revision, filename].iter().any(|value| {
+            value.is_empty() || value.len() > 512 || value.chars().any(char::is_control)
+        }) {
+            return Err("selected model provenance metadata is invalid".to_owned());
+        }
+    }
+    Ok(())
 }
 
 fn model_prompt_facts<'a>(
@@ -377,9 +517,15 @@ fn analysis_from_preview(
         schema_version: LOCAL_MODEL_SCHEMA_VERSION,
         selection_label: "model_selected_single_evidence_for_human_review_not_verified_findings",
         request_sha256: preview.request_sha256,
-        model_sha256: MODEL_SHA256,
-        model_repository_revision: MODEL_REPOSITORY_REVISION,
+        model_id: preview.model_id,
+        model_sha256: preview.model_sha256,
+        model_source: preview.model_source,
+        license_id: preview.license_id,
+        license_status: preview.license_status,
+        evaluation_status: preview.evaluation_status,
+        model_repository_revision: preview.model_repository_revision,
         runtime_source_revision: RUNTIME_REVISION,
+        backend: "cpu",
         evidence_summary: preview.evidence_summary,
         selection,
     }
@@ -484,12 +630,49 @@ pub fn analyze_trace_bytes(
     model: &Path,
     confirmed_request_sha256: &str,
 ) -> Result<LocalModelAnalysis, String> {
+    analyze_trace_bytes_with_model(
+        bytes,
+        question,
+        runtime,
+        model,
+        &pinned_model(),
+        confirmed_request_sha256,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub fn analyze_trace_bytes_for_model(
+    bytes: &[u8],
+    question: &str,
+    runtime: &Path,
+    model: &crate::model_manager::ResolvedModel,
+    confirmed_request_sha256: &str,
+) -> Result<LocalModelAnalysis, String> {
+    analyze_trace_bytes_with_model(
+        bytes,
+        question,
+        runtime,
+        &model.path,
+        model,
+        confirmed_request_sha256,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn analyze_trace_bytes_with_model(
+    bytes: &[u8],
+    question: &str,
+    runtime: &Path,
+    model_path: &Path,
+    selected_model: &crate::model_manager::ResolvedModel,
+    confirmed_request_sha256: &str,
+) -> Result<LocalModelAnalysis, String> {
     use crate::local_model_runtime::{
         TempDirectory, create_private_temp_dir, run_bounded, write_private_file,
     };
     use std::ffi::OsString;
 
-    let preview = preview_trace_bytes(bytes, question)?;
+    let preview = preview_trace_bytes_for_model(bytes, question, selected_model)?;
     if confirmed_request_sha256 != preview.request_sha256 {
         return Err(format!(
             "preview digest mismatch; review `sideeffect model-preview` and confirm its request_sha256 ({})",
@@ -498,7 +681,7 @@ pub fn analyze_trace_bytes(
     }
 
     let runtime = canonical_regular_file(runtime, "runtime")?;
-    let model = canonical_regular_file(model, "model")?;
+    let model = canonical_regular_file(model_path, "model")?;
 
     let version = run_bounded(
         &runtime,
@@ -523,7 +706,20 @@ pub fn analyze_trace_bytes(
     let temporary = create_private_temp_dir()?;
     let _temporary_guard = TempDirectory(temporary.clone());
     let staged_model = temporary.join("model.gguf");
-    copy_verified_model(&model, &staged_model, MODEL_SHA256, 512 * 1024 * 1024)?;
+    copy_verified_model(
+        &model,
+        &staged_model,
+        &preview.model_sha256,
+        512 * 1024 * 1024,
+    )?;
+    if selected_model.id != "pinned-evidence-selection"
+        && std::fs::metadata(&staged_model)
+            .map_err(|error| format!("could not verify staged model size: {error}"))?
+            .len()
+            != selected_model.size_bytes
+    {
+        return Err("selected local model size changed after selection".to_owned());
+    }
     let schema_path = temporary.join("output-schema.json");
     let schema_bytes = serde_json::to_vec(&preview.output_schema)
         .map_err(|error| format!("could not encode output schema: {error}"))?;
@@ -602,7 +798,44 @@ pub fn analyze_trace_bytes(
     _model: &Path,
     confirmed_request_sha256: &str,
 ) -> Result<LocalModelAnalysis, String> {
-    let preview = preview_trace_bytes(bytes, question)?;
+    analyze_trace_bytes_with_model(
+        bytes,
+        question,
+        _runtime,
+        _model,
+        &pinned_model(),
+        confirmed_request_sha256,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn analyze_trace_bytes_for_model(
+    bytes: &[u8],
+    question: &str,
+    runtime: &Path,
+    model: &crate::model_manager::ResolvedModel,
+    confirmed_request_sha256: &str,
+) -> Result<LocalModelAnalysis, String> {
+    analyze_trace_bytes_with_model(
+        bytes,
+        question,
+        runtime,
+        &model.path,
+        model,
+        confirmed_request_sha256,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn analyze_trace_bytes_with_model(
+    bytes: &[u8],
+    question: &str,
+    _runtime: &Path,
+    _model_path: &Path,
+    selected_model: &crate::model_manager::ResolvedModel,
+    confirmed_request_sha256: &str,
+) -> Result<LocalModelAnalysis, String> {
+    let preview = preview_trace_bytes_for_model(bytes, question, selected_model)?;
     if confirmed_request_sha256 != preview.request_sha256 {
         return Err(format!(
             "preview digest mismatch; review `sideeffect model-preview` and confirm its request_sha256 ({})",
