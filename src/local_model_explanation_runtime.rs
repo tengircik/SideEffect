@@ -16,6 +16,9 @@ const MAX_RUNTIME_OUTPUT_BYTES: usize = 64 * 1024;
 const MODEL_TIMEOUT_SECONDS: u64 = 120;
 const MODEL_CONTEXT_TOKENS: &str = "8192";
 const MODEL_OUTPUT_TOKENS: &str = "512";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const MODEL_PROCESS_MEMORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+#[cfg(windows)]
 const MODEL_PROCESS_MEMORY_LIMIT_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 
 pub fn analyze_model_explanation_bytes(
@@ -580,4 +583,54 @@ fn canonical_regular_file(path: &Path, description: &str) -> Result<std::path::P
         return Err(format!("local {description} path must be a regular file"));
     }
     Ok(canonical)
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn linux_explanation_address_space_limit_is_accepted_by_shared_runner() {
+        use std::ffi::OsString;
+        use std::path::Path;
+
+        use crate::local_model_runtime::run_bounded_with_address_space_limit;
+
+        let script = "import resource; print(resource.getrlimit(resource.RLIMIT_AS)[0])";
+        let arguments = [OsString::from("-c"), OsString::from(script)];
+        let output = run_bounded_with_address_space_limit(
+            Path::new("/usr/bin/python3"),
+            &arguments,
+            None,
+            10,
+            1024,
+            super::MODEL_PROCESS_MEMORY_LIMIT_BYTES,
+        )
+        .expect("the explanation limit must be accepted by the shared Linux runner");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout.bytes, b"4294967296\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_explanation_process_limit_is_accepted_by_job_object_runner() {
+        use std::ffi::OsString;
+        use std::time::Duration;
+
+        let executable = std::env::current_exe().expect("locate test executable");
+        let arguments = [OsString::from("--list")];
+        let output = crate::local_model_runtime::run_bounded_windows(
+            &executable,
+            &arguments,
+            None,
+            Duration::from_secs(10),
+            16 * 1024,
+            super::MODEL_PROCESS_MEMORY_LIMIT_BYTES,
+        )
+        .expect("the explanation limit must be accepted by the Windows Job Object runner");
+
+        assert!(output.status.success());
+        assert!(!output.stdout.truncated);
+        assert!(output.containment_note.contains("Job Objects"));
+    }
 }

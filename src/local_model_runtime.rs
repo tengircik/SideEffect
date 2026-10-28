@@ -11,6 +11,8 @@ use std::process::{Command, ExitStatus, Stdio};
 const DEFAULT_ADDRESS_SPACE_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_ADDRESS_SPACE_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_RUNTIME_DIAGNOSTIC_BYTES: usize = 32 * 1024;
 
 #[cfg(target_os = "linux")]
 pub struct BoundedPipe {
@@ -209,7 +211,7 @@ pub fn run_bounded_with_address_space_limit(
             drain_pipe(
                 &mut stderr,
                 &mut stderr_pipe,
-                16 * 1024,
+                MAX_RUNTIME_DIAGNOSTIC_BYTES,
                 &mut stderr_closed,
                 deadline,
             )
@@ -506,6 +508,31 @@ mod tests {
         .err()
         .expect("a limit above the cap must be rejected before spawn");
         assert!(error.contains("address-space limit"));
+    }
+
+    #[test]
+    fn bounded_runner_accepts_twenty_four_kibibytes_of_diagnostics_and_keeps_stdout_cap() {
+        let script =
+            "import sys; sys.stdout.write('o' * 2048); sys.stderr.write('e' * (24 * 1024))";
+        let arguments = [OsString::from("-c"), OsString::from(script)];
+        let output = run_bounded(python(), &arguments, None, 10, 1024).unwrap();
+
+        assert!(output.status.success());
+        assert!(output.stdout.truncated);
+        assert_eq!(output.stdout.bytes.len(), 1024);
+        assert!(!output.stderr.truncated);
+        assert_eq!(output.stderr.bytes.len(), 24 * 1024);
+    }
+
+    #[test]
+    fn bounded_runner_truncates_diagnostics_above_thirty_two_kibibytes() {
+        let script = "import sys; sys.stderr.write('e' * (32 * 1024 + 1))";
+        let arguments = [OsString::from("-c"), OsString::from(script)];
+        let output = run_bounded(python(), &arguments, None, 10, 1024).unwrap();
+
+        assert!(output.status.success());
+        assert!(output.stderr.truncated);
+        assert_eq!(output.stderr.bytes.len(), 32 * 1024);
     }
 
     #[test]
