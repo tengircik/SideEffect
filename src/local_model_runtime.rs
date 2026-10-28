@@ -1608,7 +1608,7 @@ mod windows_tests {
             &arguments,
             None,
             Duration::from_secs(10),
-            16 * 1024,
+            32 * 1024,
             1024 * 1024 * 1024,
         )
         .expect("run bounded child process");

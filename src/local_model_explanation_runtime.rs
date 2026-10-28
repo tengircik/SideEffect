@@ -624,7 +624,7 @@ mod tests {
             &arguments,
             None,
             Duration::from_secs(10),
-            16 * 1024,
+            32 * 1024,
             super::MODEL_PROCESS_MEMORY_LIMIT_BYTES,
         )
         .expect("the explanation limit must be accepted by the Windows Job Object runner");
