@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::model_manager::{
-    CatalogModel, catalog_model, create_model_stage, ensure_private_model_directory, load_registry,
-    save_registry, verify_model_stage_acl,
+    CatalogModel, catalog_model, create_model_stage, ensure_private_model_directory, lock_registry,
+    update_registry, verify_model_stage_acl,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -64,19 +64,21 @@ where
 
     let directory = ensure_private_model_directory()?;
     let destination = directory.join(catalog.filename);
-    let mut registry = load_registry()?;
-    registry.accept_catalog_license(
-        catalog.id,
-        catalog.revision,
-        catalog.license_id,
-        catalog.license_url,
-        true,
-    )?;
     // Persist before the first request; acceptance remains recorded if the
     // subsequent transfer fails or is cancelled.
-    save_registry(&registry)?;
+    update_registry(|registry| {
+        registry.accept_catalog_license(
+            catalog.id,
+            catalog.revision,
+            catalog.license_id,
+            catalog.license_url,
+            true,
+        )
+    })?;
 
     if destination.exists() {
+        let transaction = lock_registry()?;
+        let registry = transaction.load()?;
         let verified = registry.resolve(catalog.id, catalog.task)?;
         return Ok(receipt(catalog, verified.path));
     }
@@ -106,6 +108,15 @@ where
     drop(output);
     verify_model_stage_acl(&staged)?;
 
+    // Serialize publication with catalog removal and selection changes while
+    // avoiding holding the registry lock during network transfer.
+    let transaction = lock_registry()?;
+    let registry = transaction.load()?;
+    if destination.exists() {
+        let verified = registry.resolve(catalog.id, catalog.task)?;
+        return Ok(receipt(catalog, verified.path));
+    }
+
     // A hard link is an atomic same-directory publish that fails if the
     // destination exists; it never replaces another model file.
     fs::hard_link(&staged, &destination)
@@ -132,7 +143,8 @@ pub fn remove_catalog_model(
     let catalog = catalog_model(model_id)
         .ok_or_else(|| "model ID is not in the built-in catalog".to_owned())?;
     let directory = ensure_private_model_directory()?;
-    let mut registry = load_registry()?;
+    let transaction = lock_registry()?;
+    let mut registry = transaction.load()?;
     let resolved = registry.resolve(catalog.id, catalog.task)?;
     let expected = directory.join(catalog.filename);
     if resolved.path != expected {
@@ -141,7 +153,7 @@ pub fn remove_catalog_model(
     registry
         .selected_by_task
         .retain(|_, selected| selected != catalog.id);
-    save_registry(&registry)?;
+    transaction.save(&registry)?;
     fs::remove_file(&expected)
         .map_err(|_| "could not remove the verified catalog model file".to_owned())?;
     Ok(expected)

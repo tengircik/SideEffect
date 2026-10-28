@@ -3,7 +3,7 @@ use std::ffi::OsString;
 #[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -83,6 +83,26 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+const MAX_MODEL_CONFIRMATION_BYTES: usize = 256;
+
+fn read_model_confirmation() -> Result<String, String> {
+    let stdin = io::stdin();
+    let mut bytes = Vec::with_capacity(128);
+    let mut limited = Read::take(stdin.lock(), (MAX_MODEL_CONFIRMATION_BYTES + 1) as u64);
+    limited
+        .read_until(b'\n', &mut bytes)
+        .map_err(|error| format!("could not read model confirmation: {error}"))?;
+    if bytes.len() > MAX_MODEL_CONFIRMATION_BYTES {
+        return Err(format!(
+            "model confirmation exceeds the {MAX_MODEL_CONFIRMATION_BYTES}-byte limit"
+        ));
+    }
+    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        bytes.pop();
+    }
+    String::from_utf8(bytes).map_err(|_| "model confirmation must be valid UTF-8".to_owned())
 }
 
 fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
@@ -1784,10 +1804,7 @@ fn model_install(id: &OsString, select_after_install: bool) -> Result<ExitCode, 
     io::stdout()
         .flush()
         .map_err(|error| format!("could not display license confirmation prompt: {error}"))?;
-    let mut answer = String::new();
-    io::stdin()
-        .read_line(&mut answer)
-        .map_err(|error| format!("could not read license confirmation: {error}"))?;
+    let answer = read_model_confirmation()?;
     if answer.trim() != format!("ACCEPT {}", model.license_id) {
         return Err("model download cancelled; license acceptance was not confirmed".to_owned());
     }
@@ -1814,10 +1831,10 @@ fn model_install(id: &OsString, select_after_install: bool) -> Result<ExitCode, 
         },
     )?;
     if select_after_install {
-        let mut registry = sideeffect::model_manager::load_registry()?;
-        registry.resolve(id, model.task)?;
-        registry.select(model.task, id)?;
-        sideeffect::model_manager::save_registry(&registry)?;
+        sideeffect::model_manager::update_registry(|registry| {
+            registry.resolve(id, model.task)?;
+            registry.select(model.task, id)
+        })?;
         println!(
             "\nInstalled and selected {} for {} ({} bytes, SHA-256 {}).",
             receipt.id,
@@ -1895,9 +1912,9 @@ fn model_add(arguments: &[OsString]) -> Result<ExitCode, String> {
             "one or more requested model tasks are not supported on this platform".to_owned(),
         );
     }
-    let mut registry = sideeffect::model_manager::load_registry()?;
-    let id = registry.register_custom(&name, &path, license.as_deref(), tasks)?;
-    sideeffect::model_manager::save_registry(&registry)?;
+    let id = sideeffect::model_manager::update_registry(|registry| {
+        registry.register_custom(&name, &path, license.as_deref(), tasks)
+    })?;
     println!(
         "Registered {} as {}. It is user-provided and unreviewed; its SHA-256 will be rechecked before use.",
         terminal_safe_path(&path),
@@ -1915,12 +1932,13 @@ fn model_select(task: &OsString, id: &OsString) -> Result<ExitCode, String> {
         ));
     }
     let id = id.to_str().ok_or("model ID must be valid UTF-8")?;
-    let mut registry = sideeffect::model_manager::load_registry()?;
-    // Resolve before changing persistent selection. This checks installation,
-    // current file bounds, and its digest for catalog and custom models.
-    let model = registry.resolve(id, task)?;
-    registry.select(task, id)?;
-    sideeffect::model_manager::save_registry(&registry)?;
+    let model = sideeffect::model_manager::update_registry(|registry| {
+        // Resolve before changing persistent selection. This checks installation,
+        // current file bounds, and its digest for catalog and custom models.
+        let model = registry.resolve(id, task)?;
+        registry.select(task, id)?;
+        Ok(model)
+    })?;
     println!(
         "Selected {} for {}. Evaluation status: {}; this does not certify answer quality.",
         model.id,
@@ -1938,10 +1956,7 @@ fn model_remove(id: &OsString) -> Result<ExitCode, String> {
         io::stdout()
             .flush()
             .map_err(|error| format!("could not display model removal prompt: {error}"))?;
-        let mut answer = String::new();
-        io::stdin()
-            .read_line(&mut answer)
-            .map_err(|error| format!("could not read model removal confirmation: {error}"))?;
+        let answer = read_model_confirmation()?;
         if answer.trim() != format!("DELETE {id}") {
             return Err("model removal cancelled".to_owned());
         }
@@ -1952,9 +1967,7 @@ fn model_remove(id: &OsString) -> Result<ExitCode, String> {
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let mut registry = sideeffect::model_manager::load_registry()?;
-    registry.unregister(id)?;
-    sideeffect::model_manager::save_registry(&registry)?;
+    sideeffect::model_manager::update_registry(|registry| registry.unregister(id))?;
     println!("Unregistered {id}. The model file was left untouched.");
     Ok(ExitCode::SUCCESS)
 }

@@ -4,6 +4,7 @@
 //! model's current evaluation status is shown independently from its ability
 //! to load in the configured local runtime.
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -167,6 +168,50 @@ pub struct ModelRegistry {
     pub accepted_licenses: Vec<AcceptedModelLicense>,
     pub custom_models: Vec<RegisteredModel>,
     pub selected_by_task: BTreeMap<ModelTask, String>,
+}
+
+/// Holds the cross-process exclusive lock for one registry read-modify-write
+/// transaction. Keep the guard short-lived; never hold it while downloading.
+pub struct RegistryTransaction {
+    _lock_file: File,
+}
+
+impl RegistryTransaction {
+    pub fn load(&self) -> Result<ModelRegistry, String> {
+        load_registry_unlocked()
+    }
+
+    pub fn save(&self, registry: &ModelRegistry) -> Result<(), String> {
+        save_registry_unlocked(registry)
+    }
+}
+
+pub fn lock_registry() -> Result<RegistryTransaction, String> {
+    let path = registry_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "model registry path has no parent directory".to_owned())?;
+    ensure_private_store_directory(parent)?;
+    let lock_path = parent.join(".model-registry.lock");
+    let lock_file = open_registry_lock(&lock_path)
+        .map_err(|error| format!("could not open private model registry lock: {error}"))?;
+    FileExt::lock_exclusive(&lock_file)
+        .map_err(|error| format!("could not lock model registry: {error}"))?;
+    Ok(RegistryTransaction {
+        _lock_file: lock_file,
+    })
+}
+
+/// Apply one registry mutation while holding the cross-process lock. The
+/// closure must remain local and bounded; network work belongs outside it.
+pub fn update_registry<T>(
+    update: impl FnOnce(&mut ModelRegistry) -> Result<T, String>,
+) -> Result<T, String> {
+    let transaction = lock_registry()?;
+    let mut registry = transaction.load()?;
+    let result = update(&mut registry)?;
+    transaction.save(&registry)?;
+    Ok(result)
 }
 
 /// A license acceptance explicitly confirmed by the user before an installer
@@ -505,6 +550,11 @@ pub fn load_registry() -> Result<ModelRegistry, String> {
         path.parent()
             .ok_or_else(|| "model registry path has no parent directory".to_owned())?,
     )?;
+    load_registry_unlocked()
+}
+
+fn load_registry_unlocked() -> Result<ModelRegistry, String> {
+    let path = registry_path()?;
     let mut file = match open_registry_read(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -521,9 +571,8 @@ pub fn load_registry() -> Result<ModelRegistry, String> {
 }
 
 /// Save the per-user registry through an exclusive sibling staging file and
-/// same-directory rename. Existing malformed content is never read/rewritten
-/// here; callers should load and validate before making changes.
-pub fn save_registry(registry: &ModelRegistry) -> Result<(), String> {
+/// same-directory rename. Call only while a RegistryTransaction is held.
+fn save_registry_unlocked(registry: &ModelRegistry) -> Result<(), String> {
     let bytes = registry.to_json()?;
     let path = registry_path()?;
     let parent = path
@@ -1130,6 +1179,29 @@ fn open_registry_read(path: &Path) -> std::io::Result<File> {
     Ok(file)
 }
 
+#[cfg(target_os = "linux")]
+fn open_registry_lock(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(std::io::Error::other(
+            "model registry lock is not a private current-user regular file",
+        ));
+    }
+    Ok(file)
+}
+
 #[cfg(windows)]
 fn open_registry_read(path: &Path) -> std::io::Result<File> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
@@ -1150,9 +1222,40 @@ fn open_registry_read(path: &Path) -> std::io::Result<File> {
     Ok(file)
 }
 
+#[cfg(windows)]
+fn open_registry_lock(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::other(
+            "model registry lock is not a plain regular file",
+        ));
+    }
+    apply_and_verify_current_user_acl(path, false).map_err(std::io::Error::other)?;
+    Ok(file)
+}
+
 #[cfg(not(any(target_os = "linux", windows)))]
 fn open_registry_read(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().read(true).open(path)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn open_registry_lock(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
 }
 
 #[cfg(target_os = "linux")]
