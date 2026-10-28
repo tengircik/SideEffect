@@ -1,6 +1,6 @@
 # Phi-3.5-mini-instruct Q2_K query-plan confirmation corpus
 
-**Status: development-only; not a frozen holdout, release gate, model result, or real-capture benchmark. No model inference or prompt tuning was performed while creating or validating this corpus.** The candidate intent is Microsoft Phi-3.5-mini-instruct Q2_K only; this folder records no candidate result.
+**Status: development-only; not a frozen holdout, release gate, or real-capture benchmark. No model inference or prompt tuning was performed while creating or validating this corpus. A subsequent one-time candidate run is recorded below.** The candidate intent was Microsoft Phi-3.5-mini-instruct Q2_K.
 
 ## Cases and separation
 
@@ -40,3 +40,8 @@ Hashes cover exact file bytes. The corpus records each synthetic trace's byte le
 | `harborflax.trace` | 764 | `df1dd8e203d314d9814571e5d4ba3c00efecf3229e6ae605f276047fcf64ed19` |
 | `teatonic.trace` | 640 | `9c34ea814238f9a6982eedad96565d02d89c65925c29863558fab58d655e8d78` |
 | `validate_corpus.py` | 10,462 | `836e5990326eed51abd70a2fa667bf067c6348cdffeab6c79abca8736a8bead9` |
+| `model_run_report.json` | 63,292 | `16a9bfdb9fa68847c69afa9d21e8c545dc907f5a3805d569c9e018bb27066f35` |
+
+## Candidate evaluation
+
+The one-time Phi-3.5-mini Q2_K evaluation failed: it matched 10/24 answerable result sets versus 21/24 for the fixed lexical baseline, and emitted filters in all 16 required-abstention cases. It is a no-go, not a release result. See the [full per-case report](model_run_report.json).
