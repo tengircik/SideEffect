@@ -1,0 +1,8 @@
+[pid 7321] openat(AT_FDCWD, "/etc/orbit/agent.conf", {flags=O_RDONLY}, 3) = 4
+[pid 7321] openat(AT_FDCWD, "/etc/orbit/locked.conf", {flags=O_RDONLY}, 3) = -1 EACCES (Permission denied)
+[pid 7322] openat2(AT_FDCWD, "/var/lib/orbit/index.db", {flags=O_RDWR}, 5) = -1 ENOSPC (No space left on device)
+[pid 7323] connect(6, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.73")}, 16) = -1 ETIMEDOUT (Connection timed out)
+[pid 7324] execve("/opt/orbit/bin/worker", ["worker"], 0x0) = 0
+[pid 7325] execveat(AT_FDCWD, "/usr/libexec/orbit-refresh", ["orbit-refresh"], 0x0, 0) = -1 ENOENT (No such file or directory)
+[pid 7326] clone(child_stack=NULL, flags=SIGCHLD) = 7327
+[pid 7328] vfork() = 7329

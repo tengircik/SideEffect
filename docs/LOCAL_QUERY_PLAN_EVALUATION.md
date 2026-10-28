@@ -70,6 +70,19 @@ A separate, synthetic development-only corpus of 32 cases (20 answerable, 12 req
 
 The open-string schema weakened decoder constraints and produced outputs rejected by the strict Rust validator; those invalid outputs are not counted as accepted false filters. The closed-enum schema is retained as an alignment and validity correction, but the prompt candidate is not adopted: its 20% exact-plan and 40% exact-result scores are far below the registered 85% thresholds, and it has not been run through the frozen gate. The zero accepted false-filter count is only a small synthetic development result, not a safety guarantee. This experiment is not a release-gate run and does not establish behavior on real captures. Preserve the frozen corpus, gate, and M8 no-go status.
 
+### Flat-schema development experiment — 2026-10-28
+
+To test whether the nested schema structure itself caused the remaining over-abstention, a new independent synthetic corpus was authored with 32 cases (20 answerable, 12 required abstentions; SHA-256 `5d93f787666ec33bb91e585d81d30fe87f0d16ac55b51a6eb74262a34f2b4982`). All 32 cases passed the real `model-query-preview` and fixture checks. The experiment transformed the generated schema in memory to a flat top-level selector format with closed enums; it did not change the product schema, query semantics, or Rust validation. Flattened model outputs were mapped back to the product plan shape and passed through the unchanged strict validator.
+
+| Prompt and schema | Strictly valid plans | Exact answerable plans | Exact answerable result sets | Answerable abstentions | Accepted filters on required abstentions | p95 latency |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Current prompt, product schema | 32/32 | 0/20 | 1/20 | 20/20 | 0/12 | 3.909 s |
+| Nested-format examples, product schema | 32/32 | 0/20 | 1/20 | 19/20 | 0/12 | 2.962 s |
+| Current prompt, flat schema | 31/32 | 0/20 | 1/20 | 19/20 | 0/12 | 2.679 s |
+| Flat-format examples, flat schema | 32/32 | 0/20 | 1/20 | 20/20 | 0/12 | 2.384 s |
+
+A separate `nvidia-smi` probe during inference on the pinned Qwen3.5-2B runtime observed device memory rise from 740 MiB to 2,608 MiB. These were Windows RTX 3060 development runs outside the product command; the measurement is not an isolated process peak or a resource bound. Neither schema nor prompt variant improved exact plan quality on this independent set. One current-prompt flat-schema output had the wrong JSON shape and was rejected; it was not counted as a false filter. All variants emitted zero accepted filters on the required-abstention cases, but this small result does not establish safety. The test set has no source-order permutation controls and is not a release gate. The flat schema is not adopted, and M8 remains incomplete.
+
 ## GPU implementation direction
 
 If a local model candidate first passes the frozen usefulness gate, prefer GPU acceleration on hardware and a backend that SideEffect can support and validate. Keep a clearly reported CPU fallback for systems without a supported accelerator. The command must report which backend actually ran and any resource-limit or fallback outcome; it must never silently claim GPU execution. GPU support must preserve explicit user opt-in, offline behavior, strict plan validation, and bounded execution. Define and validate accelerator-memory behavior for each supported backend before claiming that its resource use is bounded. GPU availability or speed does not change the model-quality gate, and this direction is not an implemented feature or a release claim.
