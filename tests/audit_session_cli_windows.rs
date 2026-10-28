@@ -141,12 +141,11 @@ fn windows_session_keeps_a_missing_selected_path_visible_as_not_applicable() {
         .arg("audit")
         .arg("--output")
         .arg(&session)
-        .arg("--processes")
         .arg("--permission")
         .arg(&missing_path)
         .output()
         .unwrap();
-    assert!(published(&output));
+    assert_eq!(output.status.code(), Some(2));
 
     let inspect = cli(&[
         "inspect",
@@ -155,7 +154,7 @@ fn windows_session_keeps_a_missing_selected_path_visible_as_not_applicable() {
         "--session",
         session.to_str().unwrap(),
     ]);
-    assert!(published(&inspect));
+    assert_eq!(inspect.status.code(), Some(2));
     let review: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
     assert_eq!(review["status"], "partial");
     let permissions = review["sources"]
