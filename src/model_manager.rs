@@ -820,6 +820,7 @@ fn ensure_private_store_directory(path: &Path) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "model store directory has no parent".to_owned())?;
+    ensure_private_store_parent_directory(parent)?;
     let parent_metadata = fs::symlink_metadata(parent)
         .map_err(|error| format!("could not inspect model store parent directory: {error}"))?;
     if parent_metadata.file_type().is_symlink()
@@ -863,6 +864,79 @@ fn ensure_private_store_directory(path: &Path) -> Result<(), String> {
         || metadata.mode() & 0o077 != 0
     {
         return Err("model store directory is not private to the current user".to_owned());
+    }
+    Ok(())
+}
+
+/// Safely prepare missing per-user data directories without following a
+/// symlink or accepting a writable shared ancestor. Existing root-owned
+/// ancestors are allowed when they are not writable by other users; sticky
+/// root-owned temporary directories are also safe parents for a private user
+/// directory.
+#[cfg(target_os = "linux")]
+fn ensure_private_store_parent_directory(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    }) {
+        return Err("model store path must not contain dot segments".to_owned());
+    }
+
+    let current_uid = unsafe { libc::geteuid() };
+    let mut missing = Vec::new();
+    let mut cursor = path.to_path_buf();
+    loop {
+        match fs::symlink_metadata(&cursor) {
+            Ok(metadata) => {
+                let root_sticky_directory = metadata.uid() == 0 && metadata.mode() & 0o1000 != 0;
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_dir()
+                    || (metadata.uid() != current_uid && metadata.uid() != 0)
+                    || (metadata.mode() & 0o022 != 0 && !root_sticky_directory)
+                {
+                    return Err(
+                        "model store path contains an unsafe or writable shared directory"
+                            .to_owned(),
+                    );
+                }
+                if !cursor.pop() {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(cursor.clone());
+                if !cursor.pop() {
+                    return Err("model store path has no existing ancestor".to_owned());
+                }
+            }
+            Err(error) => {
+                return Err(format!("could not inspect model store path: {error}"));
+            }
+        }
+    }
+
+    for directory in missing.iter().rev() {
+        match fs::create_dir(directory) {
+            Ok(()) => fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                .map_err(|error| format!("could not restrict model data directory: {error}"))?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!("could not create model data directory: {error}"));
+            }
+        }
+        let metadata = fs::symlink_metadata(directory)
+            .map_err(|error| format!("could not inspect model data directory: {error}"))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != current_uid
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err("new model data directory is not private to the current user".to_owned());
+        }
     }
     Ok(())
 }
@@ -1314,5 +1388,75 @@ fn publish_registry(staged: &Path, destination: &Path) -> std::io::Result<()> {
         Err(std::io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod private_store_parent_tests {
+    use super::ensure_private_store_parent_directory;
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDirectory(PathBuf);
+
+    impl TempDirectory {
+        fn new() -> Self {
+            loop {
+                let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "sideeffect-private-model-parent-{}-{id}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => {
+                        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+                        return Self(path);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("could not create temporary test directory: {error}"),
+                }
+            }
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn creates_missing_private_data_directory_components() {
+        let root = TempDirectory::new();
+        let parent = root.0.join(".local").join("share");
+        ensure_private_store_parent_directory(&parent).unwrap();
+        for directory in [root.0.join(".local"), parent] {
+            let metadata = fs::symlink_metadata(directory).unwrap();
+            assert!(metadata.is_dir());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        }
+    }
+
+    #[test]
+    fn rejects_a_symlink_in_the_model_store_path() {
+        let root = TempDirectory::new();
+        let target = root.0.join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = root.0.join("link");
+        symlink(&target, &link).unwrap();
+        assert!(ensure_private_store_parent_directory(&link.join("share")).is_err());
+        assert!(!target.join("share").exists());
+    }
+
+    #[test]
+    fn rejects_dot_segments_in_the_model_store_path() {
+        let root = TempDirectory::new();
+        let path = root.0.join("..").join("outside");
+        assert!(ensure_private_store_parent_directory(&path).is_err());
     }
 }

@@ -1,6 +1,11 @@
+#![cfg(target_os = "linux")]
+
+#[path = "common/model_store.rs"]
+mod model_store;
+
+use model_store::SelectedTestModel;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -33,8 +38,13 @@ impl Drop for TempTrace {
     }
 }
 
-fn run_preview(question: &str, trace: &TempTrace) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+fn run_preview(
+    model: &SelectedTestModel,
+    question: &str,
+    trace: &TempTrace,
+) -> std::process::Output {
+    model
+        .command()
         .args(["model-query-preview", "--question", question])
         .arg(&trace.0)
         .output()
@@ -43,10 +53,11 @@ fn run_preview(question: &str, trace: &TempTrace) -> std::process::Output {
 
 #[test]
 fn query_preview_keeps_trace_facts_out_of_model_prompt_and_links_sources() {
+    let model = SelectedTestModel::new("query");
     let trace = TempTrace::with_contents(
         b"44 openat(AT_FDCWD, \"/tmp/sideeffect-private.sock\", O_RDONLY) = -1 ENOENT (No such file or directory)\n",
     );
-    let output = run_preview("Which operation returned ENOENT?", &trace);
+    let output = run_preview(&model, "Which operation returned ENOENT?", &trace);
     assert!(
         output.status.success(),
         "{}",
@@ -55,7 +66,9 @@ fn query_preview_keeps_trace_facts_out_of_model_prompt_and_links_sources() {
     let preview: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(preview["schema"], "sideeffect.local_query_plan_preview");
     assert_eq!(preview["schema_version"], 2);
-    assert_eq!(preview["model_repository"], "gguf/Qwen3.5-2B-GGUF");
+    assert_eq!(preview["model_repository"], "user-provided");
+    assert_eq!(preview["model_id"], model.id());
+    assert_eq!(preview["model_sha256"], model.sha256());
     assert_eq!(preview["trace_sha256"].as_str().unwrap().len(), 64);
     assert_eq!(preview["request_sha256"].as_str().unwrap().len(), 64);
     let prompt: serde_json::Value =
@@ -83,10 +96,11 @@ fn query_preview_keeps_trace_facts_out_of_model_prompt_and_links_sources() {
 
 #[test]
 fn query_preview_marks_partial_trace_with_exit_status_two() {
+    let model = SelectedTestModel::new("query");
     let trace = TempTrace::with_contents(
         b"44 execve(\"/usr/bin/tool\", [\"tool\"], 0x0) = 0\nmalformed trace row\n",
     );
-    let output = run_preview("Which executable succeeded?", &trace);
+    let output = run_preview(&model, "Which executable succeeded?", &trace);
     assert_eq!(output.status.code(), Some(2));
     let preview: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(preview["evidence_summary"]["parse_status"], "partial");
