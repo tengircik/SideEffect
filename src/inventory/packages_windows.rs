@@ -114,6 +114,8 @@ pub struct WindowsSoftwareDiagnostic {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value_name: Option<&'static str>,
     pub message: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub win32_error: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -219,6 +221,154 @@ impl Drop for RegistryKey {
     }
 }
 
+trait SoftwareRegistryApi {
+    type Key;
+
+    fn open_uninstall_key(&mut self, source: RegistrySource) -> Result<Self::Key, u32>;
+    fn query_subkey_info(&mut self, key: &Self::Key) -> Result<(u32, u32), u32>;
+    fn enumerate_subkey(
+        &mut self,
+        key: &Self::Key,
+        index: u32,
+        name: &mut [u16],
+        name_length: &mut u32,
+    ) -> u32;
+    fn open_registration_key(
+        &mut self,
+        source: RegistrySource,
+        name: &str,
+    ) -> Result<Self::Key, u32>;
+    fn read_selected_values(
+        &mut self,
+        key: &Self::Key,
+        registration_index: usize,
+        per_value_limit: usize,
+        aggregate_remaining: usize,
+        started: Instant,
+    ) -> (
+        Vec<WindowsRegistryValue>,
+        Vec<WindowsSoftwareDiagnostic>,
+        usize,
+    );
+}
+
+struct NativeSoftwareRegistryApi;
+
+impl SoftwareRegistryApi for NativeSoftwareRegistryApi {
+    type Key = RegistryKey;
+
+    fn open_uninstall_key(&mut self, source: RegistrySource) -> Result<Self::Key, u32> {
+        let subkey = wide_z(OsStr::new(UNINSTALL_KEY));
+        let mut key = null_mut();
+        let result = unsafe {
+            RegOpenKeyExW(
+                source.root as Handle,
+                subkey.as_ptr(),
+                0,
+                KEY_READ | source.view_flag,
+                &mut key,
+            )
+        } as u32;
+        if result == 0 {
+            Ok(RegistryKey(key))
+        } else {
+            Err(result)
+        }
+    }
+
+    fn query_subkey_info(&mut self, key: &Self::Key) -> Result<(u32, u32), u32> {
+        let mut subkey_count = 0u32;
+        let mut max_subkey_name = 0u32;
+        let result = unsafe {
+            RegQueryInfoKeyW(
+                key.0,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut subkey_count,
+                &mut max_subkey_name,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            )
+        } as u32;
+        if result == 0 {
+            Ok((subkey_count, max_subkey_name))
+        } else {
+            Err(result)
+        }
+    }
+
+    fn enumerate_subkey(
+        &mut self,
+        key: &Self::Key,
+        index: u32,
+        name: &mut [u16],
+        name_length: &mut u32,
+    ) -> u32 {
+        (unsafe {
+            RegEnumKeyExW(
+                key.0,
+                index,
+                name.as_mut_ptr(),
+                name_length,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            )
+        }) as u32
+    }
+
+    fn open_registration_key(
+        &mut self,
+        source: RegistrySource,
+        name: &str,
+    ) -> Result<Self::Key, u32> {
+        let key_path = format!("{UNINSTALL_KEY}\\{name}");
+        let key_wide = wide_z(OsStr::new(&key_path));
+        let mut key = null_mut();
+        let result = unsafe {
+            RegOpenKeyExW(
+                source.root as Handle,
+                key_wide.as_ptr(),
+                0,
+                KEY_READ | source.view_flag,
+                &mut key,
+            )
+        } as u32;
+        if result == 0 {
+            Ok(RegistryKey(key))
+        } else {
+            Err(result)
+        }
+    }
+
+    fn read_selected_values(
+        &mut self,
+        key: &Self::Key,
+        registration_index: usize,
+        per_value_limit: usize,
+        aggregate_remaining: usize,
+        started: Instant,
+    ) -> (
+        Vec<WindowsRegistryValue>,
+        Vec<WindowsSoftwareDiagnostic>,
+        usize,
+    ) {
+        read_values(
+            key.0,
+            registration_index,
+            per_value_limit,
+            aggregate_remaining,
+            started,
+        )
+    }
+}
+
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -279,6 +429,30 @@ fn collect_source(
     usize,
     usize,
 ) {
+    collect_source_with_api(
+        &mut NativeSoftwareRegistryApi,
+        source,
+        started,
+        aggregate_data_remaining,
+        aggregate_names_remaining,
+        registration_remaining,
+    )
+}
+
+fn collect_source_with_api<A: SoftwareRegistryApi>(
+    api: &mut A,
+    source: RegistrySource,
+    started: Instant,
+    aggregate_data_remaining: usize,
+    aggregate_names_remaining: usize,
+    registration_remaining: usize,
+) -> (
+    WindowsSoftwareSource,
+    Vec<WindowsSoftwareRegistration>,
+    usize,
+    usize,
+    usize,
+) {
     if started.elapsed().as_millis() >= MAX_SCAN_DURATION_MS {
         return (
             source_result(
@@ -298,76 +472,53 @@ fn collect_source(
             0,
         );
     }
-    let subkey = wide_z(OsStr::new(UNINSTALL_KEY));
-    let mut key = null_mut();
-    let open_result = unsafe {
-        RegOpenKeyExW(
-            source.root as Handle,
-            subkey.as_ptr(),
-            0,
-            KEY_READ | source.view_flag,
-            &mut key,
-        )
-    } as u32;
-    if open_result != 0 {
-        let status = source_open_status(open_result);
-        let diagnostics = if status == WindowsSoftwareStatus::NotPresent {
-            Vec::new()
-        } else {
-            vec![diagnostic(
-                "uninstall_key_unavailable",
-                None,
-                None,
-                "Windows could not open this uninstall registry view.",
-            )]
-        };
-        return (
-            source_result(source, status, 0, diagnostics),
-            Vec::new(),
-            0,
-            0,
-            0,
-        );
-    }
-    let key = RegistryKey(key);
-
-    let mut subkey_count = 0u32;
-    let mut max_subkey_name = 0u32;
-    let query_result = unsafe {
-        RegQueryInfoKeyW(
-            key.0,
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            &mut subkey_count,
-            &mut max_subkey_name,
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            null_mut(),
-        )
-    } as u32;
-    if query_result != 0 {
-        return (
-            source_result(
-                source,
-                WindowsSoftwareStatus::Error,
-                0,
+    let key = match api.open_uninstall_key(source) {
+        Ok(key) => key,
+        Err(open_result) => {
+            let status = source_open_status(open_result);
+            let diagnostics = if status == WindowsSoftwareStatus::NotPresent {
+                Vec::new()
+            } else {
                 vec![diagnostic(
-                    "uninstall_key_metadata_failed",
+                    "uninstall_key_unavailable",
                     None,
                     None,
-                    "Windows could not read uninstall registry key metadata.",
-                )],
-            ),
-            Vec::new(),
-            0,
-            0,
-            0,
-        );
-    }
+                    "Windows could not open this uninstall registry view.",
+                )]
+            };
+            return (
+                source_result(source, status, 0, diagnostics),
+                Vec::new(),
+                0,
+                0,
+                0,
+            );
+        }
+    };
+    let (subkey_count, max_subkey_name) = match api.query_subkey_info(&key) {
+        Ok(info) => info,
+        Err(error) => {
+            let status = source_open_status(error);
+            return (
+                source_result(
+                    source,
+                    status,
+                    0,
+                    vec![diagnostic_win32(
+                        "uninstall_key_metadata_failed",
+                        None,
+                        None,
+                        "Windows could not read uninstall registry key metadata.",
+                        error,
+                    )],
+                ),
+                Vec::new(),
+                0,
+                0,
+                0,
+            );
+        }
+    };
 
     let mut status = WindowsSoftwareStatus::Complete;
     let mut diagnostics = Vec::new();
@@ -408,30 +559,27 @@ fn collect_source(
         }
         let mut name = vec![0u16; name_capacity.max(1)];
         let mut name_length = name.len() as u32;
-        let result = unsafe {
-            RegEnumKeyExW(
-                key.0,
-                index as u32,
-                name.as_mut_ptr(),
-                &mut name_length,
-                null_mut(),
-                null_mut(),
-                null_mut(),
-                null_mut(),
-            )
-        } as u32;
+        let result = api.enumerate_subkey(&key, index as u32, &mut name, &mut name_length);
         if result == ERROR_NO_MORE_ITEMS {
             break;
         }
         registrations_seen = registrations_seen.saturating_add(1);
         if result != 0 {
-            status = WindowsSoftwareStatus::Partial;
-            diagnostics.push(diagnostic(
+            status = if result == ERROR_ACCESS_DENIED {
+                WindowsSoftwareStatus::Inaccessible
+            } else {
+                WindowsSoftwareStatus::Partial
+            };
+            diagnostics.push(diagnostic_win32(
                 "registration_key_read_failed",
                 Some(index),
                 None,
                 "Windows could not read a software-registration key name.",
+                result,
             ));
+            if result == ERROR_ACCESS_DENIED {
+                break;
+            }
             continue;
         }
         let name_length = name_length as usize;
@@ -487,31 +635,26 @@ fn collect_source(
             });
             continue;
         }
-        let key_path = format!("{UNINSTALL_KEY}\\{display_name}");
-        let mut registration_key = null_mut();
-        let key_wide = wide_z(OsStr::new(&key_path));
-        let open_result = unsafe {
-            RegOpenKeyExW(
-                source.root as Handle,
-                key_wide.as_ptr(),
-                0,
-                KEY_READ | source.view_flag,
-                &mut registration_key,
-            )
-        } as u32;
-        if open_result != 0 {
-            status = WindowsSoftwareStatus::Partial;
-            diagnostics.push(diagnostic(
-                "registration_disappeared_or_inaccessible",
-                Some(index),
-                None,
-                "Windows could not reopen this registration after enumeration; its values are unknown.",
-            ));
-            continue;
-        }
-        let registration_key = RegistryKey(registration_key);
-        let (values, value_diagnostics, bytes) = read_values(
-            registration_key.0,
+        let registration_key = match api.open_registration_key(source, &display_name) {
+            Ok(key) => key,
+            Err(error) => {
+                status = if error == ERROR_ACCESS_DENIED {
+                    WindowsSoftwareStatus::Inaccessible
+                } else {
+                    WindowsSoftwareStatus::Partial
+                };
+                diagnostics.push(diagnostic_win32(
+                    "registration_disappeared_or_inaccessible",
+                    Some(index),
+                    None,
+                    "Windows could not reopen this registration after enumeration; its values are unknown.",
+                    error,
+                ));
+                continue;
+            }
+        };
+        let (values, value_diagnostics, bytes) = api.read_selected_values(
+            &registration_key,
             index,
             MAX_VALUE_DATA_BYTES,
             aggregate_data_remaining.saturating_sub(data_bytes),
@@ -786,6 +929,23 @@ fn diagnostic(
         registration_index,
         value_name,
         message,
+        win32_error: None,
+    }
+}
+
+fn diagnostic_win32(
+    code: &'static str,
+    registration_index: Option<usize>,
+    value_name: Option<&'static str>,
+    message: &'static str,
+    win32_error: u32,
+) -> WindowsSoftwareDiagnostic {
+    WindowsSoftwareDiagnostic {
+        code,
+        registration_index,
+        value_name,
+        message,
+        win32_error: Some(win32_error),
     }
 }
 
@@ -819,6 +979,106 @@ fn bytes_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    enum FakeEnumeration {
+        Name(Vec<u16>),
+        Error(u32),
+    }
+
+    struct FakeRegistryApi {
+        metadata: Result<(u32, u32), u32>,
+        enumerations: VecDeque<FakeEnumeration>,
+        failed_registration_name: Option<String>,
+    }
+
+    impl FakeRegistryApi {
+        fn with_names(names: &[&str]) -> Self {
+            let encoded = names
+                .iter()
+                .map(|name| FakeEnumeration::Name(name.encode_utf16().collect()))
+                .collect::<VecDeque<_>>();
+            let max_name = names
+                .iter()
+                .map(|name| name.encode_utf16().count() as u32)
+                .max()
+                .unwrap_or(0);
+            Self {
+                metadata: Ok((names.len() as u32, max_name)),
+                enumerations: encoded,
+                failed_registration_name: None,
+            }
+        }
+    }
+
+    impl SoftwareRegistryApi for FakeRegistryApi {
+        type Key = ();
+
+        fn open_uninstall_key(&mut self, _source: RegistrySource) -> Result<Self::Key, u32> {
+            Ok(())
+        }
+
+        fn query_subkey_info(&mut self, _key: &Self::Key) -> Result<(u32, u32), u32> {
+            self.metadata
+        }
+
+        fn enumerate_subkey(
+            &mut self,
+            _key: &Self::Key,
+            _index: u32,
+            name: &mut [u16],
+            name_length: &mut u32,
+        ) -> u32 {
+            match self
+                .enumerations
+                .pop_front()
+                .unwrap_or(FakeEnumeration::Error(ERROR_NO_MORE_ITEMS))
+            {
+                FakeEnumeration::Name(units) => {
+                    if units.len() > name.len() {
+                        return ERROR_MORE_DATA;
+                    }
+                    name[..units.len()].copy_from_slice(&units);
+                    *name_length = units.len() as u32;
+                    0
+                }
+                FakeEnumeration::Error(error) => error,
+            }
+        }
+
+        fn open_registration_key(
+            &mut self,
+            _source: RegistrySource,
+            name: &str,
+        ) -> Result<Self::Key, u32> {
+            if self.failed_registration_name.as_deref() == Some(name) {
+                Err(ERROR_ACCESS_DENIED)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn read_selected_values(
+            &mut self,
+            _key: &Self::Key,
+            registration_index: usize,
+            _per_value_limit: usize,
+            _aggregate_remaining: usize,
+            _started: Instant,
+        ) -> (
+            Vec<WindowsRegistryValue>,
+            Vec<WindowsSoftwareDiagnostic>,
+            usize,
+        ) {
+            let bytes = "Observed application"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            let (display_name, _) = decode_registry_value("DisplayName", REG_SZ, &bytes);
+            assert_eq!(registration_index, 0);
+            (vec![display_name], Vec::new(), bytes.len())
+        }
+    }
 
     fn utf16_bytes(text: &str) -> Vec<u8> {
         text.encode_utf16().flat_map(u16::to_le_bytes).collect()
@@ -944,5 +1204,100 @@ mod tests {
             inventory_status(&[present_but_missing, inaccessible]),
             WindowsSoftwareStatus::Partial
         );
+    }
+
+    #[test]
+    fn metadata_access_denied_marks_source_inaccessible_and_preserves_error_code() {
+        let mut api = FakeRegistryApi::with_names(&[]);
+        api.metadata = Err(ERROR_ACCESS_DENIED);
+
+        let (source, rows, _, _, _) = collect_source_with_api(
+            &mut api,
+            REGISTRY_SOURCES[0],
+            Instant::now(),
+            MAX_AGGREGATE_VALUE_BYTES,
+            MAX_AGGREGATE_NAME_UNITS,
+            MAX_REGISTRATIONS_PER_SOURCE,
+        );
+
+        assert_eq!(source.status, WindowsSoftwareStatus::Inaccessible);
+        assert_eq!(source.registrations_seen, 0);
+        assert!(rows.is_empty());
+        assert_eq!(source.diagnostics[0].code, "uninstall_key_metadata_failed");
+        assert_eq!(source.diagnostics[0].win32_error, Some(ERROR_ACCESS_DENIED));
+    }
+
+    #[test]
+    fn generic_metadata_failure_remains_error_and_preserves_error_code() {
+        let mut api = FakeRegistryApi::with_names(&[]);
+        api.metadata = Err(1234);
+
+        let (source, rows, _, _, _) = collect_source_with_api(
+            &mut api,
+            REGISTRY_SOURCES[0],
+            Instant::now(),
+            MAX_AGGREGATE_VALUE_BYTES,
+            MAX_AGGREGATE_NAME_UNITS,
+            MAX_REGISTRATIONS_PER_SOURCE,
+        );
+
+        assert_eq!(source.status, WindowsSoftwareStatus::Error);
+        assert_eq!(source.registrations_seen, 0);
+        assert!(rows.is_empty());
+        assert_eq!(source.diagnostics[0].win32_error, Some(1234));
+    }
+
+    #[test]
+    fn enumeration_failure_keeps_previously_observed_registration_and_marks_partial() {
+        let mut api = FakeRegistryApi::with_names(&["Observed"]);
+        api.metadata = Ok((2, "Observed".encode_utf16().count() as u32));
+        api.enumerations.push_back(FakeEnumeration::Error(1234));
+
+        let (source, rows, _, _, _) = collect_source_with_api(
+            &mut api,
+            REGISTRY_SOURCES[0],
+            Instant::now(),
+            MAX_AGGREGATE_VALUE_BYTES,
+            MAX_AGGREGATE_NAME_UNITS,
+            MAX_REGISTRATIONS_PER_SOURCE,
+        );
+
+        assert_eq!(source.status, WindowsSoftwareStatus::Partial);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].registry_subkey, "Observed");
+        assert_eq!(
+            rows[0].display_name.as_deref(),
+            Some("Observed application")
+        );
+        assert!(source.diagnostics.iter().any(|item| {
+            item.code == "registration_key_read_failed"
+                && item.registration_index == Some(1)
+                && item.win32_error == Some(1234)
+        }));
+    }
+
+    #[test]
+    fn per_registration_access_denied_is_inaccessible_and_keeps_prior_rows() {
+        let mut api = FakeRegistryApi::with_names(&["Observed", "Vanished"]);
+        api.metadata = Ok((2, "Observed".encode_utf16().count() as u32));
+        api.failed_registration_name = Some("Vanished".to_string());
+
+        let (source, rows, _, _, _) = collect_source_with_api(
+            &mut api,
+            REGISTRY_SOURCES[0],
+            Instant::now(),
+            MAX_AGGREGATE_VALUE_BYTES,
+            MAX_AGGREGATE_NAME_UNITS,
+            MAX_REGISTRATIONS_PER_SOURCE,
+        );
+
+        assert_eq!(source.status, WindowsSoftwareStatus::Inaccessible);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].registry_subkey, "Observed");
+        assert!(source.diagnostics.iter().any(|item| {
+            item.code == "registration_disappeared_or_inaccessible"
+                && item.registration_index == Some(1)
+                && item.win32_error == Some(ERROR_ACCESS_DENIED)
+        }));
     }
 }

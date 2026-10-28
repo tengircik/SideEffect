@@ -47,6 +47,10 @@ fn windows_permission_command_snapshots_explicit_path_and_refuses_overwrite() {
     );
     assert_eq!(document["schema_version"], 1);
     assert_eq!(document["platform"], "windows");
+    assert_eq!(
+        document["scope"],
+        "explicit_paths_only; final_reparse_points_opened_without_following; no_sacl; no_effective_access_calculation"
+    );
     assert_eq!(document["status"], "complete");
     assert_eq!(document["objects"].as_array().unwrap().len(), 1);
     assert_eq!(document["objects"][0]["status"], "complete");

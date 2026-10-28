@@ -15,14 +15,19 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
 use windows::Win32::System::TaskScheduler::{
-    ILogonTrigger, ITaskService, TASK_ENUM_HIDDEN, TASK_TRIGGER_BOOT, TASK_TRIGGER_LOGON,
-    TASK_TRIGGER_TYPE2, TaskScheduler,
+    IExecAction, ILogonTrigger, ITaskService, TASK_ACTION_COM_HANDLER, TASK_ACTION_EXEC,
+    TASK_ACTION_SEND_EMAIL, TASK_ACTION_SHOW_MESSAGE, TASK_ACTION_TYPE, TASK_ENUM_HIDDEN,
+    TASK_TRIGGER_BOOT, TASK_TRIGGER_LOGON, TASK_TRIGGER_TYPE2, TaskScheduler,
 };
 use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_I4};
 use windows::core::{BSTR, HRESULT, Interface};
 
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_PATH_NOT_FOUND: u32 = 3;
+const ERROR_NOT_SUPPORTED: u32 = 50;
+const ERROR_CALL_NOT_IMPLEMENTED: u32 = 120;
+const ERROR_PROC_NOT_FOUND: u32 = 127;
 const ERROR_MORE_DATA: u32 = 234;
 const ERROR_NO_MORE_ITEMS: u32 = 259;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
@@ -51,6 +56,8 @@ const MAX_TASK_FOLDERS: usize = 1_024;
 const MAX_SCHEDULED_TASKS: usize = 8_192;
 const MAX_SCHEDULED_TASK_TRIGGERS: usize = 8_192;
 const MAX_TRIGGERS_PER_TASK: usize = 256;
+const MAX_SCHEDULED_TASK_ACTIONS: usize = 8_192;
+const MAX_ACTIONS_PER_TASK: usize = 256;
 const MAX_TASK_STRING_UNITS: usize = 32_768;
 const MAX_AGGREGATE_TASK_STRING_UNITS: usize = 4 * 1024 * 1024;
 const MAX_TASK_DIAGNOSTICS: usize = 256;
@@ -208,6 +215,157 @@ pub enum WindowsStartupStatus {
     Error,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupFailureClass {
+    Missing,
+    AccessDenied,
+    Unsupported,
+    ApiFailure,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupFailureContext {
+    RegistryKey,
+    StartupFolder,
+    KnownFolder,
+    ServiceManager,
+    ServiceApi,
+    TaskSchedulerSetup,
+    TaskSchedulerScan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StartupFailureMapping {
+    status: WindowsStartupStatus,
+    diagnostic_code: Option<&'static str>,
+}
+
+fn classify_win32_failure(code: u32) -> StartupFailureClass {
+    match code {
+        ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => StartupFailureClass::Missing,
+        ERROR_ACCESS_DENIED => StartupFailureClass::AccessDenied,
+        ERROR_NOT_SUPPORTED | ERROR_CALL_NOT_IMPLEMENTED | ERROR_PROC_NOT_FOUND => {
+            StartupFailureClass::Unsupported
+        }
+        _ => StartupFailureClass::ApiFailure,
+    }
+}
+
+fn classify_hresult_failure(hresult: i32) -> StartupFailureClass {
+    let raw = hresult as u32;
+    if raw == 0x8000_4001 {
+        return StartupFailureClass::Unsupported;
+    }
+    if raw & 0xffff_0000 == 0x8007_0000 {
+        return classify_win32_failure(raw & 0x0000_ffff);
+    }
+    StartupFailureClass::ApiFailure
+}
+
+fn classify_io_failure(error: &std::io::Error) -> StartupFailureClass {
+    if let Some(code) = error.raw_os_error() {
+        return classify_win32_failure(code as u32);
+    }
+    match error.kind() {
+        std::io::ErrorKind::NotFound => StartupFailureClass::Missing,
+        std::io::ErrorKind::PermissionDenied => StartupFailureClass::AccessDenied,
+        std::io::ErrorKind::Unsupported => StartupFailureClass::Unsupported,
+        _ => StartupFailureClass::ApiFailure,
+    }
+}
+
+fn map_startup_failure(
+    context: StartupFailureContext,
+    class: StartupFailureClass,
+) -> StartupFailureMapping {
+    use StartupFailureClass::{AccessDenied, ApiFailure, Missing, Unsupported};
+    let (status, diagnostic_code) = match (context, class) {
+        (StartupFailureContext::RegistryKey | StartupFailureContext::StartupFolder, Missing) => {
+            (WindowsStartupStatus::NotPresent, None)
+        }
+        (StartupFailureContext::RegistryKey, AccessDenied) => (
+            WindowsStartupStatus::Inaccessible,
+            Some("registry_key_unavailable"),
+        ),
+        (StartupFailureContext::StartupFolder, AccessDenied) => (
+            WindowsStartupStatus::Inaccessible,
+            Some("startup_folder_inaccessible"),
+        ),
+        (StartupFailureContext::RegistryKey, Unsupported) => (
+            WindowsStartupStatus::Unsupported,
+            Some("registry_key_unsupported"),
+        ),
+        (StartupFailureContext::StartupFolder, Unsupported) => (
+            WindowsStartupStatus::Unsupported,
+            Some("startup_folder_unsupported"),
+        ),
+        (StartupFailureContext::RegistryKey, ApiFailure) => (
+            WindowsStartupStatus::Error,
+            Some("registry_key_unavailable"),
+        ),
+        (StartupFailureContext::StartupFolder, ApiFailure) => (
+            WindowsStartupStatus::Error,
+            Some("startup_folder_read_failed"),
+        ),
+        (StartupFailureContext::KnownFolder, Missing) => (WindowsStartupStatus::NotPresent, None),
+        (StartupFailureContext::KnownFolder, AccessDenied) => (
+            WindowsStartupStatus::Inaccessible,
+            Some("startup_folder_inaccessible"),
+        ),
+        (StartupFailureContext::KnownFolder, Unsupported) => (
+            WindowsStartupStatus::Unsupported,
+            Some("startup_folder_unsupported"),
+        ),
+        (StartupFailureContext::KnownFolder, ApiFailure) => (
+            WindowsStartupStatus::Unavailable,
+            Some("startup_folder_unavailable"),
+        ),
+        (StartupFailureContext::ServiceManager, AccessDenied) => (
+            WindowsStartupStatus::Inaccessible,
+            Some("service_manager_access_denied"),
+        ),
+        (StartupFailureContext::ServiceManager, Unsupported) => (
+            WindowsStartupStatus::Unsupported,
+            Some("service_manager_unsupported"),
+        ),
+        (StartupFailureContext::ServiceManager, Missing | ApiFailure) => (
+            WindowsStartupStatus::Unavailable,
+            Some("service_manager_unavailable"),
+        ),
+        (StartupFailureContext::ServiceApi, Unsupported) => (
+            WindowsStartupStatus::Partial,
+            Some("service_api_unsupported"),
+        ),
+        (StartupFailureContext::ServiceApi, Missing | AccessDenied | ApiFailure) => {
+            (WindowsStartupStatus::Partial, Some("service_api_failed"))
+        }
+        (StartupFailureContext::TaskSchedulerSetup, AccessDenied) => (
+            WindowsStartupStatus::Inaccessible,
+            Some("task_scheduler_inaccessible"),
+        ),
+        (StartupFailureContext::TaskSchedulerSetup, Unsupported) => (
+            WindowsStartupStatus::Unsupported,
+            Some("task_scheduler_unsupported"),
+        ),
+        (StartupFailureContext::TaskSchedulerSetup, Missing | ApiFailure) => (
+            WindowsStartupStatus::Unavailable,
+            Some("task_scheduler_unavailable"),
+        ),
+        (StartupFailureContext::TaskSchedulerScan, Unsupported) => (
+            WindowsStartupStatus::Partial,
+            Some("task_scheduler_scan_unsupported"),
+        ),
+        (StartupFailureContext::TaskSchedulerScan, Missing | AccessDenied | ApiFailure) => (
+            WindowsStartupStatus::Partial,
+            Some("task_scheduler_scan_incomplete"),
+        ),
+    };
+    StartupFailureMapping {
+        status,
+        diagnostic_code,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WindowsRegistryView {
@@ -309,6 +467,50 @@ pub struct WindowsScheduledTaskStartupEvidence {
     pub trigger_index: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsScheduledTaskActionStatus {
+    Observed,
+    Unsupported,
+    Partial,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WindowsScheduledTaskAction {
+    pub task_path: Option<String>,
+    pub action_index: usize,
+    pub action_type: &'static str,
+    pub action_type_code: Option<i32>,
+    pub status: WindowsScheduledTaskActionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executable_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+    pub evidence: WindowsScheduledTaskActionEvidence,
+}
+
+#[derive(Clone, Copy)]
+enum ExecActionField {
+    Path,
+    Arguments,
+    WorkingDirectory,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecActionTextError {
+    Com(HRESULT),
+    Invalid(TaskStringError),
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WindowsScheduledTaskActionEvidence {
+    pub source: &'static str,
+    pub task_index: usize,
+    pub action_index: usize,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct WindowsStartupSource {
     pub id: &'static str,
@@ -341,6 +543,7 @@ pub struct WindowsStartupInventoryDocument {
     pub folder_entries: Vec<WindowsStartupFolderEntry>,
     pub service_entries: Vec<WindowsServiceStartupEntry>,
     pub scheduled_task_entries: Vec<WindowsScheduledTaskStartupEntry>,
+    pub scheduled_task_actions: Vec<WindowsScheduledTaskAction>,
 }
 
 #[derive(Clone, Copy)]
@@ -458,6 +661,103 @@ impl Drop for RegistryKey {
     }
 }
 
+trait StartupRegistryApi {
+    type Key;
+
+    fn open(&mut self, source: RegistrySource) -> Result<Self::Key, u32>;
+    fn query_value_info(&mut self, key: &Self::Key) -> Result<(u32, u32, u32), u32>;
+    fn enumerate_value(
+        &mut self,
+        key: &Self::Key,
+        index: u32,
+        buffer: &mut StartupRegistryValueBuffer,
+    ) -> u32;
+}
+
+struct StartupRegistryValueBuffer {
+    name: Vec<u16>,
+    name_length: u32,
+    value_type: u32,
+    data: Vec<u8>,
+    data_length: u32,
+}
+
+struct NativeStartupRegistryApi;
+
+impl StartupRegistryApi for NativeStartupRegistryApi {
+    type Key = RegistryKey;
+
+    fn open(&mut self, source: RegistrySource) -> Result<Self::Key, u32> {
+        let subkey = wide_z(OsStr::new(source.key));
+        let mut key = null_mut();
+        let code = unsafe {
+            RegOpenKeyExW(
+                source.root as Handle,
+                subkey.as_ptr(),
+                0,
+                KEY_READ | source.wow64_flag,
+                &mut key,
+            )
+        } as u32;
+        if code == 0 {
+            Ok(RegistryKey(key))
+        } else {
+            Err(code)
+        }
+    }
+
+    fn query_value_info(&mut self, key: &Self::Key) -> Result<(u32, u32, u32), u32> {
+        let mut value_count = 0u32;
+        let mut max_name = 0u32;
+        let mut max_data = 0u32;
+        let code = unsafe {
+            RegQueryInfoKeyW(
+                key.0,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut value_count,
+                &mut max_name,
+                &mut max_data,
+                null_mut(),
+                null_mut(),
+            )
+        } as u32;
+        if code == 0 {
+            Ok((value_count, max_name, max_data))
+        } else {
+            Err(code)
+        }
+    }
+
+    fn enumerate_value(
+        &mut self,
+        key: &Self::Key,
+        index: u32,
+        buffer: &mut StartupRegistryValueBuffer,
+    ) -> u32 {
+        (unsafe {
+            RegEnumValueW(
+                key.0,
+                index,
+                buffer.name.as_mut_ptr(),
+                &mut buffer.name_length,
+                null_mut(),
+                &mut buffer.value_type,
+                if buffer.data.is_empty() {
+                    null_mut()
+                } else {
+                    buffer.data.as_mut_ptr()
+                },
+                &mut buffer.data_length,
+            )
+        }) as u32
+    }
+}
+
 struct KnownFolderPath(*mut u16);
 
 impl Drop for KnownFolderPath {
@@ -553,9 +853,10 @@ pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
     let (service_source, services) = collect_service_start_configuration(started);
     sources.push(service_source);
     service_entries.extend(services);
-    let (task_source, tasks) = collect_scheduled_task_triggers(started);
+    let (task_source, tasks, task_actions) = collect_scheduled_task_triggers(started);
     sources.push(task_source);
     scheduled_task_entries.extend(tasks);
+    let scheduled_task_actions = task_actions;
     let status = if sources.iter().any(|source| {
         !matches!(
             source.status,
@@ -568,7 +869,7 @@ pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
     };
     WindowsStartupInventoryDocument {
         schema: "sideeffect.windows_startup_inventory",
-        schema_version: 3,
+        schema_version: 4,
         platform: "windows",
         scope: "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks",
         capture_started_at_unix_ms: started_at,
@@ -579,6 +880,7 @@ pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
         folder_entries,
         service_entries,
         scheduled_task_entries,
+        scheduled_task_actions,
     }
 }
 
@@ -618,22 +920,19 @@ fn collect_service_start_configuration(
     };
     if manager.is_null() {
         let error = unsafe { GetLastError() };
-        let status = if error == ERROR_ACCESS_DENIED {
-            WindowsStartupStatus::Inaccessible
-        } else {
-            WindowsStartupStatus::Unavailable
-        };
+        let mapping = map_startup_failure(
+            StartupFailureContext::ServiceManager,
+            classify_win32_failure(error),
+        );
         return (
             source_result(
                 "service_start_configuration",
-                status,
+                mapping.status,
                 0,
                 vec![diagnostic_win32(
-                    if error == ERROR_ACCESS_DENIED {
-                        "service_manager_access_denied"
-                    } else {
-                        "service_manager_unavailable"
-                    },
+                    mapping
+                        .diagnostic_code
+                        .unwrap_or("service_manager_unavailable"),
                     None,
                     "Windows could not open the Service Control Manager with read-only enumeration access.",
                     error,
@@ -685,15 +984,17 @@ fn collect_service_start_configuration(
             unsafe { GetLastError() }
         };
         if !success && error != ERROR_MORE_DATA {
-            status = WindowsStartupStatus::Partial;
+            let mapping = map_startup_failure(
+                StartupFailureContext::ServiceApi,
+                classify_win32_failure(error),
+            );
+            status = mapping.status;
             push_service_diagnostic(
                 &mut diagnostics,
                 diagnostic_win32(
-                    if error == ERROR_ACCESS_DENIED {
-                        "service_enumeration_access_denied"
-                    } else {
-                        "service_enumeration_failed"
-                    },
+                    mapping
+                        .diagnostic_code
+                        .unwrap_or("service_enumeration_failed"),
                     None,
                     "Windows could not enumerate all service configurations visible to this user.",
                     error,
@@ -785,15 +1086,15 @@ fn collect_service_start_configuration(
             };
             if service.is_null() {
                 let error = unsafe { GetLastError() };
-                status = WindowsStartupStatus::Partial;
+                let mapping = map_startup_failure(
+                    StartupFailureContext::ServiceApi,
+                    classify_win32_failure(error),
+                );
+                status = mapping.status;
                 push_service_diagnostic(
                     &mut diagnostics,
                     diagnostic_win32(
-                        if error == ERROR_ACCESS_DENIED {
-                            "service_configuration_access_denied"
-                        } else {
-                            "service_open_failed"
-                        },
+                        mapping.diagnostic_code.unwrap_or("service_open_failed"),
                         Some(enumerated),
                         "Windows denied or failed opening this service for configuration query; the service row is unknown.",
                         error,
@@ -813,15 +1114,17 @@ fn collect_service_start_configuration(
                 0
             };
             if first_result != 0 || first_error != ERROR_INSUFFICIENT_BUFFER {
-                status = WindowsStartupStatus::Partial;
+                let mapping = map_startup_failure(
+                    StartupFailureContext::ServiceApi,
+                    classify_win32_failure(first_error),
+                );
+                status = mapping.status;
                 push_service_diagnostic(
                     &mut diagnostics,
                     diagnostic_win32(
-                        if first_error == ERROR_ACCESS_DENIED {
-                            "service_configuration_access_denied"
-                        } else {
-                            "service_configuration_query_failed"
-                        },
+                        mapping
+                            .diagnostic_code
+                            .unwrap_or("service_configuration_query_failed"),
                         Some(enumerated),
                         "Windows could not determine the bounded service-configuration buffer size.",
                         first_error,
@@ -861,15 +1164,17 @@ fn collect_service_start_configuration(
             } != 0;
             if !query_success {
                 let error = unsafe { GetLastError() };
-                status = WindowsStartupStatus::Partial;
+                let mapping = map_startup_failure(
+                    StartupFailureContext::ServiceApi,
+                    classify_win32_failure(error),
+                );
+                status = mapping.status;
                 push_service_diagnostic(
                     &mut diagnostics,
                     diagnostic_win32(
-                        if error == ERROR_ACCESS_DENIED {
-                            "service_configuration_access_denied"
-                        } else {
-                            "service_configuration_query_failed"
-                        },
+                        mapping
+                            .diagnostic_code
+                            .unwrap_or("service_configuration_query_failed"),
                         Some(enumerated),
                         "Windows could not read this service's configuration; its row is unknown.",
                         error,
@@ -997,6 +1302,7 @@ impl Drop for ComApartment {
 enum TaskStringError {
     OverLimit,
     MalformedUtf16,
+    AggregateLimit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1006,9 +1312,14 @@ enum TaskCountError {
 
 fn collect_scheduled_task_triggers(
     started: Instant,
-) -> (WindowsStartupSource, Vec<WindowsScheduledTaskStartupEntry>) {
+) -> (
+    WindowsStartupSource,
+    Vec<WindowsScheduledTaskStartupEntry>,
+    Vec<WindowsScheduledTaskAction>,
+) {
     let mut diagnostics = Vec::new();
     let mut entries = Vec::new();
+    let mut actions = Vec::new();
     let mut status = WindowsStartupStatus::Complete;
     let mut tasks_seen = 0usize;
     let mut folders_seen = 0usize;
@@ -1030,6 +1341,7 @@ fn collect_scheduled_task_triggers(
                 )],
             ),
             entries,
+            actions,
         );
     }
     let _apartment = ComApartment;
@@ -1038,56 +1350,68 @@ fn collect_scheduled_task_triggers(
     } {
         Ok(service) => service,
         Err(error) => {
+            let mapping = task_error_mapping(&error, StartupFailureContext::TaskSchedulerSetup);
             return (
                 source_result(
                     "scheduled_task_triggers",
-                    task_error_status(&error),
+                    mapping.status,
                     0,
                     vec![diagnostic_hresult(
-                        "task_scheduler_service_unavailable",
+                        mapping
+                            .diagnostic_code
+                            .unwrap_or("task_scheduler_service_unavailable"),
                         None,
                         "Windows could not create the local Task Scheduler COM service object.",
                         error.code(),
                     )],
                 ),
                 entries,
+                actions,
             );
         }
     };
     let empty = VARIANT::default();
     if let Err(error) = unsafe { service.Connect(&empty, &empty, &empty, &empty) } {
+        let mapping = task_error_mapping(&error, StartupFailureContext::TaskSchedulerSetup);
         return (
             source_result(
                 "scheduled_task_triggers",
-                task_error_status(&error),
+                mapping.status,
                 0,
                 vec![diagnostic_hresult(
-                    "task_scheduler_connection_failed",
+                    mapping
+                        .diagnostic_code
+                        .unwrap_or("task_scheduler_connection_failed"),
                     None,
                     "Windows denied or failed connecting to the local Task Scheduler with the current user's token.",
                     error.code(),
                 )],
             ),
             entries,
+            actions,
         );
     }
     let root_path = BSTR::from("\\");
     let root = match unsafe { service.GetFolder(&root_path) } {
         Ok(root) => root,
         Err(error) => {
+            let mapping = task_error_mapping(&error, StartupFailureContext::TaskSchedulerSetup);
             return (
                 source_result(
                     "scheduled_task_triggers",
-                    task_error_status(&error),
+                    mapping.status,
                     0,
                     vec![diagnostic_hresult(
-                        "task_scheduler_root_folder_unavailable",
+                        mapping
+                            .diagnostic_code
+                            .unwrap_or("task_scheduler_root_folder_unavailable"),
                         None,
                         "Windows denied or failed opening the root folder of tasks visible to the current user.",
                         error.code(),
                     )],
                 ),
                 entries,
+                actions,
             );
         }
     };
@@ -1110,15 +1434,14 @@ fn collect_scheduled_task_triggers(
         let tasks = match unsafe { folder.GetTasks(TASK_ENUM_HIDDEN.0) } {
             Ok(tasks) => tasks,
             Err(error) => {
-                status = WindowsStartupStatus::Partial;
+                let mapping = task_error_mapping(&error, StartupFailureContext::TaskSchedulerScan);
+                status = mapping.status;
                 push_task_diagnostic(
                     &mut diagnostics,
                     diagnostic_hresult(
-                        if task_error_is_access_denied(&error) {
-                            "task_folder_access_denied"
-                        } else {
-                            "task_folder_enumeration_failed"
-                        },
+                        mapping
+                            .diagnostic_code
+                            .unwrap_or("task_folder_enumeration_failed"),
                         Some(folders_seen - 1),
                         "Windows denied or failed enumerating tasks in a visible folder; that folder remains unknown.",
                         error.code(),
@@ -1271,6 +1594,7 @@ fn collect_scheduled_task_triggers(
                     ),
                 );
             }
+            let mut task_actions_collected = false;
             for trigger_number in 1..=triggers_to_read {
                 if elapsed(started) {
                     status = WindowsStartupStatus::Partial;
@@ -1366,6 +1690,36 @@ fn collect_scheduled_task_triggers(
                         continue;
                     }
                 };
+                if !task_actions_collected {
+                    let task_action_collection = match unsafe { definition.Actions() } {
+                        Ok(collection) => Some(collection),
+                        Err(error) => {
+                            status = WindowsStartupStatus::Partial;
+                            push_task_diagnostic(
+                                &mut diagnostics,
+                                diagnostic_hresult(
+                                    "task_action_collection_read_failed",
+                                    Some(task_index),
+                                    "Windows could not read a task's action collection; its configured action remains unknown.",
+                                    error.code(),
+                                ),
+                            );
+                            None
+                        }
+                    };
+                    if let Some(collection) = task_action_collection {
+                        collect_task_actions(
+                            &collection,
+                            &task_path,
+                            task_index,
+                            &mut actions,
+                            &mut aggregate_string_units,
+                            &mut status,
+                            &mut diagnostics,
+                        );
+                    }
+                    task_actions_collected = true;
+                }
                 let task_enabled = match unsafe { task.Enabled() } {
                     Ok(enabled) => Some(enabled.0 != 0),
                     Err(error) => {
@@ -1637,6 +1991,7 @@ fn collect_scheduled_task_triggers(
             diagnostics,
         ),
         entries,
+        actions,
     )
 }
 
@@ -1646,6 +2001,353 @@ fn scheduled_trigger_name(trigger_type: TASK_TRIGGER_TYPE2) -> Option<&'static s
         TASK_TRIGGER_LOGON => Some("logon"),
         _ => None,
     }
+}
+
+fn collect_task_actions(
+    collection: &windows::Win32::System::TaskScheduler::IActionCollection,
+    task_path: &str,
+    task_index: usize,
+    actions: &mut Vec<WindowsScheduledTaskAction>,
+    aggregate_string_units: &mut usize,
+    status: &mut WindowsStartupStatus,
+    diagnostics: &mut Vec<WindowsStartupDiagnostic>,
+) {
+    let mut count = 0i32;
+    if let Err(error) = unsafe { collection.Count(&mut count) } {
+        *status = WindowsStartupStatus::Partial;
+        push_task_diagnostic(
+            diagnostics,
+            diagnostic_hresult(
+                "task_action_count_failed",
+                Some(task_index),
+                "Windows could not determine a task's action count; its actions remain unknown.",
+                error.code(),
+            ),
+        );
+        return;
+    }
+    let remaining = MAX_SCHEDULED_TASK_ACTIONS.saturating_sub(actions.len());
+    let (actions_to_read, count_limit_hit) = match bounded_task_count(count, MAX_ACTIONS_PER_TASK) {
+        Ok((bounded, per_task_limit_hit)) => {
+            let globally_bounded = bounded.min(remaining);
+            (globally_bounded, per_task_limit_hit || bounded > remaining)
+        }
+        Err(_) => {
+            *status = WindowsStartupStatus::Partial;
+            push_task_diagnostic(
+                diagnostics,
+                diagnostic(
+                    "task_action_count_malformed",
+                    Some(task_index),
+                    "Windows returned a negative action count; the task's actions remain unknown.",
+                ),
+            );
+            return;
+        }
+    };
+    if count_limit_hit {
+        *status = WindowsStartupStatus::Partial;
+        push_task_diagnostic(
+            diagnostics,
+            diagnostic(
+                if actions.len() >= MAX_SCHEDULED_TASK_ACTIONS {
+                    "task_action_row_limit_exceeded"
+                } else {
+                    "task_action_limit_exceeded"
+                },
+                Some(task_index),
+                "A scheduled-task action count limit was reached; remaining actions were not checked.",
+            ),
+        );
+    }
+
+    for action_number in 1..=actions_to_read {
+        let action_index = action_number - 1;
+        let action = match unsafe { collection.get_Item(action_number as i32) } {
+            Ok(action) => action,
+            Err(error) => {
+                *status = WindowsStartupStatus::Partial;
+                push_task_diagnostic(
+                    diagnostics,
+                    diagnostic_hresult(
+                        if task_error_is_access_denied(&error) {
+                            "task_action_access_denied"
+                        } else {
+                            "task_action_read_failed"
+                        },
+                        Some(task_index),
+                        "Windows denied or failed reading a scheduled-task action; that action remains unknown.",
+                        error.code(),
+                    ),
+                );
+                continue;
+            }
+        };
+        let mut action_type = TASK_ACTION_TYPE(0);
+        if let Err(error) = unsafe { action.Type(&mut action_type) } {
+            *status = WindowsStartupStatus::Partial;
+            push_task_diagnostic(
+                diagnostics,
+                diagnostic_hresult(
+                    "task_action_type_read_failed",
+                    Some(task_index),
+                    "Windows could not identify a scheduled-task action type; the action remains unknown.",
+                    error.code(),
+                ),
+            );
+            actions.push(WindowsScheduledTaskAction {
+                task_path: retain_action_task_path(
+                    task_path,
+                    aggregate_string_units,
+                    status,
+                    diagnostics,
+                    task_index,
+                ),
+                action_index,
+                action_type: "unknown",
+                action_type_code: None,
+                status: WindowsScheduledTaskActionStatus::Partial,
+                executable_path: None,
+                arguments: None,
+                working_directory: None,
+                evidence: WindowsScheduledTaskActionEvidence {
+                    source: "Task Scheduler IActionCollection/IAction",
+                    task_index,
+                    action_index,
+                },
+            });
+            continue;
+        }
+        let type_name = scheduled_action_name(action_type);
+        let mapped_status = scheduled_action_status(action_type);
+        if mapped_status == WindowsScheduledTaskActionStatus::Unsupported {
+            *status = WindowsStartupStatus::Partial;
+            push_task_diagnostic(
+                diagnostics,
+                diagnostic(
+                    "task_action_type_unsupported",
+                    Some(task_index),
+                    "A scheduled-task action type is recorded but not interpreted; its action-specific fields are unknown.",
+                ),
+            );
+            actions.push(WindowsScheduledTaskAction {
+                task_path: retain_action_task_path(
+                    task_path,
+                    aggregate_string_units,
+                    status,
+                    diagnostics,
+                    task_index,
+                ),
+                action_index,
+                action_type: type_name,
+                action_type_code: Some(action_type.0),
+                status: WindowsScheduledTaskActionStatus::Unsupported,
+                executable_path: None,
+                arguments: None,
+                working_directory: None,
+                evidence: WindowsScheduledTaskActionEvidence {
+                    source: "Task Scheduler IActionCollection/IAction",
+                    task_index,
+                    action_index,
+                },
+            });
+            continue;
+        }
+        let exec = match action.cast::<IExecAction>() {
+            Ok(exec) => exec,
+            Err(error) => {
+                *status = WindowsStartupStatus::Partial;
+                push_task_diagnostic(
+                    diagnostics,
+                    diagnostic_hresult(
+                        "task_exec_action_interface_unavailable",
+                        Some(task_index),
+                        "Windows could not read the typed Exec action interface; action fields remain unknown.",
+                        error.code(),
+                    ),
+                );
+                actions.push(WindowsScheduledTaskAction {
+                    task_path: retain_action_task_path(
+                        task_path,
+                        aggregate_string_units,
+                        status,
+                        diagnostics,
+                        task_index,
+                    ),
+                    action_index,
+                    action_type: type_name,
+                    action_type_code: Some(action_type.0),
+                    status: WindowsScheduledTaskActionStatus::Partial,
+                    executable_path: None,
+                    arguments: None,
+                    working_directory: None,
+                    evidence: WindowsScheduledTaskActionEvidence {
+                        source: "Task Scheduler IActionCollection/IExecAction",
+                        task_index,
+                        action_index,
+                    },
+                });
+                continue;
+            }
+        };
+        let mut row_partial = false;
+        let mut read_field = |field: ExecActionField| match read_exec_action_text(&exec, field) {
+            Ok(value) => match reserve_task_string(&value, aggregate_string_units) {
+                Ok(()) => Some(value),
+                Err(TaskStringError::AggregateLimit) => {
+                    row_partial = true;
+                    *status = WindowsStartupStatus::Partial;
+                    push_task_diagnostic(
+                        diagnostics,
+                        diagnostic(
+                            "task_action_string_budget_exceeded",
+                            Some(task_index),
+                            "The aggregate scheduled-task action string budget was reached; this and remaining action fields are omitted.",
+                        ),
+                    );
+                    None
+                }
+                Err(_) => unreachable!("BSTR was validated before aggregate accounting"),
+            },
+            Err(error) => {
+                row_partial = true;
+                *status = WindowsStartupStatus::Partial;
+                match error {
+                    ExecActionTextError::Com(code) => push_task_diagnostic(
+                        diagnostics,
+                        diagnostic_hresult(
+                            "task_action_field_read_failed",
+                            Some(task_index),
+                            "Windows could not read an Exec action field; that field remains unknown.",
+                            code,
+                        ),
+                    ),
+                    ExecActionTextError::Invalid(TaskStringError::OverLimit) => {
+                        push_task_diagnostic(
+                            diagnostics,
+                            diagnostic(
+                                "task_action_field_limit_exceeded",
+                                Some(task_index),
+                                "An Exec action field exceeded its UTF-16 length limit and was omitted.",
+                            ),
+                        )
+                    }
+                    ExecActionTextError::Invalid(TaskStringError::MalformedUtf16) => {
+                        push_task_diagnostic(
+                            diagnostics,
+                            diagnostic(
+                                "task_action_field_malformed_utf16",
+                                Some(task_index),
+                                "An Exec action field contained malformed UTF-16 and was omitted.",
+                            ),
+                        )
+                    }
+                    ExecActionTextError::Invalid(TaskStringError::AggregateLimit) => {
+                        unreachable!("aggregate limits are applied after BSTR conversion")
+                    }
+                }
+                None
+            }
+        };
+        let executable_path = read_field(ExecActionField::Path);
+        let arguments = read_field(ExecActionField::Arguments);
+        let working_directory = read_field(ExecActionField::WorkingDirectory);
+        drop(read_field);
+        actions.push(WindowsScheduledTaskAction {
+            task_path: retain_action_task_path(
+                task_path,
+                aggregate_string_units,
+                status,
+                diagnostics,
+                task_index,
+            ),
+            action_index,
+            action_type: type_name,
+            action_type_code: Some(action_type.0),
+            status: if row_partial {
+                WindowsScheduledTaskActionStatus::Partial
+            } else {
+                WindowsScheduledTaskActionStatus::Observed
+            },
+            executable_path,
+            arguments,
+            working_directory,
+            evidence: WindowsScheduledTaskActionEvidence {
+                source: "Task Scheduler IActionCollection/IExecAction",
+                task_index,
+                action_index,
+            },
+        });
+    }
+}
+
+fn retain_action_task_path(
+    task_path: &str,
+    aggregate_units: &mut usize,
+    status: &mut WindowsStartupStatus,
+    diagnostics: &mut Vec<WindowsStartupDiagnostic>,
+    task_index: usize,
+) -> Option<String> {
+    if reserve_task_string(task_path, aggregate_units).is_ok() {
+        Some(task_path.to_owned())
+    } else {
+        *status = WindowsStartupStatus::Partial;
+        push_task_diagnostic(
+            diagnostics,
+            diagnostic(
+                "task_action_string_budget_exceeded",
+                Some(task_index),
+                "The aggregate scheduled-task action string budget was reached; this action's task path is omitted.",
+            ),
+        );
+        None
+    }
+}
+
+fn scheduled_action_name(action_type: TASK_ACTION_TYPE) -> &'static str {
+    match action_type {
+        TASK_ACTION_EXEC => "exec",
+        TASK_ACTION_COM_HANDLER => "com_handler",
+        TASK_ACTION_SEND_EMAIL => "send_email",
+        TASK_ACTION_SHOW_MESSAGE => "show_message",
+        _ => "unknown",
+    }
+}
+
+fn scheduled_action_status(action_type: TASK_ACTION_TYPE) -> WindowsScheduledTaskActionStatus {
+    if action_type == TASK_ACTION_EXEC {
+        WindowsScheduledTaskActionStatus::Observed
+    } else {
+        WindowsScheduledTaskActionStatus::Unsupported
+    }
+}
+
+fn reserve_task_string(value: &str, aggregate_units: &mut usize) -> Result<(), TaskStringError> {
+    let units = value.encode_utf16().count();
+    let total = aggregate_units
+        .checked_add(units)
+        .ok_or(TaskStringError::AggregateLimit)?;
+    if total > MAX_AGGREGATE_TASK_STRING_UNITS {
+        return Err(TaskStringError::AggregateLimit);
+    }
+    *aggregate_units = total;
+    Ok(())
+}
+
+fn read_exec_action_text(
+    action: &IExecAction,
+    field: ExecActionField,
+) -> Result<String, ExecActionTextError> {
+    let mut value = BSTR::default();
+    let result = unsafe {
+        match field {
+            ExecActionField::Path => action.Path(&mut value),
+            ExecActionField::Arguments => action.Arguments(&mut value),
+            ExecActionField::WorkingDirectory => action.WorkingDirectory(&mut value),
+        }
+    };
+    result.map_err(|error| ExecActionTextError::Com(error.code()))?;
+    bounded_bstr_to_string(&value).map_err(ExecActionTextError::Invalid)
 }
 
 fn bounded_task_count(count: i32, limit: usize) -> Result<(usize, bool), TaskCountError> {
@@ -1684,15 +2386,14 @@ fn one_based_task_index(index: i32) -> VARIANT {
 }
 
 fn task_error_is_access_denied(error: &windows::core::Error) -> bool {
-    error.code().0 as u32 == 0x8007_0005
+    classify_hresult_failure(error.code().0) == StartupFailureClass::AccessDenied
 }
 
-fn task_error_status(error: &windows::core::Error) -> WindowsStartupStatus {
-    if task_error_is_access_denied(error) {
-        WindowsStartupStatus::Inaccessible
-    } else {
-        WindowsStartupStatus::Unavailable
-    }
+fn task_error_mapping(
+    error: &windows::core::Error,
+    context: StartupFailureContext,
+) -> StartupFailureMapping {
+    map_startup_failure(context, classify_hresult_failure(error.code().0))
 }
 
 fn push_task_diagnostic(
@@ -1811,78 +2512,83 @@ fn collect_registry_source(
     usize,
     usize,
 ) {
-    let subkey = wide_z(OsStr::new(source.key));
-    let mut key = null_mut();
-    let code = unsafe {
-        RegOpenKeyExW(
-            source.root as Handle,
-            subkey.as_ptr(),
-            0,
-            KEY_READ | source.wow64_flag,
-            &mut key,
-        )
-    } as u32;
-    if code != 0 {
-        let status = match code {
-            ERROR_FILE_NOT_FOUND => WindowsStartupStatus::NotPresent,
-            ERROR_ACCESS_DENIED => WindowsStartupStatus::Inaccessible,
-            _ => WindowsStartupStatus::Error,
-        };
-        let diagnostics = if status == WindowsStartupStatus::NotPresent {
-            Vec::new()
-        } else {
-            vec![diagnostic(
-                "registry_key_unavailable",
-                None,
-                "Windows could not open this startup registry key in the requested view.",
-            )]
-        };
-        return (
-            source_result(source.id, status, 0, diagnostics),
-            Vec::new(),
-            0,
-            0,
-            0,
-        );
-    }
-    let key = RegistryKey(key);
-    let mut value_count = 0u32;
-    let mut max_name = 0u32;
-    let mut max_data = 0u32;
-    let query_code = unsafe {
-        RegQueryInfoKeyW(
-            key.0,
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            &mut value_count,
-            &mut max_name,
-            &mut max_data,
-            null_mut(),
-            null_mut(),
-        )
-    } as u32;
-    if query_code != 0 {
-        return (
-            source_result(
-                source.id,
-                WindowsStartupStatus::Error,
+    collect_registry_source_with_api(
+        &mut NativeStartupRegistryApi,
+        source,
+        started,
+        aggregate_remaining,
+        aggregate_name_remaining,
+        entry_remaining,
+    )
+}
+
+fn collect_registry_source_with_api<A: StartupRegistryApi>(
+    api: &mut A,
+    source: RegistrySource,
+    started: Instant,
+    aggregate_remaining: usize,
+    aggregate_name_remaining: usize,
+    entry_remaining: usize,
+) -> (
+    WindowsStartupSource,
+    Vec<WindowsRegistryStartupEntry>,
+    usize,
+    usize,
+    usize,
+) {
+    let key = match api.open(source) {
+        Ok(key) => key,
+        Err(code) => {
+            let mapping = map_startup_failure(
+                StartupFailureContext::RegistryKey,
+                classify_win32_failure(code),
+            );
+            let diagnostics = mapping
+                .diagnostic_code
+                .map_or_else(Vec::new, |diagnostic_code| {
+                    vec![diagnostic_win32(
+                        diagnostic_code,
+                        None,
+                        "Windows could not open this startup registry key in the requested view.",
+                        code,
+                    )]
+                });
+            return (
+                source_result(source.id, mapping.status, 0, diagnostics),
+                Vec::new(),
                 0,
-                vec![diagnostic(
-                    "registry_metadata_failed",
-                    None,
-                    "Windows could not read startup registry key metadata.",
-                )],
-            ),
-            Vec::new(),
-            0,
-            0,
-            0,
-        );
-    }
+                0,
+                0,
+            );
+        }
+    };
+    let (value_count, max_name, max_data) = match api.query_value_info(&key) {
+        Ok(info) => info,
+        Err(query_code) => {
+            let status = if query_code == ERROR_ACCESS_DENIED {
+                WindowsStartupStatus::Inaccessible
+            } else {
+                WindowsStartupStatus::Error
+            };
+            return (
+                source_result(
+                    source.id,
+                    status,
+                    0,
+                    vec![diagnostic_win32(
+                        "registry_metadata_failed",
+                        None,
+                        "Windows could not read startup registry key metadata.",
+                        query_code,
+                    )],
+                ),
+                Vec::new(),
+                0,
+                0,
+                0,
+            );
+        }
+    };
     let mut diagnostics = Vec::new();
     let mut status = WindowsStartupStatus::Complete;
     let name_capacity = (max_name as usize + 1).min(MAX_VALUE_NAME_UNITS + 1);
@@ -1925,28 +2631,17 @@ fn collect_registry_source(
             ));
             break;
         }
-        let mut name = vec![0u16; name_capacity.max(1)];
-        let mut name_len = name.len() as u32;
-        let mut value_type = 0u32;
         let available = MAX_VALUE_DATA_BYTES.min(aggregate_remaining.saturating_sub(bytes_read));
-        let mut data = vec![0u8; available];
-        let mut data_len = data.len() as u32;
-        let result = unsafe {
-            RegEnumValueW(
-                key.0,
-                index as u32,
-                name.as_mut_ptr(),
-                &mut name_len,
-                null_mut(),
-                &mut value_type,
-                if data.is_empty() {
-                    null_mut()
-                } else {
-                    data.as_mut_ptr()
-                },
-                &mut data_len,
-            )
-        } as u32;
+        let mut value_buffer = StartupRegistryValueBuffer {
+            name: vec![0u16; name_capacity.max(1)],
+            name_length: 0,
+            value_type: 0,
+            data: vec![0u8; available],
+            data_length: 0,
+        };
+        value_buffer.name_length = value_buffer.name.len() as u32;
+        value_buffer.data_length = value_buffer.data.len() as u32;
+        let result = api.enumerate_value(&key, index as u32, &mut value_buffer);
         if result == ERROR_NO_MORE_ITEMS {
             break;
         }
@@ -1961,16 +2656,29 @@ fn collect_registry_source(
             continue;
         }
         if result != 0 {
-            status = WindowsStartupStatus::Partial;
-            diagnostics.push(diagnostic(
-                "registry_value_read_failed",
+            let inaccessible = result == ERROR_ACCESS_DENIED;
+            status = if inaccessible {
+                WindowsStartupStatus::Inaccessible
+            } else {
+                WindowsStartupStatus::Partial
+            };
+            diagnostics.push(diagnostic_win32(
+                if inaccessible {
+                    "registry_value_inaccessible"
+                } else {
+                    "registry_value_read_failed"
+                },
                 Some(index),
                 "Windows could not read a startup registry value.",
+                result,
             ));
+            if inaccessible {
+                break;
+            }
             continue;
         }
-        let name_len = name_len as usize;
-        if name_len > MAX_VALUE_NAME_UNITS || name_len > name.len() {
+        let name_len = value_buffer.name_length as usize;
+        if name_len > MAX_VALUE_NAME_UNITS || name_len > value_buffer.name.len() {
             status = WindowsStartupStatus::Partial;
             diagnostics.push(diagnostic(
                 "registry_value_name_limit_exceeded",
@@ -1989,7 +2697,7 @@ fn collect_registry_source(
             continue;
         }
         name_units_read = name_units_read.saturating_add(name_len);
-        let value_name = match String::from_utf16(&name[..name_len]) {
+        let value_name = match String::from_utf16(&value_buffer.name[..name_len]) {
             Ok(name) => name,
             Err(_) => {
                 status = WindowsStartupStatus::Partial;
@@ -1998,11 +2706,11 @@ fn collect_registry_source(
                     Some(index),
                     "A registry value name contained invalid UTF-16 and was displayed lossily.",
                 ));
-                String::from_utf16_lossy(&name[..name_len])
+                String::from_utf16_lossy(&value_buffer.name[..name_len])
             }
         };
-        let data_len = data_len as usize;
-        if data_len > data.len() {
+        let data_len = value_buffer.data_length as usize;
+        if data_len > value_buffer.data.len() {
             status = WindowsStartupStatus::Partial;
             diagnostics.push(diagnostic(
                 "registry_value_read_failed",
@@ -2013,8 +2721,8 @@ fn collect_registry_source(
         }
         bytes_read = bytes_read.saturating_add(data_len);
         let (type_name, command, raw_hex) = match decode_registry_text(
-            value_type,
-            &data[..data_len],
+            value_buffer.value_type,
+            &value_buffer.data[..data_len],
         ) {
             Ok((type_name, display, raw_hex, malformed_utf16)) => {
                 if malformed_utf16 {
@@ -2035,7 +2743,7 @@ fn collect_registry_source(
                     "A registry string had an odd byte length and was omitted.",
                 ));
                 (
-                    if value_type == REG_SZ {
+                    if value_buffer.value_type == REG_SZ {
                         "REG_SZ"
                     } else {
                         "REG_EXPAND_SZ"
@@ -2052,7 +2760,7 @@ fn collect_registry_source(
                     "A registry startup value exceeded the supported data limit and was omitted.",
                 ));
                 (
-                    if value_type == REG_SZ {
+                    if value_buffer.value_type == REG_SZ {
                         "REG_SZ"
                     } else {
                         "REG_EXPAND_SZ"
@@ -2087,7 +2795,7 @@ fn collect_registry_source(
                 registry_key: source.key,
                 value_index: index,
                 value_name,
-                registry_type: value_type,
+                registry_type: value_buffer.value_type,
             },
         });
     }
@@ -2153,15 +2861,29 @@ fn collect_startup_folder(
     let result =
         unsafe { SHGetKnownFolderPath(folder_id, KF_FLAG_DONT_VERIFY, null_mut(), &mut path) };
     if result < 0 || path.is_null() {
+        let class = if result < 0 {
+            classify_hresult_failure(result)
+        } else {
+            StartupFailureClass::ApiFailure
+        };
+        let mapping = map_startup_failure(StartupFailureContext::KnownFolder, class);
+        let failure_hresult = if result < 0 {
+            result
+        } else {
+            0x8000_4005u32 as i32
+        };
         return (
             source_result(
                 folder_scope,
-                WindowsStartupStatus::Unavailable,
+                mapping.status,
                 0,
-                vec![diagnostic(
-                    "startup_folder_unavailable",
+                vec![diagnostic_hresult(
+                    mapping
+                        .diagnostic_code
+                        .unwrap_or("startup_folder_unavailable"),
                     None,
                     "Windows could not resolve this known startup folder.",
+                    HRESULT(failure_hresult),
                 )],
             ),
             Vec::new(),
@@ -2219,11 +2941,15 @@ fn collect_startup_folder(
     }
     let read_dir = match fs::read_dir(&folder) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error) if classify_io_failure(&error) == StartupFailureClass::Missing => {
+            let mapping = map_startup_failure(
+                StartupFailureContext::StartupFolder,
+                StartupFailureClass::Missing,
+            );
             return (
                 source_result_with_location(
                     folder_scope,
-                    WindowsStartupStatus::NotPresent,
+                    mapping.status,
                     0,
                     Vec::new(),
                     display_folder.clone(),
@@ -2234,14 +2960,20 @@ fn collect_startup_folder(
                 0,
             );
         }
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+        Err(error) if classify_io_failure(&error) == StartupFailureClass::AccessDenied => {
+            let mapping = map_startup_failure(
+                StartupFailureContext::StartupFolder,
+                StartupFailureClass::AccessDenied,
+            );
             return (
                 source_result_with_location(
                     folder_scope,
-                    WindowsStartupStatus::Inaccessible,
+                    mapping.status,
                     0,
                     vec![diagnostic(
-                        "startup_folder_inaccessible",
+                        mapping
+                            .diagnostic_code
+                            .unwrap_or("startup_folder_inaccessible"),
                         None,
                         "Windows denied access to this startup folder.",
                     )],
@@ -2253,14 +2985,20 @@ fn collect_startup_folder(
                 0,
             );
         }
-        Err(_) => {
+        Err(error) => {
+            let mapping = map_startup_failure(
+                StartupFailureContext::StartupFolder,
+                classify_io_failure(&error),
+            );
             return (
                 source_result_with_location(
                     folder_scope,
-                    WindowsStartupStatus::Error,
+                    mapping.status,
                     0,
                     vec![diagnostic(
-                        "startup_folder_read_failed",
+                        mapping
+                            .diagnostic_code
+                            .unwrap_or("startup_folder_read_failed"),
                         None,
                         "Windows could not enumerate this startup folder.",
                     )],
@@ -2473,9 +3211,176 @@ fn utf16_hex(units: &[u16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    enum FakeRegistryValue {
+        Value {
+            name: Vec<u16>,
+            value_type: u32,
+            data: Vec<u8>,
+        },
+        Error(u32),
+    }
+
+    struct FakeStartupRegistryApi {
+        metadata: Result<(u32, u32, u32), u32>,
+        values: VecDeque<FakeRegistryValue>,
+    }
+
+    impl FakeStartupRegistryApi {
+        fn with_values(values: Vec<FakeRegistryValue>) -> Self {
+            let metadata = Ok((values.len() as u32, 16, 256));
+            Self {
+                metadata,
+                values: values.into(),
+            }
+        }
+    }
+
+    impl StartupRegistryApi for FakeStartupRegistryApi {
+        type Key = ();
+
+        fn open(&mut self, _source: RegistrySource) -> Result<Self::Key, u32> {
+            Ok(())
+        }
+
+        fn query_value_info(&mut self, _key: &Self::Key) -> Result<(u32, u32, u32), u32> {
+            self.metadata
+        }
+
+        fn enumerate_value(
+            &mut self,
+            _key: &Self::Key,
+            _index: u32,
+            buffer: &mut StartupRegistryValueBuffer,
+        ) -> u32 {
+            match self
+                .values
+                .pop_front()
+                .unwrap_or(FakeRegistryValue::Error(ERROR_NO_MORE_ITEMS))
+            {
+                FakeRegistryValue::Value {
+                    name: value_name,
+                    value_type: kind,
+                    data: value_data,
+                } => {
+                    if value_name.len() > buffer.name.len() || value_data.len() > buffer.data.len()
+                    {
+                        return ERROR_MORE_DATA;
+                    }
+                    buffer.name[..value_name.len()].copy_from_slice(&value_name);
+                    buffer.data[..value_data.len()].copy_from_slice(&value_data);
+                    buffer.name_length = value_name.len() as u32;
+                    buffer.value_type = kind;
+                    buffer.data_length = value_data.len() as u32;
+                    0
+                }
+                FakeRegistryValue::Error(error) => error,
+            }
+        }
+    }
 
     fn encode_registry_text(value: &str) -> Vec<u8> {
         value.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    fn registry_test_value(name: &str, text: &str) -> FakeRegistryValue {
+        FakeRegistryValue::Value {
+            name: name.encode_utf16().collect(),
+            value_type: REG_SZ,
+            data: encode_registry_text(text),
+        }
+    }
+
+    #[test]
+    fn registry_metadata_access_denied_is_inaccessible_with_native_code() {
+        let mut api = FakeStartupRegistryApi::with_values(Vec::new());
+        api.metadata = Err(ERROR_ACCESS_DENIED);
+
+        let (source, entries, _, _, _) = collect_registry_source_with_api(
+            &mut api,
+            REGISTRY_SOURCES[0],
+            Instant::now(),
+            MAX_AGGREGATE_REGISTRY_BYTES,
+            MAX_AGGREGATE_REGISTRY_NAME_UNITS,
+            MAX_STARTUP_ENTRIES,
+        );
+
+        assert_eq!(source.status, WindowsStartupStatus::Inaccessible);
+        assert!(entries.is_empty());
+        let diagnostic = &source.diagnostics[0];
+        assert_eq!(diagnostic.code, "registry_metadata_failed");
+        assert_eq!(diagnostic.win32_error, Some(ERROR_ACCESS_DENIED));
+    }
+
+    #[test]
+    fn registry_metadata_generic_failure_remains_error_with_native_code() {
+        let mut api = FakeStartupRegistryApi::with_values(Vec::new());
+        api.metadata = Err(1234);
+
+        let (source, entries, _, _, _) = collect_registry_source_with_api(
+            &mut api,
+            REGISTRY_SOURCES[0],
+            Instant::now(),
+            MAX_AGGREGATE_REGISTRY_BYTES,
+            MAX_AGGREGATE_REGISTRY_NAME_UNITS,
+            MAX_STARTUP_ENTRIES,
+        );
+
+        assert_eq!(source.status, WindowsStartupStatus::Error);
+        assert!(entries.is_empty());
+        assert_eq!(source.diagnostics[0].win32_error, Some(1234));
+    }
+
+    #[test]
+    fn registry_value_access_denied_retains_observed_entries_and_error_code() {
+        let mut api = FakeStartupRegistryApi::with_values(vec![
+            registry_test_value("Observed", "literal.exe"),
+            FakeRegistryValue::Error(ERROR_ACCESS_DENIED),
+        ]);
+        api.metadata = Ok((2, 16, 256));
+
+        let (source, entries, _, checked, _) = collect_registry_source_with_api(
+            &mut api,
+            REGISTRY_SOURCES[0],
+            Instant::now(),
+            MAX_AGGREGATE_REGISTRY_BYTES,
+            MAX_AGGREGATE_REGISTRY_NAME_UNITS,
+            MAX_STARTUP_ENTRIES,
+        );
+
+        assert_eq!(source.status, WindowsStartupStatus::Inaccessible);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].value_name, "Observed");
+        assert_eq!(entries[0].command.as_deref(), Some("literal.exe"));
+        assert_eq!(checked, 2);
+        assert_eq!(source.diagnostics[0].code, "registry_value_inaccessible");
+        assert_eq!(source.diagnostics[0].item_index, Some(1));
+        assert_eq!(source.diagnostics[0].win32_error, Some(ERROR_ACCESS_DENIED));
+    }
+
+    #[test]
+    fn registry_value_generic_failure_remains_partial_with_native_code() {
+        let mut api = FakeStartupRegistryApi::with_values(vec![
+            registry_test_value("Observed", "literal.exe"),
+            FakeRegistryValue::Error(1234),
+        ]);
+        api.metadata = Ok((2, 16, 256));
+
+        let (source, entries, _, checked, _) = collect_registry_source_with_api(
+            &mut api,
+            REGISTRY_SOURCES[0],
+            Instant::now(),
+            MAX_AGGREGATE_REGISTRY_BYTES,
+            MAX_AGGREGATE_REGISTRY_NAME_UNITS,
+            MAX_STARTUP_ENTRIES,
+        );
+
+        assert_eq!(source.status, WindowsStartupStatus::Partial);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(checked, 2);
+        assert_eq!(source.diagnostics[0].code, "registry_value_read_failed");
+        assert_eq!(source.diagnostics[0].win32_error, Some(1234));
     }
 
     #[test]
@@ -2531,6 +3436,182 @@ mod tests {
         assert_eq!(service_start_type(SERVICE_DEMAND_START), "manual");
         assert_eq!(service_start_type(SERVICE_DISABLED), "disabled");
         assert_eq!(service_start_type(99), "unknown");
+    }
+
+    #[test]
+    fn startup_source_failure_mapping_keeps_source_specific_statuses() {
+        let cases = [
+            (
+                StartupFailureContext::RegistryKey,
+                ERROR_FILE_NOT_FOUND,
+                WindowsStartupStatus::NotPresent,
+                None,
+            ),
+            (
+                StartupFailureContext::RegistryKey,
+                ERROR_ACCESS_DENIED,
+                WindowsStartupStatus::Inaccessible,
+                Some("registry_key_unavailable"),
+            ),
+            (
+                StartupFailureContext::RegistryKey,
+                ERROR_NOT_SUPPORTED,
+                WindowsStartupStatus::Unsupported,
+                Some("registry_key_unsupported"),
+            ),
+            (
+                StartupFailureContext::RegistryKey,
+                1234,
+                WindowsStartupStatus::Error,
+                Some("registry_key_unavailable"),
+            ),
+            (
+                StartupFailureContext::StartupFolder,
+                ERROR_PATH_NOT_FOUND,
+                WindowsStartupStatus::NotPresent,
+                None,
+            ),
+            (
+                StartupFailureContext::StartupFolder,
+                ERROR_ACCESS_DENIED,
+                WindowsStartupStatus::Inaccessible,
+                Some("startup_folder_inaccessible"),
+            ),
+            (
+                StartupFailureContext::StartupFolder,
+                ERROR_CALL_NOT_IMPLEMENTED,
+                WindowsStartupStatus::Unsupported,
+                Some("startup_folder_unsupported"),
+            ),
+            (
+                StartupFailureContext::StartupFolder,
+                1234,
+                WindowsStartupStatus::Error,
+                Some("startup_folder_read_failed"),
+            ),
+        ];
+        for (context, win32, expected_status, expected_diagnostic) in cases {
+            let mapping = map_startup_failure(context, classify_win32_failure(win32));
+            assert_eq!(
+                mapping.status, expected_status,
+                "context={context:?} code={win32}"
+            );
+            assert_eq!(mapping.diagnostic_code, expected_diagnostic);
+        }
+    }
+
+    #[test]
+    fn scm_and_scheduler_failures_preserve_inaccessible_unsupported_and_partial_states() {
+        assert_eq!(
+            map_startup_failure(
+                StartupFailureContext::ServiceManager,
+                classify_win32_failure(ERROR_ACCESS_DENIED)
+            )
+            .status,
+            WindowsStartupStatus::Inaccessible
+        );
+        assert_eq!(
+            map_startup_failure(
+                StartupFailureContext::ServiceManager,
+                classify_win32_failure(ERROR_NOT_SUPPORTED)
+            )
+            .status,
+            WindowsStartupStatus::Unsupported
+        );
+        assert_eq!(
+            map_startup_failure(
+                StartupFailureContext::ServiceManager,
+                classify_win32_failure(1234)
+            )
+            .status,
+            WindowsStartupStatus::Unavailable
+        );
+        for class in [
+            StartupFailureClass::Missing,
+            StartupFailureClass::AccessDenied,
+            StartupFailureClass::ApiFailure,
+        ] {
+            assert_eq!(
+                map_startup_failure(StartupFailureContext::ServiceApi, class).status,
+                WindowsStartupStatus::Partial
+            );
+        }
+        assert_eq!(
+            map_startup_failure(
+                StartupFailureContext::ServiceApi,
+                StartupFailureClass::Unsupported
+            ),
+            StartupFailureMapping {
+                status: WindowsStartupStatus::Partial,
+                diagnostic_code: Some("service_api_unsupported"),
+            }
+        );
+        assert_eq!(
+            classify_hresult_failure(0x8007_0005u32 as i32),
+            StartupFailureClass::AccessDenied
+        );
+        assert_eq!(
+            classify_hresult_failure(0x8007_0078u32 as i32),
+            StartupFailureClass::Unsupported
+        );
+        assert_eq!(
+            classify_hresult_failure(0x8000_4001u32 as i32),
+            StartupFailureClass::Unsupported
+        );
+        assert_eq!(
+            map_startup_failure(
+                StartupFailureContext::TaskSchedulerSetup,
+                classify_hresult_failure(0x8007_0005u32 as i32)
+            )
+            .status,
+            WindowsStartupStatus::Inaccessible
+        );
+        assert_eq!(
+            map_startup_failure(
+                StartupFailureContext::TaskSchedulerSetup,
+                classify_hresult_failure(0x8000_4001u32 as i32)
+            )
+            .status,
+            WindowsStartupStatus::Unsupported
+        );
+        assert_eq!(
+            map_startup_failure(
+                StartupFailureContext::TaskSchedulerSetup,
+                classify_hresult_failure(0x8000_4005u32 as i32)
+            )
+            .status,
+            WindowsStartupStatus::Unavailable
+        );
+        assert_eq!(
+            map_startup_failure(
+                StartupFailureContext::TaskSchedulerScan,
+                StartupFailureClass::Unsupported
+            ),
+            StartupFailureMapping {
+                status: WindowsStartupStatus::Partial,
+                diagnostic_code: Some("task_scheduler_scan_unsupported"),
+            }
+        );
+    }
+
+    #[test]
+    fn source_limit_failures_are_not_mapped_to_complete() {
+        let (bounded, limit_hit) = bounded_task_count(257, MAX_ACTIONS_PER_TASK).unwrap();
+        assert_eq!(bounded, MAX_ACTIONS_PER_TASK);
+        assert!(limit_hit);
+        let service_api_failure = map_startup_failure(
+            StartupFailureContext::ServiceApi,
+            StartupFailureClass::ApiFailure,
+        );
+        assert_eq!(service_api_failure.status, WindowsStartupStatus::Partial);
+        assert_eq!(
+            map_startup_failure(
+                StartupFailureContext::TaskSchedulerScan,
+                StartupFailureClass::ApiFailure
+            )
+            .status,
+            WindowsStartupStatus::Partial
+        );
     }
 
     #[test]
@@ -2595,11 +3676,74 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_action_mapping_only_interprets_exec_actions() {
+        assert_eq!(scheduled_action_name(TASK_ACTION_EXEC), "exec");
+        assert_eq!(
+            scheduled_action_status(TASK_ACTION_EXEC),
+            WindowsScheduledTaskActionStatus::Observed
+        );
+        for (action, name) in [
+            (TASK_ACTION_COM_HANDLER, "com_handler"),
+            (TASK_ACTION_SEND_EMAIL, "send_email"),
+            (TASK_ACTION_SHOW_MESSAGE, "show_message"),
+            (TASK_ACTION_TYPE(91), "unknown"),
+        ] {
+            assert_eq!(scheduled_action_name(action), name);
+            assert_eq!(
+                scheduled_action_status(action),
+                WindowsScheduledTaskActionStatus::Unsupported
+            );
+        }
+    }
+
+    #[test]
+    fn exec_action_text_is_serialized_inertly_without_interpretation() {
+        let action = WindowsScheduledTaskAction {
+            task_path: Some("\\Example\\Literal".to_owned()),
+            action_index: 2,
+            action_type: "exec",
+            action_type_code: Some(TASK_ACTION_EXEC.0),
+            status: WindowsScheduledTaskActionStatus::Observed,
+            executable_path: Some(r"%TEMP%\worker.exe".to_owned()),
+            arguments: Some(r#"--name "value"; $(not-run)"#.to_owned()),
+            working_directory: Some(r"C:\Work".to_owned()),
+            evidence: WindowsScheduledTaskActionEvidence {
+                source: "synthetic unit-test value",
+                task_index: 4,
+                action_index: 2,
+            },
+        };
+        let value = serde_json::to_value(action).unwrap();
+        assert_eq!(value["executable_path"], r"%TEMP%\worker.exe");
+        assert_eq!(value["arguments"], r#"--name "value"; $(not-run)"#);
+        assert_eq!(value["working_directory"], r"C:\Work");
+        assert_eq!(value["evidence"]["task_index"], 4);
+        assert_eq!(value["evidence"]["action_index"], 2);
+    }
+
+    #[test]
     fn task_collection_counts_are_clamped_and_negative_values_rejected() {
         assert_eq!(bounded_task_count(3, 5), Ok((3, false)));
         assert_eq!(bounded_task_count(8, 5), Ok((5, true)));
         assert_eq!(bounded_task_count(0, 0), Ok((0, false)));
         assert_eq!(bounded_task_count(-1, 5), Err(TaskCountError::Negative));
+    }
+
+    #[test]
+    fn scheduled_task_action_limits_are_bounded_and_string_budget_is_checked() {
+        assert_eq!(MAX_SCHEDULED_TASK_ACTIONS, 8_192);
+        assert_eq!(MAX_ACTIONS_PER_TASK, 256);
+        assert_eq!(
+            bounded_task_count(257, MAX_ACTIONS_PER_TASK),
+            Ok((256, true))
+        );
+        let mut used = MAX_AGGREGATE_TASK_STRING_UNITS - 2;
+        assert_eq!(reserve_task_string("ab", &mut used), Ok(()));
+        assert_eq!(used, MAX_AGGREGATE_TASK_STRING_UNITS);
+        assert_eq!(
+            reserve_task_string("x", &mut used),
+            Err(TaskStringError::AggregateLimit)
+        );
     }
 
     #[test]

@@ -21,6 +21,7 @@ const ERROR_NOT_FOUND: u32 = 1168;
 
 type Handle = *mut c_void;
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct ProcessEntry32W {
     size: u32,
@@ -145,74 +146,155 @@ impl Drop for OwnedHandle {
     }
 }
 
+trait WindowsProcessApi {
+    type Snapshot;
+
+    fn create_snapshot(&mut self) -> Result<Self::Snapshot, u32>;
+    fn first_process(
+        &mut self,
+        snapshot: &mut Self::Snapshot,
+    ) -> Result<Option<ProcessEntry32W>, u32>;
+    fn next_process(
+        &mut self,
+        snapshot: &mut Self::Snapshot,
+    ) -> Result<Option<ProcessEntry32W>, u32>;
+    fn read_image_path(
+        &mut self,
+        process_id: u32,
+        aggregate_remaining: usize,
+    ) -> WindowsProcessImage;
+}
+
+struct NativeWindowsProcessApi;
+
+impl WindowsProcessApi for NativeWindowsProcessApi {
+    type Snapshot = OwnedHandle;
+
+    fn create_snapshot(&mut self) -> Result<Self::Snapshot, u32> {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot as isize == -1 {
+            Err(unsafe { GetLastError() })
+        } else {
+            Ok(OwnedHandle(snapshot))
+        }
+    }
+
+    fn first_process(
+        &mut self,
+        snapshot: &mut Self::Snapshot,
+    ) -> Result<Option<ProcessEntry32W>, u32> {
+        let mut entry: ProcessEntry32W = unsafe { zeroed() };
+        entry.size = size_of::<ProcessEntry32W>() as u32;
+        if unsafe { Process32FirstW(snapshot.0, &mut entry) } != 0 {
+            Ok(Some(entry))
+        } else {
+            let error = unsafe { GetLastError() };
+            if error == ERROR_NO_MORE_FILES {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+    }
+
+    fn next_process(
+        &mut self,
+        snapshot: &mut Self::Snapshot,
+    ) -> Result<Option<ProcessEntry32W>, u32> {
+        let mut entry: ProcessEntry32W = unsafe { zeroed() };
+        entry.size = size_of::<ProcessEntry32W>() as u32;
+        if unsafe { Process32NextW(snapshot.0, &mut entry) } != 0 {
+            Ok(Some(entry))
+        } else {
+            let error = unsafe { GetLastError() };
+            if error == ERROR_NO_MORE_FILES {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+    }
+
+    fn read_image_path(
+        &mut self,
+        process_id: u32,
+        aggregate_remaining: usize,
+    ) -> WindowsProcessImage {
+        read_image_path_native(process_id, aggregate_remaining)
+    }
+}
+
 struct RawEntry(ProcessEntry32W);
 
 pub fn collect_windows_processes() -> WindowsProcessInventoryDocument {
+    collect_windows_processes_with_api(&mut NativeWindowsProcessApi)
+}
+
+fn collect_windows_processes_with_api<A: WindowsProcessApi>(
+    api: &mut A,
+) -> WindowsProcessInventoryDocument {
     let started_at = now_ms();
     let started = Instant::now();
     let mut diagnostics = Vec::new();
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot as isize == -1 {
-        diagnostics.push(diagnostic(
-            "snapshot_unavailable",
-            None,
-            "Windows could not create a process snapshot.",
-        ));
-        return finish(started_at, Vec::new(), diagnostics, 0, 0, true);
-    }
-    let snapshot = OwnedHandle(snapshot);
+    let mut snapshot = match api.create_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            diagnostics.push(diagnostic(
+                "snapshot_unavailable",
+                None,
+                "Windows could not create a process snapshot.",
+            ));
+            return finish(started_at, Vec::new(), diagnostics, 0, 0, true);
+        }
+    };
     let mut entries = Vec::with_capacity(MAX_PROCESSES.min(512));
-    let mut entry: ProcessEntry32W = unsafe { zeroed() };
-    entry.size = size_of::<ProcessEntry32W>() as u32;
-    let first = unsafe { Process32FirstW(snapshot.0, &mut entry) };
     let mut truncated = false;
     let mut process_limit_reached = false;
-    if first != 0 {
-        loop {
-            entries.push(RawEntry(copy_entry(&entry)));
-            if trim_to_process_limit(&mut entries) {
-                truncated = true;
-                process_limit_reached = true;
-                diagnostics.push(diagnostic(
-                    "process_limit_exceeded",
-                    None,
-                    "The process-count limit was reached; remaining entries were not checked.",
-                ));
-                break;
-            }
-            if started.elapsed() >= MAX_SCAN_DURATION {
-                truncated = true;
-                diagnostics.push(diagnostic(
-                    "scan_deadline_exceeded",
-                    None,
-                    "The process inventory time limit was reached; remaining snapshot entries were not checked.",
-                ));
-                break;
-            }
-            entry.size = size_of::<ProcessEntry32W>() as u32;
-            if unsafe { Process32NextW(snapshot.0, &mut entry) } == 0 {
-                let error = unsafe { GetLastError() };
-                if error != ERROR_NO_MORE_FILES {
-                    diagnostics.push(diagnostic(
-                        "snapshot_enumeration_failed",
-                        None,
-                        "Windows stopped enumerating the process snapshot unexpectedly.",
-                    ));
-                    truncated = true;
-                }
-                break;
-            }
-        }
-    } else {
-        let error = unsafe { GetLastError() };
-        if error != ERROR_NO_MORE_FILES {
+    let mut current_entry = match api.first_process(&mut snapshot) {
+        Ok(entry) => entry,
+        Err(_) => {
             diagnostics.push(diagnostic(
                 "snapshot_enumeration_failed",
                 None,
                 "Windows could not read the first process snapshot entry.",
             ));
             truncated = true;
+            None
         }
+    };
+    while let Some(entry) = current_entry {
+        entries.push(RawEntry(entry));
+        if trim_to_process_limit(&mut entries) {
+            truncated = true;
+            process_limit_reached = true;
+            diagnostics.push(diagnostic(
+                "process_limit_exceeded",
+                None,
+                "The process-count limit was reached; remaining entries were not checked.",
+            ));
+            break;
+        }
+        if started.elapsed() >= MAX_SCAN_DURATION {
+            truncated = true;
+            diagnostics.push(diagnostic(
+                "scan_deadline_exceeded",
+                None,
+                "The process inventory time limit was reached; remaining snapshot entries were not checked.",
+            ));
+            break;
+        }
+        current_entry = match api.next_process(&mut snapshot) {
+            Ok(entry) => entry,
+            Err(_) => {
+                diagnostics.push(diagnostic(
+                    "snapshot_enumeration_failed",
+                    None,
+                    "Windows stopped enumerating the process snapshot unexpectedly.",
+                ));
+                truncated = true;
+                None
+            }
+        };
     }
     drop(snapshot);
 
@@ -270,7 +352,7 @@ pub fn collect_windows_processes() -> WindowsProcessInventoryDocument {
                 utf16_code_units: None,
             }
         } else {
-            let image = read_image_path(entry.process_id, available);
+            let image = api.read_image_path(entry.process_id, available);
             if let Some(count) = image.utf16_code_units {
                 image_total = image_total.saturating_add(count);
             }
@@ -319,21 +401,6 @@ pub fn collect_windows_processes() -> WindowsProcessInventoryDocument {
     )
 }
 
-fn copy_entry(entry: &ProcessEntry32W) -> ProcessEntry32W {
-    let mut copy: ProcessEntry32W = unsafe { zeroed() };
-    copy.size = entry.size;
-    copy.usage_count = entry.usage_count;
-    copy.process_id = entry.process_id;
-    copy.default_heap_id = entry.default_heap_id;
-    copy.module_id = entry.module_id;
-    copy.thread_count = entry.thread_count;
-    copy.parent_process_id = entry.parent_process_id;
-    copy.base_priority = entry.base_priority;
-    copy.flags = entry.flags;
-    copy.executable_name = entry.executable_name;
-    copy
-}
-
 fn accept_process_id(seen: &mut HashSet<u32>, process_id: u32) -> bool {
     process_id != 0 && seen.insert(process_id)
 }
@@ -359,7 +426,7 @@ fn decode_executable_name(name: &[u16; 260]) -> (String, bool) {
     }
 }
 
-fn read_image_path(process_id: u32, aggregate_remaining: usize) -> WindowsProcessImage {
+fn read_image_path_native(process_id: u32, aggregate_remaining: usize) -> WindowsProcessImage {
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
     if handle.is_null() {
         return empty_image(image_status(unsafe { GetLastError() }));
@@ -497,6 +564,77 @@ fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    struct FakeProcessApi {
+        snapshot_error: Option<u32>,
+        first_error: Option<u32>,
+        enumeration_error_at: Option<usize>,
+        entries: Vec<ProcessEntry32W>,
+        next_index: usize,
+        images: HashMap<u32, WindowsProcessImage>,
+    }
+
+    impl FakeProcessApi {
+        fn with_entries(entries: Vec<ProcessEntry32W>) -> Self {
+            Self {
+                snapshot_error: None,
+                first_error: None,
+                enumeration_error_at: None,
+                entries,
+                next_index: 0,
+                images: HashMap::new(),
+            }
+        }
+    }
+
+    impl WindowsProcessApi for FakeProcessApi {
+        type Snapshot = ();
+
+        fn create_snapshot(&mut self) -> Result<Self::Snapshot, u32> {
+            self.snapshot_error.map_or(Ok(()), Err)
+        }
+
+        fn first_process(
+            &mut self,
+            _snapshot: &mut Self::Snapshot,
+        ) -> Result<Option<ProcessEntry32W>, u32> {
+            if let Some(error) = self.first_error {
+                return Err(error);
+            }
+            self.next_index = 0;
+            let first = self.entries.get(self.next_index).copied();
+            if first.is_some() {
+                self.next_index += 1;
+            }
+            Ok(first)
+        }
+
+        fn next_process(
+            &mut self,
+            _snapshot: &mut Self::Snapshot,
+        ) -> Result<Option<ProcessEntry32W>, u32> {
+            if self.enumeration_error_at == Some(self.next_index) {
+                return Err(ERROR_ACCESS_DENIED);
+            }
+            let next = self.entries.get(self.next_index).copied();
+            if next.is_some() {
+                self.next_index += 1;
+            }
+            Ok(next)
+        }
+
+        fn read_image_path(
+            &mut self,
+            process_id: u32,
+            _aggregate_remaining: usize,
+        ) -> WindowsProcessImage {
+            self.images
+                .get(&process_id)
+                .cloned()
+                .unwrap_or_else(|| empty_image(WindowsProcessImageStatus::Error))
+        }
+    }
 
     fn entry(name: &[u16], process_id: u32) -> ProcessEntry32W {
         let mut value: ProcessEntry32W = unsafe { zeroed() };
@@ -507,6 +645,14 @@ mod tests {
         value.executable_name[..len].copy_from_slice(&name[..len]);
         value.executable_name[len] = 0;
         value
+    }
+
+    fn observed_image(path: &str) -> WindowsProcessImage {
+        WindowsProcessImage {
+            status: WindowsProcessImageStatus::Observed,
+            path: Some(path.to_owned()),
+            utf16_code_units: Some(path.encode_utf16().count()),
+        }
     }
 
     #[test]
@@ -573,5 +719,85 @@ mod tests {
         let malformed = decode_image_path(&[0xd800]);
         assert_eq!(malformed.status, WindowsProcessImageStatus::MalformedUtf16);
         assert_eq!(malformed.path.as_deref(), Some("�"));
+    }
+
+    #[test]
+    fn snapshot_failure_is_partial_and_has_no_process_rows() {
+        let mut api = FakeProcessApi::with_entries(Vec::new());
+        api.snapshot_error = Some(ERROR_ACCESS_DENIED);
+
+        let document = collect_windows_processes_with_api(&mut api);
+
+        assert_eq!(document.status, WindowsProcessInventoryStatus::Partial);
+        assert!(document.processes.is_empty());
+        assert_eq!(document.source.diagnostics.len(), 1);
+        assert_eq!(document.source.diagnostics[0].code, "snapshot_unavailable");
+    }
+
+    #[test]
+    fn snapshot_enumeration_failure_keeps_rows_already_observed() {
+        let mut api = FakeProcessApi::with_entries(vec![entry(
+            &"first.exe".encode_utf16().collect::<Vec<_>>(),
+            10,
+        )]);
+        api.enumeration_error_at = Some(1);
+        api.images
+            .insert(10, observed_image(r"C:\Program Files\first.exe"));
+
+        let document = collect_windows_processes_with_api(&mut api);
+
+        assert_eq!(document.status, WindowsProcessInventoryStatus::Partial);
+        assert_eq!(document.processes.len(), 1);
+        assert_eq!(document.processes[0].process_id, 10);
+        assert_eq!(
+            document.processes[0].image.status,
+            WindowsProcessImageStatus::Observed
+        );
+        assert!(
+            document
+                .source
+                .diagnostics
+                .iter()
+                .any(|item| item.code == "snapshot_enumeration_failed")
+        );
+    }
+
+    #[test]
+    fn inaccessible_and_vanished_image_queries_keep_process_rows_and_mark_partial() {
+        let mut api = FakeProcessApi::with_entries(vec![
+            entry(&"observed.exe".encode_utf16().collect::<Vec<_>>(), 10),
+            entry(&"inaccessible.exe".encode_utf16().collect::<Vec<_>>(), 11),
+            entry(&"vanished.exe".encode_utf16().collect::<Vec<_>>(), 12),
+        ]);
+        api.images
+            .insert(10, observed_image(r"C:\Program Files\observed.exe"));
+        api.images
+            .insert(11, empty_image(WindowsProcessImageStatus::Inaccessible));
+        api.images
+            .insert(12, empty_image(WindowsProcessImageStatus::Vanished));
+
+        let document = collect_windows_processes_with_api(&mut api);
+
+        assert_eq!(document.status, WindowsProcessInventoryStatus::Partial);
+        assert_eq!(document.processes.len(), 3);
+        assert_eq!(document.processes[0].process_id, 10);
+        assert_eq!(
+            document.processes[1].image.status,
+            WindowsProcessImageStatus::Inaccessible
+        );
+        assert_eq!(
+            document.processes[2].image.status,
+            WindowsProcessImageStatus::Vanished
+        );
+        assert!(document.source.diagnostics.iter().any(|item| {
+            item.code == "process_image_inaccessible" && item.process_id == Some(11)
+        }));
+        assert!(
+            document
+                .source
+                .diagnostics
+                .iter()
+                .any(|item| { item.code == "process_vanished" && item.process_id == Some(12) })
+        );
     }
 }

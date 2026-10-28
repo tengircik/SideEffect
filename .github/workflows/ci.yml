@@ -119,8 +119,12 @@ jobs:
         run: cargo +1.85.0 build --locked --bin sideeffect
 
   windows:
-    name: Windows
-    runs-on: windows-latest
+    name: Windows (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
     timeout-minutes: 20
     steps:
       - name: Check out source
@@ -128,6 +132,14 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+
+      - name: Report Windows version
+        shell: pwsh
+        run: |
+          $os = Get-CimInstance -ClassName Win32_OperatingSystem
+          Write-Output "Windows caption: $($os.Caption)"
+          Write-Output "Windows version: $($os.Version)"
+          Write-Output "Windows build: $($os.BuildNumber)"
 
       - name: Install Rust components
         run: rustup component add rustfmt clippy
