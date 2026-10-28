@@ -19,6 +19,7 @@ const GENERIC_WRITE: u32 = 0x4000_0000;
 const CREATE_NEW: u32 = 1;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+const MAX_PRIVATE_DIRECTORY_FILES: usize = 8;
 static NEXT_STAGE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[repr(C)]
@@ -121,6 +122,26 @@ impl Drop for Stage {
     }
 }
 
+struct DirectoryStage {
+    directory: PathBuf,
+    files: Vec<PathBuf>,
+}
+
+impl Drop for DirectoryStage {
+    fn drop(&mut self) {
+        for file in &self.files {
+            if let Ok(path) = wide_z(file) {
+                // SAFETY: cleanup only targets a file created in this unique private stage.
+                unsafe { DeleteFileW(path.as_ptr()) };
+            }
+        }
+        if let Ok(path) = wide_z(&self.directory) {
+            // SAFETY: cleanup only targets the unique private staging directory created below.
+            unsafe { RemoveDirectoryW(path.as_ptr()) };
+        }
+    }
+}
+
 /// Publishes bytes through an owner-only sibling staging directory and never replaces a file.
 pub fn publish_private_file(
     destination: &Path,
@@ -182,6 +203,145 @@ pub fn publish_private_file(
     let result = destination;
     drop(stage);
     Ok(result)
+}
+
+/// Atomically publishes a private, fixed-name directory without replacing an existing path.
+///
+/// The directory and files receive a protected current-user-only DACL before publication.
+/// Names are restricted to flat ASCII filenames so callers cannot escape the staging root.
+pub fn publish_private_directory(
+    destination: &Path,
+    files: &[(&str, &[u8])],
+    max_total_bytes: usize,
+) -> io::Result<PathBuf> {
+    if files.is_empty() || files.len() > MAX_PRIVATE_DIRECTORY_FILES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private output directory has an invalid file count",
+        ));
+    }
+    let mut total_bytes = 0usize;
+    for (index, (name, bytes)) in files.iter().enumerate() {
+        validate_flat_file_name(name)?;
+        if files[..index].iter().any(|(existing, _)| existing == name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private output directory contains duplicate file names",
+            ));
+        }
+        total_bytes = total_bytes.checked_add(bytes.len()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "private output directory size overflowed",
+            )
+        })?;
+        if total_bytes > max_total_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("private output directory exceeds the {max_total_bytes} byte limit"),
+            ));
+        }
+    }
+
+    let file_name = destination
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "output path has no file name")
+        })?;
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = parent.canonicalize()?;
+    let destination = parent.join(file_name);
+    let descriptor = current_user_security_descriptor()?;
+    let attributes = SecurityAttributes {
+        length: size_of::<SecurityAttributes>() as u32,
+        security_descriptor: descriptor.0,
+        inherit_handle: 0,
+    };
+    let mut stage = create_directory_stage(&parent, &attributes)?;
+
+    for (name, bytes) in files {
+        let path = stage.directory.join(name);
+        let wide = wide_z(&path)?;
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                &attributes as *const SecurityAttributes as *const c_void,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            )
+        };
+        if handle as isize == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        stage.files.push(path);
+        // SAFETY: CreateFileW returned a new valid, exclusively opened file handle.
+        let mut file = unsafe { File::from_raw_handle(handle) };
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+    }
+
+    let source = wide_z(&stage.directory)?;
+    let target = wide_z(&destination)?;
+    if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    stage.files.clear();
+    let result = destination;
+    drop(stage);
+    Ok(result)
+}
+
+fn validate_flat_file_name(name: &str) -> io::Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.len() > 128
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private output file name is not a bounded flat ASCII name",
+        ));
+    }
+    Ok(())
+}
+
+fn create_directory_stage(
+    parent: &Path,
+    attributes: &SecurityAttributes,
+) -> io::Result<DirectoryStage> {
+    for _ in 0..32 {
+        let id = NEXT_STAGE_ID.fetch_add(1, Ordering::Relaxed);
+        let name = format!(".sideeffect-private-dir-{}-{id}", unsafe {
+            GetCurrentProcessId()
+        });
+        let directory = parent.join(name);
+        let wide = wide_z(&directory)?;
+        if unsafe { CreateDirectoryW(wide.as_ptr(), attributes) } != 0 {
+            return Ok(DirectoryStage {
+                directory,
+                files: Vec::new(),
+            });
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS) {
+            return Err(error);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique private staging directory",
+    ))
 }
 
 fn create_stage(parent: &Path, attributes: &SecurityAttributes) -> io::Result<Stage> {
@@ -360,6 +520,65 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"{\"safe\":true}");
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn publishes_owner_private_directory_without_replacing_existing_destination() {
+        let parent = temp_dir();
+        let destination = parent.join("audit-session");
+        let files = [
+            ("session.json", b"{\"schema_version\":1}".as_slice()),
+            ("processes.json", b"{\"schema_version\":1}".as_slice()),
+        ];
+        let published = publish_private_directory(&destination, &files, 1024).unwrap();
+
+        assert_eq!(
+            fs::read(published.join("session.json")).unwrap(),
+            files[0].1
+        );
+        assert_eq!(
+            fs::read(published.join("processes.json")).unwrap(),
+            files[1].1
+        );
+        assert_owner_only_dacl(&published);
+        assert_owner_only_dacl(&published.join("session.json"));
+        assert_owner_only_dacl(&published.join("processes.json"));
+
+        let error = publish_private_directory(&destination, &files, 1024).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(published.join("session.json")).unwrap(),
+            files[0].1
+        );
+
+        fs::remove_file(published.join("session.json")).unwrap();
+        fs::remove_file(published.join("processes.json")).unwrap();
+        fs::remove_dir(published).unwrap();
+        fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn private_directory_rejects_unsafe_names_and_total_size_before_staging() {
+        let parent = temp_dir();
+        let destination = parent.join("session");
+        let traversal = [("../outside", b"x".as_slice())];
+        assert_eq!(
+            publish_private_directory(&destination, &traversal, 10)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let oversized = [("session.json", b"1234".as_slice())];
+        assert_eq!(
+            publish_private_directory(&destination, &oversized, 3)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(!destination.exists());
+        let entries = fs::read_dir(&parent).unwrap().count();
+        assert_eq!(entries, 0);
+        fs::remove_dir(parent).unwrap();
     }
 
     fn assert_owner_only_dacl(path: &Path) {

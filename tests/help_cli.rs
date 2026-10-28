@@ -43,7 +43,12 @@ fn focused_help_covers_command_and_nested_inventory_topics() {
     #[cfg(windows)]
     assert!(startup_help.contains("boot/logon triggers in tasks visible to the current token"));
     #[cfg(windows)]
-    assert!(startup_help.contains("task actions/XML are not collected"));
+    assert!(
+        startup_help
+            .contains("bounded Exec-action executable paths, arguments, and working directories")
+    );
+    #[cfg(windows)]
+    assert!(startup_help.contains("unsupported action types remain labeled unsupported"));
 
     let packages = run(&["help", "inventory", "packages"]);
     assert!(packages.status.success());

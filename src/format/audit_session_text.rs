@@ -250,6 +250,10 @@ fn artifact_kind_name(kind: crate::audit_session::ArtifactKind) -> &'static str 
         crate::audit_session::ArtifactKind::Processes => "processes",
         crate::audit_session::ArtifactKind::Permissions => "permissions",
         crate::audit_session::ArtifactKind::Startup => "startup",
+        crate::audit_session::ArtifactKind::WindowsSoftware => "windows_software",
+        crate::audit_session::ArtifactKind::WindowsProcesses => "windows_processes",
+        crate::audit_session::ArtifactKind::WindowsPermissions => "windows_permissions",
+        crate::audit_session::ArtifactKind::WindowsStartup => "windows_startup",
         crate::audit_session::ArtifactKind::RuntimeManifest => "runtime_manifest",
         crate::audit_session::ArtifactKind::RuntimeTrace => "runtime_trace",
     }
@@ -303,6 +307,9 @@ mod tests {
         assert!(output.contains("Platform: linux (x86\\u{202e}_64)"));
         assert!(output.contains("Scope: \"safe\\n\\u{202e}path\""));
         assert!(output.contains("Status: partial"));
+        assert!(output.contains("Session interval (Unix milliseconds): 1..=2"));
+        assert!(output.contains("Interval semantics: best_effort_non_atomic"));
+        assert!(output.contains("Source interval (Unix milliseconds): 1..=2"));
         assert!(output.contains("Artifacts: none declared for this source"));
         assert!(output.contains("hashes do not authenticate the source"));
     }

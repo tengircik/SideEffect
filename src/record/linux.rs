@@ -44,6 +44,14 @@ pub struct RunBundleOutcome {
     pub time_limit_reached: bool,
 }
 
+/// Bounded bundle artifacts captured into private staging without publishing a separate bundle.
+#[derive(Debug)]
+pub struct RunBundleArtifacts {
+    pub manifest_bytes: Vec<u8>,
+    pub trace_bytes: Vec<u8>,
+    pub time_limit_reached: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StraceVersion {
     major: u64,
@@ -149,6 +157,13 @@ impl std::fmt::Display for RecordError {
 
 impl std::error::Error for RecordError {}
 
+impl RecordError {
+    /// Whether the selected command may have started before the capture error occurred.
+    pub fn target_may_have_run(&self) -> bool {
+        self.target_may_have_run
+    }
+}
+
 /// Run a command under strace and publish its bounded raw trace without
 /// replacing an existing destination.
 pub fn record_trace(
@@ -214,6 +229,52 @@ pub fn record_bundle_with_duration(
     )
 }
 
+/// Capture a bounded Linux run bundle for inclusion in a larger private artifact set.
+///
+/// The temporary bundle is never published as a separate directory. Its trace remains in the
+/// recorder's private staging directory until the caller has copied the bounded bytes; staging
+/// cleanup is anchored to the held directory descriptor when this function returns.
+pub fn record_bundle_artifacts(
+    destination_parent_anchor: &Path,
+    program: &OsStr,
+    args: &[OsString],
+    duration_limit: Duration,
+) -> Result<RunBundleArtifacts, RecordError> {
+    if !cfg!(target_arch = "x86_64") {
+        return Err(RecordError::before_launch(
+            "versioned run bundles currently require Linux x86_64; the command was not started",
+        ));
+    }
+    let mut capture = record_capture_bounded(
+        destination_parent_anchor,
+        OsStr::new("strace"),
+        program,
+        args,
+        MAX_TRACE_BYTES,
+        true,
+        Some(duration_limit),
+    )?;
+    let (manifest_bytes, trace_sha256) = bundle_manifest_bytes(&mut capture, Some(duration_limit))?;
+    let trace_bytes = read_bounded_trace_bytes(&mut capture)?;
+    if crate::fingerprint::sha256_hex(&trace_bytes) != trace_sha256 {
+        return Err(RecordError::after_launch(
+            "staged trace changed while preparing the audit session; capture was discarded",
+        ));
+    }
+    capture.output.remove_fifo().map_err(|error| {
+        RecordError::after_launch(format!(
+            "could not remove staging FIFO after session runtime capture: {error}"
+        ))
+    })?;
+    drop(capture.trace_file);
+    drop(capture.output);
+    Ok(RunBundleArtifacts {
+        manifest_bytes,
+        trace_bytes,
+        time_limit_reached: capture.time_limit_reached,
+    })
+}
+
 fn record_bundle_bounded(
     destination: &Path,
     tracer: &OsStr,
@@ -236,51 +297,15 @@ fn record_bundle_bounded(
         true,
         duration_limit,
     )?;
-    let (sha256, byte_length) = hash_exact_trace(&mut capture.trace_file, capture.bytes)?;
-    let manifest = RunManifest {
-        schema: "sideeffect.run",
-        schema_version: 2,
-        producer: Producer {
-            sideeffect_version: env!("CARGO_PKG_VERSION"),
-            operating_system: "linux",
-            architecture: "x86_64",
-        },
-        capture: Capture {
-            tracer: Tracer {
-                name: "strace",
-                major: capture.version.major,
-                minor: capture.version.minor,
-            },
-            capture_profile: "linux_process_file_network_v1",
-            strace_reported_status: reported_status(capture.status),
-            command_outcome: "not_independently_verified",
-            completeness: "unknown",
-            command_stdout: "inherited_not_captured",
-            command_stderr: "inherited_not_captured",
-            tracer_diagnostics: "inherited_not_captured",
-            time_limit_milliseconds: duration_limit.map(|value| value.as_millis() as u64),
-            stop_reason: if capture.time_limit_reached {
-                "time_limit_reached"
-            } else {
-                "tracer_exited"
-            },
-        },
-        trace: TraceFile {
-            name: "trace.strace",
-            format: "strace_text",
-            byte_length,
-            sha256: &sha256,
-        },
-    };
+    let (manifest_bytes, _) = bundle_manifest_bytes(&mut capture, duration_limit)?;
     let mut manifest_file = capture.output.create_manifest_file().map_err(|error| {
         RecordError::after_launch(format!("could not create bundle manifest: {error}"))
     })?;
-    serde_json::to_writer(&mut manifest_file, &manifest).map_err(|error| {
-        RecordError::after_launch(format!("could not serialize bundle manifest: {error}"))
+    manifest_file.write_all(&manifest_bytes).map_err(|error| {
+        RecordError::after_launch(format!("could not finalize bundle manifest: {error}"))
     })?;
     manifest_file
-        .write_all(b"\n")
-        .and_then(|()| manifest_file.flush())
+        .flush()
         .and_then(|()| manifest_file.sync_all())
         .map_err(|error| {
             RecordError::after_launch(format!("could not finalize bundle manifest: {error}"))
@@ -307,7 +332,78 @@ fn record_bundle_bounded(
     })
 }
 
-fn reported_status(status: ExitStatus) -> ReportedStatus {
+fn bundle_manifest_bytes(
+    capture: &mut CaptureStage,
+    duration_limit: Option<Duration>,
+) -> Result<(Vec<u8>, String), RecordError> {
+    let (sha256, byte_length) = hash_exact_trace(&mut capture.trace_file, capture.bytes)?;
+    let manifest = RunManifest {
+        schema: "sideeffect.run",
+        schema_version: 2,
+        producer: Producer {
+            sideeffect_version: env!("CARGO_PKG_VERSION"),
+            operating_system: "linux",
+            architecture: "x86_64",
+        },
+        capture: Capture {
+            tracer: Tracer {
+                name: "strace",
+                major: capture.version.major,
+                minor: capture.version.minor,
+            },
+            capture_profile: "linux_process_file_network_v1",
+            strace_reported_status: reported_status(&capture.status),
+            command_outcome: "not_independently_verified",
+            completeness: "unknown",
+            command_stdout: "inherited_not_captured",
+            command_stderr: "inherited_not_captured",
+            tracer_diagnostics: "inherited_not_captured",
+            time_limit_milliseconds: duration_limit.map(|value| value.as_millis() as u64),
+            stop_reason: if capture.time_limit_reached {
+                "time_limit_reached"
+            } else {
+                "tracer_exited"
+            },
+        },
+        trace: TraceFile {
+            name: "trace.strace",
+            format: "strace_text",
+            byte_length,
+            sha256: &sha256,
+        },
+    };
+    let mut manifest_bytes = serde_json::to_vec(&manifest).map_err(|error| {
+        RecordError::after_launch(format!("could not serialize bundle manifest: {error}"))
+    })?;
+    manifest_bytes.push(b'\n');
+    Ok((manifest_bytes, sha256))
+}
+
+fn read_bounded_trace_bytes(capture: &mut CaptureStage) -> Result<Vec<u8>, RecordError> {
+    capture
+        .trace_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| {
+            RecordError::after_launch(format!(
+                "could not seek staged trace for bundle read: {error}"
+            ))
+        })?;
+    let mut trace_bytes = Vec::with_capacity(capture.bytes);
+    (&mut capture.trace_file)
+        .take(capture.bytes as u64 + 1)
+        .read_to_end(&mut trace_bytes)
+        .map_err(|error| {
+            RecordError::after_launch(format!("could not read staged trace for session: {error}"))
+        })?;
+    if trace_bytes.len() != capture.bytes {
+        return Err(RecordError::after_launch(
+            "staged trace length changed before session publication; capture was discarded",
+        ));
+    }
+    Ok(trace_bytes)
+}
+
+fn reported_status(status: &ExitStatus) -> ReportedStatus {
     if let Some(code) = status.code() {
         ReportedStatus::ExitCode { value: code }
     } else if let Some(signal) = status.signal() {
