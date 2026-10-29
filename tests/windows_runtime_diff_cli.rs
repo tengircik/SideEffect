@@ -221,6 +221,23 @@ fn category<'a>(document: &'a Value, key: &str) -> &'a Value {
         .unwrap()
 }
 
+fn document_fingerprint(bytes: &[u8]) -> String {
+    let capture: Value = serde_json::from_slice(bytes).unwrap();
+    capture["document_sha256"].as_str().unwrap().to_owned()
+}
+
+fn refingerprint_capture(bytes: &[u8], schema_version: u32) -> Vec<u8> {
+    let mut capture: WindowsRuntimeCapture = serde_json::from_slice(bytes).unwrap();
+    capture.schema_version = schema_version;
+    capture.document_sha256.clear();
+    let fingerprint = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&capture).unwrap())
+    );
+    capture.document_sha256 = fingerprint;
+    serde_json::to_vec(&capture).unwrap()
+}
+
 #[test]
 fn json_compares_observed_category_counts_and_preserves_ordinals() {
     let before = capture(
@@ -236,10 +253,43 @@ fn json_compares_observed_category_counts_and_preserves_ordinals() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["schema"], "sideeffect.windows_runtime_diff_summary");
     assert_eq!(report["schema_version"], 1);
+    assert_eq!(
+        report["algorithm"]["id"],
+        "windows_etw_observed_event_category_counts"
+    );
+    assert_eq!(report["algorithm"]["version"], 1);
+    assert_eq!(
+        report["algorithm"]["basis"],
+        "fixed_category_record_counts_without_individual_event_pairing"
+    );
     assert_eq!(report["comparison_status"], "complete");
     assert_eq!(report["capture_completeness"], "unknown");
+    assert_eq!(
+        report["before"]["document_sha256"],
+        document_fingerprint(&before)
+    );
+    assert_eq!(
+        report["after"]["document_sha256"],
+        document_fingerprint(&after)
+    );
+    assert_eq!(report["before"]["producer_collection_status"], "complete");
+    assert_eq!(report["after"]["producer_collection_status"], "complete");
+    assert_eq!(report["before"]["observed_event_count"], 3);
+    assert_eq!(report["after"]["observed_event_count"], 3);
     assert_eq!(category(&report, "process.start")["before_count"], 1);
     assert_eq!(category(&report, "process.start")["after_count"], 1);
+    assert_eq!(
+        category(&report, "process.start")["observed_count_delta"],
+        0
+    );
+    assert_eq!(
+        category(&report, "process.start")["before_event_ordinals"],
+        json!([1])
+    );
+    assert_eq!(
+        category(&report, "process.start")["after_event_ordinals"],
+        json!([1])
+    );
     assert_eq!(
         category(&report, "file_io.read_request")["before_event_ordinals"][0],
         2
@@ -302,6 +352,18 @@ fn malformed_and_digest_mismatch_inputs_are_rejected_before_comparison() {
         String::from_utf8_lossy(&mismatch.stderr)
             .contains("after Windows runtime validation failed")
     );
+}
+
+#[test]
+fn correctly_refingerprinted_unsupported_capture_version_is_rejected() {
+    let before = capture(CollectionStatus::Complete, &["process.start"]);
+    let unsupported = refingerprint_capture(&before, WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION + 1);
+
+    let (_temp, output) = run_diff(&before, &unsupported, &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("after Windows runtime validation failed"));
+    assert!(stderr.contains("unsupported Windows runtime schema version"));
 }
 
 #[test]

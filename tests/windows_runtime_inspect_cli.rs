@@ -106,7 +106,9 @@ fn with_input(bytes: &[u8]) -> (PathBuf, Output) {
 
 #[test]
 fn inspect_json_preserves_capture_claim_and_disclaims_authenticity() {
-    let (path, output) = with_input(&fixture(CollectionStatus::Complete));
+    let input = fixture(CollectionStatus::Complete);
+    let expected_capture: Value = serde_json::from_slice(&input).unwrap();
+    let (path, output) = with_input(&input);
     fs::remove_file(path).unwrap();
     assert!(
         output.status.success(),
@@ -119,7 +121,7 @@ fn inspect_json_preserves_capture_claim_and_disclaims_authenticity() {
     assert_eq!(document["authenticity"], "not_verified");
     assert_eq!(document["capture_completeness"], "unknown");
     assert_eq!(document["capture_claimed_status"], "complete");
-    assert_eq!(document["capture"]["events"][0]["record_ordinal"], 1);
+    assert_eq!(document["capture"], expected_capture);
 }
 
 #[test]

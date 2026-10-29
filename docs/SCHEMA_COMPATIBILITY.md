@@ -42,6 +42,8 @@ This document describes the versioned formats currently emitted by SideEffect an
 
 The table lists current product command formats, not every development or local-model evaluation artifact in the repository. Text renderings of inspect, diff, evidence, and session review are human-readable output and do not declare a JSON schema version.
 
+The experimental Windows ETW contract has deterministic synthetic conformance checks: `inspect --windows-runtime` preserves the complete validated v3 capture in its v1 inspection envelope, and `diff --windows-runtime` verifies the v1 summary's algorithm identifier/version/basis, both capture fingerprints and collection statuses, observed counts, category counts, and event ordinals. A correctly re-fingerprinted capture with an unsupported schema version is rejected. These tests validate serialization and reader behavior only; they do not establish compatibility with live ETW providers, Windows versions, or capture completeness.
+
 ### Session artifact contracts
 
 The v1 session envelope is platform-neutral. Its current exact artifact contracts are:
