@@ -13,7 +13,6 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use serde::Deserialize;
 use serde::Serialize;
-#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
 use sideeffect::audit_session_linux::{AuditOptions, collect_and_publish};
@@ -61,7 +60,7 @@ use sideeffect::record::publish_private_windows_file;
 use sideeffect::startup_correlation::correlate_startup_bytes;
 use sideeffect::trace::strace::parse_trace_bytes;
 
-const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect inspect [--format json|text] --bundle <run-bundle-directory>\n       sideeffect inspect [--format json|text] --session <audit-session-directory>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff --bundles [--format json|text] <baseline-bundle> <candidate-bundle>\n       sideeffect diff --bundles --format html --output <report.html> <baseline-bundle> <candidate-bundle>\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect inventory packages --output <new-inventory.json>\n\
+const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect inspect [--format json|text] --bundle <run-bundle-directory>\n       sideeffect inspect [--format json|text] --session <audit-session-directory>\n       sideeffect inspect [--format json|text] --windows-runtime <capture.json>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff --bundles [--format json|text] <baseline-bundle> <candidate-bundle>\n       sideeffect diff --bundles --format html --output <report.html> <baseline-bundle> <candidate-bundle>\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect inventory packages --output <new-inventory.json>\n\
        sideeffect explain <strace-trace-file>\n\
        sideeffect explain --diff <baseline-trace> <candidate-trace>\n\
        sideeffect explain --inventory-diff <before.json> <after.json>\n\
@@ -156,6 +155,16 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             if command == "inspect" && format_flag == "--format" && session_flag == "--session" =>
         {
             inspect_session_with_format(format, path)
+        }
+        [command, flag, path] if command == "inspect" && flag == "--windows-runtime" => {
+            inspect_windows_runtime_with_format(&OsString::from("json"), path)
+        }
+        [command, format_flag, format, windows_flag, path]
+            if command == "inspect"
+                && format_flag == "--format"
+                && windows_flag == "--windows-runtime" =>
+        {
+            inspect_windows_runtime_with_format(format, path)
         }
         [command, path] if command == "inspect" => inspect(path),
         [command, path] if command == "explain" => explain_trace_file(path),
@@ -1147,7 +1156,7 @@ Collects explicitly selected Linux inventory sources and an optional bounded com
             }
         }
         "inspect" => {
-            "Usage: sideeffect inspect [--format json|text] TRACE\n       sideeffect inspect [--format json|text] --bundle DIR\n       sideeffect inspect [--format json|text] --session DIR\nReads bounded local strace evidence, a validated run bundle, or a verified audit session on a supported platform. It never runs represented commands. JSON is the default; text output escapes terminal controls and user-influenced scope text. Session inspection checks the manifest, platform-specific private file layout, artifact schemas, byte lengths, and SHA-256 values; hashes do not authenticate the source. Partial input is labeled and exits with status 2."
+            "Usage: sideeffect inspect [--format json|text] TRACE\n       sideeffect inspect [--format json|text] --bundle DIR\n       sideeffect inspect [--format json|text] --session DIR\n       sideeffect inspect [--format json|text] --windows-runtime FILE\nReads bounded local strace evidence, a validated run bundle, a verified audit session, or a Windows ETW capture. It never runs represented commands. JSON is the default; text output escapes terminal controls and user-influenced fields. Windows runtime inspection accepts schema v3, validates its document fingerprint and bounds, and does not authenticate authorship or establish capture completeness. Partial input is labeled and exits with status 2."
         }
         "diff" => {
             "Usage: sideeffect diff [--format json|text] LEFT RIGHT\n       sideeffect diff --format html --output REPORT.html LEFT RIGHT\n       sideeffect diff --bundles [--format json|text] LEFT_DIR RIGHT_DIR\nCompares complete parsed observations. HTML reports are available on Linux and are static, offline, and private. Trace values may be sensitive."
@@ -1513,6 +1522,71 @@ fn inspect_with_format(format: &OsString, path: &OsString) -> Result<ExitCode, S
         return Err("inspect format must be either 'json' or 'text'".to_owned());
     }
     inspect_bytes_with_format(format, read_bounded(path)?)
+}
+
+fn inspect_windows_runtime_with_format(
+    format: &OsString,
+    path: &OsString,
+) -> Result<ExitCode, String> {
+    if !matches!(format.to_str(), Some("json" | "text")) {
+        return Err("inspect format must be either 'json' or 'text'".to_owned());
+    }
+    let bytes = read_input_file(
+        Path::new(path),
+        sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
+        "Windows runtime capture",
+    )?;
+    let source_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let capture = sideeffect::windows_runtime::inspect_windows_runtime_bytes(&bytes)?;
+    let partial =
+        capture.collection_status == sideeffect::windows_runtime::CollectionStatus::Partial;
+    match format.to_str() {
+        Some("json") => {
+            let inspection = sideeffect::windows_runtime::WindowsRuntimeInspection {
+                schema: sideeffect::windows_runtime::WINDOWS_RUNTIME_INSPECTION_SCHEMA,
+                schema_version:
+                    sideeffect::windows_runtime::WINDOWS_RUNTIME_INSPECTION_SCHEMA_VERSION,
+                validation_status: "validated_untrusted_document",
+                source_sha256: &source_sha256,
+                representation_fingerprint_verified: true,
+                authenticity: "not_verified",
+                capture_completeness: &capture.capture_completeness,
+                capture_claimed_status: capture.collection_status,
+                capture: &capture,
+            };
+            write_json(&inspection, "Windows runtime inspection")?;
+        }
+        Some("text") => {
+            let mut output = CappedBuffer::new(MAX_REPORT_BYTES);
+            sideeffect::format::write_windows_runtime_text(&capture, &mut output).map_err(
+                |error| {
+                    if output.exceeded {
+                        format!(
+                            "Windows runtime text exceeds the {MAX_REPORT_BYTES} byte output limit"
+                        )
+                    } else {
+                        format!("could not render Windows runtime inspection: {error}")
+                    }
+                },
+            )?;
+            output.write_all(b"Source file SHA-256: ").map_err(|_| {
+                format!("Windows runtime text exceeds the {MAX_REPORT_BYTES} byte output limit")
+            })?;
+            output.write_all(source_sha256.as_bytes()).map_err(|_| {
+                format!("Windows runtime text exceeds the {MAX_REPORT_BYTES} byte output limit")
+            })?;
+            output.write_all(b"\n").map_err(|_| {
+                format!("Windows runtime text exceeds the {MAX_REPORT_BYTES} byte output limit")
+            })?;
+            write_buffer(&output, "Windows runtime inspection")?;
+        }
+        _ => unreachable!("format was checked above"),
+    }
+    Ok(if partial {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn explain_trace_file(path: &OsString) -> Result<ExitCode, String> {

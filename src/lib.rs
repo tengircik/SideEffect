@@ -24,3 +24,4 @@ pub mod model_manager;
 pub mod record;
 pub mod startup_correlation;
 pub mod trace;
+pub mod windows_runtime;
