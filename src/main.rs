@@ -872,14 +872,14 @@ fn record_windows_etw(
 ) -> Result<ExitCode, String> {
     #[cfg(windows)]
     {
-        let capture = sideeffect::record::record_windows_process_capture(
+        let capture = sideeffect::record::record_windows_runtime_capture(
             Path::new(output),
             program,
             args,
             duration,
         )?;
         eprintln!(
-            "Saved {} Windows process lifecycle records to {} (collection: {:?}; capture completeness: unknown; ETW loss stats available: {}, final snapshot: {}, observation: {}).",
+            "Saved {} Windows process/file/network ETW records to {} (collection: {:?}; capture completeness: unknown; ETW loss stats available: {}, final snapshot: {}, observation: {}).",
             capture.events.len(),
             terminal_safe_path(Path::new(output)),
             capture.collection_status,
@@ -1164,7 +1164,7 @@ Collects explicitly selected Linux inventory sources and an optional bounded com
         "record" => {
             #[cfg(windows)]
             {
-                "Usage: sideeffect record --windows-etw OUTPUT.json --duration-seconds 1..60 -- PROGRAM [ARGS...]\nStarts a bounded native ETW process-lifecycle capture. The NT Kernel Logger observes system-wide process events for the capture window; records are not attributed to the selected command or its descendants. Controlling the NT Kernel Logger requires administrative privileges. No automatic elevation is requested. This is observation, not isolation or a safety check."
+                "Usage: sideeffect record --windows-etw OUTPUT.json --duration-seconds 1..60 -- PROGRAM [ARGS...]\nStarts a bounded native ETW capture for process lifecycle, selected file activity, and TCP/UDP observations. The NT Kernel Logger observes system-wide events during the capture window; this prototype does not attribute every file event to the selected command or its descendants. File records describe observed requests/operations, not guaranteed success. Controlling the NT Kernel Logger requires administrative privileges. No automatic elevation is requested. This is observation, not isolation or a safety check."
             }
             #[cfg(not(windows))]
             {

@@ -15,7 +15,7 @@ The `sideeffect.audit_session` v1 manifest is a platform-neutral envelope. Nativ
 | Windows | permissions | `permissions.windows.json` | `sideeffect.windows_permission_inventory` | 1 |
 | Windows | startup | `startup.windows.json` | `sideeffect.windows_startup_inventory` | 4 |
 
-The Windows runtime role currently has no artifact contract. An explicitly selected Windows runtime source is recorded as `unsupported` with a diagnostic and no artifact. The process-only ETW prototype is not represented as a completed runtime source.
+The Windows runtime role currently has no artifact contract. An explicitly selected Windows runtime source is recorded as `unsupported` with a diagnostic and no artifact. The experimental ETW process/file/network capture output is not represented as a completed runtime source.
 
 `complete` means the selected collector produced its declared artifact set. It does not mean exhaustive system coverage. `partial`, `unsupported`, `unavailable`, `access_denied`, and other non-complete states remain visible and force the enclosing session to `partial`. Runtime can never be marked complete in this session version because capture completeness is not established.
 

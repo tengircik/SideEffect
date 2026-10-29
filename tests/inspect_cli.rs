@@ -218,8 +218,7 @@ impl TempBundle {
         if let Some((stop_reason, time_limit_milliseconds)) = capture_context {
             manifest["capture"]["stop_reason"] = serde_json::json!(stop_reason);
             if let Some(milliseconds) = time_limit_milliseconds {
-                manifest["capture"]["time_limit_milliseconds"] =
-                    serde_json::json!(milliseconds);
+                manifest["capture"]["time_limit_milliseconds"] = serde_json::json!(milliseconds);
             }
         }
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();

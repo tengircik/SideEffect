@@ -5,6 +5,8 @@ mod paths;
 mod windows;
 #[cfg(windows)]
 mod windows_etw;
+#[cfg(windows)]
+mod windows_io_decode;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -22,7 +24,7 @@ pub use windows::publish_private_file as publish_private_windows_file;
 pub use windows_etw::{
     CollectionStatus as WindowsRuntimeCollectionStatus, DecodeStatus as WindowsRuntimeDecodeStatus,
     DecodedProcessPayload as WindowsDecodedProcessPayload, WindowsRuntimeCapture,
-    record_windows_process_capture,
+    record_windows_runtime_capture,
 };
 
 #[cfg(target_os = "linux")]

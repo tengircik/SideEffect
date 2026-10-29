@@ -27,7 +27,7 @@ fn focused_help_covers_command_and_nested_inventory_topics() {
     #[cfg(target_os = "linux")]
     assert!(record_help.contains("current user's permissions"));
     #[cfg(windows)]
-    assert!(record_help.contains("system-wide process events"));
+    assert!(record_help.contains("system-wide events"));
     assert!(record_help.contains("not isolation") || record_help.contains("not a safety check"));
 
     let inspect = run(&["inspect", "--help"]);

@@ -1,7 +1,7 @@
-//! Bounded Windows process-lifecycle observations from the NT Kernel Logger.
+//! Bounded Windows process, file, and network observations from the NT Kernel Logger.
 //!
-//! The kernel logger is system-wide. This first prototype does not attribute
-//! process events to the selected command or claim that a parent caused a child.
+//! The kernel logger is system-wide. Records remain observations from the capture
+//! window; this module does not infer that one activity caused another.
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -15,20 +15,27 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SUCCESS};
 use windows_sys::Win32::System::Diagnostics::Etw::{
-    CONTROLTRACE_HANDLE, CloseTrace, EVENT_RECORD, EVENT_TRACE_CONTROL_QUERY,
-    EVENT_TRACE_FLAG_PROCESS, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
-    EVENT_TRACE_REAL_TIME_MODE, EVENT_TRACE_TYPE_END, EVENT_TRACE_TYPE_START, EventTraceGuid,
-    OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, ProcessTrace,
-    StartTraceW, StopTraceW, SystemTraceControlGuid, WNODE_FLAG_TRACED_GUID,
+    CONTROLTRACE_HANDLE, CloseTrace, EVENT_HEADER_FLAG_32_BIT_HEADER,
+    EVENT_HEADER_FLAG_64_BIT_HEADER, EVENT_RECORD, EVENT_TRACE_CONTROL_QUERY,
+    EVENT_TRACE_FLAG_DISK_FILE_IO, EVENT_TRACE_FLAG_DISK_IO, EVENT_TRACE_FLAG_FILE_IO_INIT,
+    EVENT_TRACE_FLAG_NETWORK_TCPIP, EVENT_TRACE_FLAG_PROCESS, EVENT_TRACE_LOGFILEW,
+    EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EVENT_TRACE_TYPE_END,
+    EVENT_TRACE_TYPE_START, EventTraceGuid, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
+    PROCESS_TRACE_MODE_REAL_TIME, ProcessGuid, ProcessTrace, StartTraceW, StopTraceW,
+    SystemTraceControlGuid, WNODE_FLAG_TRACED_GUID,
 };
 
 #[path = "payload_decode.rs"]
 mod payload_decode;
+use super::windows_io_decode::{
+    Activity, DecodeResult as IoDecodeResult, DecodeStatus as IoDecodeStatus, PointerWidth,
+    decode_classic_event,
+};
 use payload_decode::decode_event_payload;
 pub use payload_decode::{DecodeStatus, DecodedProcessPayload};
 
 pub const WINDOWS_RUNTIME_CAPTURE_SCHEMA: &str = "sideeffect.windows_runtime_capture";
-pub const WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION: u32 = 2;
+pub const WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION: u32 = 3;
 pub const MAX_WINDOWS_RUNTIME_DURATION_SECONDS: u64 = 60;
 const MAX_EVENT_RECORDS: usize = 50_000;
 const MAX_EVENT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
@@ -59,7 +66,7 @@ pub struct WindowsRuntimeCapture {
     pub limits: AppliedLimits,
     pub event_loss: EventLoss,
     pub document_sha256: String,
-    pub events: Vec<NativeProcessEvent>,
+    pub events: Vec<NativeRuntimeEvent>,
     pub diagnostics: Vec<String>,
 }
 
@@ -132,7 +139,7 @@ impl Default for EventLoss {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct NativeProcessEvent {
+pub struct NativeRuntimeEvent {
     pub record_ordinal: u64,
     pub provider_guid: String,
     pub event_id: u16,
@@ -148,20 +155,24 @@ pub struct NativeProcessEvent {
     pub timestamp_qpc: i64,
     /// Exact bytes from EVENT_RECORD.UserData for this source event.
     pub raw_payload_hex: String,
-    pub payload_decoding: DecodedProcessPayload,
+    /// Present for ProcessGuid records; never populated from the event header.
+    pub payload_decoding: Option<DecodedProcessPayload>,
+    /// Present for FileIo/DiskIo/TcpIp/UdpIp and unsupported provider records.
+    pub observation_decoding: Option<serde_json::Value>,
 }
 
 #[derive(Default)]
 struct Collector {
-    events: Vec<NativeProcessEventBytes>,
+    events: Vec<NativeRuntimeEventBytes>,
     payload_bytes: usize,
     limit_reached: bool,
     malformed: bool,
+    oversized_payload_events: usize,
     unsupported_provider_events: usize,
 }
 
 #[derive(Clone)]
-struct NativeProcessEventBytes {
+struct NativeRuntimeEventBytes {
     provider_guid: String,
     event_id: u16,
     event_version: u8,
@@ -172,12 +183,13 @@ struct NativeProcessEventBytes {
     header_flags: u16,
     timestamp_qpc: i64,
     raw_payload: Vec<u8>,
-    payload_decoding: DecodedProcessPayload,
+    payload_decoding: Option<DecodedProcessPayload>,
+    observation_decoding: Option<IoDecodeResult>,
 }
 
-/// Run a selected command while collecting process start/end ETW records.
+/// Run a selected command while collecting bounded system-wide ETW records.
 /// Session creation must succeed before the command is launched.
-pub fn record_windows_process_capture(
+pub fn record_windows_runtime_capture(
     destination: &Path,
     program: &OsStr,
     args: &[std::ffi::OsString],
@@ -245,10 +257,17 @@ pub fn record_windows_process_capture(
     let loss = session.loss.clone().unwrap_or_default();
     let event_limit = collector.limit_reached;
     let malformed = collector.malformed;
+    let oversized_payload_events = collector.oversized_payload_events;
     let unsupported_provider_events = collector.unsupported_provider_events;
     let mut events = Vec::with_capacity(collector.events.len());
     for (index, event) in collector.events.iter().enumerate() {
-        events.push(NativeProcessEvent {
+        let observation_decoding = event
+            .observation_decoding
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| format!("could not serialize ETW observation decoding: {error}"))?;
+        events.push(NativeRuntimeEvent {
             record_ordinal: (index + 1) as u64,
             provider_guid: event.provider_guid.clone(),
             event_id: event.event_id,
@@ -261,6 +280,7 @@ pub fn record_windows_process_capture(
             timestamp_qpc: event.timestamp_qpc,
             raw_payload_hex: hex(&event.raw_payload),
             payload_decoding: event.payload_decoding.clone(),
+            observation_decoding,
         });
     }
     drop(collector);
@@ -276,6 +296,11 @@ pub fn record_windows_process_capture(
     }
     if malformed {
         diagnostics.push("invalid_or_unsupported_etw_record_seen".to_owned());
+    }
+    if oversized_payload_events > 0 {
+        diagnostics.push(format!(
+            "oversized_or_null_etw_payload_events_excluded:{oversized_payload_events}"
+        ));
     }
     if unsupported_provider_events > 0 {
         diagnostics.push(format!(
@@ -314,7 +339,7 @@ pub fn record_windows_process_capture(
         schema: WINDOWS_RUNTIME_CAPTURE_SCHEMA,
         schema_version: WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION,
         platform: "windows",
-        capture_profile: "windows_nt_kernel_process_lifecycle_v1",
+        capture_profile: "windows_nt_kernel_process_file_network_v1",
         collection_status: status,
         capture_completeness: "unknown",
         started_at_unix_ms: start_unix_ms,
@@ -324,13 +349,13 @@ pub fn record_windows_process_capture(
         target,
         session: SessionMetadata {
             name: SESSION_NAME,
-            provider: "NT Kernel Logger Process provider",
-            scope: "system_wide_process_lifecycle_during_capture_window",
+            provider: "NT Kernel Logger process, FileIo, DiskIo, TcpIp, and UdpIp providers",
+            scope: "system_wide_process_file_and_network_events_during_capture_window",
             buffer_size_kb_requested: BUFFER_SIZE_KB,
             minimum_buffers_requested: MINIMUM_BUFFERS,
             maximum_buffers_requested: MAXIMUM_BUFFERS,
             buffer_count_reported: session.buffer_count,
-            provider_process_id_header_semantics: "header PID/TID is event context and may not identify the process described by a process-start payload",
+            provider_process_id_header_semantics: "header PID/TID is event context only; process events and network events expose separate payload identity fields, and file-operation attribution is not inferred",
         },
         limits: AppliedLimits {
             maximum_duration_seconds: MAX_WINDOWS_RUNTIME_DURATION_SECONDS,
@@ -421,7 +446,14 @@ impl EtwSession {
             (*props).MinimumBuffers = MINIMUM_BUFFERS;
             (*props).MaximumBuffers = MAXIMUM_BUFFERS;
             (*props).LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-            (*props).EnableFlags = EVENT_TRACE_FLAG_PROCESS;
+            // File-name events require both DISK_IO and DISK_FILE_IO. The
+            // supported DiskIo layouts are decoded separately; unknown layouts
+            // remain raw and make the result partial.
+            (*props).EnableFlags = EVENT_TRACE_FLAG_PROCESS
+                | EVENT_TRACE_FLAG_DISK_IO
+                | EVENT_TRACE_FLAG_DISK_FILE_IO
+                | EVENT_TRACE_FLAG_FILE_IO_INIT
+                | EVENT_TRACE_FLAG_NETWORK_TCPIP;
             (*props).LoggerNameOffset = properties_size as u32;
             std::ptr::copy_nonoverlapping(
                 name.as_ptr(),
@@ -582,29 +614,19 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
     let event = unsafe { &*record };
     let header = &event.EventHeader;
     let guid = header.ProviderId;
-    // ProcessGuid identifies the classic kernel process event class. Only its
-    // documented Start/End opcodes are labeled; unknown opcodes stay visible.
-    let process_guid = windows_sys::Win32::System::Diagnostics::Etw::ProcessGuid;
-    if !guid_equal(guid, process_guid) {
-        if !guid_equal(guid, EventTraceGuid) && !event.UserContext.is_null() {
-            let state = unsafe { &*event.UserContext.cast::<Mutex<Collector>>() };
-            let mut state = state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.unsupported_provider_events = state.unsupported_provider_events.saturating_add(1);
-            state.malformed = true;
-        }
+    // EventTraceGuid records are ETW session control metadata, not observations
+    // from the explicitly enabled process/file/network provider set.
+    if guid_equal(guid, EventTraceGuid) {
         return;
     }
-    let opcode = header.EventDescriptor.Opcode;
-    let event_kind = classify_process_opcode(opcode);
     let length = usize::from(event.UserDataLength);
     if length > MAX_EVENT_PAYLOAD_LENGTH || (length > 0 && event.UserData.is_null()) {
         if !event.UserContext.is_null() {
-            unsafe { &*event.UserContext.cast::<Mutex<Collector>>() }
+            let mut state = unsafe { &*event.UserContext.cast::<Mutex<Collector>>() }
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .malformed = true;
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.malformed = true;
+            state.oversized_payload_events = state.oversized_payload_events.saturating_add(1);
         }
         return;
     }
@@ -623,18 +645,62 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
         let bytes = unsafe { std::slice::from_raw_parts(event.UserData.cast::<u8>(), length) };
         payload.extend_from_slice(bytes);
     }
-    let payload_decoding = decode_event_payload(event);
+    let provider_guid = format_guid(guid);
+    let descriptor = &header.EventDescriptor;
+    let (event_kind, payload_decoding, observation_decoding) = if guid_equal(guid, ProcessGuid) {
+        (
+            classify_process_opcode(descriptor.Opcode),
+            Some(decode_event_payload(event)),
+            None,
+        )
+    } else {
+        let pointer_width = match header.Flags {
+            flags
+                if flags & (EVENT_HEADER_FLAG_32_BIT_HEADER as u16) != 0
+                    && flags & (EVENT_HEADER_FLAG_64_BIT_HEADER as u16) == 0 =>
+            {
+                Some(PointerWidth::Bits32)
+            }
+            flags
+                if flags & (EVENT_HEADER_FLAG_64_BIT_HEADER as u16) != 0
+                    && flags & (EVENT_HEADER_FLAG_32_BIT_HEADER as u16) == 0 =>
+            {
+                Some(PointerWidth::Bits64)
+            }
+            _ => None,
+        };
+        let decoded = decode_classic_event(
+            &provider_guid,
+            descriptor.Id,
+            descriptor.Version,
+            descriptor.Opcode,
+            pointer_width,
+            &payload,
+        );
+        let kind = match decoded.observation.as_ref().map(|item| &item.activity) {
+            Some(Activity::File(_)) => "file_io_observation",
+            Some(Activity::Disk(_)) => "disk_io_observation",
+            Some(Activity::Network(_)) => "network_observation",
+            None => "unsupported_or_malformed_provider_event",
+        };
+        (kind, None, Some(decoded))
+    };
     let state = unsafe { &*event.UserContext.cast::<Mutex<Collector>>() };
     let mut state = state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(decoded) = observation_decoding.as_ref() {
+        if decoded.status == IoDecodeStatus::UnsupportedProvider {
+            state.unsupported_provider_events = state.unsupported_provider_events.saturating_add(1);
+        }
+    }
     append_event(
         &mut state,
-        NativeProcessEventBytes {
-            provider_guid: format_guid(guid),
-            event_id: header.EventDescriptor.Id,
-            event_version: header.EventDescriptor.Version,
-            opcode,
+        NativeRuntimeEventBytes {
+            provider_guid,
+            event_id: descriptor.Id,
+            event_version: descriptor.Version,
+            opcode: descriptor.Opcode,
             event_kind,
             header_process_id: header.ProcessId,
             header_thread_id: header.ThreadId,
@@ -642,11 +708,12 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
             timestamp_qpc: header.TimeStamp,
             raw_payload: payload,
             payload_decoding,
+            observation_decoding,
         },
     );
 }
 
-fn append_event(state: &mut Collector, event: NativeProcessEventBytes) -> bool {
+fn append_event(state: &mut Collector, event: NativeRuntimeEventBytes) -> bool {
     let payload_len = event.raw_payload.len();
     if payload_len > MAX_EVENT_PAYLOAD_LENGTH {
         state.malformed = true;
@@ -658,9 +725,15 @@ fn append_event(state: &mut Collector, event: NativeProcessEventBytes) -> bool {
         state.limit_reached = true;
         return false;
     }
-    if event.event_kind == "unsupported_process_event"
-        || event.payload_decoding.status != DecodeStatus::Decoded
-    {
+    let process_decode_failed = event
+        .payload_decoding
+        .as_ref()
+        .is_some_and(|decoded| decoded.status != DecodeStatus::Decoded);
+    let observation_decode_failed = event
+        .observation_decoding
+        .as_ref()
+        .is_some_and(|decoded| decoded.status != IoDecodeStatus::Decoded);
+    if process_decode_failed || observation_decode_failed {
         state.malformed = true;
     }
     if state.events.try_reserve(1).is_err() {
@@ -816,7 +889,7 @@ mod tests {
 
     #[test]
     fn event_and_payload_limits_reject_the_first_over_limit_record() {
-        let event = |raw_payload: Vec<u8>| NativeProcessEventBytes {
+        let event = |raw_payload: Vec<u8>| NativeRuntimeEventBytes {
             provider_guid: "{3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c}".to_owned(),
             event_id: 1,
             event_version: 0,
@@ -828,10 +901,11 @@ mod tests {
                 windows_sys::Win32::System::Diagnostics::Etw::EVENT_HEADER_FLAG_64_BIT_HEADER as u16,
             timestamp_qpc: 0,
             raw_payload,
-            payload_decoding: DecodedProcessPayload::undecoded(
+            payload_decoding: Some(DecodedProcessPayload::undecoded(
                 DecodeStatus::SchemaUnavailable,
                 "fixture_is_not_a_real_etw_decode",
-            ),
+            )),
+            observation_decoding: None,
         };
         let mut state = Collector::default();
         for _ in 0..(MAX_EVENT_PAYLOAD_BYTES / MAX_EVENT_PAYLOAD_LENGTH) {
@@ -853,6 +927,33 @@ mod tests {
             event(vec![0; MAX_EVENT_PAYLOAD_LENGTH + 1])
         ));
         assert!(state.malformed);
+    }
+
+    #[test]
+    fn unsupported_observation_schema_marks_capture_partial_and_retains_raw_event() {
+        let mut state = Collector::default();
+        let event = NativeRuntimeEventBytes {
+            provider_guid: "{90cbdc39-4a3e-11d1-84f4-0000f80464e3}".to_owned(),
+            event_id: 0,
+            event_version: 2,
+            opcode: 0,
+            event_kind: "unsupported_or_malformed_provider_event",
+            header_process_id: 7,
+            header_thread_id: 8,
+            header_flags: EVENT_HEADER_FLAG_64_BIT_HEADER as u16,
+            timestamp_qpc: 9,
+            raw_payload: vec![1, 2, 3],
+            payload_decoding: None,
+            observation_decoding: Some(IoDecodeResult {
+                status: IoDecodeStatus::MalformedPayload,
+                diagnostic: Some("fixture_malformed_payload"),
+                observation: None,
+            }),
+        };
+        assert!(append_event(&mut state, event));
+        assert!(state.malformed);
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(state.events[0].raw_payload, vec![1, 2, 3]);
     }
 
     #[test]

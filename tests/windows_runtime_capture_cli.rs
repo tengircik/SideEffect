@@ -77,7 +77,7 @@ fn record_help_explains_system_scope_and_permissions() {
     let output = cli(&["help", "record"]);
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("system-wide process events"));
+    assert!(text.contains("system-wide events"));
     assert!(text.contains("No automatic elevation"));
-    assert!(text.contains("not attributed to the selected command"));
+    assert!(text.contains("does not attribute every file event"));
 }

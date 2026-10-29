@@ -23,7 +23,7 @@ This document describes the versioned formats currently emitted by SideEffect an
 | Bundle trace entry | `strace_text` v1; raw `trace.strace` bytes | Linux `record --bundle` | Parsed as raw `strace` text after bundle validation. |
 | Audit session envelope | `sideeffect.audit_session` v1 | Linux and Windows `audit` | `inspect --session` accepts v1 with the exact platform/artifact contracts below. |
 | Audit session review JSON | `sideeffect.audit_session_review` v1 | `inspect --session --format json` | Output-only; not accepted as a session manifest. |
-| Windows ETW capture | `sideeffect.windows_runtime_capture` v2 | Experimental Windows `record --windows-etw` | Output-only. It is not accepted by `inspect`, `diff`, bundle inspection, or the Windows session runtime contract. |
+| Windows ETW capture | `sideeffect.windows_runtime_capture` v3 | Experimental Windows `record --windows-etw` | Output-only. It is not accepted by `inspect`, `diff`, bundle inspection, or the Windows session runtime contract. |
 | Package inventory comparison | `sideeffect.package_inventory_diff` v1 | `explain --inventory-diff` | Reads Linux `sideeffect.inventory` v2 documents only. |
 | Startup correlation | `sideeffect.startup_correlation` v1 | `correlate-startup` | Reads Linux `sideeffect.startup_inventory` v2 and raw `strace` text; output is not an input format. |
 | Trace explanation JSON | Shape version 1 (no schema-name field) | `explain TRACE` | Output-only. Input is raw `strace` text. |
@@ -54,7 +54,7 @@ The v1 session envelope is platform-neutral. Its current exact artifact contract
 | Windows | Permissions | `permissions.windows.json` | `sideeffect.windows_permission_inventory` v1 |
 | Windows | Startup | `startup.windows.json` | `sideeffect.windows_startup_inventory` v4 |
 
-Windows runtime has no session artifact contract. A selected Windows runtime source is recorded as unsupported with a diagnostic; the process-only ETW prototype is not a completed session artifact. Session inspection checks envelope rules, fixed names, schema/version headers, byte lengths, and SHA-256 values, then renders metadata. It does not fully validate the semantic contents of each native inventory artifact.
+Windows runtime has no session artifact contract. A selected Windows runtime source is recorded as unsupported with a diagnostic; the experimental process/file/network ETW prototype is not a completed session artifact. Session inspection checks envelope rules, fixed names, schema/version headers, byte lengths, and SHA-256 values, then renders metadata. It does not fully validate the semantic contents of each native inventory artifact.
 
 ## Accepted inputs and unsupported versions
 
@@ -62,7 +62,7 @@ Windows runtime has no session artifact contract. A selected Windows runtime sou
 - Current trace and diff JSON schemas (v7 and v3) are produced, not JSON import formats. Trace JSON versions v1-v5 and diff JSON versions v1-v2 were standalone exports and are not imported or migrated. Trace schema v6 was not published. This document makes no compatibility or round-trip claim for those historical exports.
 - Package inventory comparison requires the Linux package schema `sideeffect.inventory` v2. Unsupported schema versions or malformed documents are rejected; it does not convert older versions. Startup correlation requires a saved Linux aggregate startup inventory with schema `sideeffect.startup_inventory` v2 and raw trace text. It does not upgrade older startup documents.
 - Session readers accept only the v1 envelope and the exact artifact combinations in the table above. Unknown platform/source/artifact combinations, unexpected versions, unknown manifest fields, duplicate or extra artifacts, oversized files, and digest mismatches are rejected. Windows runtime artifacts are unsupported in sessions. A session's `complete` status means the selected collectors produced their declared artifacts, not exhaustive coverage.
-- The Windows ETW v2 capture is a prototype output only; no current command imports it. The explanation JSON, aggregate summary, audit-session review, and HTML report are likewise output-only.
+- The Windows ETW v3 capture is a prototype output only; no current command imports it. The explanation JSON, aggregate summary, audit-session review, and HTML report are likewise output-only.
 - Local-model previews and analyses are versioned outputs, not persisted capture evidence or general import formats. The local model registry is persisted per user and accepts only its current exact schema version; no registry migration is promised. Model runtime compatibility and schema validation do not establish answer quality.
 - Unsupported or malformed raw trace rows are represented by parser diagnostics/partial status where possible; this is separate from accepting an unsupported SideEffect JSON schema. Diff refuses partial parsed traces rather than treating unparsed rows as absent events.
 
