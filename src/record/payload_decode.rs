@@ -428,14 +428,22 @@ fn validate_selected_properties(
         .map_err(|_| "process_id_property_schema_is_unexpected")?;
     validate_id_property(parent_id, pointer_size)
         .map_err(|_| "parent_process_id_property_schema_is_unexpected")?;
-    if !property_flags_supported(image.flags)
-        || image.count != 1
-        || image.length != 0
-        || image.input_type != TDH_INTYPE_UNICODESTRING as u16
-        || (image.output_type != TDH_OUTTYPE_NULL as u16
-            && image.output_type != TDH_OUTTYPE_STRING as u16)
+    if !property_flags_supported(image.flags) {
+        return Err("image_file_name_property_flags_are_unsupported");
+    }
+    if image.count != 1 {
+        return Err("image_file_name_property_count_is_unsupported");
+    }
+    if image.length != 0 {
+        return Err("image_file_name_property_length_is_unsupported");
+    }
+    if image.input_type != TDH_INTYPE_UNICODESTRING as u16 {
+        return Err("image_file_name_property_type_is_unsupported");
+    }
+    if image.output_type != TDH_OUTTYPE_NULL as u16
+        && image.output_type != TDH_OUTTYPE_STRING as u16
     {
-        return Err("image_file_name_property_schema_is_unexpected");
+        return Err("image_file_name_property_format_is_unsupported");
     }
     Ok(())
 }
