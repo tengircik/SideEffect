@@ -20,20 +20,20 @@ SideEffect turns selected local software sources and bounded runtime captures in
 Install the `sideeffect-audit` Agent Skill for Codex, Claude Code, OpenCode, and other compatible agents. The skill lets your chosen agent use SideEffect's deterministic CLI; it does not require SideEffect's experimental local-model commands.
 
 ```sh
-DISABLE_TELEMETRY=1 npx skills add tengircik/SideEffect --skill sideeffect-audit -g --copy
+DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/c5c57f7bbfcad0a5c16c6499c0f2a7c1fb5b2a1f/.agents/skills/sideeffect-audit --skill sideeffect-audit -g --copy
 ```
 
 PowerShell:
 
 ```powershell
 $env:DISABLE_TELEMETRY = "1"
-npx skills add tengircik/SideEffect --skill sideeffect-audit -g --copy
+npx skills add https://github.com/tengircik/SideEffect/tree/c5c57f7bbfcad0a5c16c6499c0f2a7c1fb5b2a1f/.agents/skills/sideeffect-audit --skill sideeffect-audit -g --copy
 ```
 
 The community `skills` installer detects available clients and installs the skill in their native location. To select Codex, Claude Code, and OpenCode explicitly:
 
 ```sh
-DISABLE_TELEMETRY=1 npx skills add tengircik/SideEffect --skill sideeffect-audit -a codex -a claude-code -a opencode -g --copy
+DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/c5c57f7bbfcad0a5c16c6499c0f2a7c1fb5b2a1f/.agents/skills/sideeffect-audit --skill sideeffect-audit -a codex -a claude-code -a opencode -g --copy
 ```
 
 For Oh My Pi (OMP), copy the reviewed skill folder to `.omp/skills/sideeffect-audit/`. Follow the complete [Agent Skill installation guide](docs/AGENT_SKILL.md) for OMP, project-local installation, updating, privacy, and verification.

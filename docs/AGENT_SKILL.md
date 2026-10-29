@@ -13,13 +13,13 @@ SideEffect ships a portable [Agent Skills](https://agentskills.io/specification)
 The `skills` CLI detects installed agents, lets you choose one or more destinations, and installs the selected skill in each agent's native location. Install globally for your user:
 
 ```sh
-DISABLE_TELEMETRY=1 npx skills add tengircik/SideEffect --skill sideeffect-audit -g
+DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/c5c57f7bbfcad0a5c16c6499c0f2a7c1fb5b2a1f/.agents/skills/sideeffect-audit --skill sideeffect-audit -g --copy
 ```
 
 To select destinations explicitly:
 
 ```sh
-DISABLE_TELEMETRY=1 npx skills add tengircik/SideEffect --skill sideeffect-audit -a codex -a claude-code -a opencode -g --copy
+DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/c5c57f7bbfcad0a5c16c6499c0f2a7c1fb5b2a1f/.agents/skills/sideeffect-audit --skill sideeffect-audit -a codex -a claude-code -a opencode -g --copy
 ```
 
 The installer is maintained by Vercel and is separate from SideEffect. Its anonymous telemetry is disabled in the commands above. Use the installer's interactive choice or consult its current [CLI reference](https://github.com/vercel-labs/skills) and [supported-agent list](https://github.com/vercel-labs/skills/blob/main/docs/agents.md) for additional clients. The installer may change supported agent IDs and options over time.
@@ -28,7 +28,7 @@ For a project-only installation, omit `-g` and run the command from the project 
 
 ## Oh My Pi (OMP)
 
-Oh My Pi has a native project skill directory. Copy the reviewed folder into `.omp/skills/sideeffect-audit/` in the project, or into the user-level skills directory documented by your installed OMP version. The resulting file must be `SKILL.md` directly inside `sideeffect-audit`.
+Oh My Pi has a native project skill directory and a default user-level skills directory. Copy the reviewed folder into `.omp/skills/sideeffect-audit/` in the project, or `~/.omp/agent/skills/sideeffect-audit/` for the default OMP profile. The resulting file must be `SKILL.md` directly inside `sideeffect-audit`. A named OMP profile uses its profile-specific agent directory.
 
 ```powershell
 New-Item -ItemType Directory -Force .omp\skills\sideeffect-audit | Out-Null
@@ -54,7 +54,7 @@ Runtime capture requires a separate confirmation of the exact command, duration,
 
 ## Update and remove
 
-Update an installation with `npx skills update` following that tool's current CLI guidance. To remove it, use `npx skills remove sideeffect-audit` and review the selected destinations before confirming. For OMP, delete only the `sideeffect-audit` folder from the chosen OMP skills directory. Do not remove neighboring skills or agent settings.
+The quick install command uses an immutable Git commit so the instructions you review are the instructions you install. To update, review the desired newer commit and run `npx skills add` again with that commit's direct `.agents/skills/sideeffect-audit` URL. `npx skills update` refreshes an installation from its recorded source; a source pinned to an immutable commit remains at that revision. To remove it, use `npx skills remove sideeffect-audit` and review the selected destinations before confirming. For OMP, delete only the `sideeffect-audit` folder from the chosen OMP skills directory. Do not remove neighboring skills or agent settings.
 
 ## Privacy and evidence handling
 
