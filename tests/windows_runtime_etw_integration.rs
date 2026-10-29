@@ -130,13 +130,36 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
         }),
         "capture did not include the fixture's file-name event"
     );
-    assert!(events.iter().any(|event| {
+    let loopback_network_seen = events.iter().any(|event| {
         event["observation_decoding"]["status"] == "decoded"
             && event["observation_decoding"]["observation"]["activity"]["kind"] == "network"
             && event["observation_decoding"]["observation"]["activity"]["observation"]["payload_process_id"] == target_pid
             && event["observation_decoding"]["observation"]["activity"]["observation"]["destination_address"]["v4"] == serde_json::json!([127, 0, 0, 1])
             && event["observation_decoding"]["observation"]["activity"]["observation"]["destination_port"] == port
-    }), "capture did not include the fixture's loopback network event with payload PID");
+    });
+    let network_event_summaries = events
+        .iter()
+        .filter(|event| {
+            event["provider_guid"]
+                .as_str()
+                .is_some_and(|guid| guid.contains("9a280ac0") || guid.contains("bf3a50c5"))
+        })
+        .take(64)
+        .map(|event| {
+            serde_json::json!({
+                "event_id": event["event_id"],
+                "event_version": event["event_version"],
+                "opcode": event["opcode"],
+                "status": event["observation_decoding"]["status"],
+                "diagnostic": event["observation_decoding"]["diagnostic"]
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        loopback_network_seen,
+        "capture did not include the fixture's loopback network event with payload PID; network event summaries: {}",
+        serde_json::to_string(&network_event_summaries).unwrap()
+    );
     fs::remove_file(fixture_file).unwrap();
     fs::remove_file(output).unwrap();
     fs::remove_dir(directory).unwrap();
