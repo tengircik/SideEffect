@@ -60,7 +60,7 @@ use sideeffect::record::publish_private_windows_file;
 use sideeffect::startup_correlation::correlate_startup_bytes;
 use sideeffect::trace::strace::parse_trace_bytes;
 
-const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect inspect [--format json|text] --bundle <run-bundle-directory>\n       sideeffect inspect [--format json|text] --session <audit-session-directory>\n       sideeffect inspect [--format json|text] --windows-runtime <capture.json>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff --bundles [--format json|text] <baseline-bundle> <candidate-bundle>\n       sideeffect diff --bundles --format html --output <report.html> <baseline-bundle> <candidate-bundle>\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect inventory packages --output <new-inventory.json>\n\
+const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect inspect [--format json|text] --bundle <run-bundle-directory>\n       sideeffect inspect [--format json|text] --session <audit-session-directory>\n       sideeffect inspect [--format json|text] --windows-runtime <capture.json>\n       sideeffect inspect --format html --output <report.html> --windows-runtime <capture.json>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff --bundles [--format json|text] <baseline-bundle> <candidate-bundle>\n       sideeffect diff --bundles --format html --output <report.html> <baseline-bundle> <candidate-bundle>\n       sideeffect diff --windows-runtime [--format json|text] <before-capture.json> <after-capture.json>\n       sideeffect diff --format html --output <report.html> --windows-runtime <before-capture.json> <after-capture.json> (native Windows)\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect inventory packages --output <new-inventory.json>\n\
        sideeffect explain <strace-trace-file>\n\
        sideeffect explain --diff <baseline-trace> <candidate-trace>\n\
        sideeffect explain --inventory-diff <before.json> <after.json>\n\
@@ -166,6 +166,22 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
                 && windows_flag == "--windows-runtime" =>
         {
             inspect_windows_runtime_with_format(format, path)
+        }
+        [
+            command,
+            format_flag,
+            format,
+            output_flag,
+            output,
+            windows_flag,
+            capture,
+        ] if command == "inspect"
+            && format_flag == "--format"
+            && format == "html"
+            && output_flag == "--output"
+            && windows_flag == "--windows-runtime" =>
+        {
+            inspect_windows_runtime_html(output, capture)
         }
         [command, path] if command == "inspect" => inspect(path),
         [command, path] if command == "explain" => explain_trace_file(path),
@@ -295,6 +311,59 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             evidence(path, digest, line, byte_offset, byte_length)
         }
         [command, left, right] if command == "diff" => diff(left, right),
+        [command, runtime_flag, before, after]
+            if command == "diff" && runtime_flag == "--windows-runtime" =>
+        {
+            diff_windows_runtime_with_format(&OsString::from("json"), before, after, None)
+        }
+        [command, runtime_flag, format_flag, format, before, after]
+            if command == "diff"
+                && runtime_flag == "--windows-runtime"
+                && format_flag == "--format" =>
+        {
+            diff_windows_runtime_with_format(format, before, after, None)
+        }
+        [command, format_flag, format, runtime_flag, before, after]
+            if command == "diff"
+                && format_flag == "--format"
+                && runtime_flag == "--windows-runtime" =>
+        {
+            diff_windows_runtime_with_format(format, before, after, None)
+        }
+        [
+            command,
+            runtime_flag,
+            format_flag,
+            format,
+            output_flag,
+            output,
+            before,
+            after,
+        ] if command == "diff"
+            && runtime_flag == "--windows-runtime"
+            && format_flag == "--format"
+            && format == "html"
+            && output_flag == "--output" =>
+        {
+            diff_windows_runtime_with_format(format, before, after, Some(output))
+        }
+        [
+            command,
+            format_flag,
+            format,
+            output_flag,
+            output,
+            runtime_flag,
+            before,
+            after,
+        ] if command == "diff"
+            && format_flag == "--format"
+            && format == "html"
+            && output_flag == "--output"
+            && runtime_flag == "--windows-runtime" =>
+        {
+            diff_windows_runtime_with_format(format, before, after, Some(output))
+        }
         [command, bundles_flag, left, right]
             if command == "diff" && bundles_flag == "--bundles" =>
         {
@@ -1160,10 +1229,10 @@ Collects explicitly selected Linux inventory sources and an optional bounded com
             }
         }
         "inspect" => {
-            "Usage: sideeffect inspect [--format json|text] TRACE\n       sideeffect inspect [--format json|text] --bundle DIR\n       sideeffect inspect [--format json|text] --session DIR\n       sideeffect inspect [--format json|text] --windows-runtime FILE\nReads bounded local strace evidence, a validated run bundle, a verified audit session, or a Windows ETW capture. It never runs represented commands. JSON is the default; text output escapes terminal controls and user-influenced fields. Windows runtime inspection accepts schema v3, validates its document fingerprint and bounds, and does not authenticate authorship or establish capture completeness. Partial input is labeled and exits with status 2."
+            "Usage: sideeffect inspect [--format json|text] TRACE\n       sideeffect inspect [--format json|text] --bundle DIR\n       sideeffect inspect [--format json|text] --session DIR\n       sideeffect inspect [--format json|text] --windows-runtime FILE\n       sideeffect inspect --format html --output NEW_REPORT.html --windows-runtime FILE (native Windows)\nReads bounded local strace evidence, a validated run bundle, a verified audit session, or a Windows ETW capture. It never runs represented commands. JSON is the default; text output escapes terminal controls and user-influenced fields. Windows runtime inspection accepts schema v3, validates its document fingerprint and bounds, and does not authenticate authorship or establish capture completeness. HTML file export uses the protected current-user publisher and is available only on native Windows. Partial input is labeled and exits with status 2."
         }
         "diff" => {
-            "Usage: sideeffect diff [--format json|text] LEFT RIGHT\n       sideeffect diff --format html --output REPORT.html LEFT RIGHT\n       sideeffect diff --bundles [--format json|text] LEFT_DIR RIGHT_DIR\nCompares complete parsed observations. HTML reports are available on Linux and are static, offline, and private. Trace values may be sensitive."
+            "Usage: sideeffect diff [--format json|text] LEFT RIGHT\n       sideeffect diff --format html --output REPORT.html LEFT RIGHT\n       sideeffect diff --bundles [--format json|text] LEFT_DIR RIGHT_DIR\n       sideeffect diff --windows-runtime [--format json|text] BEFORE.json AFTER.json\n       sideeffect diff --format html --output REPORT.html --windows-runtime BEFORE.json AFTER.json (native Windows)\nCompares complete parsed strace observations, or validated Windows ETW capture category counts. Windows records are not paired: category deltas describe observed counts only, capture completeness remains unknown, and no causal or absence claims are made. Windows HTML uses the protected current-user publisher and a static offline report. Input and report data may be sensitive."
         }
         "diff-summary" => {
             "Usage: sideeffect diff-summary [--format json] LEFT RIGHT\n       sideeffect diff-summary --format html --output REPORT.html LEFT RIGHT\nWrites aggregate change counts without event strings or evidence references. Counts may still be sensitive; the output is not a safe-to-share verdict."
@@ -1629,6 +1698,68 @@ fn inspect_windows_runtime_with_format(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn inspect_windows_runtime_html(
+    output_path: &OsString,
+    capture_path: &OsString,
+) -> Result<ExitCode, String> {
+    #[cfg(windows)]
+    {
+        let output_path = Path::new(output_path);
+        match fs::symlink_metadata(output_path) {
+            Ok(_) => {
+                return Err(
+                    "HTML report destination already exists; refusing to replace it".to_owned(),
+                );
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect HTML report destination: {error}"
+                ));
+            }
+        }
+        let bytes = read_input_file(
+            Path::new(capture_path),
+            sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
+            "Windows runtime capture",
+        )?;
+        let source_sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let capture = sideeffect::windows_runtime::inspect_windows_runtime_bytes(&bytes)?;
+        let partial =
+            capture.collection_status == sideeffect::windows_runtime::CollectionStatus::Partial;
+        let mut html = CappedBuffer::new(MAX_REPORT_BYTES);
+        sideeffect::format::write_windows_runtime_html(&capture, &source_sha256, &mut html)
+            .map_err(|error| {
+                if html.exceeded {
+                    format!("Windows runtime HTML report exceeds the {MAX_REPORT_BYTES} byte output limit")
+                } else {
+                    format!("could not render Windows runtime HTML report: {error}")
+                }
+            })?;
+        let published = publish_private_windows_file(output_path, &html.bytes, MAX_REPORT_BYTES)
+            .map_err(|error| {
+                format!("could not publish HTML report without replacing a file: {error}")
+            })?;
+        eprintln!(
+            "Offline Windows runtime HTML report written to {}. Capture data may be sensitive; review before sharing. This is one capture review, not a comparison.",
+            terminal_safe_path(&published)
+        );
+        Ok(if partial {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (output_path, capture_path);
+        Err(
+            "Windows runtime HTML file export is available only in native Windows builds"
+                .to_owned(),
+        )
+    }
 }
 
 fn explain_trace_file(path: &OsString) -> Result<ExitCode, String> {
@@ -2585,6 +2716,116 @@ fn diff_with_output_format(
         DiffOutputFormat::Text => write_text(&result)?,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn diff_windows_runtime_with_format(
+    format: &OsString,
+    before_path: &OsString,
+    after_path: &OsString,
+    output_path: Option<&OsString>,
+) -> Result<ExitCode, String> {
+    let format = format
+        .to_str()
+        .ok_or("Windows runtime diff format must be valid UTF-8")?;
+    if !matches!(format, "json" | "text" | "html") {
+        return Err("Windows runtime diff format must be json, text, or html".to_owned());
+    }
+    match (format, output_path) {
+        ("html", None) => {
+            return Err("Windows runtime HTML diff requires --output REPORT.html".to_owned());
+        }
+        ("json" | "text", Some(_)) => {
+            return Err("--output is supported only for Windows runtime HTML diff".to_owned());
+        }
+        ("html", Some(_)) if !cfg!(windows) => {
+            return Err(
+                "Windows runtime HTML diff is available only in native Windows builds".to_owned(),
+            );
+        }
+        _ => {}
+    }
+
+    let before_bytes = read_input_file(
+        Path::new(before_path),
+        sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
+        "before Windows runtime capture",
+    )?;
+    let after_bytes = read_input_file(
+        Path::new(after_path),
+        sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
+        "after Windows runtime capture",
+    )?;
+    let before = sideeffect::windows_runtime::inspect_windows_runtime_bytes(&before_bytes)
+        .map_err(|error| format!("before Windows runtime validation failed: {error}"))?;
+    let after = sideeffect::windows_runtime::inspect_windows_runtime_bytes(&after_bytes)
+        .map_err(|error| format!("after Windows runtime validation failed: {error}"))?;
+    let summary =
+        sideeffect::windows_runtime_diff::compare_windows_runtime_captures(&before, &after)?;
+    let partial =
+        summary.comparison_status == sideeffect::windows_runtime_diff::ComparisonStatus::Partial;
+
+    match format {
+        "json" => write_json(&summary, "Windows runtime aggregate comparison")?,
+        "text" => {
+            let mut text = CappedBuffer::new(MAX_REPORT_BYTES);
+            sideeffect::format::write_windows_runtime_diff_text(
+                &summary, &before, &after, &mut text,
+            )
+            .map_err(|error| {
+                if text.exceeded {
+                    format!(
+                        "Windows runtime diff text exceeds the {MAX_REPORT_BYTES} byte output limit"
+                    )
+                } else {
+                    format!("could not render Windows runtime diff text: {error}")
+                }
+            })?;
+            text.write_all(b"\n").map_err(|_| {
+                format!(
+                    "Windows runtime diff text exceeds the {MAX_REPORT_BYTES} byte output limit"
+                )
+            })?;
+            write_buffer(&text, "Windows runtime aggregate comparison")?;
+        }
+        "html" => {
+            #[cfg(windows)]
+            {
+                let mut html = CappedBuffer::new(MAX_REPORT_BYTES);
+                sideeffect::format::write_windows_runtime_diff_html(&summary, &mut html)
+                    .map_err(|error| {
+                        if html.exceeded {
+                            format!("Windows runtime diff HTML exceeds the {MAX_REPORT_BYTES} byte output limit")
+                        } else {
+                            format!("could not render Windows runtime diff HTML: {error}")
+                        }
+                    })?;
+                let output = output_path.expect("HTML output path was validated above");
+                let published = publish_private_windows_file(
+                    Path::new(output),
+                    &html.bytes,
+                    MAX_REPORT_BYTES,
+                )
+                .map_err(|error| {
+                    format!(
+                        "could not publish Windows runtime diff without replacing a file: {error}"
+                    )
+                })?;
+                eprintln!(
+                    "Offline Windows runtime aggregate comparison written to {}. The report contains sensitive capture fingerprints and event counts; review before sharing.",
+                    terminal_safe_path(&published)
+                );
+            }
+            #[cfg(not(windows))]
+            unreachable!("unsupported HTML diff was rejected above");
+        }
+        _ => unreachable!("format was validated above"),
+    }
+
+    Ok(if partial {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn read_and_parse(path: &OsString) -> Result<sideeffect::model::TraceDocument, String> {

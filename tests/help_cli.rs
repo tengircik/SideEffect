@@ -37,6 +37,12 @@ fn focused_help_covers_command_and_nested_inventory_topics() {
     assert!(inspect.status.success());
     assert!(String::from_utf8_lossy(&inspect.stdout).contains("--session DIR"));
 
+    let diff = run(&["help", "diff"]);
+    assert!(diff.status.success());
+    let diff_help = String::from_utf8_lossy(&diff.stdout);
+    assert!(diff_help.contains("diff --windows-runtime"));
+    assert!(diff_help.contains("records are not paired"));
+
     let associated = run(&["help", "associated-behavior"]);
     assert!(associated.status.success());
     let associated_help = String::from_utf8_lossy(&associated.stdout);

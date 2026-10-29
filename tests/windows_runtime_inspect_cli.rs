@@ -153,3 +153,69 @@ fn inspect_rejects_capture_with_mismatched_representation_fingerprint() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("SHA-256 mismatch"));
 }
+
+fn html_paths() -> (PathBuf, PathBuf) {
+    let suffix = NEXT.fetch_add(1, Ordering::Relaxed);
+    (
+        std::env::temp_dir().join(format!(
+            "sideeffect-windows-runtime-html-{}-{suffix}.json",
+            std::process::id()
+        )),
+        std::env::temp_dir().join(format!(
+            "sideeffect-windows-runtime-html-{}-{suffix}.html",
+            std::process::id()
+        )),
+    )
+}
+
+#[cfg(windows)]
+#[test]
+fn html_report_uses_no_clobber_publisher_and_rejects_existing_target() {
+    let (capture_path, report_path) = html_paths();
+    fs::write(&capture_path, fixture(CollectionStatus::Complete)).unwrap();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+            .args(["inspect", "--format", "html", "--output"])
+            .arg(&report_path)
+            .arg("--windows-runtime")
+            .arg(&capture_path)
+            .output()
+            .unwrap()
+    };
+
+    let first = run();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let report = fs::read(&report_path).unwrap();
+    let html = String::from_utf8(report.clone()).unwrap();
+    assert!(html.contains("default-src 'none'"));
+    assert!(html.contains("Event evidence ID 1"));
+    assert!(!html.contains("<script"));
+    assert!(html.contains("\\u001b"));
+
+    let second = run();
+    assert_eq!(second.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&second.stderr).contains("already exists"));
+    assert_eq!(fs::read(&report_path).unwrap(), report);
+    fs::remove_file(capture_path).unwrap();
+    fs::remove_file(report_path).unwrap();
+}
+
+#[cfg(not(windows))]
+#[test]
+fn html_report_is_explicitly_unsupported_outside_native_windows() {
+    let (capture_path, report_path) = html_paths();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["inspect", "--format", "html", "--output"])
+        .arg(&report_path)
+        .arg("--windows-runtime")
+        .arg(&capture_path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("only in native Windows builds"));
+    assert!(!report_path.exists());
+}
