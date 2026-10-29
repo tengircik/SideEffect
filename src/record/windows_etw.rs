@@ -44,6 +44,7 @@ const MAX_EVENT_PAYLOAD_LENGTH: usize = 64 * 1024;
 const BUFFER_SIZE_KB: u32 = 16;
 const MINIMUM_BUFFERS: u32 = 8;
 const MAXIMUM_BUFFERS: u32 = 32;
+const CONTROL_TRACE_NAME_CAPACITY: usize = 1024;
 // SystemTraceControlGuid identifies the reserved NT Kernel Logger. Windows
 // requires its well-known name; this session is shared with other software.
 const SESSION_NAME: &str = "NT Kernel Logger";
@@ -541,16 +542,12 @@ impl EtwSession {
         if self.stopped {
             return Ok(());
         }
-        let mut properties =
-            vec![0_u64; size_of::<EVENT_TRACE_PROPERTIES>().div_ceil(size_of::<u64>())];
+        // ControlTrace writes session properties and the logger/log-file names
+        // back into this buffer. Reserving only the struct can make QUERY and
+        // STOP return ERROR_MORE_DATA, which leaves final loss counters
+        // unavailable even when ETW has stopped the session successfully.
+        let mut properties = control_trace_properties_buffer();
         let props = properties.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
-        unsafe {
-            (*props).Wnode.BufferSize = size_of::<EVENT_TRACE_PROPERTIES>() as u32;
-            (*props).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-            (*props).Wnode.Guid = SystemTraceControlGuid;
-            (*props).LogFileNameOffset = 0;
-            (*props).LoggerNameOffset = 0;
-        }
         let query = unsafe {
             windows_sys::Win32::System::Diagnostics::Etw::ControlTraceW(
                 self.handle,
@@ -596,6 +593,23 @@ impl EtwSession {
         let _ = query;
         Ok(())
     }
+}
+
+fn control_trace_properties_buffer() -> Vec<u64> {
+    let properties_size = size_of::<EVENT_TRACE_PROPERTIES>();
+    let logger_name_offset = properties_size;
+    let log_file_name_offset = logger_name_offset + CONTROL_TRACE_NAME_CAPACITY * size_of::<u16>();
+    let total_size = log_file_name_offset + CONTROL_TRACE_NAME_CAPACITY * size_of::<u16>();
+    let mut words = vec![0_u64; total_size.div_ceil(size_of::<u64>())];
+    let props = words.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
+    unsafe {
+        (*props).Wnode.BufferSize = total_size as u32;
+        (*props).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+        (*props).Wnode.Guid = SystemTraceControlGuid;
+        (*props).LoggerNameOffset = logger_name_offset as u32;
+        (*props).LogFileNameOffset = log_file_name_offset as u32;
+    }
+    words
 }
 
 fn validate_process_trace_result(result: u32) -> Result<(), String> {
@@ -854,6 +868,36 @@ fn classify_process_opcode(opcode: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_trace_buffer_reserves_bounded_name_output_space() {
+        let words = control_trace_properties_buffer();
+        let props = words.as_ptr().cast::<EVENT_TRACE_PROPERTIES>();
+        let properties_size = size_of::<EVENT_TRACE_PROPERTIES>();
+        let log_file_name_offset = properties_size + CONTROL_TRACE_NAME_CAPACITY * size_of::<u16>();
+        let total_size = log_file_name_offset + CONTROL_TRACE_NAME_CAPACITY * size_of::<u16>();
+        unsafe {
+            assert_eq!((*props).Wnode.BufferSize as usize, total_size);
+            let actual_guid = (*props).Wnode.Guid;
+            assert_eq!(
+                (
+                    actual_guid.data1,
+                    actual_guid.data2,
+                    actual_guid.data3,
+                    actual_guid.data4,
+                ),
+                (
+                    SystemTraceControlGuid.data1,
+                    SystemTraceControlGuid.data2,
+                    SystemTraceControlGuid.data3,
+                    SystemTraceControlGuid.data4,
+                )
+            );
+            assert_eq!((*props).LoggerNameOffset as usize, properties_size);
+            assert_eq!((*props).LogFileNameOffset as usize, log_file_name_offset);
+        }
+        assert!(words.len() * size_of::<u64>() >= total_size);
+    }
 
     #[test]
     fn process_event_opcodes_are_classified_only_for_known_class() {
