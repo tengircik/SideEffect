@@ -15,6 +15,9 @@ fn help_command_and_flag_show_command_list() {
         let text = String::from_utf8_lossy(&output.stdout);
         assert!(text.contains("sideeffect help [command [subcommand]]"));
         assert!(text.contains("sideeffect model-preview"));
+        assert!(text.contains(
+            "sideeffect associated-behavior <startup-inventory.json> <strace-trace-file>"
+        ));
         assert!(text.contains("--session <audit-session-directory>"));
     }
 }
@@ -33,6 +36,14 @@ fn focused_help_covers_command_and_nested_inventory_topics() {
     let inspect = run(&["inspect", "--help"]);
     assert!(inspect.status.success());
     assert!(String::from_utf8_lossy(&inspect.stdout).contains("--session DIR"));
+
+    let associated = run(&["help", "associated-behavior"]);
+    assert!(associated.status.success());
+    let associated_help = String::from_utf8_lossy(&associated.stdout);
+    assert!(
+        associated_help.contains("Candidate matches do not prove startup execution or causation")
+    );
+    assert!(associated_help.contains("No match is insufficient evidence"));
 
     let startup = run(&["help", "inventory", "startup"]);
     assert!(startup.status.success());

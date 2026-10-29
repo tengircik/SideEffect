@@ -123,6 +123,14 @@ This read-only operation accepts a saved Linux `sideeffect.startup_inventory` v2
 
 The operation never runs, shell-parses, or expands startup command text. It does not parse cron or SysV, perform `PATH` lookup, match `argv[0]`, or resolve symlink targets or canonical paths; exact literal path strings are compared as written, so a literal path may itself name a symlink. Values outside the narrow literal subset are counted as unsupported and make the result partial. Inventory input is capped at 64 MiB, raw trace input at 32 MiB, supported configuration rows at 50,000, copied configuration/source metadata at 8 MiB, parsed trace rows at 100,000, and JSON output at 64 MiB. Startup source references are carried through from the supplied inventory and source files are not re-read. Complete means only that inputs and rows in this narrow supported subset were processed without partial or unsupported items; it does not mean the full startup/runtime relationship was covered. Partial inputs or unsupported relevant rows publish status and exit `2`; invalid inputs exit `1`. Runtime evidence names the `strace -f` row-prefix identifier `caller_task_id`, which may be a task/thread ID and is not necessarily a process or parent PID. A candidate does not prove that a startup hook ran, that a startup manager caused the process, or that unrelated activity is attributable. The inventory and trace are separate snapshots; raw-trace capture completeness remains unknown, and no match is not evidence of non-execution. Treat the output as sensitive local evidence and review it before sharing.
 
+## Produce an associated-behavior summary
+
+```sh
+sideeffect associated-behavior ./startup.json ./capture.trace
+```
+
+This first M12 adapter writes a bounded `sideeffect.associated_behavior_summary` v1 JSON document to stdout. It reuses the same Linux startup-inventory v2 and raw `strace` input contract as `correlate-startup`, labels its algorithm and adapter, preserves every startup and runtime evidence reference, and distinguishes `candidate_match` from `insufficient_evidence`. A complete status means only that this narrow supported subset was processed; `capture_completeness` remains `unknown`. The summary does not establish that a hook executed or caused a process. Partial inputs or unsupported relevant forms exit `2`; a complete run with no supported match reports `insufficient_evidence` and exits `0`. Cross-platform associated-behavior adapters, Windows ETW associations, and broad compatibility validation remain open M12 work.
+
 ## Try the current command
 
 From the repository root, run:

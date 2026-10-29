@@ -127,6 +127,14 @@ To compare a saved startup snapshot with a saved raw `strace` trace:
 
 This writes bounded `sideeffect.startup_correlation` v1 JSON to stdout. Inventory input is capped at 64 MiB, raw trace input at 32 MiB, supported configuration rows at 50,000, copied configuration/source metadata at 8 MiB, parsed trace rows at 100,000, and JSON output at 64 MiB. Only simple literal absolute executable paths from XDG `Exec` and systemd `Service.Exec*` values are compared with the filename argument of successful `execve`/`execveat` rows. Both sides retain exact evidence references and duplicate matches remain grouped. The command never executes or shell-parses configuration values, and carries startup references from the supplied snapshot without re-reading source files. It does not parse cron/SysV or perform PATH lookup or `argv[0]` matching. It compares exact path strings as written and never resolves symlink targets or canonical paths, so a configured literal path may itself name a symlink. Unsupported values make the output partial. `complete` means processing completed only within this narrow supported subset, not full correlation coverage. Complete inputs exit `0`; partial inputs or unsupported relevant rows publish status and exit `2`; invalid inputs exit `1`. Runtime evidence calls the `strace -f` row-prefix identifier `caller_task_id`; it may identify a thread and is not necessarily a process or parent PID. A candidate is not proof that a startup hook ran or caused a process; no match does not establish non-execution. The separate snapshots are not an atomic view, and raw trace capture completeness remains unknown.
 
+To emit the additive first associated-behavior schema:
+
+```sh
+./target/release/sideeffect associated-behavior ./startup.json ./capture.trace
+```
+
+This command writes bounded `sideeffect.associated_behavior_summary` v1 JSON to stdout. Its Linux startup/exec path adapter preserves the exact evidence references and calls each path equality a `candidate_match`; no match is `insufficient_evidence`, not a negative finding. Partial input or coverage exits `2`. A complete result remains limited to the supported subset and does not prove startup execution or causation. Cross-platform M12 adapters and compatibility validation remain incomplete.
+
 ## Collect a Linux audit session
 
 ```sh

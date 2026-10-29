@@ -72,6 +72,7 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect model-query --question <question> --runtime <llama-completion> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect model list | show <id> | install <id> | setup <id> | add | select <task> <id> | remove <id>\n\
        sideeffect correlate-startup <startup-inventory.json> <strace-trace-file>\n\
+       sideeffect associated-behavior <startup-inventory.json> <strace-trace-file>\n\
        sideeffect inventory processes --output <new-inventory.json>\n\
        sideeffect inventory startup --output <new-inventory.json>\n\
        sideeffect inventory permissions --output <new-inventory.json> <path>...\n\
@@ -252,6 +253,9 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         }
         [command, startup_path, trace_path] if command == "correlate-startup" => {
             correlate_startup(startup_path, trace_path)
+        }
+        [command, startup_path, trace_path] if command == "associated-behavior" => {
+            associated_behavior(startup_path, trace_path)
         }
         [command, subcommand, option, output]
             if command == "inventory" && subcommand == "packages" && option == "--output" =>
@@ -1242,6 +1246,9 @@ Collects explicitly selected Linux inventory sources and an optional bounded com
         "correlate-startup" => {
             "Usage: sideeffect correlate-startup STARTUP_INVENTORY.json TRACE\nFinds narrow exact-path candidate matches between supported saved startup configuration and successful exec evidence. A match does not prove that a hook caused or initiated execution."
         }
+        "associated-behavior" => {
+            "Usage: sideeffect associated-behavior STARTUP_INVENTORY.json TRACE\nWrites a versioned associated-behavior summary for the first Linux adapter. It compares supported literal XDG/systemd executable paths with successful exec evidence and preserves source references. Candidate matches do not prove startup execution or causation. No match is insufficient evidence, not a negative finding. Partial input or coverage exits with status 2."
+        }
         "model" => {
             "Usage: sideeffect model list\n       sideeffect model show ID\n       sideeffect model install ID\n       sideeffect model setup ID\n       sideeffect model add --name NAME --path FILE --for evidence|explanation|query [--license ID]\n       sideeffect model select evidence|explanation|query ID\n       sideeffect model remove ID\n\nLists pinned catalog candidates and user-provided models. Catalog evaluation status is shown separately from runtime compatibility. Installing a catalog model requires explicit license acceptance; analysis never downloads weights implicitly. The setup command installs and selects the catalog model for its declared task. Registering a local model records its size and SHA-256, but does not verify task compatibility, licensing, or quality. Removing a custom registration leaves the model file untouched. Select a model for its task before running a model preview."
         }
@@ -1409,6 +1416,41 @@ fn correlate_startup(startup_path: &OsString, trace_path: &OsString) -> Result<E
             "Saved partial startup-correlation results with {match_count} candidate path-match group(s). Check input statuses and diagnostics; missing matches remain unknown."
         );
         Ok(ExitCode::from(2))
+    }
+}
+
+fn associated_behavior(startup_path: &OsString, trace_path: &OsString) -> Result<ExitCode, String> {
+    let startup_bytes = read_input_file(
+        Path::new(startup_path),
+        MAX_REPORT_BYTES,
+        "startup inventory",
+    )?;
+    let trace_bytes = read_input_file(Path::new(trace_path), MAX_TRACE_BYTES, "trace")?;
+    let report = sideeffect::startup_correlation::summarize_associated_startup_behavior(
+        &startup_bytes,
+        &trace_bytes,
+    )?;
+    let partial = report.status == "partial";
+    let candidate_count = report.summary.candidate_match_count;
+    let association_status = report.association_status;
+    let mut json = CappedBuffer::new(MAX_REPORT_BYTES);
+    serde_json::to_writer(&mut json, &report).map_err(|error| {
+        format!("associated-behavior output exceeds the {MAX_REPORT_BYTES} byte limit: {error}")
+    })?;
+    json.write_all(b"\n").map_err(|_| {
+        format!("associated-behavior output exceeds the {MAX_REPORT_BYTES} byte limit")
+    })?;
+    write_buffer(&json, "associated-behavior summary")?;
+    if partial {
+        eprintln!(
+            "Saved partial associated-behavior results with {candidate_count} candidate match(es); check diagnostics and source status."
+        );
+        Ok(ExitCode::from(2))
+    } else {
+        eprintln!(
+            "Processed the supported associated-behavior subset: {candidate_count} candidate match(es), association status {association_status}. Capture completeness remains unknown."
+        );
+        Ok(ExitCode::SUCCESS)
     }
 }
 
