@@ -150,6 +150,8 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
                 "event_id": event["event_id"],
                 "event_version": event["event_version"],
                 "opcode": event["opcode"],
+                "header_flags": event["header_flags"],
+                "payload_length": event["raw_payload_hex"].as_str().map(|value| value.len() / 2),
                 "status": event["observation_decoding"]["status"],
                 "diagnostic": event["observation_decoding"]["diagnostic"]
             })
