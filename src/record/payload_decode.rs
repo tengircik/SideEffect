@@ -8,9 +8,11 @@ use windows_sys::Win32::System::Diagnostics::Etw::{
     EVENT_PROPERTY_INFO, EVENT_RECORD, EVENT_TRACE_TYPE_DC_END, EVENT_TRACE_TYPE_DC_START,
     EVENT_TRACE_TYPE_END, EVENT_TRACE_TYPE_START, PROPERTY_DATA_DESCRIPTOR, ProcessGuid,
     PropertyHasTags, PropertyParamCount, PropertyParamFixedCount, PropertyParamFixedLength,
-    PropertyParamLength, PropertyStruct, TDH_INTYPE_POINTER, TDH_INTYPE_UINT32,
-    TDH_INTYPE_UNICODESTRING, TDH_OUTTYPE_HEXINT32, TDH_OUTTYPE_HEXINT64, TDH_OUTTYPE_NULL,
-    TDH_OUTTYPE_STRING, TRACE_EVENT_INFO, TdhGetEventInformation, TdhGetProperty,
+    PropertyParamLength, PropertyStruct, TDH_INTYPE_ANSISTRING, TDH_INTYPE_COUNTEDANSISTRING,
+    TDH_INTYPE_COUNTEDSTRING, TDH_INTYPE_NONNULLTERMINATEDANSISTRING,
+    TDH_INTYPE_NONNULLTERMINATEDSTRING, TDH_INTYPE_POINTER, TDH_INTYPE_REVERSEDCOUNTEDSTRING,
+    TDH_INTYPE_UINT32, TDH_INTYPE_UNICODESTRING, TDH_OUTTYPE_HEXINT32, TDH_OUTTYPE_HEXINT64,
+    TDH_OUTTYPE_NULL, TDH_OUTTYPE_STRING, TRACE_EVENT_INFO, TdhGetEventInformation, TdhGetProperty,
     TdhGetPropertySize,
 };
 
@@ -438,7 +440,21 @@ fn validate_selected_properties(
         return Err("image_file_name_property_length_is_unsupported");
     }
     if image.input_type != TDH_INTYPE_UNICODESTRING as u16 {
-        return Err("image_file_name_property_type_is_unsupported");
+        return Err(match i32::from(image.input_type) {
+            TDH_INTYPE_ANSISTRING => "image_file_name_type_is_ansi_string",
+            TDH_INTYPE_COUNTEDSTRING => "image_file_name_type_is_counted_utf16_string",
+            TDH_INTYPE_COUNTEDANSISTRING => "image_file_name_type_is_counted_ansi_string",
+            TDH_INTYPE_NONNULLTERMINATEDSTRING => {
+                "image_file_name_type_is_non_null_terminated_utf16_string"
+            }
+            TDH_INTYPE_NONNULLTERMINATEDANSISTRING => {
+                "image_file_name_type_is_non_null_terminated_ansi_string"
+            }
+            TDH_INTYPE_REVERSEDCOUNTEDSTRING => {
+                "image_file_name_type_is_reversed_counted_utf16_string"
+            }
+            _ => "image_file_name_property_type_is_unsupported",
+        });
     }
     if image.output_type != TDH_OUTTYPE_NULL as u16
         && image.output_type != TDH_OUTTYPE_STRING as u16
