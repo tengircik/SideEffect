@@ -195,6 +195,23 @@ pub fn record_windows_runtime_capture(
     args: &[std::ffi::OsString],
     duration_limit: Duration,
 ) -> Result<WindowsRuntimeCapture, String> {
+    ensure_destination_absent(destination)?;
+
+    let (document, output) =
+        collect_windows_runtime_capture_before_launch(program, args, duration_limit, || {
+            ensure_destination_absent(destination)
+        })?;
+    super::publish_private_windows_file(destination, &output, MAX_DOCUMENT_BYTES)
+        .map_err(|error| format!("could not publish private Windows runtime capture without replacing an existing path: {error}"))?;
+    Ok(document)
+}
+
+pub(crate) fn collect_windows_runtime_capture_before_launch(
+    program: &OsStr,
+    args: &[std::ffi::OsString],
+    duration_limit: Duration,
+    before_launch: impl FnOnce() -> Result<(), String>,
+) -> Result<(WindowsRuntimeCapture, Vec<u8>), String> {
     let seconds = duration_limit.as_secs();
     if duration_limit.subsec_nanos() != 0
         || !(1..=MAX_WINDOWS_RUNTIME_DURATION_SECONDS).contains(&seconds)
@@ -203,24 +220,22 @@ pub fn record_windows_runtime_capture(
             "Windows ETW duration must be a whole number of seconds from 1 to {MAX_WINDOWS_RUNTIME_DURATION_SECONDS}"
         ));
     }
-    if destination.exists() {
-        return Err("Windows runtime output already exists; refusing to overwrite".to_owned());
-    }
 
     let collector = Arc::new(Mutex::new(Collector::default()));
-    let mut session = EtwSession::start(collector.clone())?;
+    let (mut session, mut child) = setup_before_target_launch(
+        || EtwSession::start(collector.clone()),
+        before_launch,
+        |_| {
+            let mut command = build_target_command(program, args);
+            command
+                .spawn()
+                .map_err(|error| format!("could not start selected program: {error}"))
+        },
+    )?;
     let start_unix_ms = session.started_at_unix_ms;
     // Session setup is outside the requested runtime budget. The deadline
     // starts after the real-time ETW consumer reports ready and before spawn.
     let runtime_started = Instant::now();
-    let mut command = build_target_command(program, args);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = session.stop();
-            return Err(format!("could not start selected program: {error}"));
-        }
-    };
     let target_pid = child.id();
     let mut timed_out = false;
     let exit_status = loop {
@@ -384,15 +399,32 @@ pub fn record_windows_runtime_capture(
             "Windows runtime capture exceeds the {MAX_DOCUMENT_BYTES} byte document limit; no output was published"
         ));
     }
-    super::publish_private_windows_file(destination, &output, MAX_DOCUMENT_BYTES)
-        .map_err(|error| format!("could not publish private Windows runtime capture without replacing an existing path: {error}"))?;
-    Ok(document)
+    Ok((document, output))
 }
 
 fn build_target_command(program: &OsStr, args: &[std::ffi::OsString]) -> Command {
     let mut command = Command::new(program);
     command.args(args);
     command
+}
+
+fn ensure_destination_absent(destination: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(destination) {
+        Ok(_) => Err("Windows runtime output already exists; refusing to overwrite".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not check Windows runtime output: {error}")),
+    }
+}
+
+fn setup_before_target_launch<S, T>(
+    setup: impl FnOnce() -> Result<S, String>,
+    before_launch: impl FnOnce() -> Result<(), String>,
+    launch: impl FnOnce(&mut S) -> Result<T, String>,
+) -> Result<(S, T), String> {
+    let mut state = setup()?;
+    before_launch()?;
+    let target = launch(&mut state)?;
+    Ok((state, target))
 }
 
 impl EventLoss {
@@ -989,5 +1021,37 @@ mod tests {
                 .map(OsString::as_os_str)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn setup_failure_returns_before_target_launch_is_invoked() {
+        use std::cell::Cell;
+        let launched = Cell::new(false);
+        let result = setup_before_target_launch::<(), ()>(
+            || Err("synthetic ETW setup failure".to_owned()),
+            || Ok(()),
+            |_| {
+                launched.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap_err(), "synthetic ETW setup failure");
+        assert!(!launched.get());
+    }
+
+    #[test]
+    fn prelaunch_check_failure_returns_before_target_launch_is_invoked() {
+        use std::cell::Cell;
+        let launched = Cell::new(false);
+        let result = setup_before_target_launch::<(), ()>(
+            || Ok(()),
+            || Err("synthetic destination collision".to_owned()),
+            |_| {
+                launched.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap_err(), "synthetic destination collision");
+        assert!(!launched.get());
     }
 }

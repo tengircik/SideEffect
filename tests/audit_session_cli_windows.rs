@@ -177,7 +177,7 @@ fn windows_session_keeps_a_missing_selected_path_visible_as_not_applicable() {
 }
 
 #[test]
-fn windows_runtime_is_explicitly_unsupported_and_session_is_partial() {
+fn windows_runtime_requires_explicit_source_duration_and_command_before_capture() {
     let root = temp_dir();
     let session = root.join("audit");
     let output = cli(&[
@@ -185,25 +185,62 @@ fn windows_runtime_is_explicitly_unsupported_and_session_is_partial() {
         "--output",
         session.to_str().unwrap(),
         "--runtime-source",
+        "windows-etw",
     ]);
-    assert_eq!(output.status.code(), Some(2));
-    let inspect = cli(&[
-        "inspect",
-        "--format",
-        "json",
-        "--session",
-        session.to_str().unwrap(),
-    ]);
-    assert_eq!(inspect.status.code(), Some(2));
-    let value: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
-    assert_eq!(value["status"], "partial");
-    assert_eq!(value["sources"][0]["status"], "unsupported");
+    assert!(!output.status.success());
     assert!(
-        value["sources"][0]["artifacts"]
-            .as_array()
-            .unwrap()
-            .is_empty()
+        String::from_utf8_lossy(&output.stderr).contains("requires --runtime-duration-seconds")
     );
+    assert!(!session.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn windows_runtime_duration_is_rejected_without_a_runtime_source() {
+    let root = temp_dir();
+    let session = root.join("audit");
+    let output = cli(&[
+        "audit",
+        "--output",
+        session.to_str().unwrap(),
+        "--packages",
+        "--runtime-duration-seconds",
+        "1",
+    ]);
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--runtime-duration-seconds requires --runtime-source windows-etw")
+    );
+    assert!(!session.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn windows_runtime_refuses_existing_session_destination_before_target_launch() {
+    let root = temp_dir();
+    let session = root.join("audit");
+    fs::create_dir(&session).unwrap();
+    fs::write(session.join("sentinel"), b"keep").unwrap();
+    let marker = root.join("target-launched");
+    let command = cli(&[
+        "audit",
+        "--output",
+        session.to_str().unwrap(),
+        "--runtime-source",
+        "windows-etw",
+        "--runtime-duration-seconds",
+        "1",
+        "--",
+        "cmd.exe",
+        "/C",
+        &format!("echo started>{}", marker.display()),
+    ]);
+    assert!(!command.status.success());
+    assert!(String::from_utf8_lossy(&command.stderr).contains("already exists"));
+    assert!(!marker.exists());
+    assert_eq!(fs::read(session.join("sentinel")).unwrap(), b"keep");
     fs::remove_dir_all(root).unwrap();
 }
 

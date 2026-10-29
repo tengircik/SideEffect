@@ -12,9 +12,10 @@ use crate::inventory::{
 };
 use crate::record::publish_private_windows_directory;
 use serde::Serialize;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_WINDOWS_SESSION_BYTES: usize = 128 * 1024 * 1024;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
@@ -26,6 +27,9 @@ pub struct WindowsAuditOptions {
     pub startup: bool,
     pub permission_paths: Vec<PathBuf>,
     pub include_runtime: bool,
+    pub runtime_duration: Option<Duration>,
+    pub runtime_program: Option<OsString>,
+    pub runtime_arguments: Vec<OsString>,
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +60,33 @@ pub fn collect_and_publish(
     }
     if options.permission_paths.len() > 256 {
         return Err("permission path count exceeds the 256 path limit".to_owned());
+    }
+    if options.include_runtime
+        != (options.runtime_duration.is_some() && options.runtime_program.is_some())
+        || (!options.include_runtime
+            && (options.runtime_duration.is_some()
+                || options.runtime_program.is_some()
+                || !options.runtime_arguments.is_empty()))
+    {
+        return Err(
+            "Windows runtime capture requires --runtime-source windows-etw, --runtime-duration-seconds, and -- PROGRAM [ARGS...]".to_owned(),
+        );
+    }
+    if options.include_runtime {
+        match std::fs::symlink_metadata(destination) {
+            Ok(_) => {
+                return Err(
+                    "Windows audit-session output already exists; refusing to launch the runtime command"
+                        .to_owned(),
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not check Windows audit-session destination before runtime launch: {error}"
+                ));
+            }
+        }
     }
     let started = now_ms()?;
     let mut artifacts = Vec::new();
@@ -154,8 +185,80 @@ pub fn collect_and_publish(
         ));
     }
     if options.include_runtime {
-        let when = now_ms()?;
-        sources.push(source(SourceRole::Runtime, "native Windows runtime activity capture is unsupported by this audit-session path; experimental ETW process prototype is not evidence-complete", when, when, SourceStatus::Unsupported, vec!["windows_runtime_source_unsupported"], vec![]));
+        let duration = options.runtime_duration.ok_or_else(|| {
+            "Windows runtime capture requires --runtime-duration-seconds".to_owned()
+        })?;
+        let program = options
+            .runtime_program
+            .as_deref()
+            .ok_or_else(|| "Windows runtime capture requires -- PROGRAM [ARGS...]".to_owned())?;
+        let (capture, bytes) = crate::record::collect_windows_runtime_capture_before_launch(
+            program,
+            &options.runtime_arguments,
+            duration,
+            || ensure_runtime_destination_absent(destination),
+        )?;
+        let mut diagnostics = vec!["capture_completeness_unknown"];
+        if capture.collection_status == crate::record::WindowsRuntimeCollectionStatus::Partial {
+            diagnostics.push("etw_collection_partial");
+        }
+        if capture.event_loss.events_lost > 0
+            || capture.event_loss.log_buffers_lost > 0
+            || capture.event_loss.real_time_buffers_lost > 0
+        {
+            diagnostics.push("etw_loss_reported");
+        }
+        if !capture.event_loss.loss_statistics_available
+            || !capture.event_loss.final_snapshot_available
+        {
+            diagnostics.push("etw_loss_statistics_unavailable");
+        }
+        if capture.stop_reason == crate::record::WindowsRuntimeStopReason::DurationLimitReached {
+            diagnostics.push("duration_limit_reached");
+        }
+        let mut source = source(
+            SourceRole::Runtime,
+            "system-wide NT Kernel Logger process, selected FileIo/DiskIo, and TCP/UDP observations during a bounded window; no event attribution or completeness claim",
+            capture.started_at_unix_ms,
+            capture.ended_at_unix_ms,
+            SourceStatus::Partial,
+            diagnostics,
+            vec![
+                (
+                    "max_duration_seconds",
+                    capture.limits.maximum_duration_seconds,
+                ),
+                ("max_events", capture.limits.maximum_events as u64),
+                (
+                    "max_total_payload_bytes",
+                    capture.limits.maximum_total_payload_bytes as u64,
+                ),
+                (
+                    "max_payload_bytes_per_event",
+                    capture.limits.maximum_payload_bytes_per_event as u64,
+                ),
+                (
+                    "max_document_bytes",
+                    capture.limits.maximum_document_bytes as u64,
+                ),
+            ],
+        );
+        source.artifacts.push(SessionArtifactRef {
+            kind: ArtifactKind::WindowsRuntimeCapture,
+            path: "runtime.windows.json".to_owned(),
+            schema: "sideeffect.windows_runtime_capture".to_owned(),
+            schema_version: 3,
+            byte_length: bytes.len() as u64,
+            sha256: sha256_hex(&bytes),
+        });
+        sources.push(source);
+        artifacts.push(artifact(
+            ArtifactKind::WindowsRuntimeCapture,
+            "runtime.windows.json",
+            "sideeffect.windows_runtime_capture",
+            3,
+            bytes,
+        ));
     }
 
     let ended = now_ms()?;
@@ -194,6 +297,19 @@ fn status_from_serialized<T: Serialize>(value: &T, key: &str) -> (SourceStatus, 
         Some("unsupported") => (SourceStatus::Unsupported, vec!["source_unsupported"]),
         Some("not_checked") => (SourceStatus::NotChecked, vec!["source_not_checked"]),
         _ => (SourceStatus::Failed, vec!["source_failed"]),
+    }
+}
+
+fn ensure_runtime_destination_absent(destination: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(destination) {
+        Ok(_) => Err(
+            "Windows audit-session output already exists; refusing to launch the runtime command"
+                .to_owned(),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not check Windows audit-session destination before runtime launch: {error}"
+        )),
     }
 }
 
@@ -299,7 +415,7 @@ fn role_kind(role: SourceRole) -> Option<ArtifactKind> {
         SourceRole::Processes => Some(ArtifactKind::WindowsProcesses),
         SourceRole::Permissions => Some(ArtifactKind::WindowsPermissions),
         SourceRole::Startup => Some(ArtifactKind::WindowsStartup),
-        SourceRole::Runtime => None,
+        SourceRole::Runtime => Some(ArtifactKind::WindowsRuntimeCapture),
     }
 }
 
@@ -308,4 +424,41 @@ fn now_ms() -> Result<u128, String> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .map_err(|_| "system clock is before the Unix epoch".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{artifact, build_manifest, source};
+    use crate::audit_session::{ArtifactKind, SessionStatus, SourceRole, SourceStatus};
+
+    #[test]
+    fn windows_runtime_source_manifest_binds_capture_bytes_and_stays_partial() {
+        let bytes = br#"{"schema":"sideeffect.windows_runtime_capture","schema_version":3,"synthetic_fixture":true}"#.to_vec();
+        let artifacts = [artifact(
+            ArtifactKind::WindowsRuntimeCapture,
+            "runtime.windows.json",
+            "sideeffect.windows_runtime_capture",
+            3,
+            bytes.clone(),
+        )];
+        let runtime_source = source(
+            SourceRole::Runtime,
+            "synthetic bounded ETW fixture",
+            1_001,
+            1_002,
+            SourceStatus::Partial,
+            vec!["capture_completeness_unknown"],
+            vec![("max_events", 50_000)],
+        );
+
+        let manifest = build_manifest(1_000, 1_003, vec![runtime_source], &artifacts).unwrap();
+        assert_eq!(manifest.status, SessionStatus::Partial);
+        let reference = &manifest.sources[0].artifacts[0];
+        assert_eq!(reference.kind, ArtifactKind::WindowsRuntimeCapture);
+        assert_eq!(reference.path, "runtime.windows.json");
+        assert_eq!(reference.byte_length, bytes.len() as u64);
+        assert_eq!(reference.sha256, crate::fingerprint::sha256_hex(&bytes));
+        assert_eq!(manifest.sources[0].status, SourceStatus::Partial);
+        manifest.validate().unwrap();
+    }
 }

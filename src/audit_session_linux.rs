@@ -292,7 +292,8 @@ pub fn collect_and_publish(
             ArtifactKind::WindowsSoftware
             | ArtifactKind::WindowsProcesses
             | ArtifactKind::WindowsPermissions
-            | ArtifactKind::WindowsStartup => {
+            | ArtifactKind::WindowsStartup
+            | ArtifactKind::WindowsRuntimeCapture => {
                 return Err(
                     "Windows artifacts are not supported in Linux audit collection".to_owned(),
                 );

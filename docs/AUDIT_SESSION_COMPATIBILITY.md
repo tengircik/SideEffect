@@ -14,8 +14,9 @@ The `sideeffect.audit_session` v1 manifest is a platform-neutral envelope. Nativ
 | Windows | processes | `processes.windows.json` | `sideeffect.windows_process_inventory` | 1 |
 | Windows | permissions | `permissions.windows.json` | `sideeffect.windows_permission_inventory` | 1 |
 | Windows | startup | `startup.windows.json` | `sideeffect.windows_startup_inventory` | 4 |
+| Windows | runtime | `runtime.windows.json` | `sideeffect.windows_runtime_capture` | 3 |
 
-The Windows runtime role currently has no artifact contract. An explicitly selected Windows runtime source is recorded as `unsupported` with a diagnostic and no artifact. The experimental ETW process/file/network capture output is not represented as a completed runtime source.
+Windows runtime capture is selected explicitly with `--runtime-source windows-etw --runtime-duration-seconds 1..60 -- PROGRAM [ARGS...]`. ETW setup must succeed before the target launches. The target's arguments remain separate argv values. The NT Kernel Logger is shared and system-wide for the bounded capture window; controlling it requires permission, and SideEffect never elevates. The captured v3 JSON document is included as the fixed runtime artifact in the one atomically published session directory. It retains bounded raw ETW payloads, capture interval, target outcome, loss metadata, and diagnostics. The session source is always `partial` because capture completeness is unknown. Setup, launch, or capture errors fail the audit before session publication; they are not represented as an empty successful artifact. No target/descendant event attribution or causal inference is made.
 
 `complete` means the selected collector produced its declared artifact set. It does not mean exhaustive system coverage. `partial`, `unsupported`, `unavailable`, `access_denied`, and other non-complete states remain visible and force the enclosing session to `partial`. Runtime can never be marked complete in this session version because capture completeness is not established.
 

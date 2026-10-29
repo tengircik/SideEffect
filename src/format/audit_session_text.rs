@@ -256,6 +256,7 @@ fn artifact_kind_name(kind: crate::audit_session::ArtifactKind) -> &'static str 
         crate::audit_session::ArtifactKind::WindowsStartup => "windows_startup",
         crate::audit_session::ArtifactKind::RuntimeManifest => "runtime_manifest",
         crate::audit_session::ArtifactKind::RuntimeTrace => "runtime_trace",
+        crate::audit_session::ArtifactKind::WindowsRuntimeCapture => "windows_runtime_capture",
     }
 }
 

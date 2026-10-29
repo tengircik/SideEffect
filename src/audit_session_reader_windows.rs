@@ -266,6 +266,11 @@ fn verify_schema(
     if reference.kind == ArtifactKind::RuntimeTrace {
         return Ok(());
     }
+    if reference.kind == ArtifactKind::WindowsRuntimeCapture {
+        crate::windows_runtime::inspect_windows_runtime_bytes(bytes)
+            .map_err(|_| SessionReadError::ArtifactJsonInvalid(label(&reference.path)))?;
+        return Ok(());
+    }
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let matches = (HeaderSeed {
         schema: &reference.schema,
@@ -352,6 +357,7 @@ fn label(path: &str) -> &'static str {
         "startup.windows.json" => "startup.windows.json",
         "run.json" => "run.json",
         "trace.strace" => "trace.strace",
+        "runtime.windows.json" => "runtime.windows.json",
         _ => "unknown entry",
     }
 }
@@ -547,15 +553,96 @@ fn owner_only_acl_contract(
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionReadError, owner_only_acl, owner_only_acl_contract, verify_schema};
-    use crate::audit_session::{ArtifactKind, SessionArtifactRef};
+    use super::{
+        SessionReadError, owner_only_acl, owner_only_acl_contract, read_verified_session,
+        verify_schema,
+    };
+    use crate::audit_session::{
+        AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, ArtifactKind, AuditSessionManifest,
+        AuditSessionSource, IntervalSemantics, SessionArtifactRef, SessionStatus, SourceRole,
+        SourceStatus,
+    };
+    use crate::windows_runtime::{
+        AppliedLimits, CollectionStatus, EventLoss, SessionMetadata, StopReason, TargetOutcome,
+        WindowsRuntimeCapture,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(prefix: &str) -> std::path::PathBuf {
+        for _ in 0..32 {
+            let path = std::env::temp_dir().join(format!(
+                "{prefix}-{}-{}",
+                std::process::id(),
+                NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return path,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create test directory: {error}"),
+            }
+        }
+        panic!("could not allocate a unique test directory")
+    }
+
+    fn valid_runtime_bytes() -> Vec<u8> {
+        let mut capture = WindowsRuntimeCapture {
+            schema: crate::windows_runtime::WINDOWS_RUNTIME_CAPTURE_SCHEMA.to_owned(),
+            schema_version: crate::windows_runtime::WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION,
+            platform: "windows".to_owned(),
+            capture_profile: "windows_nt_kernel_process_file_network_v1".to_owned(),
+            collection_status: CollectionStatus::Partial,
+            capture_completeness: "unknown".to_owned(),
+            started_at_unix_ms: 1_000,
+            ended_at_unix_ms: 1_002,
+            requested_duration_seconds: 1,
+            stop_reason: StopReason::EtwStatisticsUnavailable,
+            target: TargetOutcome {
+                process_id: 42,
+                exit_code: Some(0),
+                status_available: true,
+            },
+            session: SessionMetadata {
+                name: "NT Kernel Logger".to_owned(),
+                provider: "NT Kernel Logger process, FileIo, DiskIo, TcpIp, and UdpIp providers"
+                    .to_owned(),
+                scope: "system_wide_process_file_and_network_events_during_capture_window"
+                    .to_owned(),
+                buffer_size_kb_requested: 16,
+                minimum_buffers_requested: 8,
+                maximum_buffers_requested: 32,
+                buffer_count_reported: 8,
+                provider_process_id_header_semantics: "header PID/TID is event context only"
+                    .to_owned(),
+            },
+            limits: AppliedLimits {
+                maximum_duration_seconds: 60,
+                maximum_events: 50_000,
+                maximum_total_payload_bytes: 8 * 1024 * 1024,
+                maximum_payload_bytes_per_event: 64 * 1024,
+                maximum_document_bytes: 32 * 1024 * 1024,
+            },
+            event_loss: EventLoss {
+                events_lost: 0,
+                log_buffers_lost: 0,
+                real_time_buffers_lost: 0,
+                loss_statistics_available: false,
+                observation: "unavailable".to_owned(),
+                final_snapshot_available: false,
+            },
+            document_sha256: String::new(),
+            events: vec![],
+            diagnostics: vec!["synthetic_fixture_not_a_live_capture".to_owned()],
+        };
+        let canonical = serde_json::to_vec(&capture).unwrap();
+        capture.document_sha256 = crate::fingerprint::sha256_hex(&canonical);
+        serde_json::to_vec(&capture).unwrap()
+    }
 
     #[test]
     fn publisher_owner_is_the_current_user_and_reader_accepts_its_private_dacl() {
-        let root =
-            std::env::temp_dir().join(format!("sideeffect-session-acl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir(&root).unwrap();
+        let root = temp_dir("sideeffect-session-acl");
         let destination = root.join("session");
         let files = [("session.json", b"fixture".as_slice())];
         crate::record::publish_private_windows_directory(&destination, &files, 1024).unwrap();
@@ -603,6 +690,93 @@ mod tests {
             ),
             Err(SessionReadError::ArtifactSchemaMismatch(
                 "software.windows.json"
+            ))
+        ));
+    }
+
+    #[test]
+    fn synthetic_windows_runtime_artifact_publishes_once_and_reader_verifies_contract() {
+        let root = temp_dir("sideeffect-windows-runtime-session");
+        let destination = root.join("audit");
+        let runtime = valid_runtime_bytes();
+        let manifest = AuditSessionManifest {
+            schema: AUDIT_SESSION_SCHEMA.to_owned(),
+            schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+            platform: "windows".to_owned(),
+            architecture: "x86_64".to_owned(),
+            started_at_unix_ms: 1_000,
+            ended_at_unix_ms: 1_002,
+            interval_semantics: IntervalSemantics::BestEffortNonAtomic,
+            status: SessionStatus::Partial,
+            sources: vec![AuditSessionSource {
+                role: SourceRole::Runtime,
+                platform: "windows".to_owned(),
+                scope: "synthetic ETW artifact contract fixture".to_owned(),
+                started_at_unix_ms: 1_000,
+                ended_at_unix_ms: 1_002,
+                status: SourceStatus::Partial,
+                applied_limits: vec![],
+                diagnostic_codes: vec!["capture_completeness_unknown".to_owned()],
+                artifacts: vec![SessionArtifactRef {
+                    kind: ArtifactKind::WindowsRuntimeCapture,
+                    path: "runtime.windows.json".to_owned(),
+                    schema: "sideeffect.windows_runtime_capture".to_owned(),
+                    schema_version: 3,
+                    byte_length: runtime.len() as u64,
+                    sha256: crate::fingerprint::sha256_hex(&runtime),
+                }],
+            }],
+        };
+        manifest.validate().unwrap();
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let files = [
+            ("session.json", manifest_bytes.as_slice()),
+            ("runtime.windows.json", runtime.as_slice()),
+        ];
+        crate::record::publish_private_windows_directory(&destination, &files, 8192).unwrap();
+        let verified = read_verified_session(&destination).unwrap();
+        assert_eq!(verified.manifest().status, SessionStatus::Partial);
+        assert_eq!(verified.artifacts().len(), 1);
+        assert_eq!(verified.artifacts()[0].path(), "runtime.windows.json");
+        assert_eq!(verified.artifacts()[0].bytes(), runtime);
+
+        assert!(
+            crate::record::publish_private_windows_directory(&destination, &files, 8192).is_err()
+        );
+        assert_eq!(
+            std::fs::read(destination.join("runtime.windows.json")).unwrap(),
+            runtime.as_slice()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn windows_runtime_session_reader_rejects_malformed_and_digest_invalid_documents() {
+        let reference = SessionArtifactRef {
+            kind: ArtifactKind::WindowsRuntimeCapture,
+            path: "runtime.windows.json".to_owned(),
+            schema: "sideeffect.windows_runtime_capture".to_owned(),
+            schema_version: 3,
+            byte_length: 1,
+            sha256: "0".repeat(64),
+        };
+        let valid = valid_runtime_bytes();
+        assert!(verify_schema(&reference, &valid).is_ok());
+        assert!(matches!(
+            verify_schema(&reference, b"{"),
+            Err(SessionReadError::ArtifactJsonInvalid(
+                "runtime.windows.json"
+            ))
+        ));
+
+        let mut value: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+        value["document_sha256"] = serde_json::Value::String("0".repeat(64));
+        let bad_digest = serde_json::to_vec(&value).unwrap();
+        assert!(matches!(
+            verify_schema(&reference, &bad_digest),
+            Err(SessionReadError::ArtifactJsonInvalid(
+                "runtime.windows.json"
             ))
         ));
     }

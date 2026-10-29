@@ -643,9 +643,29 @@ fn audit_command(arguments: &[OsString]) -> Result<ExitCode, String> {
                     options.startup = true;
                     index += 1;
                 }
-                Some("--runtime-source") if selected.insert("runtime") => {
+                Some("--runtime-source")
+                    if selected.insert("runtime")
+                        && arguments
+                            .get(index + 1)
+                            .is_some_and(|value| value == "windows-etw") =>
+                {
                     options.include_runtime = true;
-                    index += 1;
+                    index += 2;
+                }
+                Some("--runtime-duration-seconds")
+                    if options.runtime_duration.is_none() && index + 1 < arguments.len() =>
+                {
+                    options.runtime_duration =
+                        Some(parse_windows_duration_seconds(&arguments[index + 1])?);
+                    index += 2;
+                }
+                Some("--") if options.include_runtime => {
+                    let Some(program) = arguments.get(index + 1) else {
+                        return Err("Windows runtime command is missing after --".to_owned());
+                    };
+                    options.runtime_program = Some(program.clone());
+                    options.runtime_arguments = arguments[index + 2..].to_vec();
+                    break;
                 }
                 Some("--permission") if index + 1 < arguments.len() => {
                     options
@@ -660,6 +680,17 @@ fn audit_command(arguments: &[OsString]) -> Result<ExitCode, String> {
                     ));
                 }
             }
+        }
+        if options.include_runtime
+            && (options.runtime_duration.is_none() || options.runtime_program.is_none())
+        {
+            return Err("Windows runtime capture requires --runtime-duration-seconds 1..60 -- PROGRAM [ARGS...]".to_owned());
+        }
+        if options.runtime_duration.is_some() && !options.include_runtime {
+            return Err(
+                "Windows --runtime-duration-seconds requires --runtime-source windows-etw"
+                    .to_owned(),
+            );
         }
         let destination =
             destination.ok_or_else(|| "audit requires --output DIRECTORY".to_owned())?;
@@ -1221,7 +1252,7 @@ Collects explicitly selected Linux inventory sources and an optional bounded com
             }
             #[cfg(windows)]
             {
-                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages] [--processes] [--startup] [--permission PATH]... [--runtime-source]\nCollects selected bounded native Windows inventories into one current-user-private session directory. --permission inspects explicitly selected paths only. --runtime-source records that native Windows runtime capture is unsupported; it does not claim an ETW capture. Sessions are non-atomic, and partial/unsupported sources cause exit status 2."
+                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages] [--processes] [--startup] [--permission PATH]... [--runtime-source windows-etw --runtime-duration-seconds 1..60 -- PROGRAM [ARGS...]]\nCollects selected bounded native Windows inventories and optional system-wide ETW observations into one current-user-private session directory. --permission inspects explicitly selected paths only. ETW requires permission to control the shared NT Kernel Logger; SideEffect never elevates. The command is passed as separate arguments and is not started unless ETW setup succeeds. Capture completeness is unknown, so runtime-containing sessions are partial."
             }
             #[cfg(not(any(target_os = "linux", windows)))]
             {

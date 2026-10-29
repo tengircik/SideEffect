@@ -117,6 +117,7 @@ pub enum ArtifactKind {
     WindowsStartup,
     RuntimeManifest,
     RuntimeTrace,
+    WindowsRuntimeCapture,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -208,12 +209,6 @@ impl AuditSessionManifest {
             {
                 return Err(ValidationError::ArtifactSetMismatch);
             }
-            if source.role == SourceRole::Runtime
-                && source.platform == "windows"
-                && !source.artifacts.is_empty()
-            {
-                return Err(ValidationError::ArtifactSetMismatch);
-            }
             let mut source_artifact_kinds = HashSet::new();
             for artifact in &source.artifacts {
                 let (path, schema, version) = artifact_contract(artifact.kind)?;
@@ -270,7 +265,7 @@ fn expected_artifacts(
             SourceRole::Processes => vec![ArtifactKind::WindowsProcesses],
             SourceRole::Permissions => vec![ArtifactKind::WindowsPermissions],
             SourceRole::Startup => vec![ArtifactKind::WindowsStartup],
-            SourceRole::Runtime => Vec::new(),
+            SourceRole::Runtime => vec![ArtifactKind::WindowsRuntimeCapture],
         }),
         _ => Err(ValidationError::UnsupportedArtifactPlatform),
     }
@@ -306,6 +301,11 @@ fn artifact_contract(
         ),
         ArtifactKind::RuntimeManifest => ("run.json", "sideeffect.run", 2),
         ArtifactKind::RuntimeTrace => ("trace.strace", "strace_text", 1),
+        ArtifactKind::WindowsRuntimeCapture => (
+            "runtime.windows.json",
+            "sideeffect.windows_runtime_capture",
+            3,
+        ),
     })
 }
 
@@ -558,16 +558,34 @@ mod tests {
         manifest.sources.push(AuditSessionSource {
             role: SourceRole::Runtime,
             platform: "windows".to_owned(),
-            scope: "native runtime capture unsupported".to_owned(),
+            scope: "bounded system-wide ETW observations; completeness unknown".to_owned(),
             started_at_unix_ms: 1001,
             ended_at_unix_ms: 1002,
-            status: SourceStatus::Unsupported,
-            applied_limits: Vec::new(),
-            diagnostic_codes: vec!["windows_runtime_source_unsupported".to_owned()],
-            artifacts: Vec::new(),
+            status: SourceStatus::Partial,
+            applied_limits: vec![AppliedLimit {
+                code: "max_events".to_owned(),
+                value: 50_000,
+            }],
+            diagnostic_codes: vec!["capture_completeness_unknown".to_owned()],
+            artifacts: vec![SessionArtifactRef {
+                kind: ArtifactKind::WindowsRuntimeCapture,
+                path: "runtime.windows.json".to_owned(),
+                schema: "sideeffect.windows_runtime_capture".to_owned(),
+                schema_version: 3,
+                byte_length: 1,
+                sha256: "1".repeat(64),
+            }],
         });
         manifest.status = SessionStatus::Partial;
         assert!(manifest.validate().is_ok());
+
+        manifest.sources[1].status = SourceStatus::Complete;
+        manifest.status = SessionStatus::Partial;
+        assert_eq!(
+            manifest.validate(),
+            Err(ValidationError::RuntimeCompletenessNotEstablished)
+        );
+        manifest.sources[1].status = SourceStatus::Partial;
 
         manifest.sources[0].artifacts[0].schema_version = 99;
         assert_eq!(
