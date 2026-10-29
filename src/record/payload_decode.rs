@@ -18,7 +18,7 @@ const MAX_TDH_METADATA_BYTES: usize = 256 * 1024;
 const MAX_TDH_PROPERTIES: usize = 128;
 const MAX_PROPERTY_BYTES: usize = 64 * 1024;
 const MAX_IMAGE_FILE_NAME_UTF16_UNITS: usize = 32 * 1024;
-const SUPPORTED_EVENT_VERSIONS: std::ops::RangeInclusive<u8> = 0..=3;
+const SUPPORTED_EVENT_VERSIONS: std::ops::RangeInclusive<u8> = 0..=4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -722,8 +722,8 @@ mod tests {
     }
 
     #[test]
-    fn documented_process_v2_v3_uint32_fields_decode() {
-        for version in [1, 2, 3] {
+    fn validated_process_v1_through_v4_uint32_fields_decode() {
+        for version in [1, 2, 3, 4] {
             let metadata = schema(version, false);
             let decoded = decode_validated_properties(
                 &metadata,
@@ -739,11 +739,11 @@ mod tests {
 
     #[test]
     fn unknown_version_opcode_metadata_types_and_duplicate_properties_fail_closed() {
-        let mut metadata = schema(4, false);
-        assert!(validate_metadata(&metadata, 0, 4, EVENT_TRACE_TYPE_START as u8).is_ok());
+        let mut metadata = schema(5, false);
+        assert!(validate_metadata(&metadata, 0, 5, EVENT_TRACE_TYPE_START as u8).is_ok());
         assert!(!SUPPORTED_EVENT_VERSIONS.contains(&metadata.event_version));
         assert_eq!(
-            validate_event_key(4, EVENT_TRACE_TYPE_START as u8),
+            validate_event_key(5, EVENT_TRACE_TYPE_START as u8),
             Err(DecodeStatus::UnsupportedVersion)
         );
         assert_eq!(
