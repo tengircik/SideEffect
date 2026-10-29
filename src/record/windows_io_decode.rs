@@ -514,7 +514,7 @@ fn decode_network(
     let source_port = cursor.port()?;
     let (sequence_number, connection_id) =
         if schema.ends_with("typegroup1") || schema.ends_with("typegroup3") {
-            (cursor.u32()?, cursor.pointer(width)?)
+            (cursor.u32()?, cursor.connection_id(width)?)
         } else if schema.ends_with("typegroup2") || schema.ends_with("typegroup4") {
             if transport == Transport::Tcp {
                 // MSS, SACK, timestamp and window-scale options; receive window;
@@ -526,14 +526,14 @@ fn decode_network(
                 let _receive_window = cursor.u32()?;
                 let _receive_window_scale = cursor.i16()?;
                 let _send_window_scale = cursor.i16()?;
-                (cursor.u32()?, cursor.pointer(width)?)
+                (cursor.u32()?, cursor.connection_id(width)?)
             } else {
-                (cursor.u32()?, cursor.pointer(width)?)
+                (cursor.u32()?, cursor.connection_id(width)?)
             }
         } else if schema.ends_with("send") {
             let _start_time = cursor.u32()?;
             let _end_time = cursor.u32()?;
-            (cursor.u32()?, cursor.pointer(width)?)
+            (cursor.u32()?, cursor.connection_id(width)?)
         } else {
             return Err(ParseError::Unsupported);
         };
@@ -688,6 +688,18 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    fn connection_id(&mut self, pointer_width: PointerWidth) -> Result<u64, ParseError> {
+        // The Windows Server 2022/2025 live acceptance records use a 32-bit
+        // connection ID even when EVENT_HEADER marks the record as 64-bit.
+        // Accept that observed wire variant only when it exactly occupies the
+        // final four bytes; the documented pointer-sized form remains valid.
+        match (pointer_width, self.remaining()) {
+            (PointerWidth::Bits32, 4) | (PointerWidth::Bits64, 4) => Ok(u64::from(self.u32()?)),
+            (PointerWidth::Bits64, 8) => self.u64(),
+            _ => Err(ParseError::Malformed),
+        }
+    }
+
     fn port(&mut self) -> Result<u16, ParseError> {
         let bytes: [u8; 2] = self
             .take(2)?
@@ -749,6 +761,10 @@ impl<'a> Cursor<'a> {
 
     fn is_empty(&self) -> bool {
         self.offset == self.bytes.len()
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
     }
 }
 
@@ -848,8 +864,21 @@ mod tests {
     }
 
     fn network_payload(opcode: u8, transport: Transport, width: PointerWidth) -> Vec<u8> {
+        network_payload_with_connection_id_width(opcode, transport, width, width)
+    }
+
+    fn network_payload_with_connection_id_width(
+        opcode: u8,
+        transport: Transport,
+        header_width: PointerWidth,
+        connection_id_width: PointerWidth,
+    ) -> Vec<u8> {
         if transport == Transport::Udp && matches!(opcode, 26 | 27) {
-            return network_payload_v6_udp(width);
+            let mut bytes = network_payload_v6_udp(header_width);
+            if header_width == PointerWidth::Bits64 && connection_id_width == PointerWidth::Bits32 {
+                bytes.truncate(bytes.len() - 4);
+            }
+            return bytes;
         }
         let mut bytes = Vec::new();
         u32v(&mut bytes, 7);
@@ -867,15 +896,15 @@ mod tests {
             bytes.extend_from_slice(&1_i16.to_le_bytes());
             bytes.extend_from_slice(&1_i16.to_le_bytes());
             u32v(&mut bytes, 9);
-            pointer(&mut bytes, 10, width);
+            pointer(&mut bytes, 10, connection_id_width);
         } else if transport == Transport::Tcp && matches!(opcode, 10 | 26) {
             u32v(&mut bytes, 100);
             u32v(&mut bytes, 101);
             u32v(&mut bytes, 9);
-            pointer(&mut bytes, 10, width);
+            pointer(&mut bytes, 10, connection_id_width);
         } else {
             u32v(&mut bytes, 9);
-            pointer(&mut bytes, 10, width);
+            pointer(&mut bytes, 10, connection_id_width);
         }
         bytes
     }
@@ -1039,6 +1068,54 @@ mod tests {
         assert_eq!(
             network.destination_address,
             IpAddress::V6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+        );
+    }
+
+    #[test]
+    fn network_events_accept_exact_four_byte_connection_id_on_64_bit_headers() {
+        for (provider, transport, opcodes) in [
+            (
+                TCP_IP_GUID,
+                Transport::Tcp,
+                &[10, 11, 12, 13, 14, 15, 16, 18][..],
+            ),
+            (UDP_IP_GUID, Transport::Udp, &[10, 11][..]),
+        ] {
+            for opcode in opcodes {
+                let payload = network_payload_with_connection_id_width(
+                    *opcode,
+                    transport,
+                    PointerWidth::Bits64,
+                    PointerWidth::Bits32,
+                );
+                let result = decode_classic_event(
+                    provider,
+                    0,
+                    2,
+                    *opcode,
+                    Some(PointerWidth::Bits64),
+                    &payload,
+                );
+                assert_eq!(
+                    result.status,
+                    DecodeStatus::Decoded,
+                    "{transport:?} opcode {opcode}"
+                );
+            }
+        }
+
+        let mut trailing = network_payload_with_connection_id_width(
+            11,
+            Transport::Tcp,
+            PointerWidth::Bits64,
+            PointerWidth::Bits32,
+        );
+        trailing.push(0);
+        assert_eq!(
+            decode_classic_event(TCP_IP_GUID, 0, 2, 11, Some(PointerWidth::Bits64), &trailing,)
+                .status,
+            DecodeStatus::MalformedPayload,
+            "the observed narrow connection ID must not permit trailing bytes"
         );
     }
 
