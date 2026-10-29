@@ -1,10 +1,10 @@
 use std::io::{self, Write};
 
-use crate::windows_runtime_diff::{ComparisonStatus, WindowsRuntimeDiffSummary};
+use crate::windows_runtime_diff::{ComparisonStatus, EventDeltaStatus, WindowsRuntimeDiffSummary};
 
 const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; connect-src 'none'; frame-src 'none'; media-src 'none'; script-src 'none'";
 
-/// Write a static offline aggregate comparison report. Dynamic values are inert
+/// Write a static offline runtime comparison report. Dynamic values are inert
 /// escaped text; the caller enforces the report byte limit and publishes safely.
 pub fn write_windows_runtime_diff_html<W: Write>(
     summary: &WindowsRuntimeDiffSummary,
@@ -12,7 +12,7 @@ pub fn write_windows_runtime_diff_html<W: Write>(
 ) -> io::Result<()> {
     writer.write_all(b"<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta http-equiv=\"Content-Security-Policy\" content=\"")?;
     writer.write_all(CSP.as_bytes())?;
-    writer.write_all(b"\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>SideEffect Windows runtime comparison</title>\n<style>:root{color-scheme:light dark;font:16px/1.5 system-ui,sans-serif}body{max-width:72rem;margin:2rem auto;padding:0 1rem}h1,h2{line-height:1.2}.notice,.summary,.category{border:1px solid #8886;border-radius:.5rem;padding:1rem;margin:1rem 0}.notice{border-left:.25rem solid #b87900}.skip-link{position:absolute;left:1rem;top:0;z-index:1;transform:translateY(-150%);background:Canvas;color:CanvasText;padding:.5rem 1rem;border:2px solid currentColor}.skip-link:focus{transform:translateY(1rem)}.value{unicode-bidi:isolate;white-space:pre-wrap;overflow-wrap:anywhere}dl{display:grid;grid-template-columns:minmax(12rem,18rem) minmax(0,1fr);gap:.35rem 1rem}dt{font-weight:600}.ordinals{overflow-wrap:anywhere}@media(max-width:40rem){dl{grid-template-columns:1fr;gap:0}dt{margin-top:.5rem}}</style>\n</head>\n<body>\n<a class=\"skip-link\" href=\"#report-content\">Skip to report content</a>\n<main id=\"report-content\" tabindex=\"-1\">\n<header><h1>SideEffect Windows runtime aggregate comparison</h1><p class=\"notice\">This report compares category counts from two separately captured Windows ETW documents. Individual records are not paired. Capture data and fingerprints may be sensitive; review before sharing.</p></header>\n<section class=\"summary\"><h2>Comparison context</h2><dl>\n<dt>Summary schema</dt><dd>")?;
+    writer.write_all(b"\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>SideEffect Windows runtime comparison</title>\n<style>:root{color-scheme:light dark;font:16px/1.5 system-ui,sans-serif}body{max-width:72rem;margin:2rem auto;padding:0 1rem}h1,h2{line-height:1.2}.notice,.summary,.category,.event{border:1px solid #8886;border-radius:.5rem;padding:1rem;margin:1rem 0}.notice{border-left:.25rem solid #b87900}.skip-link{position:absolute;left:1rem;top:0;z-index:1;transform:translateY(-150%);background:Canvas;color:CanvasText;padding:.5rem 1rem;border:2px solid currentColor}.skip-link:focus{transform:translateY(1rem)}.value{unicode-bidi:isolate;white-space:pre-wrap;overflow-wrap:anywhere}dl{display:grid;grid-template-columns:minmax(12rem,18rem) minmax(0,1fr);gap:.35rem 1rem}dt{font-weight:600}.ordinals{overflow-wrap:anywhere}@media(max-width:40rem){dl{grid-template-columns:1fr;gap:0}dt{margin-top:.5rem}}</style>\n</head>\n<body>\n<a class=\"skip-link\" href=\"#report-content\">Skip to report content</a>\n<main id=\"report-content\" tabindex=\"-1\">\n<header><h1>SideEffect Windows runtime comparison</h1><p class=\"notice\">This report compares two bounded Windows ETW captures. Exact normalized matches and candidate-changed records are distinct; candidate matching does not establish event identity or causation. Capture data and fingerprints may be sensitive; review before sharing.</p></header>\n<section class=\"summary\"><h2>Comparison context</h2><dl>\n<dt>Summary schema</dt><dd>")?;
     write_value(writer, summary.schema)?;
     write!(
         writer,
@@ -36,6 +36,17 @@ pub fn write_windows_runtime_diff_html<W: Write>(
         b" (not independently authenticated)</dd>\n<dt>Before retained records</dt><dd>",
     )?;
     write!(writer, "{}", summary.before.observed_event_count)?;
+    write!(
+        writer,
+        "</dd>\n<dt>Before reported event loss</dt><dd>events={} log_buffers={} real_time_buffers={} (statistics available: {}; final snapshot: {}; diagnostics: {}) — ",
+        summary.before.event_loss.events_lost,
+        summary.before.event_loss.log_buffers_lost,
+        summary.before.event_loss.real_time_buffers_lost,
+        summary.before.event_loss.loss_statistics_available,
+        summary.before.event_loss.final_snapshot_available,
+        summary.before.diagnostics_count,
+    )?;
+    write_value(writer, &summary.before.event_loss.observation)?;
     writer.write_all(b"</dd>\n<dt>After capture SHA-256</dt><dd>")?;
     write_value(writer, &summary.after.document_sha256)?;
     writer.write_all(b"</dd>\n<dt>After producer status</dt><dd>")?;
@@ -46,12 +57,19 @@ pub fn write_windows_runtime_diff_html<W: Write>(
     writer.write_all(
         b" (not independently authenticated)</dd>\n<dt>After retained records</dt><dd>",
     )?;
+    write!(writer, "{}</dd>", summary.after.observed_event_count)?;
     write!(
         writer,
-        "{}</dd>\n</dl></section>",
-        summary.after.observed_event_count
+        "</dd>\n<dt>After reported event loss</dt><dd>events={} log_buffers={} real_time_buffers={} (statistics available: {}; final snapshot: {}; diagnostics: {}) — ",
+        summary.after.event_loss.events_lost,
+        summary.after.event_loss.log_buffers_lost,
+        summary.after.event_loss.real_time_buffers_lost,
+        summary.after.event_loss.loss_statistics_available,
+        summary.after.event_loss.final_snapshot_available,
+        summary.after.diagnostics_count,
     )?;
-    writer.write_all(b"\n<p>Observed category counts do not establish event absence, operation success, causation, or target attribution. Event ordinals refer to positions in one capture document; they are not byte offsets or matched event identities.</p>\n<section><h2>Category deltas (")?;
+    write_value(writer, &summary.after.event_loss.observation)?;
+    writer.write_all(b"</dd>\n</dl></section>\n<p>Category counts and one-sided observations do not establish event absence, operation success, causation, or target attribution. Event ordinals refer to positions in one capture document; they are not byte offsets. Candidate matches do not prove the same underlying execution.</p>\n<section><h2>Category count deltas (")?;
     write!(writer, "{}", summary.categories.len())?;
     writer.write_all(b")</h2>")?;
     if summary.categories.is_empty() {
@@ -75,6 +93,34 @@ pub fn write_windows_runtime_diff_html<W: Write>(
         write_ordinals(writer, &category.after_event_ordinals)?;
         writer.write_all(b"</dd></dl></article>\n")?;
     }
+    writer.write_all(b"</section>\n<section><h2>Event-level observations (")?;
+    write!(writer, "{}", summary.event_changes.len())?;
+    writer.write_all(b")</h2>")?;
+    if summary.event_changes.is_empty() {
+        writer
+            .write_all(b"<p>No event-level differences or candidate matches were observed.</p>")?;
+    }
+    for change in &summary.event_changes {
+        writer.write_all(b"<article class=\"event\"><h3>")?;
+        write_value(writer, event_status(change.status))?;
+        writer.write_all(" — ".as_bytes())?;
+        write_value(writer, change.category)?;
+        writer.write_all(b"</h3><dl><dt>Confidence</dt><dd>")?;
+        write_value(writer, change.confidence)?;
+        writer.write_all(b"</dd><dt>Comparison basis</dt><dd>")?;
+        write_value(writer, change.basis)?;
+        writer.write_all(b"</dd><dt>Diagnostic</dt><dd>")?;
+        if let Some(diagnostic) = change.diagnostic {
+            write_value(writer, diagnostic)?;
+        } else {
+            writer.write_all(b"none")?;
+        }
+        writer.write_all(b"</dd><dt>Before evidence</dt><dd>")?;
+        write_evidence(writer, &change.before)?;
+        writer.write_all(b"</dd><dt>After evidence</dt><dd>")?;
+        write_evidence(writer, &change.after)?;
+        writer.write_all(b"</dd></dl></article>")?;
+    }
     writer.write_all(b"</section>\n<section><h2>Diagnostics (")?;
     write!(writer, "{}", summary.diagnostics.len())?;
     writer.write_all(b")</h2><ul>")?;
@@ -84,6 +130,47 @@ pub fn write_windows_runtime_diff_html<W: Write>(
         writer.write_all(b"</li>")?;
     }
     writer.write_all(b"</ul></section>\n</main>\n</body>\n</html>\n")
+}
+
+fn write_evidence<W: Write>(
+    writer: &mut W,
+    references: &[crate::windows_runtime_diff::EventEvidenceReference],
+) -> io::Result<()> {
+    if references.is_empty() {
+        return writer.write_all(b"none");
+    }
+    for (index, reference) in references.iter().enumerate() {
+        if index > 0 {
+            writer.write_all(b"<br>")?;
+        }
+        write_value(writer, "capture SHA-256 ")?;
+        write_value(writer, &reference.capture_sha256)?;
+        write!(
+            writer,
+            "; record ordinal {} ; provider ",
+            reference.record_ordinal
+        )?;
+        write_value(writer, &reference.provider_guid)?;
+        write!(
+            writer,
+            "; event id {} version {} opcode ",
+            reference.event_id, reference.event_version
+        )?;
+        write!(writer, "{}; kind ", reference.opcode)?;
+        write_value(writer, &reference.event_kind)?;
+        write!(writer, "; category ")?;
+        write_value(writer, reference.category)?;
+    }
+    Ok(())
+}
+
+fn event_status(value: EventDeltaStatus) -> &'static str {
+    match value {
+        EventDeltaStatus::Unchanged => "unchanged",
+        EventDeltaStatus::CandidateChanged => "candidate changed",
+        EventDeltaStatus::ObservedOnlyBefore => "observed only before",
+        EventDeltaStatus::ObservedOnlyAfter => "observed only after",
+    }
 }
 
 fn write_value<W: Write>(writer: &mut W, value: &str) -> io::Result<()> {
@@ -183,11 +270,11 @@ mod tests {
     fn summary(before_hash: &str, after_hash: &str) -> WindowsRuntimeDiffSummary {
         WindowsRuntimeDiffSummary {
             schema: "sideeffect.windows_runtime_diff_summary",
-            schema_version: 1,
+            schema_version: 2,
             algorithm: ComparisonAlgorithm {
-                id: "windows_etw_observed_event_category_counts",
-                version: 1,
-                basis: "fixed_category_record_counts_without_individual_event_pairing",
+                id: "windows_etw_exact_multiset_and_unique_candidate_diff",
+                version: 2,
+                basis: "fixed_category_counts_plus_exact_record_multiset_and_unique_identity_candidates",
             },
             comparison_status: ComparisonStatus::Partial,
             capture_completeness: "unknown",
@@ -196,12 +283,30 @@ mod tests {
                 producer_collection_status: crate::windows_runtime::CollectionStatus::Complete,
                 capture_completeness: "unknown",
                 observed_event_count: 1,
+                event_loss: crate::windows_runtime_diff::EventLossSummary {
+                    events_lost: 0,
+                    log_buffers_lost: 0,
+                    real_time_buffers_lost: 0,
+                    loss_statistics_available: true,
+                    final_snapshot_available: true,
+                    observation: "none".to_owned(),
+                },
+                diagnostics_count: 0,
             },
             after: CaptureSide {
                 document_sha256: after_hash.to_owned(),
                 producer_collection_status: crate::windows_runtime::CollectionStatus::Partial,
                 capture_completeness: "unknown",
                 observed_event_count: 0,
+                event_loss: crate::windows_runtime_diff::EventLossSummary {
+                    events_lost: 0,
+                    log_buffers_lost: 0,
+                    real_time_buffers_lost: 0,
+                    loss_statistics_available: false,
+                    final_snapshot_available: false,
+                    observation: "unavailable".to_owned(),
+                },
+                diagnostics_count: 0,
             },
             categories: vec![CategoryCountDelta {
                 category: "process.start",
@@ -211,6 +316,7 @@ mod tests {
                 before_event_ordinals: vec![1],
                 after_event_ordinals: vec![],
             }],
+            event_changes: vec![],
             diagnostics: vec!["one_or_both_captures_report_partial_collection"],
             limitations: vec![],
         }
@@ -256,7 +362,7 @@ mod tests {
         assert!(html.contains("Before count"));
         assert!(html.contains(">1</dd>"));
         assert!(html.contains(">none</dd>"));
-        assert!(html.contains("Individual records are not paired"));
+        assert!(html.contains("candidate matching does not establish event identity"));
         assert!(
             html.contains("event absence, operation success, causation, or target attribution")
         );

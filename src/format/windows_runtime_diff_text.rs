@@ -1,7 +1,10 @@
 use std::io::{self, Write};
 
 use crate::windows_runtime::{CollectionStatus, WindowsRuntimeCapture};
-use crate::windows_runtime_diff::{ComparisonStatus, WindowsRuntimeDiffSummary};
+use crate::windows_runtime_diff::{
+    ComparisonStatus, EventDelta, EventDeltaStatus, EventEvidenceReference,
+    WindowsRuntimeDiffSummary,
+};
 
 /// Render an aggregate comparison of validated Windows runtime captures.
 /// Dynamic fingerprints are escaped as terminal-safe ASCII.
@@ -11,7 +14,7 @@ pub fn write_windows_runtime_diff_text<W: Write>(
     after: &WindowsRuntimeCapture,
     writer: &mut W,
 ) -> io::Result<()> {
-    writer.write_all(b"SideEffect Windows runtime aggregate comparison\n")?;
+    writer.write_all(b"SideEffect Windows runtime capture comparison\n")?;
     writeln!(
         writer,
         "Schema: {} v{}",
@@ -25,7 +28,7 @@ pub fn write_windows_runtime_diff_text<W: Write>(
     writer.write_all(b"\nCapture completeness: unknown\n")?;
     write_side(writer, "Before", &summary.before, before.collection_status)?;
     write_side(writer, "After", &summary.after, after.collection_status)?;
-    writer.write_all(b"\nObserved category deltas (records are not paired):\n")?;
+    writer.write_all(b"\nObserved category count deltas:\n")?;
     if summary.categories.is_empty() {
         writer.write_all(b"  No supported categories were observed in either capture.\n")?;
     }
@@ -44,10 +47,19 @@ pub fn write_windows_runtime_diff_text<W: Write>(
         write_ordinals(writer, &category.after_event_ordinals)?;
         writer.write_all(b"\n")?;
     }
-    writer.write_all(b"\nInterpretation limits:\n")?;
     writer.write_all(
-        b"  Counts describe observed category records only; individual records are not paired.\n",
+        b"\nEvent-level observations (candidate matches do not prove event identity):\n",
     )?;
+    if summary.event_changes.is_empty() {
+        writer.write_all(b"  No event-level differences or candidate matches were observed.\n")?;
+    }
+    for change in &summary.event_changes {
+        write_event_delta(writer, change)?;
+    }
+    writer.write_all(b"\nInterpretation limits:\n")?;
+    writer.write_all(b"  Exact unchanged groups compare normalized records as multisets, ignoring only capture-local ordinal and QPC timestamp.\n")?;
+    writer.write_all(b"  Candidate-changed groups use a unique operation/path or process/image key; this does not prove the same execution.\n")?;
+    writer.write_all(b"  One-sided observations are not removals or additions; incomplete capture evidence can hide records.\n")?;
     writer.write_all(b"  A count difference does not establish event absence, operation success, causation, or target attribution.\n")?;
     writer.write_all(b"  Capture completeness remains unknown, even when both producers report complete collection.\n")?;
     writer.write_all(b"  Event ordinals refer to positions in their own capture documents, not source byte offsets.\n")?;
@@ -72,10 +84,72 @@ fn write_side<W: Write>(
     write_quoted(writer, &side.document_sha256)?;
     write!(
         writer,
-        "\n{label} producer collection status: {} (not independently authenticated)\n{label} retained event records: {}\n",
+        "\n{label} producer collection status: {} (not independently authenticated)\n{label} retained event records: {}\n{label} reported event loss: events={} log_buffers={} realtime_buffers={}\n{label} loss statistics available: {}\n{label} final loss snapshot available: {}\n{label} capture diagnostics: {}\n{label} loss observation: ",
         collection_status_name(status),
-        side.observed_event_count
-    )
+        side.observed_event_count,
+        side.event_loss.events_lost,
+        side.event_loss.log_buffers_lost,
+        side.event_loss.real_time_buffers_lost,
+        side.event_loss.loss_statistics_available,
+        side.event_loss.final_snapshot_available,
+        side.diagnostics_count
+    )?;
+    write_quoted(writer, &side.event_loss.observation)?;
+    writer.write_all(b"\n")
+}
+
+fn write_event_delta<W: Write>(writer: &mut W, delta: &EventDelta) -> io::Result<()> {
+    writeln!(
+        writer,
+        "  {} [confidence={}; basis={}] category={}",
+        event_status_name(delta.status),
+        delta.confidence,
+        delta.basis,
+        delta.category
+    )?;
+    if let Some(diagnostic) = delta.diagnostic {
+        writer.write_all(b"    Diagnostic: ")?;
+        write_quoted(writer, diagnostic)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.write_all(b"    Before evidence:\n")?;
+    write_event_references(writer, &delta.before)?;
+    writer.write_all(b"    After evidence:\n")?;
+    write_event_references(writer, &delta.after)
+}
+
+fn write_event_references<W: Write>(
+    writer: &mut W,
+    references: &[EventEvidenceReference],
+) -> io::Result<()> {
+    if references.is_empty() {
+        return writer.write_all(b"      none\n");
+    }
+    for reference in references {
+        writer.write_all(b"      capture=")?;
+        write_quoted(writer, &reference.capture_sha256)?;
+        write!(writer, " ordinal={} provider=", reference.record_ordinal)?;
+        write_quoted(writer, &reference.provider_guid)?;
+        writeln!(
+            writer,
+            " event_id={} version={} opcode={} kind={} category={}",
+            reference.event_id,
+            reference.event_version,
+            reference.opcode,
+            reference.event_kind,
+            reference.category
+        )?;
+    }
+    Ok(())
+}
+
+fn event_status_name(value: EventDeltaStatus) -> &'static str {
+    match value {
+        EventDeltaStatus::Unchanged => "unchanged",
+        EventDeltaStatus::CandidateChanged => "candidate_changed",
+        EventDeltaStatus::ObservedOnlyBefore => "observed_only_before",
+        EventDeltaStatus::ObservedOnlyAfter => "observed_only_after",
+    }
 }
 
 fn write_ordinals<W: Write>(writer: &mut W, ordinals: &[u64]) -> io::Result<()> {
@@ -129,11 +203,11 @@ mod tests {
     fn text_is_terminal_safe_and_states_comparison_limits() {
         let mut summary = WindowsRuntimeDiffSummary {
             schema: "sideeffect.windows_runtime_diff_summary",
-            schema_version: 1,
+            schema_version: 2,
             algorithm: crate::windows_runtime_diff::ComparisonAlgorithm {
                 id: "test\u{1b}[31m",
-                version: 1,
-                basis: "counts_only",
+                version: 2,
+                basis: "multiset_and_candidate_diff",
             },
             comparison_status: ComparisonStatus::Partial,
             capture_completeness: "unknown",
@@ -142,12 +216,30 @@ mod tests {
                 producer_collection_status: CollectionStatus::Complete,
                 capture_completeness: "unknown",
                 observed_event_count: 1,
+                event_loss: crate::windows_runtime_diff::EventLossSummary {
+                    events_lost: 0,
+                    log_buffers_lost: 0,
+                    real_time_buffers_lost: 0,
+                    loss_statistics_available: true,
+                    final_snapshot_available: true,
+                    observation: "none".to_owned(),
+                },
+                diagnostics_count: 0,
             },
             after: crate::windows_runtime_diff::CaptureSide {
                 document_sha256: "after".to_owned(),
                 producer_collection_status: CollectionStatus::Partial,
                 capture_completeness: "unknown",
                 observed_event_count: 1,
+                event_loss: crate::windows_runtime_diff::EventLossSummary {
+                    events_lost: 0,
+                    log_buffers_lost: 0,
+                    real_time_buffers_lost: 0,
+                    loss_statistics_available: true,
+                    final_snapshot_available: true,
+                    observation: "none".to_owned(),
+                },
+                diagnostics_count: 0,
             },
             categories: vec![crate::windows_runtime_diff::CategoryCountDelta {
                 category: "process.start",
@@ -157,6 +249,7 @@ mod tests {
                 before_event_ordinals: vec![1],
                 after_event_ordinals: vec![],
             }],
+            event_changes: vec![],
             diagnostics: vec!["partial"],
             limitations: vec![],
         };
@@ -211,8 +304,8 @@ mod tests {
         let mut output = Vec::new();
         write_windows_runtime_diff_text(&summary, &before, &after, &mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("Observed category deltas"));
-        assert!(output.contains("records are not paired"));
+        assert!(output.contains("Observed category count deltas"));
+        assert!(output.contains("Event-level observations"));
         assert!(
             output.contains("event absence, operation success, causation, or target attribution")
         );

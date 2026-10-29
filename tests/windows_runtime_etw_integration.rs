@@ -12,11 +12,12 @@ use std::time::{Duration, Instant};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
-/// Opt-in local acceptance test. This needs permission to control the NT Kernel
-/// Logger and is intentionally ignored by normal CI. Its child fixture creates
-/// and reads one temporary file, then connects to a loopback TCP listener.
+/// Opt-in acceptance test. This needs permission to control the NT Kernel
+/// Logger and is explicitly run on privileged GitHub-hosted Windows CI runners.
+/// Its child fixture creates and reads one temporary file, then connects to a
+/// loopback TCP listener.
 #[test]
-#[ignore = "manual ETW acceptance; controlling NT Kernel Logger requires administrative privileges"]
+#[ignore = "requires administrative access to the NT Kernel Logger; run explicitly"]
 fn captures_process_file_and_loopback_network_observations_and_reports_loss_state() {
     let directory = std::env::temp_dir().join(format!(
         "sideeffect-windows-etw-integration-{}-{}",

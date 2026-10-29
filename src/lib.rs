@@ -25,5 +25,6 @@ pub mod record;
 pub mod startup_correlation;
 pub mod trace;
 pub mod windows_runtime;
+pub mod windows_runtime_attribution;
 pub mod windows_runtime_diff;
 pub mod windows_startup_correlation;

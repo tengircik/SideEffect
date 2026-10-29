@@ -36,6 +36,20 @@ impl Drop for Temp {
 
 fn event(ordinal: u64, kind: &str) -> NativeRuntimeEvent {
     let io_descriptor = match kind {
+        "file.create_name_a" | "file.create_name_b" => Some((
+            "{90cbdc39-4a3e-11d1-84f4-0000f80464e3}",
+            2,
+            32,
+            "file_io_observation",
+            "windows.kernel_file_io",
+            2,
+            "file",
+            json!({
+                "operation":"create_name",
+                "path":r"C:\Apps\worker.exe",
+                "file_object": if kind.ends_with("_a") { 10 } else { 20 }
+            }),
+        )),
         "file.read_request" => Some((
             "{90cbdc39-4a3e-11d1-84f4-0000f80464e3}",
             2,
@@ -252,15 +266,15 @@ fn json_compares_observed_category_counts_and_preserves_ordinals() {
     assert_eq!(output.status.code(), Some(0));
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["schema"], "sideeffect.windows_runtime_diff_summary");
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(
         report["algorithm"]["id"],
-        "windows_etw_observed_event_category_counts"
+        "windows_etw_exact_multiset_and_unique_candidate_diff"
     );
-    assert_eq!(report["algorithm"]["version"], 1);
+    assert_eq!(report["algorithm"]["version"], 2);
     assert_eq!(
         report["algorithm"]["basis"],
-        "fixed_category_record_counts_without_individual_event_pairing"
+        "fixed_category_counts_plus_exact_record_multiset_and_unique_identity_candidates"
     );
     assert_eq!(report["comparison_status"], "complete");
     assert_eq!(report["capture_completeness"], "unknown");
@@ -307,6 +321,30 @@ fn json_compares_observed_category_counts_and_preserves_ordinals() {
         category(&report, "network.tcp.connect")["before_event_ordinals"][0],
         3
     );
+    assert!(report["event_changes"].as_array().is_some());
+    assert!(
+        report["event_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|delta| {
+                delta["status"] == "unchanged"
+                    && delta["category"] == "process.start"
+                    && delta["before"][0]["record_ordinal"] == 1
+                    && delta["after"][0]["record_ordinal"] == 1
+            })
+    );
+    assert!(
+        report["event_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|delta| {
+                delta["status"] == "observed_only_before"
+                    && delta["category"] == "network.tcp.connect"
+                    && delta["before"][0]["capture_sha256"] == report["before"]["document_sha256"]
+            })
+    );
     assert!(
         report["limitations"]
             .as_array()
@@ -315,8 +353,69 @@ fn json_compares_observed_category_counts_and_preserves_ordinals() {
             .any(|item| {
                 item.as_str()
                     .unwrap()
-                    .contains("individual ETW records are not paired")
+                    .contains("exact normalized event records")
             })
+    );
+}
+
+#[test]
+fn json_reports_unique_changed_identity_as_candidate_with_both_input_references() {
+    let before = capture(CollectionStatus::Complete, &["file.create_name_a"]);
+    let after = capture(CollectionStatus::Complete, &["file.create_name_b"]);
+    let (_temp, output) = run_diff(&before, &after, &[]);
+    assert_eq!(output.status.code(), Some(0));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let candidate = report["event_changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|delta| delta["status"] == "candidate_changed")
+        .unwrap();
+    assert_eq!(candidate["basis"], "unique_file_operation_and_literal_path");
+    assert_eq!(candidate["before"][0]["record_ordinal"], 1);
+    assert_eq!(candidate["after"][0]["record_ordinal"], 1);
+    assert_eq!(
+        candidate["before"][0]["capture_sha256"],
+        report["before"]["document_sha256"]
+    );
+    assert_eq!(
+        candidate["after"][0]["capture_sha256"],
+        report["after"]["document_sha256"]
+    );
+    assert!(
+        candidate["diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("does_not_prove_same_underlying_execution")
+    );
+}
+
+#[test]
+fn partial_capture_never_turns_unmatched_before_events_into_removals() {
+    let before = capture(CollectionStatus::Complete, &["process.start"]);
+    let after = capture(CollectionStatus::Partial, &[]);
+    let (_temp, output) = run_diff(&before, &after, &[]);
+    assert_eq!(output.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["event_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|delta| {
+                delta["status"] == "observed_only_before"
+                    && delta["diagnostic"]
+                        .as_str()
+                        .unwrap()
+                        .contains("other_capture_is_incomplete")
+            })
+    );
+    assert!(
+        !report["event_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|delta| delta["status"] == "removed")
     );
 }
 
@@ -327,8 +426,8 @@ fn text_is_terminal_safe_and_partial_collection_exits_two() {
     let (_temp, output) = run_diff(&before, &after, &["--format", "text"]);
     assert_eq!(output.status.code(), Some(2));
     let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("Observed category deltas"));
-    assert!(text.contains("records are not paired"));
+    assert!(text.contains("Observed category count deltas"));
+    assert!(text.contains("One-sided observations are not removals or additions"));
     assert!(text.contains("Capture completeness remains unknown"));
     assert!(text.contains("event absence, operation success, causation, or target attribution"));
 }
@@ -403,7 +502,11 @@ fn html_uses_static_csp_and_refuses_to_replace_existing_report() {
         assert!(html.contains("default-src 'none'"));
         assert!(html.contains("connect-src 'none'"));
         assert!(html.contains("script-src 'none'"));
-        assert!(html.contains("Individual records are not paired"));
+        assert!(
+            html.contains(
+                "Category counts and one-sided observations do not establish event absence"
+            )
+        );
         assert!(!html.contains("<script"));
         let second = run();
         assert_eq!(second.status.code(), Some(1));
@@ -461,7 +564,7 @@ fn html_format_and_output_after_runtime_flag_are_supported_or_explicitly_rejecte
         assert!(
             fs::read_to_string(&report_path)
                 .unwrap()
-                .contains("Category deltas")
+                .contains("Category count deltas")
         );
     }
     #[cfg(not(windows))]

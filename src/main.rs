@@ -73,6 +73,7 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect model list | show <id> | install <id> | setup <id> | add | select <task> <id> | remove <id>\n\
        sideeffect correlate-startup <startup-inventory.json> <strace-trace-file>\n\
        sideeffect associated-behavior <startup-inventory.json> <runtime-evidence-file>\n\
+       sideeffect attribute --windows-runtime <capture.json>\n\
        sideeffect inventory processes --output <new-inventory.json>\n\
        sideeffect inventory startup --output <new-inventory.json>\n\
        sideeffect inventory permissions --output <new-inventory.json> <path>...\n\
@@ -159,6 +160,9 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         }
         [command, flag, path] if command == "inspect" && flag == "--windows-runtime" => {
             inspect_windows_runtime_with_format(&OsString::from("json"), path)
+        }
+        [command, flag, path] if command == "attribute" && flag == "--windows-runtime" => {
+            attribute_windows_runtime(path)
         }
         [command, format_flag, format, windows_flag, path]
             if command == "inspect"
@@ -1247,8 +1251,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         "audit" => {
             #[cfg(target_os = "linux")]
             {
-                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages] [--processes] [--startup] [--permission PATH]... [--runtime-duration-seconds 1..3600 -- PROGRAM [ARGS...]]
-Collects explicitly selected Linux inventory sources and an optional bounded command capture into one local, private session directory. Runtime command arguments stay separate and are passed without a shell. The session stores the native run manifest and raw trace, which may contain sensitive arguments and paths. Each source has its own interval; the session is not an atomic snapshot. Runtime completeness remains unknown, so runtime sources and sessions containing runtime are partial. Partial and unavailable selected sources are preserved and cause exit status 2. Native Windows builds group their separately versioned inventory artifacts; Windows runtime capture remains unsupported."
+                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages] [--processes] [--startup] [--permission PATH]... [--runtime-duration-seconds 1..3600 -- PROGRAM [ARGS...]]\nCollects explicitly selected Linux inventory sources and an optional bounded command capture into one local, private session directory. Linux runtime uses external strace. Runtime command arguments stay separate and are passed without a shell. The session stores the native run manifest and raw trace, which may contain sensitive arguments and paths. Each source has its own interval; the session is not an atomic snapshot. Runtime completeness remains unknown, so runtime sources and sessions containing runtime are partial. Partial and unavailable selected sources are preserved and cause exit status 2."
             }
             #[cfg(windows)]
             {
@@ -1263,7 +1266,7 @@ Collects explicitly selected Linux inventory sources and an optional bounded com
             "Usage: sideeffect inspect [--format json|text] TRACE\n       sideeffect inspect [--format json|text] --bundle DIR\n       sideeffect inspect [--format json|text] --session DIR\n       sideeffect inspect [--format json|text] --windows-runtime FILE\n       sideeffect inspect --format html --output NEW_REPORT.html --windows-runtime FILE (native Windows)\nReads bounded local strace evidence, a validated run bundle, a verified audit session, or a Windows ETW capture. It never runs represented commands. JSON is the default; text output escapes terminal controls and user-influenced fields. Windows runtime inspection accepts schema v3, validates its document fingerprint and bounds, and does not authenticate authorship or establish capture completeness. HTML file export uses the protected current-user publisher and is available only on native Windows. Partial input is labeled and exits with status 2."
         }
         "diff" => {
-            "Usage: sideeffect diff [--format json|text] LEFT RIGHT\n       sideeffect diff --format html --output REPORT.html LEFT RIGHT\n       sideeffect diff --bundles [--format json|text] LEFT_DIR RIGHT_DIR\n       sideeffect diff --windows-runtime [--format json|text] BEFORE.json AFTER.json\n       sideeffect diff --format html --output REPORT.html --windows-runtime BEFORE.json AFTER.json (native Windows)\nCompares complete parsed strace observations, or validated Windows ETW capture category counts. Windows records are not paired: category deltas describe observed counts only, capture completeness remains unknown, and no causal or absence claims are made. Windows HTML uses the protected current-user publisher and a static offline report. Input and report data may be sensitive."
+            "Usage: sideeffect diff [--format json|text] LEFT RIGHT\n       sideeffect diff --format html --output REPORT.html LEFT RIGHT\n       sideeffect diff --bundles [--format json|text] LEFT_DIR RIGHT_DIR\n       sideeffect diff --windows-runtime [--format json|text] BEFORE.json AFTER.json\n       sideeffect diff --format html --output REPORT.html --windows-runtime BEFORE.json AFTER.json (native Windows)\nCompares complete parsed strace observations or validated Windows ETW captures. Windows summary v2 preserves category counts, compares exact normalized record multisets, and labels unique supported changed identities as candidates with source references. One-sided observations are not removals or additions; capture completeness remains unknown, and no causal or system-level absence claims are made. Windows HTML uses the protected current-user publisher and a static offline report. Input and report data may be sensitive."
         }
         "diff-summary" => {
             "Usage: sideeffect diff-summary [--format json] LEFT RIGHT\n       sideeffect diff-summary --format html --output REPORT.html LEFT RIGHT\nWrites aggregate change counts without event strings or evidence references. Counts may still be sensitive; the output is not a safe-to-share verdict."
@@ -1277,7 +1280,7 @@ Collects explicitly selected Linux inventory sources and an optional bounded com
         "record" => {
             #[cfg(windows)]
             {
-                "Usage: sideeffect record --windows-etw OUTPUT.json --duration-seconds 1..60 -- PROGRAM [ARGS...]\nStarts a bounded native ETW capture for process lifecycle, selected file activity, and TCP/UDP observations. The NT Kernel Logger observes system-wide events during the capture window; this prototype does not attribute every file event to the selected command or its descendants. File records describe observed requests/operations, not guaranteed success. Controlling the NT Kernel Logger requires administrative privileges. No automatic elevation is requested. This is observation, not isolation or a safety check."
+                "Usage: sideeffect record --windows-etw OUTPUT.json --duration-seconds 1..60 -- PROGRAM [ARGS...]\nStarts a bounded native ETW capture for process lifecycle, selected file activity, and TCP/UDP observations. The NT Kernel Logger observes system-wide events during the capture window. A separate attribute command provides only candidate process lineage and network PID associations; file/disk header PIDs remain event-context candidates. File records describe observed requests/operations, not guaranteed success. Controlling the NT Kernel Logger requires administrative privileges. No automatic elevation is requested. This is observation, not isolation or a safety check."
             }
             #[cfg(not(windows))]
             {
@@ -1348,6 +1351,9 @@ Collects explicitly selected Linux inventory sources and an optional bounded com
         }
         "associated-behavior" => {
             "Usage: sideeffect associated-behavior STARTUP_INVENTORY.json RUNTIME_EVIDENCE\nWrites a versioned, evidence-linked candidate summary. Linux accepts startup inventory v2 plus raw strace text. Windows accepts startup inventory v4 plus a validated ETW capture v3 and compares only identical drive-rooted path strings from observed Exec task actions and decoded process-start events. It does not normalize or basename-match paths. Candidate matches do not prove startup execution or causation. No match is insufficient evidence, not a negative finding. Partial input or coverage exits with status 2."
+        }
+        "attribute" => {
+            "Usage: sideeffect attribute --windows-runtime CAPTURE.json\nWrites a separate evidence-linked candidate view over a validated Windows ETW v3 capture. Descendant process links require supported process-start payloads and observed active parent IDs. Network association uses the decoded payload process ID. File and disk header PIDs remain context candidates, not ownership. Capture bytes are unchanged. Missing lifecycle data, ambiguity, unsupported records, or reported/unavailable loss is surfaced as partial or unassigned evidence; no causal or absence claims are made."
         }
         "model" => {
             "Usage: sideeffect model list\n       sideeffect model show ID\n       sideeffect model install ID\n       sideeffect model setup ID\n       sideeffect model add --name NAME --path FILE --for evidence|explanation|query [--license ID]\n       sideeffect model select evidence|explanation|query ID\n       sideeffect model remove ID\n\nLists pinned catalog candidates and user-provided models. Catalog evaluation status is shown separately from runtime compatibility. Installing a catalog model requires explicit license acceptance; analysis never downloads weights implicitly. The setup command installs and selects the catalog model for its declared task. Registering a local model records its size and SHA-256, but does not verify task compatibility, licensing, or quality. Removing a custom registration leaves the model file untouched. Select a model for its task before running a model preview."
@@ -1699,6 +1705,24 @@ fn inspect_with_format(format: &OsString, path: &OsString) -> Result<ExitCode, S
         return Err("inspect format must be either 'json' or 'text'".to_owned());
     }
     inspect_bytes_with_format(format, read_bounded(path)?)
+}
+
+fn attribute_windows_runtime(path: &OsString) -> Result<ExitCode, String> {
+    let bytes = read_input_file(
+        Path::new(path),
+        sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
+        "Windows runtime capture",
+    )?;
+    let summary =
+        sideeffect::windows_runtime_attribution::summarize_windows_runtime_attribution(&bytes)
+            .map_err(|error| format!("Windows runtime attribution failed: {error}"))?;
+    let partial = summary.status == "partial";
+    write_json(&summary, "Windows runtime attribution summary")?;
+    Ok(if partial {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn inspect_windows_runtime_with_format(
@@ -2831,7 +2855,7 @@ fn diff_windows_runtime_with_format(
         summary.comparison_status == sideeffect::windows_runtime_diff::ComparisonStatus::Partial;
 
     match format {
-        "json" => write_json(&summary, "Windows runtime aggregate comparison")?,
+        "json" => write_json(&summary, "Windows runtime comparison")?,
         "text" => {
             let mut text = CappedBuffer::new(MAX_REPORT_BYTES);
             sideeffect::format::write_windows_runtime_diff_text(
@@ -2851,7 +2875,7 @@ fn diff_windows_runtime_with_format(
                     "Windows runtime diff text exceeds the {MAX_REPORT_BYTES} byte output limit"
                 )
             })?;
-            write_buffer(&text, "Windows runtime aggregate comparison")?;
+            write_buffer(&text, "Windows runtime comparison")?;
         }
         "html" => {
             #[cfg(windows)]
@@ -2877,7 +2901,7 @@ fn diff_windows_runtime_with_format(
                     )
                 })?;
                 eprintln!(
-                    "Offline Windows runtime aggregate comparison written to {}. The report contains sensitive capture fingerprints and event counts; review before sharing.",
+                    "Offline Windows runtime comparison written to {}. The report contains sensitive capture fingerprints, event details, and source references; review before sharing.",
                     terminal_safe_path(&published)
                 );
             }

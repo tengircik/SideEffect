@@ -79,5 +79,5 @@ fn record_help_explains_system_scope_and_permissions() {
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("system-wide events"));
     assert!(text.contains("No automatic elevation"));
-    assert!(text.contains("does not attribute every file event"));
+    assert!(text.contains("file/disk header PIDs remain event-context candidates"));
 }

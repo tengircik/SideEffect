@@ -18,6 +18,7 @@ fn help_command_and_flag_show_command_list() {
         assert!(text.contains(
             "sideeffect associated-behavior <startup-inventory.json> <runtime-evidence-file>"
         ));
+        assert!(text.contains("sideeffect attribute --windows-runtime <capture.json>"));
         assert!(text.contains("--session <audit-session-directory>"));
     }
 }
@@ -41,7 +42,8 @@ fn focused_help_covers_command_and_nested_inventory_topics() {
     assert!(diff.status.success());
     let diff_help = String::from_utf8_lossy(&diff.stdout);
     assert!(diff_help.contains("diff --windows-runtime"));
-    assert!(diff_help.contains("records are not paired"));
+    assert!(diff_help.contains("Windows summary v2"));
+    assert!(diff_help.contains("unique supported changed identities as candidates"));
 
     let associated = run(&["help", "associated-behavior"]);
     assert!(associated.status.success());
