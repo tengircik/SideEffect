@@ -67,6 +67,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y strace python3
 
+      - name: Validate portable agent skill
+        run: python3 scripts/validate_agent_skill.py
+
       - name: Check formatting
         run: cargo fmt --all --check
 

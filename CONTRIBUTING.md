@@ -4,7 +4,7 @@ Thank you for your interest in SideEffect.
 
 ## Current project state
 
-The repository has an early Rust implementation of `sideeffect inspect TRACE` (JSON by default, terminal-safe text with `--format text`), paired `diff`, Linux `record`, and Linux-only offline HTML export. GitHub Actions CI checks Linux and Windows builds; its Linux job installs the distribution `strace` and `python3` packages and runs real-tracer integration tests that observe a child `execve`, temporary file operations, and loopback-only TCP activity, and verify propagation of a target exit code 37 and SIGTERM termination after trace publication. The event test checks for a successful child `execve` either as a complete row or as matched unfinished/resumed evidence rows, depending on tracer output; it captures command output in memory, checks it for selected trace sentinels, and verifies that its private temporary directory is removed. The workflow has no artifact-upload step. Synthetic fixtures exercise parser/diff behavior but are not real captures. These tests do not establish broader syscall coverage, independent tracer success, capture completeness, or external-network behavior.
+SideEffect is a Rust CLI for bounded local software inventory, startup configuration review, selected-path permission evidence, runtime capture, and evidence-linked comparison on Linux and native Windows. The repository also provides a portable Agent Skill for compatible coding agents. Read [`docs/PRODUCT.md`](docs/PRODUCT.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/PLAN.md`](docs/PLAN.md), and [`SECURITY.md`](SECURITY.md) before changing behavior or guarantees. The compatibility matrix records the exact validation scope. CI checks Rust formatting, Clippy, tests, real Linux tracer capture, native Windows behavior, live ETW acceptance on Windows Server runners, and Agent Skill package structure. Synthetic fixtures remain separate from real captures.
 
 Before proposing implementation work, read:
 
@@ -13,7 +13,7 @@ Before proposing implementation work, read:
 - [`docs/PLAN.md`](docs/PLAN.md)
 - [`SECURITY.md`](SECURITY.md)
 
-The capture target is a Rust CLI for Linux x86_64 using an external `strace` executable. Existing WSL2 may be used as a Linux environment, but native Windows tracing is not in the initial scope. `inspect` and `diff` do not invoke `strace`; `record` does. No LLM or hosted service is required.
+Runtime capture uses external `strace` on Linux and native ETW on Windows. `inspect` and `diff` process saved evidence. The evidence-first CLI and Agent Skill do not require a local LLM or hosted SideEffect service.
 
 ## Local checks
 
