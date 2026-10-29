@@ -93,11 +93,33 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
     }));
     assert!(document["target"]["process_id"].as_u64().unwrap() > 0);
     let target_pid = document["target"]["process_id"].as_u64().unwrap();
-    assert!(events.iter().any(|event| {
+    let target_process_start_seen = events.iter().any(|event| {
         event["event_kind"] == "process_start"
             && event["payload_decoding"]["status"] == "decoded"
             && event["payload_decoding"]["process_id"] == target_pid
-    }));
+    });
+    let process_observations = events
+        .iter()
+        .filter(|event| event["payload_decoding"].is_object())
+        .map(|event| {
+            serde_json::json!({
+                "event_id": event["event_id"],
+                "event_version": event["event_version"],
+                "opcode": event["opcode"],
+                "event_kind": event["event_kind"],
+                "payload_decoding": {
+                    "status": event["payload_decoding"]["status"],
+                    "diagnostic": event["payload_decoding"]["diagnostic"],
+                    "process_id": event["payload_decoding"]["process_id"]
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        target_process_start_seen,
+        "target process start was not decoded; target PID {target_pid}; process observations: {}",
+        serde_json::to_string(&process_observations).unwrap()
+    );
     assert!(
         events.iter().any(|event| {
             event["observation_decoding"]["status"] == "decoded"
