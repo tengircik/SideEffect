@@ -22,7 +22,7 @@ pub const MAX_WINDOWS_RUNTIME_EVENT_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_WINDOWS_RUNTIME_DURATION_SECONDS: u64 = 60;
 const MAX_JSON_ARRAY_ENTRIES: usize = MAX_WINDOWS_RUNTIME_EVENTS * 4;
 const MAX_JSON_OBJECT_ENTRIES: usize = 4096;
-const MAX_JSON_VALUE_NODES: usize = 4_000_000;
+pub(crate) const MAX_JSON_VALUE_NODES: usize = 4_000_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
@@ -509,6 +509,13 @@ fn parse_strict_json_with_budget(
     let value = StrictValueSeed::new(max_nodes).deserialize(&mut deserializer)?;
     deserializer.end()?;
     Ok(value)
+}
+
+pub(crate) fn parse_strict_json_value(
+    bytes: &[u8],
+    max_nodes: usize,
+) -> Result<Value, serde_json::Error> {
+    parse_strict_json_with_budget(bytes, max_nodes).map(StrictValue::into_value)
 }
 
 #[cfg(test)]

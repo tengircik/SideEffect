@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -168,4 +169,159 @@ fn cli_rejects_oversized_startup_input_before_json_parsing() {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("startup inventory input exceeds"));
+}
+
+#[test]
+fn cli_dispatches_windows_inputs_to_the_exact_path_candidate_adapter() {
+    use sideeffect::windows_runtime::{
+        AppliedLimits, CollectionStatus, DecodedProcessPayload, EventLoss, NativeRuntimeEvent,
+        ProcessDecodeStatus, SessionMetadata, StopReason, TargetOutcome, WindowsRuntimeCapture,
+    };
+
+    let temp = Temp::new();
+    let startup_path = temp.0.join("startup.windows.json");
+    let runtime_path = temp.0.join("runtime.windows.json");
+    let output = json!({
+        "schema": "sideeffect.windows_startup_inventory",
+        "schema_version": 4,
+        "platform": "windows",
+        "scope": "synthetic_fixture_not_a_live_capture",
+        "capture_started_at_unix_ms": 10,
+        "capture_ended_at_unix_ms": 11,
+        "status": "complete",
+        "sources": [],
+        "registry_entries": [],
+        "folder_entries": [],
+        "service_entries": [],
+        "scheduled_task_entries": [],
+        "scheduled_task_actions": [{
+            "task_path": "\\Synthetic\\Task",
+            "action_index": 0,
+            "action_type": "exec",
+            "action_type_code": 0,
+            "status": "observed",
+            "executable_path": r"C:\Apps\worker.exe",
+            "evidence": {
+                "source": "synthetic_fixture_not_a_live_capture",
+                "task_index": 4,
+                "action_index": 0
+            }
+        }]
+    });
+    fs::write(&startup_path, serde_json::to_vec(&output).unwrap()).unwrap();
+
+    let mut capture = WindowsRuntimeCapture {
+        schema: sideeffect::windows_runtime::WINDOWS_RUNTIME_CAPTURE_SCHEMA.to_owned(),
+        schema_version: sideeffect::windows_runtime::WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION,
+        platform: "windows".to_owned(),
+        capture_profile: "windows_nt_kernel_process_file_network_v1".to_owned(),
+        collection_status: CollectionStatus::Partial,
+        capture_completeness: "unknown".to_owned(),
+        started_at_unix_ms: 10,
+        ended_at_unix_ms: 20,
+        requested_duration_seconds: 1,
+        stop_reason: StopReason::EtwStatisticsUnavailable,
+        target: TargetOutcome {
+            process_id: 77,
+            exit_code: Some(0),
+            status_available: true,
+        },
+        session: SessionMetadata {
+            name: "NT Kernel Logger".to_owned(),
+            provider: "synthetic ETW fixture".to_owned(),
+            scope: "synthetic_fixture_not_a_live_capture".to_owned(),
+            buffer_size_kb_requested: 16,
+            minimum_buffers_requested: 8,
+            maximum_buffers_requested: 32,
+            buffer_count_reported: 8,
+            provider_process_id_header_semantics: "header PID/TID is event context only".to_owned(),
+        },
+        limits: AppliedLimits {
+            maximum_duration_seconds: 60,
+            maximum_events: sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_EVENTS,
+            maximum_total_payload_bytes:
+                sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_PAYLOAD_BYTES,
+            maximum_payload_bytes_per_event:
+                sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_EVENT_PAYLOAD_BYTES,
+            maximum_document_bytes: sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
+        },
+        event_loss: EventLoss {
+            events_lost: 0,
+            log_buffers_lost: 0,
+            real_time_buffers_lost: 0,
+            loss_statistics_available: false,
+            observation: "unavailable".to_owned(),
+            final_snapshot_available: false,
+        },
+        document_sha256: String::new(),
+        events: vec![NativeRuntimeEvent {
+            record_ordinal: 1,
+            provider_guid: "{3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c}".to_owned(),
+            event_id: 0,
+            event_version: 2,
+            opcode: 1,
+            event_kind: "process_start".to_owned(),
+            header_process_id: 77,
+            header_thread_id: 78,
+            header_flags: 0,
+            timestamp_qpc: 100,
+            raw_payload_hex: "00".to_owned(),
+            payload_decoding: Some(DecodedProcessPayload {
+                status: ProcessDecodeStatus::Decoded,
+                schema_name: Some("windows.kernel_process_typegroup1".to_owned()),
+                schema_version: Some(2),
+                pointer_size_bytes: Some(8),
+                process_id: Some(77),
+                parent_process_id: Some(1),
+                image_file_name: Some(r"C:\Apps\worker.exe".to_owned()),
+                diagnostic: None,
+            }),
+            observation_decoding: None,
+        }],
+        diagnostics: vec!["synthetic_fixture_not_a_live_capture".to_owned()],
+    };
+    capture.document_sha256 = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&capture).unwrap())
+    );
+    fs::write(&runtime_path, serde_json::to_vec(&capture).unwrap()).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("associated-behavior")
+        .arg(&startup_path)
+        .arg(&runtime_path)
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&result.stdout).unwrap_or_else(|error| {
+        panic!(
+            "Windows associated-behavior CLI returned no JSON: {error}; stderr: {}",
+            String::from_utf8_lossy(&result.stderr)
+        )
+    });
+    assert_eq!(result.status.code(), Some(2));
+    assert_eq!(
+        report["schema"],
+        "sideeffect.windows_associated_behavior_summary"
+    );
+    assert_eq!(report["association_status"], "candidate_match");
+    assert_eq!(report["status"], "partial");
+    assert_eq!(
+        report["associations"][0]["startup_evidence"][0]["task_index"],
+        4
+    );
+    assert_eq!(
+        report["associations"][0]["runtime_evidence"][0]["record_ordinal"],
+        1
+    );
+    assert_eq!(
+        report["inputs"]["runtime_capture"]["capture_completeness"],
+        "unknown"
+    );
+    assert!(
+        report["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str().unwrap().contains("no basename matching"))
+    );
 }

@@ -16,7 +16,7 @@ fn help_command_and_flag_show_command_list() {
         assert!(text.contains("sideeffect help [command [subcommand]]"));
         assert!(text.contains("sideeffect model-preview"));
         assert!(text.contains(
-            "sideeffect associated-behavior <startup-inventory.json> <strace-trace-file>"
+            "sideeffect associated-behavior <startup-inventory.json> <runtime-evidence-file>"
         ));
         assert!(text.contains("--session <audit-session-directory>"));
     }

@@ -72,7 +72,7 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect model-query --question <question> --runtime <llama-completion> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect model list | show <id> | install <id> | setup <id> | add | select <task> <id> | remove <id>\n\
        sideeffect correlate-startup <startup-inventory.json> <strace-trace-file>\n\
-       sideeffect associated-behavior <startup-inventory.json> <strace-trace-file>\n\
+       sideeffect associated-behavior <startup-inventory.json> <runtime-evidence-file>\n\
        sideeffect inventory processes --output <new-inventory.json>\n\
        sideeffect inventory startup --output <new-inventory.json>\n\
        sideeffect inventory permissions --output <new-inventory.json> <path>...\n\
@@ -1347,7 +1347,7 @@ Collects explicitly selected Linux inventory sources and an optional bounded com
             "Usage: sideeffect correlate-startup STARTUP_INVENTORY.json TRACE\nFinds narrow exact-path candidate matches between supported saved startup configuration and successful exec evidence. A match does not prove that a hook caused or initiated execution."
         }
         "associated-behavior" => {
-            "Usage: sideeffect associated-behavior STARTUP_INVENTORY.json TRACE\nWrites a versioned associated-behavior summary for the first Linux adapter. It compares supported literal XDG/systemd executable paths with successful exec evidence and preserves source references. Candidate matches do not prove startup execution or causation. No match is insufficient evidence, not a negative finding. Partial input or coverage exits with status 2."
+            "Usage: sideeffect associated-behavior STARTUP_INVENTORY.json RUNTIME_EVIDENCE\nWrites a versioned, evidence-linked candidate summary. Linux accepts startup inventory v2 plus raw strace text. Windows accepts startup inventory v4 plus a validated ETW capture v3 and compares only identical drive-rooted path strings from observed Exec task actions and decoded process-start events. It does not normalize or basename-match paths. Candidate matches do not prove startup execution or causation. No match is insufficient evidence, not a negative finding. Partial input or coverage exits with status 2."
         }
         "model" => {
             "Usage: sideeffect model list\n       sideeffect model show ID\n       sideeffect model install ID\n       sideeffect model setup ID\n       sideeffect model add --name NAME --path FILE --for evidence|explanation|query [--license ID]\n       sideeffect model select evidence|explanation|query ID\n       sideeffect model remove ID\n\nLists pinned catalog candidates and user-provided models. Catalog evaluation status is shown separately from runtime compatibility. Installing a catalog model requires explicit license acceptance; analysis never downloads weights implicitly. The setup command installs and selects the catalog model for its declared task. Registering a local model records its size and SHA-256, but does not verify task compatibility, licensing, or quality. Removing a custom registration leaves the model file untouched. Select a model for its task before running a model preview."
@@ -1525,14 +1525,49 @@ fn associated_behavior(startup_path: &OsString, trace_path: &OsString) -> Result
         MAX_REPORT_BYTES,
         "startup inventory",
     )?;
-    let trace_bytes = read_input_file(Path::new(trace_path), MAX_TRACE_BYTES, "trace")?;
+    let runtime_bytes =
+        read_input_file(Path::new(trace_path), MAX_TRACE_BYTES, "runtime evidence")?;
+    let startup_schema = serde_json::from_slice::<serde_json::Value>(&startup_bytes)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("schema")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    if startup_schema.as_deref()
+        == Some(sideeffect::windows_startup_correlation::WINDOWS_STARTUP_INVENTORY_SCHEMA)
+    {
+        let report = sideeffect::windows_startup_correlation::summarize_windows_startup_behavior(
+            &startup_bytes,
+            &runtime_bytes,
+        )?;
+        let partial = report.status == "partial";
+        let candidate_count = report.summary.candidate_path_group_count;
+        let association_status = report.association_status;
+        return write_associated_behavior_report(
+            &report,
+            partial,
+            candidate_count,
+            association_status,
+        );
+    }
     let report = sideeffect::startup_correlation::summarize_associated_startup_behavior(
         &startup_bytes,
-        &trace_bytes,
+        &runtime_bytes,
     )?;
     let partial = report.status == "partial";
     let candidate_count = report.summary.candidate_match_count;
     let association_status = report.association_status;
+    write_associated_behavior_report(&report, partial, candidate_count, association_status)
+}
+
+fn write_associated_behavior_report<T: Serialize>(
+    report: &T,
+    partial: bool,
+    candidate_count: usize,
+    association_status: &str,
+) -> Result<ExitCode, String> {
     let mut json = CappedBuffer::new(MAX_REPORT_BYTES);
     serde_json::to_writer(&mut json, &report).map_err(|error| {
         format!("associated-behavior output exceeds the {MAX_REPORT_BYTES} byte limit: {error}")
