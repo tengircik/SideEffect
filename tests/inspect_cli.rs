@@ -209,6 +209,22 @@ impl TempBundle {
             .output()
             .unwrap()
     }
+
+    fn set_schema_version(&self, version: u64, capture_context: Option<(&str, Option<u64>)>) {
+        let manifest_path = self.0.join("run.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["schema_version"] = serde_json::json!(version);
+        if let Some((stop_reason, time_limit_milliseconds)) = capture_context {
+            manifest["capture"]["stop_reason"] = serde_json::json!(stop_reason);
+            if let Some(milliseconds) = time_limit_milliseconds {
+                manifest["capture"]["time_limit_milliseconds"] =
+                    serde_json::json!(milliseconds);
+            }
+        }
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -239,6 +255,35 @@ fn inspect_bundle_matches_inspecting_its_trace_without_path_leak() {
     let raw_document: serde_json::Value = serde_json::from_slice(&raw.stdout).unwrap();
     assert_eq!(document, raw_document);
     assert!(!String::from_utf8_lossy(&output.stdout).contains(bundle.0.to_str().unwrap()));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn inspect_bundle_preserves_supported_v1_and_v2_capture_context() {
+    let v1_bundle = TempBundle::new(b"close(1) = 0\n");
+    let v1_output = v1_bundle.inspect();
+    assert!(
+        v1_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&v1_output.stderr)
+    );
+    let v1_trace: serde_json::Value = serde_json::from_slice(&v1_output.stdout).unwrap();
+    assert_eq!(v1_trace["schema_version"], 7);
+    assert!(v1_trace.get("bundle_capture").is_none());
+
+    let v2_bundle = TempBundle::new(b"close(1) = 0\n");
+    v2_bundle.set_schema_version(2, Some(("time_limit_reached", Some(1_000))));
+    let v2_output = v2_bundle.inspect();
+    assert_eq!(v2_output.status.code(), Some(2));
+    let v2_trace: serde_json::Value = serde_json::from_slice(&v2_output.stdout).unwrap();
+    assert_eq!(v2_trace["schema_version"], 7);
+    assert_eq!(
+        v2_trace["bundle_capture"],
+        serde_json::json!({
+            "stop_reason": "time_limit_reached",
+            "time_limit_milliseconds": 1_000
+        })
+    );
 }
 
 #[cfg(target_os = "linux")]
