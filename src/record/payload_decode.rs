@@ -150,11 +150,8 @@ pub(super) fn decode_event_payload(event: &EVENT_RECORD) -> DecodedProcessPayloa
             "tdh_schema_does_not_match_process_event",
         );
     }
-    if validate_selected_properties(&metadata, pointer_size).is_err() {
-        return DecodedProcessPayload::undecoded(
-            DecodeStatus::SchemaMismatch,
-            "process_property_schema_is_unexpected",
-        );
+    if let Err(diagnostic) = validate_selected_properties(&metadata, pointer_size) {
+        return DecodedProcessPayload::undecoded(DecodeStatus::SchemaMismatch, diagnostic);
     }
 
     let process_id = match query_property(event, "ProcessId") {
@@ -417,12 +414,20 @@ fn validate_event_key(version: u8, opcode: u8) -> Result<(), DecodeStatus> {
     Ok(())
 }
 
-fn validate_selected_properties(metadata: &EventMetadata, pointer_size: usize) -> Result<(), ()> {
-    let process_id = find_property(metadata, "ProcessId")?;
-    let parent_id = find_property(metadata, "ParentId")?;
-    let image = find_property(metadata, "ImageFileName")?;
-    validate_id_property(process_id, pointer_size)?;
-    validate_id_property(parent_id, pointer_size)?;
+fn validate_selected_properties(
+    metadata: &EventMetadata,
+    pointer_size: usize,
+) -> Result<(), &'static str> {
+    let process_id = find_property(metadata, "ProcessId")
+        .map_err(|_| "process_id_property_is_missing_or_ambiguous")?;
+    let parent_id = find_property(metadata, "ParentId")
+        .map_err(|_| "parent_process_id_property_is_missing_or_ambiguous")?;
+    let image = find_property(metadata, "ImageFileName")
+        .map_err(|_| "image_file_name_property_is_missing_or_ambiguous")?;
+    validate_id_property(process_id, pointer_size)
+        .map_err(|_| "process_id_property_schema_is_unexpected")?;
+    validate_id_property(parent_id, pointer_size)
+        .map_err(|_| "parent_process_id_property_schema_is_unexpected")?;
     if !property_flags_supported(image.flags)
         || image.count != 1
         || image.length != 0
@@ -430,7 +435,7 @@ fn validate_selected_properties(metadata: &EventMetadata, pointer_size: usize) -
         || (image.output_type != TDH_OUTTYPE_NULL as u16
             && image.output_type != TDH_OUTTYPE_STRING as u16)
     {
-        return Err(());
+        return Err("image_file_name_property_schema_is_unexpected");
     }
     Ok(())
 }
