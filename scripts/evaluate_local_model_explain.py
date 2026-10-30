@@ -23,7 +23,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 CORPUS_RELATIVE_PATH = Path("tests/fixtures/local_model_explain_v1/corpus.json")
 FIXTURE_DIRECTORY = ROOT / "tests" / "fixtures" / "local_model_explain_v1"
-EXPECTED_CORPUS_SHA256 = "b67fe04f43674a61fb4e1c472f19824bf0f1110a120dd0f304d57c581cbad8af"
+EXPECTED_CORPUS_SHA256 = "cd67fd08e783743808b08914b775992f9c6ee0a24a14ad7a3568684940ff16be"
 MAX_CORPUS_BYTES = 128 * 1024
 MAX_FIXTURE_BYTES = 64 * 1024
 MAX_CASES = 128
@@ -255,14 +255,22 @@ def validate_response(response: Any, allowed_ids: set[str], case_id: str) -> tup
 def _validate_results(results_path: Path, corpus: dict[str, Any], corpus_digest: str) -> dict[str, Any]:
     raw = _read_regular_file(results_path, MAX_RESULTS_BYTES, "pre-recorded results")
     results = _decode_json(raw, "pre-recorded results")
-    results = _exact_keys(results, {"schema", "schema_version", "corpus_sha256", "cases"}, "results")
+    _require(isinstance(results, dict), "results must be an object")
+    result_keys = set(results)
+    _require(result_keys in (
+        {"schema", "schema_version", "corpus_sha256", "cases"},
+        {"schema", "schema_version", "corpus_sha256", "cases", "errors"},
+    ), "results contain missing or unexpected keys")
     _require(results["schema"] == "sideeffect.local_model_explain_development_results", "unsupported results schema")
     _require(results["schema_version"] == 1, "unsupported results version")
     _require(results["corpus_sha256"] == corpus_digest, "results corpus digest does not match the pinned development corpus")
     rows = results["cases"]
-    _require(isinstance(rows, list) and len(rows) == len(corpus["cases"]), "results must contain one row for every corpus case")
+    errors = results.get("errors", [])
+    _require(isinstance(rows, list) and len(rows) <= len(corpus["cases"]), "results cases must be a bounded array")
+    _require(isinstance(errors, list) and len(errors) <= len(corpus["cases"]), "results errors must be a bounded array")
     expected_cases = {case["id"]: case for case in corpus["cases"]}
     seen: set[str] = set()
+    execution_errors: list[dict[str, str]] = []
     report_rows: list[dict[str, Any]] = []
     total_valid = 0
     total_status_correct = 0
@@ -272,6 +280,17 @@ def _validate_results(results_path: Path, corpus: dict[str, Any], corpus_digest:
     human_reviewed = 0
     human_label_exact = 0
     human_unsupported_claim_rows = 0
+
+    for index, row in enumerate(errors):
+        row = _exact_keys(row, {"case_id", "phase", "error"}, f"results.errors[{index}]")
+        case_id = row["case_id"]
+        _require(isinstance(case_id, str) and case_id in expected_cases and case_id not in seen, f"unknown or duplicate error case ID: {case_id}")
+        _require(isinstance(row["phase"], str) and row["phase"] in {"preview", "analysis"}, f"invalid error phase in case {case_id}")
+        message = _bounded_string(row["error"], f"error for {case_id}", 1024)
+        seen.add(case_id)
+        execution_errors.append({"case_id": case_id, "phase": row["phase"], "error": message})
+
+    case_responses: dict[str, tuple[str, str | None, list[str]]] = {}
 
     for index, row in enumerate(rows):
         row = _exact_keys(row, {"case_id", "response", "available_evidence", "latency_ms", "human_review"}, f"results.cases[{index}]")
@@ -296,6 +315,11 @@ def _validate_results(results_path: Path, corpus: dict[str, Any], corpus_digest:
         status_match = response["status"] == case["expected_status"] and response["abstain_reason"] == case["expected_abstain_reason"]
         total_status_correct += int(status_match)
         cited_labels = {label for evidence_id in cited_ids for label in evidence_labels[evidence_id]}
+        case_responses[case_id] = (
+            response["status"],
+            response["abstain_reason"],
+            sorted(cited_labels),
+        )
         required = set(case["required_evidence_labels"])
         citation_hits = len(required & cited_labels)
         total_citation_label_hits += citation_hits
@@ -336,20 +360,30 @@ def _validate_results(results_path: Path, corpus: dict[str, Any], corpus_digest:
 
     _require(seen == set(expected_cases), "results omit one or more corpus cases")
     sorted_latencies = sorted(latencies)
-    p95 = sorted_latencies[math.ceil(0.95 * len(sorted_latencies)) - 1]
+    p95 = sorted_latencies[math.ceil(0.95 * len(sorted_latencies)) - 1] if sorted_latencies else None
+    permutation_rows = []
+    for group in corpus["permutation_groups"]:
+        signatures = [case_responses.get(case_id) for case_id in group["case_ids"]]
+        consistent = all(signature is not None for signature in signatures) and len(set(map(repr, signatures))) == 1
+        permutation_rows.append({"group_id": group["id"], "consistent": consistent})
     return {
         "schema": "sideeffect.local_model_explain_development_report",
         "schema_version": 1,
         "evaluation_status": "development_only_not_a_release_gate",
         "corpus_sha256": corpus_digest,
-        "cases": len(report_rows),
+        "cases": len(corpus["cases"]),
         "response_contract_valid_count": total_valid,
+        "execution_error_count": len(execution_errors),
+        "execution_errors": execution_errors,
         "expected_status_match_count": total_status_correct,
         "required_evidence_label_recall": (total_citation_label_hits / total_required_labels) if total_required_labels else None,
         "human_reviewed_case_count": human_reviewed,
         "human_review_exact_label_match_count": human_label_exact,
         "human_review_cases_with_unsupported_claims": human_unsupported_claim_rows,
         "p95_latency_ms": p95,
+        "permutation_group_count": len(permutation_rows),
+        "permutation_consistent_group_count": sum(row["consistent"] for row in permutation_rows),
+        "permutation_groups": permutation_rows,
         "semantic_text_truth_verified_automatically": False,
         "report_rows": report_rows,
     }
