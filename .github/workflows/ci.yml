@@ -10,6 +10,27 @@ permissions:
   contents: read
 
 jobs:
+  trace-parser-fuzz-smoke:
+    name: Trace parser fuzz smoke (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install nightly Rust and cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked --version 0.12.0
+
+      - name: Run bounded parser fuzz smoke
+        run: cargo +nightly fuzz run parse_trace_bytes -- -runs=100 -max_len=65536
+
   strace-minimum-compatibility:
     name: Linux strace compatibility (Ubuntu 24.04)
     runs-on: ubuntu-24.04

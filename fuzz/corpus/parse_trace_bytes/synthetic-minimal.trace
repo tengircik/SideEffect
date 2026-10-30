@@ -1,0 +1,3 @@
+execve("/usr/bin/true", ["true"], 0x7ffd /* 1 var */) = 0
+exit_group(0) = ?
++++ exited with 0 +++
