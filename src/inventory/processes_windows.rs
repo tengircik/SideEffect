@@ -36,6 +36,13 @@ struct ProcessEntry32W {
     executable_name: [u16; 260],
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct FileTime {
+    low: u32,
+    high: u32,
+}
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> Handle;
@@ -47,6 +54,13 @@ unsafe extern "system" {
         flags: u32,
         name: *mut u16,
         size: *mut u32,
+    ) -> i32;
+    fn GetProcessTimes(
+        process: Handle,
+        creation: *mut FileTime,
+        exit: *mut FileTime,
+        kernel: *mut FileTime,
+        user: *mut FileTime,
     ) -> i32;
     fn CloseHandle(handle: Handle) -> i32;
     fn GetLastError() -> u32;
@@ -85,8 +99,28 @@ pub struct WindowsProcessRow {
     pub parent_process_id: u32,
     pub thread_count: u32,
     pub executable_name: String,
+    pub creation_time: WindowsProcessCreationTime,
     pub image: WindowsProcessImage,
     pub evidence: WindowsProcessEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsProcessCreationTimeStatus {
+    Observed,
+    Inaccessible,
+    Vanished,
+    Error,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WindowsProcessCreationTime {
+    pub status: WindowsProcessCreationTimeStatus,
+    /// Raw Windows FILETIME ticks (100 ns units since 1601-01-01 UTC).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filetime_100ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -163,6 +197,7 @@ trait WindowsProcessApi {
         process_id: u32,
         aggregate_remaining: usize,
     ) -> WindowsProcessImage;
+    fn read_creation_time(&mut self, process_id: u32) -> WindowsProcessCreationTime;
 }
 
 struct NativeWindowsProcessApi;
@@ -221,6 +256,10 @@ impl WindowsProcessApi for NativeWindowsProcessApi {
         aggregate_remaining: usize,
     ) -> WindowsProcessImage {
         read_image_path_native(process_id, aggregate_remaining)
+    }
+
+    fn read_creation_time(&mut self, process_id: u32) -> WindowsProcessCreationTime {
+        read_creation_time_native(process_id)
     }
 }
 
@@ -362,12 +401,21 @@ fn collect_windows_processes_with_api<A: WindowsProcessApi>(
             }
             image
         };
+        let creation_time = api.read_creation_time(entry.process_id);
+        if creation_time.status != WindowsProcessCreationTimeStatus::Observed {
+            truncated = true;
+            diagnostics.push(creation_time_diagnostic(
+                entry.process_id,
+                creation_time.status,
+            ));
+        }
         rows.push(WindowsProcessRow {
             process_id: entry.process_id,
             parent_process_id: entry.parent_process_id,
             thread_count: entry.thread_count,
             executable_name: name.clone(),
             image,
+            creation_time,
             evidence: WindowsProcessEvidence {
                 snapshot_source: "ToolHelp32Snapshot/PROCESSENTRY32W",
                 snapshot_index: index,
@@ -446,6 +494,69 @@ fn read_image_path_native(process_id: u32, aggregate_remaining: usize) -> Window
         };
     }
     decode_image_path(&buffer[..length])
+}
+
+fn read_creation_time_native(process_id: u32) -> WindowsProcessCreationTime {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if handle.is_null() {
+        return empty_creation_time(creation_time_status(unsafe { GetLastError() }));
+    }
+    let handle = OwnedHandle(handle);
+    let mut creation = FileTime { low: 0, high: 0 };
+    let mut exit = FileTime { low: 0, high: 0 };
+    let mut kernel = FileTime { low: 0, high: 0 };
+    let mut user = FileTime { low: 0, high: 0 };
+    if unsafe { GetProcessTimes(handle.0, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+        return empty_creation_time(creation_time_status(unsafe { GetLastError() }));
+    }
+    WindowsProcessCreationTime {
+        status: WindowsProcessCreationTimeStatus::Observed,
+        filetime_100ns: Some(((creation.high as u64) << 32) | creation.low as u64),
+        source: Some("OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)/GetProcessTimes"),
+    }
+}
+
+fn creation_time_status(error: u32) -> WindowsProcessCreationTimeStatus {
+    match error {
+        ERROR_ACCESS_DENIED => WindowsProcessCreationTimeStatus::Inaccessible,
+        ERROR_INVALID_HANDLE | ERROR_INVALID_PARAMETER | ERROR_NOT_FOUND => {
+            WindowsProcessCreationTimeStatus::Vanished
+        }
+        _ => WindowsProcessCreationTimeStatus::Error,
+    }
+}
+
+fn empty_creation_time(status: WindowsProcessCreationTimeStatus) -> WindowsProcessCreationTime {
+    WindowsProcessCreationTime {
+        status,
+        filetime_100ns: None,
+        source: None,
+    }
+}
+
+fn creation_time_diagnostic(
+    process_id: u32,
+    status: WindowsProcessCreationTimeStatus,
+) -> WindowsProcessDiagnostic {
+    let (code, message) = match status {
+        WindowsProcessCreationTimeStatus::Inaccessible => (
+            "process_creation_time_inaccessible",
+            "Windows denied access to this process creation time.",
+        ),
+        WindowsProcessCreationTimeStatus::Vanished => (
+            "process_creation_time_vanished",
+            "The process disappeared before its creation time could be read.",
+        ),
+        WindowsProcessCreationTimeStatus::Error => (
+            "process_creation_time_query_failed",
+            "Windows could not query this process creation time.",
+        ),
+        WindowsProcessCreationTimeStatus::Observed => (
+            "unexpected_creation_time_status",
+            "An unexpected process creation time status was returned.",
+        ),
+    };
+    diagnostic(code, Some(process_id), message)
 }
 
 fn decode_image_path(units: &[u16]) -> WindowsProcessImage {
@@ -544,7 +655,7 @@ fn finish(
     };
     WindowsProcessInventoryDocument {
         schema: "sideeffect.windows_process_inventory",
-        schema_version: 1,
+        schema_version: 2,
         platform: "windows",
         scope: "toolhelp_process_snapshot_and_queryable_image_paths",
         capture_started_at_unix_ms: started_at,
@@ -573,6 +684,7 @@ mod tests {
         entries: Vec<ProcessEntry32W>,
         next_index: usize,
         images: HashMap<u32, WindowsProcessImage>,
+        creation_times: HashMap<u32, WindowsProcessCreationTime>,
     }
 
     impl FakeProcessApi {
@@ -584,6 +696,7 @@ mod tests {
                 entries,
                 next_index: 0,
                 images: HashMap::new(),
+                creation_times: HashMap::new(),
             }
         }
     }
@@ -634,6 +747,13 @@ mod tests {
                 .cloned()
                 .unwrap_or_else(|| empty_image(WindowsProcessImageStatus::Error))
         }
+
+        fn read_creation_time(&mut self, process_id: u32) -> WindowsProcessCreationTime {
+            self.creation_times
+                .get(&process_id)
+                .cloned()
+                .unwrap_or_else(|| empty_creation_time(WindowsProcessCreationTimeStatus::Error))
+        }
     }
 
     fn entry(name: &[u16], process_id: u32) -> ProcessEntry32W {
@@ -652,6 +772,14 @@ mod tests {
             status: WindowsProcessImageStatus::Observed,
             path: Some(path.to_owned()),
             utf16_code_units: Some(path.encode_utf16().count()),
+        }
+    }
+
+    fn observed_creation_time(filetime_100ns: u64) -> WindowsProcessCreationTime {
+        WindowsProcessCreationTime {
+            status: WindowsProcessCreationTimeStatus::Observed,
+            filetime_100ns: Some(filetime_100ns),
+            source: Some("synthetic GetProcessTimes result"),
         }
     }
 
@@ -743,6 +871,7 @@ mod tests {
         api.enumeration_error_at = Some(1);
         api.images
             .insert(10, observed_image(r"C:\Program Files\first.exe"));
+        api.creation_times.insert(10, observed_creation_time(1234));
 
         let document = collect_windows_processes_with_api(&mut api);
 
@@ -752,6 +881,10 @@ mod tests {
         assert_eq!(
             document.processes[0].image.status,
             WindowsProcessImageStatus::Observed
+        );
+        assert_eq!(
+            document.processes[0].creation_time.filetime_100ns,
+            Some(1234)
         );
         assert!(
             document
@@ -799,5 +932,30 @@ mod tests {
                 .iter()
                 .any(|item| { item.code == "process_vanished" && item.process_id == Some(12) })
         );
+    }
+
+    #[test]
+    fn unavailable_creation_time_is_preserved_and_makes_inventory_partial() {
+        let mut api = FakeProcessApi::with_entries(vec![entry(
+            &"restricted.exe".encode_utf16().collect::<Vec<_>>(),
+            19,
+        )]);
+        api.images.insert(19, observed_image(r"C:\restricted.exe"));
+        api.creation_times.insert(
+            19,
+            empty_creation_time(WindowsProcessCreationTimeStatus::Inaccessible),
+        );
+
+        let document = collect_windows_processes_with_api(&mut api);
+
+        assert_eq!(document.status, WindowsProcessInventoryStatus::Partial);
+        assert_eq!(
+            document.processes[0].creation_time.status,
+            WindowsProcessCreationTimeStatus::Inaccessible
+        );
+        assert_eq!(document.processes[0].creation_time.filetime_100ns, None);
+        assert!(document.source.diagnostics.iter().any(|item| {
+            item.code == "process_creation_time_inaccessible" && item.process_id == Some(19)
+        }));
     }
 }

@@ -419,7 +419,7 @@ impl AuditSessionManifest {
                     || !source_artifact_kinds.insert(artifact.kind)
                     || artifact.path != path
                     || artifact.schema != schema
-                    || artifact.schema_version != version
+                    || !artifact_version_supported(artifact.kind, artifact.schema_version, version)
                 {
                     return Err(ValidationError::ArtifactContractMismatch);
                 }
@@ -451,6 +451,15 @@ impl AuditSessionManifest {
     }
 }
 
+fn artifact_version_supported(kind: ArtifactKind, observed: u32, current: u32) -> bool {
+    observed == current
+        || (observed == 1
+            && matches!(
+                kind,
+                ArtifactKind::Processes | ArtifactKind::WindowsProcesses
+            ))
+}
+
 fn expected_artifacts(
     role: SourceRole,
     platform: &str,
@@ -479,7 +488,7 @@ fn artifact_contract(
 ) -> Result<(&'static str, &'static str, u32), ValidationError> {
     Ok(match kind {
         ArtifactKind::Packages => ("packages.json", "sideeffect.inventory", 2),
-        ArtifactKind::Processes => ("processes.json", "sideeffect.process_inventory", 1),
+        ArtifactKind::Processes => ("processes.json", "sideeffect.process_inventory", 2),
         ArtifactKind::Permissions => ("permissions.json", "sideeffect.permission_inventory", 1),
         ArtifactKind::Startup => ("startup.json", "sideeffect.startup_inventory", 2),
         ArtifactKind::WindowsSoftware => (
@@ -490,7 +499,7 @@ fn artifact_contract(
         ArtifactKind::WindowsProcesses => (
             "processes.windows.json",
             "sideeffect.windows_process_inventory",
-            1,
+            2,
         ),
         ArtifactKind::WindowsPermissions => (
             "permissions.windows.json",
@@ -909,6 +918,20 @@ mod tests {
             manifest.validate(),
             Err(ValidationError::ArtifactContractMismatch)
         );
+    }
+
+    #[test]
+    fn process_artifact_contracts_accept_legacy_v1_and_current_v2() {
+        for kind in [ArtifactKind::Processes, ArtifactKind::WindowsProcesses] {
+            assert!(super::artifact_version_supported(kind, 1, 2));
+            assert!(super::artifact_version_supported(kind, 2, 2));
+            assert!(!super::artifact_version_supported(kind, 3, 2));
+        }
+        assert!(!super::artifact_version_supported(
+            ArtifactKind::Packages,
+            1,
+            2
+        ));
     }
 
     #[test]

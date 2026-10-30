@@ -42,7 +42,7 @@ fn live_proc_inventory_writes_private_schema_without_fixed_count_assumptions() {
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     let value: serde_json::Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
     assert_eq!(value["schema"], "sideeffect.process_inventory");
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["schema_version"], 2);
     assert_eq!(value["platform"], "linux");
     assert_eq!(value["scope"], "numeric_proc_status_entries");
     assert!(value["capture_started_at_unix_ms"].as_u64().is_some());
@@ -63,6 +63,20 @@ fn live_proc_inventory_writes_private_schema_without_fixed_count_assumptions() {
         matches!(
             row["executable_link"]["status"].as_str(),
             Some("observed" | "inaccessible" | "vanished" | "over_limit" | "unsupported" | "error")
+        )
+    }));
+    assert!(value["processes"].as_array().unwrap().iter().all(|row| {
+        matches!(
+            row["start_time"]["status"].as_str(),
+            Some(
+                "observed"
+                    | "inaccessible"
+                    | "vanished"
+                    | "malformed"
+                    | "pid_mismatch"
+                    | "changed_during_read"
+                    | "not_checked"
+            )
         )
     }));
     let collision = Command::new(env!("CARGO_BIN_EXE_sideeffect"))

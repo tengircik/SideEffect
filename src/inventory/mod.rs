@@ -64,13 +64,14 @@ pub use processes::{
     MAX_AGGREGATE_STATUS_BYTES, MAX_PROCESS_DIRECTORIES, ProcessDiagnostic, ProcessEvidence,
     ProcessExecutableEvidence, ProcessExecutableLink, ProcessExecutableLinkStatus,
     ProcessInventoryDocument, ProcessInventorySource, ProcessInventoryStatus, ProcessRow,
-    collect_processes, collect_processes_from,
+    ProcessStartTime, ProcessStartTimeEvidence, ProcessStartTimeStatus, collect_processes,
+    collect_processes_from,
 };
 #[cfg(windows)]
 pub use processes_windows::{
-    WindowsProcessDiagnostic, WindowsProcessImage, WindowsProcessImageStatus,
-    WindowsProcessInventoryDocument, WindowsProcessInventoryStatus, WindowsProcessRow,
-    collect_windows_processes,
+    WindowsProcessCreationTime, WindowsProcessCreationTimeStatus, WindowsProcessDiagnostic,
+    WindowsProcessImage, WindowsProcessImageStatus, WindowsProcessInventoryDocument,
+    WindowsProcessInventoryStatus, WindowsProcessRow, collect_windows_processes,
 };
 #[cfg(target_os = "linux")]
 pub use startup::{

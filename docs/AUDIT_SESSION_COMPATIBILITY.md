@@ -1,6 +1,6 @@
 # Audit session compatibility
 
-The `sideeffect.audit_session` v3 manifest is a platform-neutral envelope. Readers also accept v1 and v2 manifests; v1 has no `coverage_manifest`, so its coverage status is rendered as `unknown`. Native inventory and runtime artifacts keep their own schemas. A reader accepts only the exact combinations below; it does not migrate artifact versions or treat an unknown source as complete. Unknown platform strings and artifact contracts are rejected.
+The `sideeffect.audit_session` v3 manifest is a platform-neutral envelope. Readers also accept v1 and v2 manifests; v1 has no `coverage_manifest`, so its coverage status is rendered as `unknown`. Native inventory and runtime artifacts keep their own schemas. Process artifact readers accept both their historical v1 and current v2 contracts so earlier sessions remain reviewable; new collectors write v2. Other artifact contracts remain exact. The reader does not migrate artifact versions or treat an unknown source as complete. Unknown platform strings and artifact contracts are rejected.
 
 V2 includes a bounded `coverage_manifest` with version 1 and one status per selected source role. Status is one of `observed`, `configured`, `not_observed`, `not_checked`, `unsupported`, `inaccessible`, `partial`, or `unknown`. The current producers report `configured` for a complete startup source, `observed` for a complete selected inventory snapshot, preserve partial/not-checked/unsupported/access-denied as `partial`/`not_checked`/`unsupported`/`inaccessible`, and use `unknown` for other incomplete states. Here `observed` means the selected inventory was read; it does not claim runtime activity. Runtime capture remains partial today. These values describe the selected collector result only; they do not assert exhaustive OS coverage.
 
@@ -9,13 +9,13 @@ V3 retains that coverage map and adds bounded per-source requested settings, sou
 | Platform | Source role | Fixed artifact | Native schema | Version |
 | --- | --- | --- | --- | ---: |
 | Linux | packages | `packages.json` | `sideeffect.inventory` | 2 |
-| Linux | processes | `processes.json` | `sideeffect.process_inventory` | 1 |
+| Linux | processes | `processes.json` | `sideeffect.process_inventory` | 2 |
 | Linux | permissions | `permissions.json` | `sideeffect.permission_inventory` | 1 |
 | Linux | startup | `startup.json` | `sideeffect.startup_inventory` | 2 |
 | Linux | runtime | `run.json` | `sideeffect.run` | 2 |
 | Linux | runtime | `trace.strace` | `strace_text` | 1 |
 | Windows | packages/software registrations | `software.windows.json` | `sideeffect.windows_software_inventory` | 1 |
-| Windows | processes | `processes.windows.json` | `sideeffect.windows_process_inventory` | 1 |
+| Windows | processes | `processes.windows.json` | `sideeffect.windows_process_inventory` | 2 |
 | Windows | permissions | `permissions.windows.json` | `sideeffect.windows_permission_inventory` | 1 |
 | Windows | startup | `startup.windows.json` | `sideeffect.windows_startup_inventory` | 4 |
 | Windows | runtime | `runtime.windows.json` | `sideeffect.windows_runtime_capture` | 3 |

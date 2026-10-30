@@ -39,6 +39,7 @@ fn windows_process_command_includes_current_test_process_and_refuses_overwrite()
     let bytes = fs::read(&output).unwrap();
     let document: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(document["schema"], "sideeffect.windows_process_inventory");
+    assert_eq!(document["schema_version"], 2);
     assert_eq!(document["platform"], "windows");
     assert_eq!(
         document["scope"],
@@ -49,6 +50,16 @@ fn windows_process_command_includes_current_test_process_and_refuses_overwrite()
         row["process_id"] == std::process::id()
             && row["evidence"]["snapshot_source"] == "ToolHelp32Snapshot/PROCESSENTRY32W"
     }));
+    let current = document["processes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["process_id"] == std::process::id())
+        .unwrap();
+    assert!(matches!(
+        current["creation_time"]["status"].as_str(),
+        Some("observed" | "inaccessible" | "vanished" | "error")
+    ));
 
     let second = run(&directory, &output);
     assert!(!second.status.success());

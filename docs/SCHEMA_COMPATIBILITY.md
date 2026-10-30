@@ -9,14 +9,14 @@ This document describes the versioned formats currently emitted by SideEffect an
 | Trace inspection JSON | No `schema` name field; `schema_version` 7 | `inspect TRACE`, `inspect --bundle DIR` | Not imported as JSON. `inspect` and `diff` read bounded raw `strace` text. |
 | Trace diff JSON | No `schema` name field; `schema_version` 3 | `diff` and `diff --bundles` | Not imported as JSON by current commands. |
 | Linux package inventory | `sideeffect.inventory` v2 | Linux `inventory packages` | Package inventory comparison accepts v2 only. Session inspection checks the declared header/version and hash, not every inventory field. |
-| Linux process inventory | `sideeffect.process_inventory` v1 | Linux `inventory processes` | No standalone semantic importer. Session inspection checks the declared header/version and hash. |
+| Linux process inventory | `sideeffect.process_inventory` v2 (session readers also accept v1) | Linux `inventory processes` | No standalone semantic importer. Session inspection checks the declared header/version and hash. |
 | Linux permission inventory | `sideeffect.permission_inventory` v1 | Linux `inventory permissions` | No standalone semantic importer. Session inspection checks the declared header/version and hash. |
 | Linux aggregate startup inventory | `sideeffect.startup_inventory` v2 | Linux `inventory startup` | `correlate-startup` accepts v2 as saved input; session inspection checks its declared header/version and hash. |
 | Linux XDG startup component | `sideeffect.xdg_autostart_inventory` v1 | Nested in the Linux aggregate startup inventory | No standalone importer. |
 | Linux systemd component | `sideeffect.systemd_unit_inventory` v1 | Nested in the Linux aggregate startup inventory | No standalone importer. |
 | Linux legacy startup component | `sideeffect.legacy_startup_inventory` v1 | Nested in the Linux aggregate startup inventory | No standalone importer. |
 | Windows software inventory | `sideeffect.windows_software_inventory` v1 | Windows `inventory packages` | No standalone semantic importer. Session inspection checks the declared header/version and hash. |
-| Windows process inventory | `sideeffect.windows_process_inventory` v1 | Windows `inventory processes` | No standalone semantic importer. Session inspection checks the declared header/version and hash. |
+| Windows process inventory | `sideeffect.windows_process_inventory` v2 (session readers also accept v1) | Windows `inventory processes` | No standalone semantic importer. Session inspection checks the declared header/version and hash. |
 | Windows permission inventory | `sideeffect.windows_permission_inventory` v1 | Windows `inventory permissions` | No standalone semantic importer. Session inspection checks the declared header/version and hash. |
 | Windows startup inventory | `sideeffect.windows_startup_inventory` v4 | Windows `inventory startup` | No standalone semantic importer. Session inspection checks the declared header/version and hash. |
 | Linux run bundle manifest | `sideeffect.run` v2 | Linux `record --bundle` | Linux `inspect --bundle` and `diff --bundles` accept v1 and v2. |
@@ -57,13 +57,13 @@ The audit-session envelope is platform-neutral. Its current exact artifact contr
 | Platform | Role | Fixed artifact | Artifact schema / version |
 | --- | --- | --- | --- |
 | Linux | Packages | `packages.json` | `sideeffect.inventory` v2 |
-| Linux | Processes | `processes.json` | `sideeffect.process_inventory` v1 |
+| Linux | Processes | `processes.json` | `sideeffect.process_inventory` v2 |
 | Linux | Permissions | `permissions.json` | `sideeffect.permission_inventory` v1 |
 | Linux | Startup | `startup.json` | `sideeffect.startup_inventory` v2 |
 | Linux | Runtime | `run.json` | `sideeffect.run` v2 |
 | Linux | Runtime | `trace.strace` | `strace_text` v1 |
 | Windows | Packages/software registrations | `software.windows.json` | `sideeffect.windows_software_inventory` v1 |
-| Windows | Processes | `processes.windows.json` | `sideeffect.windows_process_inventory` v1 |
+| Windows | Processes | `processes.windows.json` | `sideeffect.windows_process_inventory` v2 |
 | Windows | Permissions | `permissions.windows.json` | `sideeffect.windows_permission_inventory` v1 |
 | Windows | Startup | `startup.windows.json` | `sideeffect.windows_startup_inventory` v4 |
 | Windows | Runtime | `runtime.windows.json` | `sideeffect.windows_runtime_capture` v3 |

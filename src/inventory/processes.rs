@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const MAX_PROCESS_DIRECTORIES: usize = 8_192;
 pub const MAX_STATUS_BYTES: usize = 64 * 1024;
+pub const MAX_PROCESS_STAT_BYTES: usize = 4 * 1024;
 pub const MAX_AGGREGATE_STATUS_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_PROCESS_SCAN_DURATION: Duration = Duration::from_secs(10);
 pub const MAX_EXECUTABLE_LINK_BYTES: usize = 4 * 1024;
@@ -44,6 +45,7 @@ pub struct ProcessInventorySource {
 #[derive(Clone, Debug, Serialize)]
 pub struct ProcessRow {
     pub pid: u32,
+    pub start_time: ProcessStartTime,
     pub executable_link: ProcessExecutableLink,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -72,6 +74,38 @@ pub struct ProcessRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seccomp: Option<u32>,
     pub evidence: Vec<ProcessEvidence>,
+}
+
+/// Kernel process-generation evidence. The raw clock ticks are intentionally
+/// retained; converting them to wall time would require an additional clock
+/// source and would not improve PID-reuse discrimination.
+#[derive(Clone, Debug, Serialize)]
+pub struct ProcessStartTime {
+    pub status: ProcessStartTimeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticks_since_boot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<ProcessStartTimeEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessStartTimeStatus {
+    NotChecked,
+    Observed,
+    Inaccessible,
+    Vanished,
+    Malformed,
+    PidMismatch,
+    ChangedDuringRead,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProcessStartTimeEvidence {
+    pub source: String,
+    pub byte_length: usize,
+    pub record_sha256: String,
+    pub field_number: u8,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -234,6 +268,7 @@ fn collect_with_limits(root: &Path, limits: Limits) -> ProcessInventoryDocument 
             break;
         }
         directories_seen += 1;
+        let start_time_before = read_process_start_time(&directory, pid);
         let path = directory.join("status");
         let remaining = limits.aggregate.saturating_sub(total_bytes);
         if remaining == 0 {
@@ -312,6 +347,16 @@ fn collect_with_limits(root: &Path, limits: Limits) -> ProcessInventoryDocument 
                     empty_executable_link(status)
                 }
             };
+        let start_time_after = read_process_start_time(&directory, pid);
+        row.start_time = match (start_time_before, start_time_after) {
+            (Ok(before), Ok(after)) if before.ticks_since_boot == after.ticks_since_boot => before,
+            (Ok(_), Ok(_)) => empty_start_time(ProcessStartTimeStatus::ChangedDuringRead),
+            (Err(status), _) | (_, Err(status)) => empty_start_time(status),
+        };
+        if row.start_time.status != ProcessStartTimeStatus::Observed {
+            partial = true;
+            diagnostics.push(start_time_diagnostic(pid, row.start_time.status));
+        }
         rows.push(row);
         diagnostics.append(&mut row_diags);
     }
@@ -340,7 +385,7 @@ fn finish(
     };
     ProcessInventoryDocument {
         schema: "sideeffect.process_inventory",
-        schema_version: 1,
+        schema_version: 2,
         platform: "linux",
         scope: "numeric_proc_status_entries",
         capture_started_at_unix_ms: started,
@@ -380,6 +425,105 @@ fn read_bounded_status(path: &Path, limit: usize) -> Result<Vec<u8>, ReadStatusE
     Ok(bytes)
 }
 
+fn read_process_start_time(
+    directory: &Path,
+    expected_pid: u32,
+) -> Result<ProcessStartTime, ProcessStartTimeStatus> {
+    let bytes =
+        read_bounded_status(&directory.join("stat"), MAX_PROCESS_STAT_BYTES).map_err(|error| {
+            match error {
+                ReadStatusError::Vanished => ProcessStartTimeStatus::Vanished,
+                ReadStatusError::TooLarge(_) => ProcessStartTimeStatus::Malformed,
+                ReadStatusError::Unreadable(_) => ProcessStartTimeStatus::Inaccessible,
+            }
+        })?;
+    parse_process_start_time(&bytes, expected_pid)
+}
+
+fn parse_process_start_time(
+    bytes: &[u8],
+    expected_pid: u32,
+) -> Result<ProcessStartTime, ProcessStartTimeStatus> {
+    let record = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let separator = record
+        .iter()
+        .rposition(|byte| *byte == b')')
+        .ok_or(ProcessStartTimeStatus::Malformed)?;
+    let pid_separator = record
+        .iter()
+        .position(|byte| byte.is_ascii_whitespace())
+        .ok_or(ProcessStartTimeStatus::Malformed)?;
+    let reported_pid = std::str::from_utf8(&record[..pid_separator])
+        .ok()
+        .and_then(|text| text.parse::<u32>().ok())
+        .ok_or(ProcessStartTimeStatus::Malformed)?;
+    if reported_pid != expected_pid {
+        return Err(ProcessStartTimeStatus::PidMismatch);
+    }
+    if separator < pid_separator || record.get(pid_separator + 1) != Some(&b'(') {
+        return Err(ProcessStartTimeStatus::Malformed);
+    }
+    // After the closing comm parenthesis, token 0 is field 3 (state), making
+    // field 22 (starttime) token 19. Using the final ')' handles ')' in comm.
+    let fields = record[separator + 1..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    let ticks_since_boot = fields
+        .get(19)
+        .and_then(|field| std::str::from_utf8(field).ok())
+        .and_then(|text| text.parse::<u64>().ok())
+        .ok_or(ProcessStartTimeStatus::Malformed)?;
+    Ok(ProcessStartTime {
+        status: ProcessStartTimeStatus::Observed,
+        ticks_since_boot: Some(ticks_since_boot),
+        evidence: Some(ProcessStartTimeEvidence {
+            source: "procfs:/proc/<pid>/stat".to_owned(),
+            byte_length: bytes.len(),
+            record_sha256: sha256_hex(record),
+            field_number: 22,
+        }),
+    })
+}
+
+fn empty_start_time(status: ProcessStartTimeStatus) -> ProcessStartTime {
+    ProcessStartTime {
+        status,
+        ticks_since_boot: None,
+        evidence: None,
+    }
+}
+
+fn start_time_diagnostic(pid: u32, status: ProcessStartTimeStatus) -> ProcessDiagnostic {
+    let (code, message) = match status {
+        ProcessStartTimeStatus::Inaccessible => (
+            "process_start_time_inaccessible",
+            "The process start-time record could not be read due to access restrictions.",
+        ),
+        ProcessStartTimeStatus::Vanished => (
+            "process_start_time_vanished",
+            "The process disappeared while its start time was being checked.",
+        ),
+        ProcessStartTimeStatus::Malformed => (
+            "process_start_time_malformed",
+            "The process start-time record was malformed or exceeded its size limit.",
+        ),
+        ProcessStartTimeStatus::PidMismatch => (
+            "process_start_time_pid_mismatch",
+            "The process start-time record PID did not match its procfs directory.",
+        ),
+        ProcessStartTimeStatus::ChangedDuringRead => (
+            "process_identity_changed_during_read",
+            "The process start-time value changed during collection; generation evidence is unknown.",
+        ),
+        ProcessStartTimeStatus::Observed | ProcessStartTimeStatus::NotChecked => (
+            "process_start_time_unavailable",
+            "The process start-time value was not observed.",
+        ),
+    };
+    diag(code, Some(pid), Some("starttime"), message)
+}
+
 fn diag(
     code: &'static str,
     pid: Option<u32>,
@@ -389,6 +533,7 @@ fn diag(
     ProcessDiagnostic {
         code,
         pid,
+        start_time: empty_start_time(ProcessStartTimeStatus::NotChecked),
         field,
         message,
         evidence: None,
@@ -757,6 +902,11 @@ mod tests {
             fs::create_dir(&d).unwrap();
             fs::write(d.join("status"), bytes).unwrap();
         }
+        fn stat(&self, pid: u32, bytes: &[u8]) {
+            let d = self.0.join(pid.to_string());
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("stat"), bytes).unwrap();
+        }
         fn executable_link(&self, pid: u32, target: &[u8]) {
             let directory = self.0.join(pid.to_string());
             fs::create_dir_all(&directory).unwrap();
@@ -784,6 +934,70 @@ mod tests {
         );
         assert_eq!(ev.raw_source_line, "CapEff:\t0000000000000000");
         assert_eq!(ev.line_sha256, sha256_hex(line));
+    }
+
+    #[test]
+    fn parses_proc_stat_starttime_even_when_comm_contains_parentheses() {
+        // fields 3 through 21 follow comm; field 22 is starttime.
+        let stat = b"42 (worker ) pool) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987654\n";
+        let start_time = parse_process_start_time(stat, 42).unwrap();
+        assert_eq!(start_time.status, ProcessStartTimeStatus::Observed);
+        assert_eq!(start_time.ticks_since_boot, Some(987654));
+        assert_eq!(start_time.evidence.as_ref().unwrap().field_number, 22);
+        assert_eq!(
+            start_time.evidence.as_ref().unwrap().record_sha256,
+            sha256_hex(stat.strip_suffix(b"\n").unwrap())
+        );
+    }
+
+    #[test]
+    fn proc_stat_starttime_reports_pid_mismatch_and_malformed_records() {
+        let stat = b"43 (worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 100\n";
+        assert_eq!(
+            parse_process_start_time(stat, 42).unwrap_err(),
+            ProcessStartTimeStatus::PidMismatch
+        );
+        assert_eq!(
+            parse_process_start_time(b"42 (worker) S 1 2\n", 42).unwrap_err(),
+            ProcessStartTimeStatus::Malformed
+        );
+    }
+
+    #[test]
+    fn collection_keeps_malformed_and_vanished_starttime_states_explicit() {
+        let t = Temp::new();
+        t.status(42, VALID);
+        t.stat(42, b"not a proc stat record\n");
+        t.status(43, b"Name:\tworker\nPid:\t43\nTgid:\t43\nPPid:\t1\n");
+
+        let document = collect_with_limits(
+            &t.0,
+            Limits {
+                directories: 2,
+                status: MAX_STATUS_BYTES,
+                aggregate: MAX_AGGREGATE_STATUS_BYTES,
+            },
+        );
+
+        let malformed = document.processes.iter().find(|row| row.pid == 42).unwrap();
+        assert_eq!(
+            malformed.start_time.status,
+            ProcessStartTimeStatus::Malformed
+        );
+        let vanished = document.processes.iter().find(|row| row.pid == 43).unwrap();
+        assert_eq!(vanished.start_time.status, ProcessStartTimeStatus::Vanished);
+        assert!(
+            document.source.diagnostics.iter().any(|item| {
+                item.code == "process_start_time_malformed" && item.pid == Some(42)
+            })
+        );
+        assert!(
+            document
+                .source
+                .diagnostics
+                .iter()
+                .any(|item| { item.code == "process_start_time_vanished" && item.pid == Some(43) })
+        );
     }
     #[test]
     fn malformed_and_missing_fields_are_diagnostics() {
@@ -926,6 +1140,10 @@ mod tests {
     fn exact_status_limit_succeeds_and_limit_plus_one_is_partial() {
         let t = Temp::new();
         t.status(42, VALID);
+        t.stat(
+            42,
+            b"42 (worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987654\n",
+        );
         t.executable_link(42, b"/synthetic/not-opened");
         let doc = collect_with_limits(
             &t.0,
