@@ -1,8 +1,27 @@
 # SideEffect Improvement Roadmap
 
-**Status:** proposed future work; this document is not a schedule, implementation claim, or release promise. It expands the existing bounded audit product into a staged investigation workflow. Every phase is gated by evidence, privacy, and platform validation. Linux and native Windows have equal product priority. A capability is not considered part of the shared product until its supported workflow and limitations are documented and validated on both platforms, or an explicit platform-specific limitation is accepted and shown to users.
+**Status:** active investigation and delivery plan; this document is not a schedule, completion claim, or release promise. It expands the existing bounded audit product into a staged investigation workflow. Every phase is gated by evidence, privacy, and platform validation. Linux and native Windows have equal product priority. A capability is not considered part of the shared product until its supported workflow and limitations are documented and validated on both platforms, or an explicit platform-specific limitation is accepted and shown to users.
 
 This roadmap is based on the repository documentation and the technical critiques listed in the traceability matrix below. It is a planning synthesis, not a new code audit. Existing implementation status remains governed by `PRODUCT.md`, `ARCHITECTURE.md`, `PLAN.md`, compatibility records, and the security policy. A planned capability does not imply that a collector can observe every relevant system action.
+
+## Implementation status (2026-10-30)
+
+These are audited status summaries, not phase acceptance. “Partial” means useful code exists while the named phase gate remains open.
+
+| Milestone | Current status | Evidence and open gate |
+|---|---|---|
+| R0 — Scope and evidence quality | Partial | Audit-session v2-v5 coverage/source/host/collector metadata, process-generation evidence, and session comparability exist. A phase-wide source-by-source acceptance review remains open. |
+| R1 — Collector reliability | Partial | Bounded Linux trace fuzzing and real `strace` integration exist; an initial WSL benchmark now measures one real workload. Broad OS/provider matrices, loss/failure scenarios, sustained fuzzing, and representative performance measurements remain open. |
+| R2 — Software/process/startup discovery | Partial | Package, process, and startup snapshots exist; `inventory path-executables` now adds a bounded current-PATH inventory for Linux and Windows. Additional discovery adapters and configured/effective/observed startup separation remain open. |
+| R3 — Event model and timeline | Partial | Common event envelope v1 adapts Linux strace and Windows ETW records with evidence links and uncertainty. The integrated process graph, timeline, filtering, drilldown, and live-capture adapter acceptance remain open. |
+| R4 — Semantic diff and baselines | Partial | Exact Linux trace diff, Linux package comparison, and conservative Windows ETW comparison exist. Three-layer diff, normalized-field ledger, broader source comparisons, and reviewed behavioral baselines remain open. |
+| R5 — System-change intelligence | Partial | Package/ETW comparisons and candidate startup correlation exist. General before/after session and selected-root change review plus controlled cross-platform change scenarios remain open. |
+| R6 — Effective access analysis | Not implemented | Selected-path permission inventories exist; no identity- and policy-aware effective-access evaluator or native access-check acceptance exists. |
+| R7 — Queries, cases, reports, and GUI | Partial | Trace-specific optional model query paths, metadata review, and static reports exist. A deterministic cross-session query engine, case files, shared findings model, GUI, and reviewed redaction workflow remain open. |
+| R8 — Signed provenance | Not implemented | Artifact hashes check byte consistency only. Canonical signatures, user-controlled key lifecycle, offline trust states, and their privacy/test design remain open. |
+| R9 — Optional local-model assistance | Reopened; experimental | Model lifecycle and task-specific previews/analyses exist, but no candidate passes current quality gates. The R3-R7 evidence/query/case prerequisites and an independently reviewed integrated benchmark remain open; no model is approved. |
+
+The Linux benchmark method is documented in [TRACE_BENCHMARKING.md](TRACE_BENCHMARKING.md). Its single WSL2 run is a smoke measurement, not native-Linux or release-performance acceptance. R9 evaluation details and frozen results remain in the task-specific evaluation documents; schema-valid output alone is not evidence of useful analysis.
 
 ## Product outcome and boundaries
 

@@ -868,6 +868,7 @@ fn classify_process_opcode(opcode: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::{EvidenceReference, SourceCompleteness, from_windows_etw};
 
     #[test]
     fn control_trace_buffer_reserves_bounded_name_output_space() {
@@ -1050,6 +1051,218 @@ mod tests {
                 CollectionStatus::Partial
             );
         }
+    }
+
+    #[test]
+    fn common_envelope_keeps_qpc_header_context_payload_evidence_and_loss_state() {
+        let make_capture =
+            |event_loss: EventLoss,
+             collection_status: CollectionStatus,
+             stop_reason: StopReason,
+             diagnostics: Vec<String>| WindowsRuntimeCapture {
+                schema: WINDOWS_RUNTIME_CAPTURE_SCHEMA,
+                schema_version: WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION,
+                platform: "windows",
+                capture_profile: "synthetic_etw_fixture",
+                collection_status,
+                capture_completeness: "unknown",
+                started_at_unix_ms: 100,
+                ended_at_unix_ms: 200,
+                requested_duration_seconds: 1,
+                stop_reason,
+                target: TargetOutcome {
+                    process_id: 4242,
+                    exit_code: Some(0),
+                    status_available: true,
+                },
+                session: SessionMetadata {
+                    name: "synthetic-session",
+                    provider: "synthetic provider metadata",
+                    scope: "synthetic fixture only",
+                    buffer_size_kb_requested: 16,
+                    minimum_buffers_requested: 8,
+                    maximum_buffers_requested: 32,
+                    buffer_count_reported: 8,
+                    provider_process_id_header_semantics: "header context only",
+                },
+                limits: AppliedLimits {
+                    maximum_duration_seconds: 60,
+                    maximum_events: 50_000,
+                    maximum_total_payload_bytes: 8 * 1024 * 1024,
+                    maximum_payload_bytes_per_event: 64 * 1024,
+                    maximum_document_bytes: 32 * 1024 * 1024,
+                },
+                event_loss,
+                document_sha256: "00".repeat(32),
+                events: vec![NativeRuntimeEvent {
+                    record_ordinal: 1,
+                    provider_guid: "synthetic-provider-guid".to_owned(),
+                    event_id: 1,
+                    event_version: 0,
+                    opcode: 1,
+                    event_kind: "synthetic_process_start",
+                    header_process_id: 777,
+                    header_thread_id: 9,
+                    header_flags: 0,
+                    timestamp_qpc: 12345,
+                    raw_payload_hex: "010203".to_owned(),
+                    payload_decoding: None,
+                    observation_decoding: None,
+                }],
+                diagnostics,
+            };
+
+        let clean = make_capture(
+            EventLoss {
+                loss_statistics_available: true,
+                final_snapshot_available: true,
+                observation: "synthetic_fixture",
+                ..EventLoss::default()
+            },
+            CollectionStatus::Complete,
+            StopReason::TargetExited,
+            vec![],
+        );
+        let envelope = from_windows_etw(&clean);
+        assert_eq!(
+            envelope.source_state.completeness,
+            SourceCompleteness::Unknown
+        );
+        let reported_fingerprint = "00".repeat(32);
+        assert_eq!(
+            envelope.source.sha256.as_deref(),
+            Some(reported_fingerprint.as_str())
+        );
+        assert_eq!(envelope.events.len(), 1);
+        let event = &envelope.events[0];
+        assert_eq!(event.source_timestamp.as_ref().unwrap().value, "12345");
+        assert_eq!(
+            event.source_timestamp.as_ref().unwrap().clock_unit,
+            "ETW_QPC_ticks"
+        );
+        assert_eq!(event.identity_context[0].value, "777");
+        assert!(
+            event.identity_context[0]
+                .ambiguity
+                .contains("header context only")
+        );
+        let expected_payload_hash = format!("{:x}", Sha256::digest([1_u8, 2, 3]));
+        assert!(matches!(
+            &event.evidence,
+            EvidenceReference::WindowsEtwRecord {
+                record_ordinal: 1,
+                json_pointer,
+                raw_payload_sha256,
+            } if json_pointer == "/events/0" && raw_payload_sha256 == &expected_payload_hash
+        ));
+
+        let reported_loss = make_capture(
+            EventLoss {
+                events_lost: 1,
+                loss_statistics_available: true,
+                final_snapshot_available: true,
+                observation: "synthetic_fixture",
+                ..EventLoss::default()
+            },
+            CollectionStatus::Partial,
+            StopReason::EtwLossReported,
+            vec!["etw_reported_event_loss".to_owned()],
+        );
+        assert_eq!(
+            from_windows_etw(&reported_loss).source_state.completeness,
+            SourceCompleteness::Partial
+        );
+
+        let unavailable_loss = make_capture(
+            EventLoss {
+                observation: "unavailable",
+                ..EventLoss::default()
+            },
+            CollectionStatus::Partial,
+            StopReason::EtwStatisticsUnavailable,
+            vec![
+                "etw_loss_statistics_unavailable".to_owned(),
+                "etw_final_loss_statistics_unavailable".to_owned(),
+            ],
+        );
+        assert_eq!(
+            from_windows_etw(&unavailable_loss)
+                .source_state
+                .completeness,
+            SourceCompleteness::Unknown
+        );
+
+        let unrelated_diagnostic = make_capture(
+            EventLoss::default(),
+            CollectionStatus::Partial,
+            StopReason::EtwStatisticsUnavailable,
+            vec!["prefix_etw_loss_statistics_unavailable_suffix".to_owned()],
+        );
+        assert_eq!(
+            from_windows_etw(&unrelated_diagnostic)
+                .source_state
+                .completeness,
+            SourceCompleteness::Partial
+        );
+
+        let incomplete_statistics_without_partial_status = make_capture(
+            EventLoss::default(),
+            CollectionStatus::Complete,
+            StopReason::EtwStatisticsUnavailable,
+            vec![],
+        );
+        assert_eq!(
+            from_windows_etw(&incomplete_statistics_without_partial_status)
+                .source_state
+                .completeness,
+            SourceCompleteness::Unknown
+        );
+
+        let mut explicitly_complete = clean.clone();
+        explicitly_complete.capture_completeness = "complete";
+        assert_eq!(
+            from_windows_etw(&explicitly_complete)
+                .source_state
+                .completeness,
+            SourceCompleteness::Complete
+        );
+
+        let mut invalid_source_fingerprint = clean.clone();
+        invalid_source_fingerprint.document_sha256 = "not-a-sha256".to_owned();
+        let invalid_fingerprint_envelope = from_windows_etw(&invalid_source_fingerprint);
+        assert_eq!(invalid_fingerprint_envelope.source.sha256, None);
+        assert_eq!(
+            invalid_fingerprint_envelope.source_state.completeness,
+            SourceCompleteness::Partial
+        );
+
+        let mut oversized_payload = clean.clone();
+        oversized_payload.events[0].raw_payload_hex = "00".repeat(64 * 1024 + 1);
+        let oversized_envelope = from_windows_etw(&oversized_payload);
+        assert!(oversized_envelope.events.is_empty());
+        assert_eq!(
+            oversized_envelope.diagnostics[0].code,
+            "payload_size_limit_exceeded"
+        );
+        assert_eq!(
+            oversized_envelope.source_state.completeness,
+            SourceCompleteness::Partial
+        );
+
+        let mut excessive_diagnostics = clean.clone();
+        excessive_diagnostics.diagnostics = vec!["synthetic diagnostic".to_owned(); 300];
+        let bounded_diagnostics = from_windows_etw(&excessive_diagnostics);
+        assert_eq!(bounded_diagnostics.source_state.diagnostics.len(), 257);
+        assert!(
+            bounded_diagnostics
+                .source_state
+                .diagnostics
+                .contains(&"source_diagnostics_truncated".to_owned())
+        );
+        assert_eq!(
+            bounded_diagnostics.source_state.completeness,
+            SourceCompleteness::Partial
+        );
     }
 
     #[test]
