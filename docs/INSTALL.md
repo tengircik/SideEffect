@@ -105,6 +105,33 @@ cargo build --locked --release --bin sideeffect
 
 The binary remains in `target/release/`; this project does not install it into a system directory. Cargo may download locked Rust dependencies from the configured registry. Review organization or network policy before allowing dependency downloads.
 
+### Windows PowerShell: `sideeffect` is not recognized
+
+When installed from this source with `cargo install --path . --locked --bin sideeffect`, Cargo normally places `sideeffect.exe` in `%USERPROFILE%\.cargo\bin`. Check that the executable exists and runs:
+
+```powershell
+$cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+$sideeffectExe = Join-Path $cargoBin "sideeffect.exe"
+Test-Path -LiteralPath $sideeffectExe
+if (Test-Path -LiteralPath $sideeffectExe) { & $sideeffectExe --version }
+```
+
+Inspect which command PowerShell resolves and whether the Cargo bin directory is on this terminal's PATH:
+
+```powershell
+Get-Command sideeffect -All -ErrorAction SilentlyContinue | Format-List CommandType, Source, Definition
+where.exe sideeffect
+$env:Path -split ';' | Where-Object { $_ -ieq $cargoBin }
+```
+
+If PATH was just changed, close and reopen PowerShell (and any terminal or agent that should use it) so it receives the updated environment. You can run the verified installed executable directly without relying on PATH:
+
+```powershell
+& (Join-Path $env:USERPROFILE ".cargo\bin\sideeffect.exe") --version
+```
+
+If you used `cargo build --release` instead of `cargo install`, the binary is in the repository's `target\release\sideeffect.exe`; from the repository root, invoke it as `& .\target\release\sideeffect.exe --version`.
+
 Try the parser with the included synthetic trace:
 
 ```sh

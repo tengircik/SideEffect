@@ -4,15 +4,15 @@
 
 This roadmap is based on the repository documentation and the technical critiques listed in the traceability matrix below. It is a planning synthesis, not a new code audit. Existing implementation status remains governed by `PRODUCT.md`, `ARCHITECTURE.md`, `PLAN.md`, the [source acceptance matrix](SOURCE_ACCEPTANCE.md), compatibility records, and the security policy. A planned capability does not imply that a collector can observe every relevant system action.
 
-## Implementation status (2026-10-30)
+## Implementation status (2026-10-31)
 
 These are audited status summaries, not phase acceptance. “Partial” means useful code exists while the named phase gate remains open.
 
 | Milestone | Current status | Evidence and open gate |
 |---|---|---|
-| R0 — Scope and evidence quality | Partial | Audit-session v2-v5 coverage/source/host/collector metadata, process-generation evidence, and session comparability exist. A phase-wide source-by-source acceptance review remains open. |
-| R1 — Collector reliability | Partial | Bounded Linux trace fuzzing and real `strace` integration exist; an initial WSL benchmark now measures one real workload. Broad OS/provider matrices, loss/failure scenarios, sustained fuzzing, and representative performance measurements remain open. |
-| R2 — Software/process/startup discovery | Partial | Package, process, and startup snapshots exist; `inventory path-executables` covers current PATH on Linux and Windows, and Linux package discovery now includes optional Flatpak refs. Additional discovery adapters and configured/effective/observed startup separation remain open. |
+| R0 — Scope and evidence quality | Partial | Audit-session v2-v6 coverage/source/host/collector metadata, process-generation evidence, and session comparability exist. The source acceptance matrix documents current producer status vocabulary and limits; a phase-wide source-by-source acceptance review remains open. |
+| R1 — Collector reliability | Partial | Bounded Linux trace fuzzing and real `strace` integration exist; WSL scale measurements cover one smoke workload, with representative 10k/100k runs pending. Broad OS/provider matrices, loss/failure scenarios, sustained fuzzing, and cross-platform performance acceptance remain open. |
+| R2 — Software/process/startup discovery | Partial | Package, process, and startup snapshots exist; `inventory path-executables` covers current PATH on Linux and Windows, Linux audit sessions can include that bounded snapshot, and Linux package discovery includes optional Flatpak refs. Additional discovery adapters and configured/effective/observed startup separation remain open. |
 | R3 — Event model and timeline | Partial | Common event envelope v1 is exposed through bounded Linux strace and native Windows ETW CLI adapters with evidence links and uncertainty. The integrated process graph, timeline, filtering, drilldown, and live-capture adapter acceptance remain open. |
 | R4 — Semantic diff and baselines | Partial | Exact Linux trace diff, Linux package comparison, and conservative Windows ETW comparison exist. Three-layer diff, normalized-field ledger, broader source comparisons, and reviewed behavioral baselines remain open. |
 | R5 — System-change intelligence | Partial | Package/ETW comparisons and candidate startup correlation exist. General before/after session and selected-root change review plus controlled cross-platform change scenarios remain open. |
@@ -21,7 +21,7 @@ These are audited status summaries, not phase acceptance. “Partial” means us
 | R8 — Signed provenance | Not implemented | Artifact hashes check byte consistency only. Canonical signatures, user-controlled key lifecycle, offline trust states, and their privacy/test design remain open. |
 | R9 — Optional local-model assistance | Reopened; experimental | `model list/show/install/setup/add/select/remove` and task-specific previews/analyses exist, but no catalog candidate passes its quality gate. The inference runtime is a separate user-managed executable; only the explanation task exposes a product CUDA selector, with no recorded Linux CUDA acceptance. R3-R7 evidence/query/case prerequisites, a GPU/CPU usability review, and an independently reviewed integrated benchmark remain open; no model is approved. |
 
-The Linux benchmark method is documented in [TRACE_BENCHMARKING.md](TRACE_BENCHMARKING.md). Its single WSL2 run is a smoke measurement, not native-Linux or release-performance acceptance. R9 evaluation details and frozen results remain in the task-specific evaluation documents; schema-valid output alone is not evidence of useful analysis.
+The short Linux benchmark method is documented in [TRACE_BENCHMARKING.md](TRACE_BENCHMARKING.md); the 10k–1M scale procedure is documented in [TRACE_SCALE_BENCHMARKING.md](TRACE_SCALE_BENCHMARKING.md). WSL2 measurements are not native-Linux or release-performance acceptance. R9 evaluation details and frozen results remain in the task-specific evaluation documents; schema-valid output alone is not evidence of useful analysis.
 
 ## Product outcome and boundaries
 
