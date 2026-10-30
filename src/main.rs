@@ -32,6 +32,7 @@ use sideeffect::format::{
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{InventoryStatus, collect_packages};
 use sideeffect::inventory::{PackageComparisonStatus, compare_package_inventory_json};
+use sideeffect::inventory::{PathExecutableInventory, collect_path_executables};
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{PermissionInventoryStatus, collect_permissions};
 #[cfg(target_os = "linux")]
@@ -76,6 +77,7 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect attribute --windows-runtime <capture.json>\n\
        sideeffect inventory processes --output <new-inventory.json>\n\
        sideeffect inventory startup --output <new-inventory.json>\n\
+       sideeffect inventory path-executables --output <new-inventory.json>\n\
        sideeffect inventory permissions --output <new-inventory.json> <path>...\n\
        sideeffect audit --output <new-session-directory> [--packages] [--processes] [--startup] [--permission <path>]... [--runtime-duration-seconds <1..3600> -- <program> [args...]]\n\
        sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect record --trace <new-trace-file> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect help [command [subcommand]]\n       sideeffect version\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. On Linux, inventory packages reads available local dpkg, RPM, pacman, and APK databases; on Windows, it reads selected current-user and machine-wide Uninstall registry entries. Both are bounded source snapshots and can miss unregistered software. Windows does not use Win32_Product or launch uninstall commands. On Linux, inventory processes reads bounded numeric /proc status entries and executable-link identities; on Windows, it reads a Tool Help snapshot and queries accessible image paths. Neither adapter reads command lines or promises atomic or exhaustive coverage. On Linux, inventory startup discovers curated sources; on Windows, it inventories selected Run/RunOnce values, Startup folders, and visible service configuration and boot/logon triggers in tasks visible to the current token. For tasks, bounded Exec-action executable paths, arguments, and working directories are recorded as inert text; other action types remain unsupported with unknown action-specific fields. Neither platform establishes that a configured entry ran. Inventory permissions inspects only explicit Linux paths and records ownership/type/mode, supported POSIX ACLs, and Linux file-capability xattrs; it never follows the final path symlink or calculates effective access. Record follows a selected command's traced descendants and may enforce a requested wall-clock limit; this is observation, not isolation or a safety check.";
@@ -291,6 +293,13 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             if command == "inventory" && subcommand == "startup" && option == "--output" =>
         {
             inventory_startup(output)
+        }
+        [command, subcommand, option, output]
+            if command == "inventory"
+                && subcommand == "path-executables"
+                && option == "--output" =>
+        {
+            inventory_path_executables(output)
         }
         [command, subcommand, option, output, paths @ ..]
             if command == "inventory"
@@ -898,6 +907,29 @@ fn inventory_startup(output: &OsString) -> Result<ExitCode, String> {
     }
 }
 
+fn inventory_path_executables(output: &OsString) -> Result<ExitCode, String> {
+    let document: PathExecutableInventory = collect_path_executables();
+    let complete = document.status == "complete";
+    let mut json = CappedBuffer::new(MAX_REPORT_BYTES);
+    serde_json::to_writer(&mut json, &document).map_err(|error| format!("could not serialize PATH executable inventory within the {MAX_REPORT_BYTES} byte limit: {error}"))?;
+    #[cfg(target_os = "linux")]
+    let published = publish_private_file(Path::new(output), &json.bytes, MAX_REPORT_BYTES)
+        .map_err(|error| format!("could not publish private PATH executable inventory: {error}"))?;
+    #[cfg(windows)]
+    let published = publish_private_windows_file(Path::new(output), &json.bytes, MAX_REPORT_BYTES)
+        .map_err(|error| format!("could not publish private PATH executable inventory: {error}"))?;
+    eprintln!(
+        "Saved a {} current-process PATH executable-candidate snapshot to {}. Candidate rows are metadata heuristics, commands were not run, and PATH coverage may be partial.",
+        if complete { "complete" } else { "partial" },
+        terminal_safe_path(&published)
+    );
+    Ok(if complete {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
 fn inventory_permissions(output: &OsString, paths: &[OsString]) -> Result<ExitCode, String> {
     #[cfg(target_os = "linux")]
     {
@@ -1288,7 +1320,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             }
         }
         "inventory" => {
-            "Usage: sideeffect inventory packages|processes|startup|permissions --output FILE [PATH...]\nCollects bounded, local snapshots from sources supported on this platform. Sources are curated and coverage can be partial; inspect output and diagnostics before drawing conclusions."
+            "Usage: sideeffect inventory packages|processes|startup|path-executables|permissions --output FILE [PATH...]\nCollects bounded, local snapshots from sources supported on this platform. Sources are curated and coverage can be partial; inspect output and diagnostics before drawing conclusions."
         }
         "inventory startup" => {
             #[cfg(target_os = "linux")]
@@ -1331,6 +1363,9 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             {
                 "Usage: sideeffect inventory processes --output FILE\nProcess inventory is not supported on this platform."
             }
+        }
+        "inventory path-executables" => {
+            "Usage: sideeffect inventory path-executables --output FILE\nSnapshots the current process PATH and checks one directory level using platform metadata heuristics. It never executes candidates; symlinks/reparse points and limits make results partial."
         }
         "inventory permissions" => {
             #[cfg(target_os = "linux")]

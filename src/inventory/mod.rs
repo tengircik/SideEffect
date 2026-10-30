@@ -7,6 +7,7 @@ mod package_diff;
 mod packages;
 #[cfg(windows)]
 mod packages_windows;
+mod path_executables;
 #[cfg(target_os = "linux")]
 mod permissions;
 #[cfg(windows)]
@@ -34,6 +35,7 @@ pub use package_diff::{
     PackageIdentity, PackageInventoryComparison, PackageInventoryDelta, PackageSourceComparison,
     compare_package_inventories, compare_package_inventory_json,
 };
+pub use path_executables::{PathExecutableInventory, collect_path_executables};
 
 #[cfg(target_os = "linux")]
 pub use debian::collect_debian_packages;

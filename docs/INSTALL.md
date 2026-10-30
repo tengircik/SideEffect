@@ -121,6 +121,14 @@ This does not require `strace`. The fixture is illustrative data, not a capture 
 
 This native Windows inventory writes `sideeffect.windows_process_inventory` v2 using one Tool Help process snapshot and queries image paths and creation FILETIME only where `PROCESS_QUERY_LIMITED_INFORMATION` is available. Creation FILETIME is PID-generation evidence; inaccessible, vanished, or failed queries remain unknown and make the result partial. It does not read command lines, inspect memory, start processes, or request elevation. The snapshot and subsequent queries happen at different times, so processes can exit or identifiers can be reused between them. The scan is limited to 8,192 process entries, 10 seconds, 32,768 UTF-16 code units per path, 4 Mi aggregate path code units, and 64 MiB of JSON. The output is staged under an explicit current-user-only Windows DACL and is published without replacing an existing destination. Process names and image paths can be sensitive; review before sharing.
 
+## Find executable candidates on the current PATH
+
+```sh
+sideeffect inventory path-executables --output ./path-executables.json
+```
+
+The same command works on native Windows. It snapshots only the invoking process's current `PATH` and, on Windows, captured `PATHEXT`. It checks each directory one level deep, preserves order and duplicate components, and maps empty components to the current working directory with an explicit marker. Linux candidates are regular files with an execute bit; Windows candidates are regular files with a captured `PATHEXT` suffix; if `PATHEXT` is unavailable, regular-file rows remain unknown. These are metadata heuristics: SideEffect does not execute candidate files or recursively inspect directories. It skips symlinks/reparse points observed by metadata checks; concurrent filesystem replacements can race between a check and enumeration. It does not determine shell command resolution. Limits are 256 components, 4 KiB per Linux component or 32,767 UTF-16 units per Windows component, 20,000 directory entries, 16 MiB aggregate path/name bytes on Linux or UTF-16 code units on Windows, five seconds checked between operations, and 64 MiB serialized output. Limit, inaccessible, symlink/reparse, and unavailable-source conditions are represented as partial/unknown; partial results are written and exit with status `2`. The output is private and no-clobber. PATH values, names, and paths are sensitive; inspect the JSON before sharing.
+
 ## Experimental Windows process, file, and network capture
 
 ```powershell

@@ -84,6 +84,8 @@ sideeffect.exe inventory startup --output .\startup.json
 
 The inventory retains source-linked configuration facts for supported startup locations, including XDG, systemd, SysV, and cron on Linux; Windows Run/RunOnce entries, Startup folders, visible services, and visible Task Scheduler boot/logon triggers. Configured commands remain inert evidence.
 
+To inspect the current process's executable-name candidates, run `sideeffect inventory path-executables --output ./path-executables.json` (PowerShell: `sideeffect.exe inventory path-executables --output .\path-executables.json`). It snapshots only the current process `PATH`, checks each listed directory one level deep, and never runs discovered files. Rows label candidates, non-candidates, and unknown entries. Linux uses regular files with an execute bit; Windows uses regular files whose suffix matches the captured `PATHEXT`. Empty components map to the current working directory and are recorded. Results are heuristic, preserve PATH order and observed directory enumeration order (which may vary between runs), and may be partial; paths and names can reveal local configuration.
+
 ### Capture a selected Linux command
 
 ```sh
@@ -141,6 +143,7 @@ SideEffect provides a native Rust CLI for Linux x86_64 and Windows x64. The Linu
 - [Product scope](docs/PRODUCT.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Delivery plan](docs/PLAN.md)
+- [Linux real-trace benchmark methodology](docs/TRACE_BENCHMARKING.md)
 - [Security policy and private vulnerability reporting](SECURITY.md)
 - [Release notes](docs/RELEASE_NOTES.md)
 
