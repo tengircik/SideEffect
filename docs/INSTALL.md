@@ -217,11 +217,11 @@ The Windows adapter writes `sideeffect.windows_associated_behavior_summary` v1. 
 
 ```sh
 ./target/release/sideeffect audit --output ./audit-session \
-  --packages --processes --startup \
+  --packages --processes --startup --path-executables \
   --permission ./some/file --permission ./some/directory
 ```
 
-Specify one or more source selectors: `--packages`, `--processes`, `--startup`, and repeated `--permission PATH` options. Permission inspection is limited to the paths you name. The command does not record runtime activity. It stores each selected inventory in its native JSON schema beside a `session.json` manifest with per-source scope, timestamps, status, selected key limits, diagnostics, artifact length, schema, and SHA-256. Collections run over a best-effort interval, not an atomic system snapshot. Partial artifacts are retained and cause exit status `2`.
+Specify one or more source selectors: `--packages`, `--processes`, `--startup`, `--path-executables`, and repeated `--permission PATH` options. Permission inspection is limited to the paths you name. The PATH source records the same one-level metadata heuristic as `inventory path-executables`; it does not execute candidates or resolve commands through a shell. The command does not record runtime activity. It stores each selected inventory in its native JSON schema beside a `session.json` manifest with per-source scope, timestamps, status, selected key limits, diagnostics, artifact length, schema, and SHA-256. Collections run over a best-effort interval, not an atomic system snapshot. Partial artifacts are retained and cause exit status `2`.
 
 The complete directory is built in a private sibling staging directory and atomically published without overwriting an existing destination. On Linux, the session directory is mode `0700` and its files are mode `0600`. Windows inventory sessions and inspection are supported using a current-user-owned directory with a protected current-user-only DACL. An explicitly selected Windows runtime source can add its bounded ETW v3 capture as a fixed `runtime.windows.json` artifact in the same audit session; runtime and containing session status remain partial because capture completeness is unknown. Artifacts can contain sensitive system and user data. There is no automatic redaction, upload, or deletion.
 
@@ -231,7 +231,7 @@ To verify and review the session metadata:
 ./target/release/sideeffect inspect --format text --session ./audit-session
 ```
 
-The reader requires a current-user-owned private directory and private regular files, rejects symlinks and unlisted entries, checks bounded JSON syntax and declared schema/version headers, and verifies every declared artifact's length and SHA-256 before writing a review. It does not fully validate each inventory artifact's domain schema or print raw inventory rows. Use `--format json` for the versioned `sideeffect.audit_session_review` v4 output, which includes recorded host OS/version and caller privilege context, source settings, runtime loss state, and artifact provenance. Older session versions retain absent host context; it is not reconstructed. A hash match does not authenticate the session producer. Partial sessions are still reviewable and return exit status `2`.
+The reader requires a current-user-owned private directory and private regular files, rejects symlinks and unlisted entries, checks bounded JSON syntax and declared schema/version headers, and verifies every declared artifact's length and SHA-256 before writing a review. It does not fully validate each inventory artifact's domain schema or print raw inventory rows. Use `--format json` for the versioned `sideeffect.audit_session_review` v6 output, which includes recorded host OS/version and caller privilege context, source settings, runtime loss state, and artifact provenance. Older session versions retain absent host context; it is not reconstructed. A hash match does not authenticate the session producer. Partial sessions are still reviewable and return exit status `2`.
 
 ## Record a command on Linux
 
