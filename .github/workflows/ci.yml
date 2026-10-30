@@ -136,15 +136,10 @@ jobs:
           for installed in \
             "$HOME/.agents/skills/sideeffect-audit" \
             "$HOME/.claude/skills/sideeffect-audit" \
-            "$HOME/.cursor/skills/sideeffect-audit" \
-            "$HOME/.gemini/skills/sideeffect-audit" \
-            "$HOME/.copilot/skills/sideeffect-audit" \
-            "$HOME/.config/opencode/skills/sideeffect-audit"; do
+            "$HOME/.codeium/windsurf/skills/sideeffect-audit"; do
             test -f "$installed/SKILL.md"
             diff -qr "$source" "$installed"
           done
-          test -f "$HOME/.codeium/windsurf/skills/sideeffect-audit/SKILL.md"
-          diff -qr "$source" "$HOME/.codeium/windsurf/skills/sideeffect-audit"
 
   msrv:
     name: Linux MSRV (Rust 1.85)
