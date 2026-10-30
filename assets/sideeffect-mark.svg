@@ -1,20 +1,30 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="140" height="140" viewBox="0 0 140 140" role="img" aria-labelledby="title desc">
   <title id="title">SideEffect mark</title>
-  <desc id="desc">A terminal prompt and evidence ring form the SideEffect mark.</desc>
+  <desc id="desc">A magnifying lens reveals a captured activity trace on a dark blue field.</desc>
   <defs>
-    <linearGradient id="surface" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#101827"/>
-      <stop offset="1" stop-color="#1b2b3e"/>
+    <linearGradient id="surface" x1="12" y1="10" x2="128" y2="132" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#172438"/>
+      <stop offset="1" stop-color="#0d1726"/>
     </linearGradient>
-    <linearGradient id="signal" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#5eead4"/>
-      <stop offset="1" stop-color="#60a5fa"/>
+    <linearGradient id="signal" x1="31" y1="50" x2="104" y2="91" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#63e7d5"/>
+      <stop offset="1" stop-color="#65a9ff"/>
     </linearGradient>
+    <radialGradient id="lens-glow" cx="0" cy="0" r="1" gradientTransform="translate(77 57) rotate(90) scale(36)" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#253d59" stop-opacity=".75"/>
+      <stop offset="1" stop-color="#172438" stop-opacity=".08"/>
+    </radialGradient>
   </defs>
-  <rect x="5" y="5" width="130" height="130" rx="36" fill="url(#surface)" stroke="#334155" stroke-width="2"/>
-  <path d="m35 46 18 16-18 16" fill="none" stroke="url(#signal)" stroke-linecap="round" stroke-linejoin="round" stroke-width="8"/>
-  <path d="M62 79h18" fill="none" stroke="#e2e8f0" stroke-linecap="round" stroke-width="8"/>
-  <circle cx="88" cy="58" r="24" fill="none" stroke="#e2e8f0" stroke-width="6"/>
-  <path d="m105 75 13 13" fill="none" stroke="#e2e8f0" stroke-linecap="round" stroke-width="7"/>
-  <circle cx="88" cy="58" r="7" fill="url(#signal)"/>
+
+  <rect x="5" y="5" width="130" height="130" rx="35" fill="url(#surface)"/>
+  <rect x="5.75" y="5.75" width="128.5" height="128.5" rx="34.25" stroke="#91a8c4" stroke-opacity=".28" stroke-width="1.5"/>
+  <path d="M25 71h13l7-13 9 27 9-17h10" fill="none" stroke="url(#signal)" stroke-linecap="round" stroke-linejoin="round" stroke-width="5.5"/>
+  <circle cx="46" cy="58" r="2.5" fill="#83f3e3"/>
+  <circle cx="63" cy="68" r="2.5" fill="#88baff"/>
+
+  <circle cx="78" cy="59" r="26" fill="url(#lens-glow)" stroke="#e3edf8" stroke-width="5.5"/>
+  <path d="M59 70h7l5-9 6 16 6-11h12" fill="none" stroke="url(#signal)" stroke-linecap="round" stroke-linejoin="round" stroke-width="4.5"/>
+  <circle cx="94" cy="66" r="2.5" fill="#72c8ff"/>
+  <path d="m97 79 18 18" fill="none" stroke="#e3edf8" stroke-linecap="round" stroke-width="7"/>
+  <circle cx="78" cy="59" r="2.5" fill="#f4f8fd" fill-opacity=".9"/>
 </svg>
