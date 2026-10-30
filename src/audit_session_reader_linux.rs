@@ -536,6 +536,7 @@ fn fixed_entry_label(name: &[u8]) -> &'static str {
         b"packages.json" => "packages.json",
         b"processes.json" => "processes.json",
         b"startup.json" => "startup.json",
+        b"path-executables.json" => "path-executables.json",
         b"software.windows.json" => "software.windows.json",
         b"processes.windows.json" => "processes.windows.json",
         b"permissions.windows.json" => "permissions.windows.json",

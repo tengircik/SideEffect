@@ -52,6 +52,7 @@ fn audit_cli_publishes_private_session_with_verified_source_intervals_and_hashes
         .arg("--packages")
         .arg("--processes")
         .arg("--startup")
+        .arg("--path-executables")
         .arg("--permission")
         .arg(permission_target)
         .output()
@@ -76,6 +77,7 @@ fn audit_cli_publishes_private_session_with_verified_source_intervals_and_hashes
         names,
         [
             "packages.json",
+            "path-executables.json",
             "permissions.json",
             "processes.json",
             "session.json",
@@ -86,7 +88,7 @@ fn audit_cli_publishes_private_session_with_verified_source_intervals_and_hashes
     let manifest_bytes = fs::read(output.join("session.json")).unwrap();
     let manifest = parse_manifest(&manifest_bytes).unwrap();
     assert_eq!(manifest.platform, "linux");
-    assert_eq!(manifest.sources.len(), 4);
+    assert_eq!(manifest.sources.len(), 5);
     assert!(manifest.started_at_unix_ms <= manifest.ended_at_unix_ms);
     let roles = manifest
         .sources
@@ -99,6 +101,7 @@ fn audit_cli_publishes_private_session_with_verified_source_intervals_and_hashes
             SourceRole::Packages,
             SourceRole::Processes,
             SourceRole::Startup,
+            SourceRole::PathExecutables,
             SourceRole::Permissions
         ]
     );
@@ -142,12 +145,12 @@ fn audit_cli_publishes_private_session_with_verified_source_intervals_and_hashes
         if format == "json" {
             let review: serde_json::Value = serde_json::from_slice(&reviewed.stdout).unwrap();
             assert_eq!(review["schema"], "sideeffect.audit_session_review");
-            assert_eq!(review["schema_version"], 5);
+            assert_eq!(review["schema_version"], 6);
             assert!(review["sources"][0]["collector"]["id"].is_string());
             assert_eq!(review["host_context"]["os_name"]["status"], "observed");
             assert!(review["host_context"]["privilege"].is_string());
             assert_eq!(review["authenticity"], "not_established");
-            assert_eq!(review["sources"].as_array().unwrap().len(), 4);
+            assert_eq!(review["sources"].as_array().unwrap().len(), 5);
             assert!(review["sources"][0]["coverage_status"].is_string());
             assert_eq!(
                 review["sources"][0]["artifacts"][0]["integrity"],
@@ -186,6 +189,60 @@ fn audit_cli_publishes_private_session_with_verified_source_intervals_and_hashes
     assert!(
         String::from_utf8_lossy(&rejected.stderr).contains("audit session verification failed")
     );
+}
+
+#[test]
+fn partial_path_source_forces_partial_session_and_has_fixed_provenance() {
+    let directory = TestDirectory::new();
+    let output = directory.0.join("path.session");
+    let duplicate = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&output)
+        .arg("--path-executables")
+        .arg("--path-executables")
+        .output()
+        .unwrap();
+    assert_eq!(duplicate.status.code(), Some(1));
+    assert!(!output.exists());
+    let result = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&output)
+        .arg("--path-executables")
+        .env_remove("PATH")
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    let manifest = parse_manifest(&fs::read(output.join("session.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest.status,
+        sideeffect::audit_session::SessionStatus::Partial
+    );
+    let source = manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::PathExecutables)
+        .unwrap();
+    assert_eq!(source.status, SourceStatus::Partial);
+    assert_eq!(
+        manifest
+            .coverage_manifest
+            .as_ref()
+            .unwrap()
+            .sources
+            .iter()
+            .find(|source| source.role == SourceRole::PathExecutables)
+            .unwrap()
+            .status,
+        sideeffect::audit_session::CoverageStatus::Partial
+    );
+    assert_eq!(source.artifacts[0].path, "path-executables.json");
+    assert_eq!(
+        source.artifacts[0].schema,
+        "sideeffect.path_executable_inventory"
+    );
+    assert_eq!(source.artifacts[0].schema_version, 1);
 }
 
 #[test]

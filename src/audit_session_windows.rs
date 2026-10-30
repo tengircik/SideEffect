@@ -8,8 +8,8 @@ use crate::audit_session::{
 };
 use crate::fingerprint::sha256_hex;
 use crate::inventory::{
-    collect_windows_permissions, collect_windows_processes, collect_windows_software,
-    collect_windows_startup,
+    collect_path_executables, collect_windows_permissions, collect_windows_processes,
+    collect_windows_software, collect_windows_startup,
 };
 use crate::record::publish_private_windows_directory;
 use serde::Serialize;
@@ -26,6 +26,7 @@ pub struct WindowsAuditOptions {
     pub software: bool,
     pub processes: bool,
     pub startup: bool,
+    pub path_executables: bool,
     pub permission_paths: Vec<PathBuf>,
     pub include_runtime: bool,
     pub runtime_duration: Option<Duration>,
@@ -54,6 +55,7 @@ pub fn collect_and_publish(
     if !options.software
         && !options.processes
         && !options.startup
+        && !options.path_executables
         && options.permission_paths.is_empty()
         && !options.include_runtime
     {
@@ -182,6 +184,47 @@ pub fn collect_and_publish(
             "startup.windows.json",
             "sideeffect.windows_startup_inventory",
             4,
+            value,
+        ));
+    }
+    if options.path_executables {
+        let source_started = now_ms()?;
+        let doc = collect_path_executables();
+        let source_ended = now_ms()?;
+        let status = match doc.status {
+            "complete" => SourceStatus::Complete,
+            "partial" => SourceStatus::Partial,
+            _ => SourceStatus::Unknown,
+        };
+        let diagnostics = doc
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        let value = serde_json::to_vec(&doc)
+            .map_err(|e| format!("could not serialize PATH executable inventory: {e}"))?;
+        sources.push(source(
+            SourceRole::PathExecutables,
+            "one-level metadata snapshot of the current process PATH; candidate heuristics only, no execution or shell resolution",
+            source_started,
+            source_ended,
+            status,
+            diagnostics,
+            vec![
+                ("max_components", doc.limits.max_components as u64),
+                ("max_component_path_bytes_or_units", doc.limits.max_component_path_bytes_or_units as u64),
+                ("max_entries", doc.limits.max_entries as u64),
+                ("max_aggregate_path_and_name_bytes_or_units", doc.limits.max_aggregate_path_and_name_bytes_or_units as u64),
+                ("max_pathext_utf16_units", doc.limits.max_pathext_utf16_units as u64),
+                ("max_pathext_extensions", doc.limits.max_pathext_extensions as u64),
+                ("deadline_seconds", doc.limits.deadline_seconds),
+            ],
+        ));
+        artifacts.push(artifact(
+            ArtifactKind::PathExecutables,
+            "path-executables.json",
+            "sideeffect.path_executable_inventory",
+            1,
             value,
         ));
     }
@@ -579,6 +622,7 @@ fn role_kind(role: SourceRole) -> Option<ArtifactKind> {
         SourceRole::Processes => Some(ArtifactKind::WindowsProcesses),
         SourceRole::Permissions => Some(ArtifactKind::WindowsPermissions),
         SourceRole::Startup => Some(ArtifactKind::WindowsStartup),
+        SourceRole::PathExecutables => Some(ArtifactKind::PathExecutables),
         SourceRole::Runtime => Some(ArtifactKind::WindowsRuntimeCapture),
     }
 }

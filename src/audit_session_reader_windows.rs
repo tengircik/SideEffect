@@ -351,6 +351,7 @@ fn label(path: &str) -> &'static str {
         "processes.json" => "processes.json",
         "permissions.json" => "permissions.json",
         "startup.json" => "startup.json",
+        "path-executables.json" => "path-executables.json",
         "software.windows.json" => "software.windows.json",
         "processes.windows.json" => "processes.windows.json",
         "permissions.windows.json" => "permissions.windows.json",

@@ -8,7 +8,10 @@ use crate::audit_session::{
     SessionArtifactRef, SessionId, SessionStatus, SourceRole, SourceStatus,
 };
 use crate::fingerprint::sha256_hex;
-use crate::inventory::{collect_packages, collect_permissions, collect_processes, collect_startup};
+use crate::inventory::{
+    collect_packages, collect_path_executables, collect_permissions, collect_processes,
+    collect_startup,
+};
 use crate::record::{SessionOutput, record_bundle_artifacts};
 use serde::Serialize;
 use serde_json::Value;
@@ -26,6 +29,7 @@ pub struct AuditOptions {
     pub packages: bool,
     pub processes: bool,
     pub startup: bool,
+    pub path_executables: bool,
     pub permission_paths: Vec<PathBuf>,
     pub runtime_program: Option<OsString>,
     pub runtime_arguments: Vec<OsString>,
@@ -52,6 +56,7 @@ pub fn collect_and_publish(
     if !options.packages
         && !options.processes
         && !options.startup
+        && !options.path_executables
         && options.permission_paths.is_empty()
         && options.runtime_program.is_none()
     {
@@ -167,6 +172,49 @@ pub fn collect_and_publish(
             ],
         )?);
         artifacts.push(artifact("startup.json", &document)?);
+    }
+
+    if options.path_executables {
+        let started = now_unix_ms()?;
+        let document = collect_path_executables();
+        let ended = now_unix_ms()?;
+        let value = serde_json::to_value(&document).map_err(|error| {
+            format!("could not inspect PATH executable inventory metadata: {error}")
+        })?;
+        let status = match document.status {
+            "complete" => SourceStatus::Complete,
+            "partial" => SourceStatus::Partial,
+            _ => SourceStatus::Unknown,
+        };
+        let path_platform = value
+            .get("platform")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "PATH executable artifact has no platform field".to_owned())?;
+        let path_source = AuditSessionSource {
+            role: SourceRole::PathExecutables,
+            collector: Some(crate::audit_session::collector_identity(path_platform, SourceRole::PathExecutables)),
+            platform: path_platform.to_owned(),
+            scope: "one-level metadata snapshot of the current process PATH; candidate heuristics only, no execution or shell resolution".to_owned(),
+            started_at_unix_ms: started,
+            ended_at_unix_ms: ended,
+            status,
+            applied_limits: vec![
+                limit("max_components", document.limits.max_components as u64),
+                limit("max_component_path_bytes_or_units", document.limits.max_component_path_bytes_or_units as u64),
+                limit("max_entries", document.limits.max_entries as u64),
+                limit("max_aggregate_path_and_name_bytes_or_units", document.limits.max_aggregate_path_and_name_bytes_or_units as u64),
+                limit("max_pathext_utf16_units", document.limits.max_pathext_utf16_units as u64),
+                limit("max_pathext_extensions", document.limits.max_pathext_extensions as u64),
+                limit("deadline_seconds", document.limits.deadline_seconds),
+            ],
+            requested_settings: Vec::new(),
+            effective_settings: Vec::new(),
+            loss: None,
+            diagnostic_codes: collect_codes(&value),
+            artifacts: Vec::new(),
+        };
+        sources.push(path_source);
+        artifacts.push(artifact("path-executables.json", &document)?);
     }
 
     if !options.permission_paths.is_empty() {
@@ -303,6 +351,7 @@ pub fn collect_and_publish(
             ArtifactKind::Processes => SourceRole::Processes,
             ArtifactKind::Permissions => SourceRole::Permissions,
             ArtifactKind::Startup => SourceRole::Startup,
+            ArtifactKind::PathExecutables => SourceRole::PathExecutables,
             ArtifactKind::WindowsSoftware
             | ArtifactKind::WindowsProcesses
             | ArtifactKind::WindowsPermissions
@@ -527,6 +576,7 @@ fn artifact_kind(file_name: &str) -> Result<ArtifactKind, String> {
         "processes.json" => Ok(ArtifactKind::Processes),
         "startup.json" => Ok(ArtifactKind::Startup),
         "permissions.json" => Ok(ArtifactKind::Permissions),
+        "path-executables.json" => Ok(ArtifactKind::PathExecutables),
         "run.json" => Ok(ArtifactKind::RuntimeManifest),
         "trace.strace" => Ok(ArtifactKind::RuntimeTrace),
         "software.windows.json" => Ok(ArtifactKind::WindowsSoftware),
