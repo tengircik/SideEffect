@@ -13,19 +13,19 @@ SideEffect ships a portable [Agent Skills](https://agentskills.io/specification)
 The `skills` CLI detects installed agents, lets you choose one or more destinations, and installs the selected skill in each agent's native location. Install globally for your user:
 
 ```sh
-DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/ea7c5ef3bba5477df77eac6728bc26d43ff25a88/.agents/skills/sideeffect-audit -g --copy
+DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/ea7c5ef17ca16263afb62026e36c42d135bf6de8/.agents/skills/sideeffect-audit -g --copy
 ```
 
 To install for every client supported by the installer:
 
 ```sh
-DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/ea7c5ef3bba5477df77eac6728bc26d43ff25a88/.agents/skills/sideeffect-audit --agent '*' -g --copy
+DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/ea7c5ef17ca16263afb62026e36c42d135bf6de8/.agents/skills/sideeffect-audit --agent '*' -g --copy
 ```
 
 To select destinations explicitly:
 
 ```sh
-DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/ea7c5ef3bba5477df77eac6728bc26d43ff25a88/.agents/skills/sideeffect-audit --agent codex --agent claude-code --agent cursor --agent opencode -g --copy
+DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/ea7c5ef17ca16263afb62026e36c42d135bf6de8/.agents/skills/sideeffect-audit --agent codex --agent claude-code --agent cursor --agent opencode -g --copy
 ```
 
 The installer is maintained by Vercel and is separate from SideEffect. Its anonymous telemetry is disabled in the commands above. To install the skill for every agent it supports, use `--agent '*'`; to choose specific clients, pass their IDs after `--agent`. Consult the installer's current [CLI reference](https://github.com/vercel-labs/skills/blob/main/docs/commands.md) and [supported-agent list](https://github.com/vercel-labs/skills/blob/main/docs/agents.md) for additional clients. The installer may change supported agent IDs and options over time.
@@ -66,7 +66,7 @@ Runtime capture requires a separate confirmation of the exact command, duration,
 
 ## Update and remove
 
-The quick install commands use immutable commit `ea7c5ef3bba5477df77eac6728bc26d43ff25a88` so the instructions you review are the instructions you install. To update, review the desired newer commit and run `npx skills add` again with that commit's direct `.agents/skills/sideeffect-audit` URL. `npx skills update` refreshes an installation from its recorded source; a source pinned to an immutable commit remains at that revision. To remove it, use `npx skills remove sideeffect-audit` and review the selected destinations before confirming. For OMP, delete only the `sideeffect-audit` folder from the chosen OMP skills directory. Do not remove neighboring skills or agent settings.
+The quick install commands use immutable commit `ea7c5ef17ca16263afb62026e36c42d135bf6de8` so the instructions you review are the instructions you install. To update, review the desired newer commit and run `npx skills add` again with that commit's direct `.agents/skills/sideeffect-audit` URL. `npx skills update` refreshes an installation from its recorded source; a source pinned to an immutable commit remains at that revision. To remove it, use `npx skills remove sideeffect-audit` and review the selected destinations before confirming. For OMP, delete only the `sideeffect-audit` folder from the chosen OMP skills directory. Do not remove neighboring skills or agent settings.
 
 ## Privacy and evidence handling
 

@@ -16,7 +16,7 @@ REFERENCE = SKILL_DIR / "references" / "workflows.md"
 NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 SKILL_SOURCE_URL = (
     "https://github.com/tengircik/SideEffect/tree/"
-    "ea7c5ef3bba5477df77eac6728bc26d43ff25a88/.agents/skills/sideeffect-audit"
+    "ea7c5ef17ca16263afb62026e36c42d135bf6de8/.agents/skills/sideeffect-audit"
 )
 
 
