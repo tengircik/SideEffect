@@ -2,10 +2,10 @@
 
 use crate::audit_session::{
     AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, AppliedLimit, ArtifactKind,
-    AuditSessionManifest, AuditSessionSource, CoverageManifest, IntervalSemantics,
-    MAX_SESSION_ARTIFACT_BYTES, MAX_SESSION_SOURCES, MAX_SESSION_TIMESTAMP_UNIX_MS,
-    MAX_SESSION_TOTAL_ARTIFACT_BYTES, SessionArtifactRef, SessionId, SessionStatus, SourceRole,
-    SourceStatus,
+    AuditSessionManifest, AuditSessionSource, ContextFact, ContextFactStatus, CoverageManifest,
+    HostContext, IntervalSemantics, MAX_SESSION_ARTIFACT_BYTES, MAX_SESSION_SOURCES,
+    MAX_SESSION_TIMESTAMP_UNIX_MS, MAX_SESSION_TOTAL_ARTIFACT_BYTES, PrivilegeContext,
+    SessionArtifactRef, SessionId, SessionStatus, SourceRole, SourceStatus,
 };
 use crate::fingerprint::sha256_hex;
 use crate::inventory::{collect_packages, collect_permissions, collect_processes, collect_startup};
@@ -276,6 +276,7 @@ pub fn collect_and_publish(
         }
     }
 
+    let host_context = host_context();
     let session_end = now_unix_ms()?;
     if sources.is_empty() || sources.len() > MAX_SESSION_SOURCES {
         return Err("selected audit sources exceed the session source limit".to_owned());
@@ -332,6 +333,7 @@ pub fn collect_and_publish(
         session_id,
         platform: "linux".to_owned(),
         architecture: std::env::consts::ARCH.to_owned(),
+        host_context: Some(host_context),
         started_at_unix_ms: session_start,
         ended_at_unix_ms: session_end,
         interval_semantics: IntervalSemantics::BestEffortNonAtomic,
@@ -365,6 +367,54 @@ pub fn collect_and_publish(
         parent_sync_confirmed,
         manifest,
     })
+}
+
+fn host_context() -> HostContext {
+    let mut uts = std::mem::MaybeUninit::<libc::utsname>::uninit();
+    let (os_name, os_version) = if unsafe { libc::uname(uts.as_mut_ptr()) } == 0 {
+        let uts = unsafe { uts.assume_init() };
+        let bounded = |field: &[libc::c_char]| {
+            let bytes: Vec<u8> = field
+                .iter()
+                .take_while(|byte| **byte != 0)
+                .map(|byte| *byte as u8)
+                .take(128)
+                .collect();
+            let decoded = String::from_utf8_lossy(&bytes);
+            let mut end = decoded.len().min(128);
+            while !decoded.is_char_boundary(end) {
+                end -= 1;
+            }
+            decoded[..end].to_owned()
+        };
+        (bounded(&uts.sysname), bounded(&uts.release))
+    } else {
+        (String::new(), String::new())
+    };
+    let fact = |value: String| {
+        if value.is_empty() {
+            ContextFact {
+                status: ContextFactStatus::Unknown,
+                value: None,
+            }
+        } else {
+            ContextFact {
+                status: ContextFactStatus::Observed,
+                value: Some(value),
+            }
+        }
+    };
+    HostContext {
+        os_name: fact(os_name),
+        os_version: fact(os_version),
+        // This reports the process effective-UID context; it is not a broad
+        // statement about capabilities or access to every system resource.
+        privilege: if unsafe { libc::geteuid() } == 0 {
+            PrivilegeContext::Elevated
+        } else {
+            PrivilegeContext::NotElevated
+        },
+    }
 }
 
 fn build_source(

@@ -705,6 +705,17 @@ mod tests {
             session_id: "0123456789abcdef0123456789abcdef".to_owned(),
             platform: "windows".to_owned(),
             architecture: "x86_64".to_owned(),
+            host_context: Some(crate::audit_session::HostContext {
+                os_name: crate::audit_session::ContextFact {
+                    status: crate::audit_session::ContextFactStatus::Observed,
+                    value: Some("Windows".to_owned()),
+                },
+                os_version: crate::audit_session::ContextFact {
+                    status: crate::audit_session::ContextFactStatus::Observed,
+                    value: Some("10.0.26100".to_owned()),
+                },
+                privilege: crate::audit_session::PrivilegeContext::NotElevated,
+            }),
             started_at_unix_ms: 1_000,
             ended_at_unix_ms: 1_002,
             interval_semantics: IntervalSemantics::BestEffortNonAtomic,

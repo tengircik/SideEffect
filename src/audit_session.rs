@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 pub const AUDIT_SESSION_SCHEMA: &str = "sideeffect.audit_session";
-pub const AUDIT_SESSION_SCHEMA_VERSION: u32 = 3;
+pub const AUDIT_SESSION_SCHEMA_VERSION: u32 = 4;
 pub const AUDIT_SESSION_V1_SCHEMA_VERSION: u32 = 1;
 pub const AUDIT_SESSION_V2_SCHEMA_VERSION: u32 = 2;
+pub const AUDIT_SESSION_V3_SCHEMA_VERSION: u32 = 3;
 pub const COVERAGE_MANIFEST_VERSION: u32 = 1;
 pub const MAX_AUDIT_SESSION_MANIFEST_BYTES: usize = 512 * 1024;
 pub const MAX_SESSION_SOURCES: usize = 8;
@@ -41,9 +42,45 @@ pub struct AuditSessionManifest {
     pub interval_semantics: IntervalSemantics,
     pub status: SessionStatus,
     pub sources: Vec<AuditSessionSource>,
+    /// Host identity and caller privilege facts. Absent from v1-v3 manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_context: Option<HostContext>,
     /// Missing in v1 manifests; v2 and v3 producers include an explicit bounded map.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_manifest: Option<CoverageManifest>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostContext {
+    pub os_name: ContextFact,
+    pub os_version: ContextFact,
+    pub privilege: PrivilegeContext,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextFact {
+    pub status: ContextFactStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextFactStatus {
+    Observed,
+    Unknown,
+    NotChecked,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivilegeContext {
+    Elevated,
+    NotElevated,
+    Unknown,
+    NotChecked,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -277,6 +314,7 @@ impl AuditSessionManifest {
                 self.schema_version,
                 AUDIT_SESSION_V1_SCHEMA_VERSION
                     | AUDIT_SESSION_V2_SCHEMA_VERSION
+                    | AUDIT_SESSION_V3_SCHEMA_VERSION
                     | AUDIT_SESSION_SCHEMA_VERSION
             )
         {
@@ -287,13 +325,33 @@ impl AuditSessionManifest {
         }
         validate_platform(&self.platform)?;
         validate_token(&self.architecture, MAX_PLATFORM_BYTES, "architecture")?;
+        match (&self.host_context, self.schema_version) {
+            (None, 1..=3) => {}
+            (Some(context), AUDIT_SESSION_SCHEMA_VERSION) => {
+                for fact in [&context.os_name, &context.os_version] {
+                    match (fact.status, &fact.value) {
+                        (ContextFactStatus::Observed, Some(value)) => {
+                            validate_bounded_text(value, 128, "host context value")?;
+                        }
+                        (ContextFactStatus::Unknown | ContextFactStatus::NotChecked, None) => {}
+                        _ => return Err(ValidationError::InvalidHostContext),
+                    }
+                }
+            }
+            _ => return Err(ValidationError::InvalidHostContext),
+        }
         validate_interval(self.started_at_unix_ms, self.ended_at_unix_ms)?;
         if self.sources.is_empty() || self.sources.len() > MAX_SESSION_SOURCES {
             return Err(ValidationError::SourceCountOutOfBounds);
         }
         match (&self.coverage_manifest, self.schema_version) {
             (None, AUDIT_SESSION_V1_SCHEMA_VERSION) => {}
-            (Some(coverage), AUDIT_SESSION_V2_SCHEMA_VERSION | AUDIT_SESSION_SCHEMA_VERSION) => {
+            (
+                Some(coverage),
+                AUDIT_SESSION_V2_SCHEMA_VERSION
+                | AUDIT_SESSION_V3_SCHEMA_VERSION
+                | AUDIT_SESSION_SCHEMA_VERSION,
+            ) => {
                 if coverage.version != COVERAGE_MANIFEST_VERSION
                     || coverage.sources.len() != self.sources.len()
                     || coverage.sources.len() > MAX_SESSION_SOURCES
@@ -354,7 +412,7 @@ impl AuditSessionManifest {
                 validate_code(&setting.code)?;
             }
             if source.role == SourceRole::Runtime
-                && self.schema_version == AUDIT_SESSION_SCHEMA_VERSION
+                && self.schema_version >= AUDIT_SESSION_V3_SCHEMA_VERSION
             {
                 if source.loss.is_none() {
                     return Err(ValidationError::InvalidLossMetadata);
@@ -362,7 +420,7 @@ impl AuditSessionManifest {
             } else if source.loss.is_some() {
                 return Err(ValidationError::InvalidLossMetadata);
             }
-            if self.schema_version != AUDIT_SESSION_SCHEMA_VERSION
+            if self.schema_version < AUDIT_SESSION_V3_SCHEMA_VERSION
                 && (!source.requested_settings.is_empty() || !source.effective_settings.is_empty())
             {
                 return Err(ValidationError::InvalidSourceSettings);
@@ -614,6 +672,7 @@ pub enum ValidationError {
     SourceOutsideSessionInterval,
     MetadataCountOutOfBounds,
     InvalidLossMetadata,
+    InvalidHostContext,
     InvalidSourceSettings,
     InvalidCode,
     UnsupportedArtifactPlatform,
@@ -647,6 +706,17 @@ mod tests {
             session_id: "0123456789abcdef0123456789abcdef".to_owned(),
             platform: "linux".to_owned(),
             architecture: "x86_64".to_owned(),
+            host_context: Some(super::HostContext {
+                os_name: super::ContextFact {
+                    status: super::ContextFactStatus::Observed,
+                    value: Some("Linux".to_owned()),
+                },
+                os_version: super::ContextFact {
+                    status: super::ContextFactStatus::Observed,
+                    value: Some("6.1".to_owned()),
+                },
+                privilege: super::PrivilegeContext::NotElevated,
+            }),
             started_at_unix_ms: 1000,
             ended_at_unix_ms: 1002,
             interval_semantics: IntervalSemantics::BestEffortNonAtomic,
@@ -726,6 +796,7 @@ mod tests {
         let mut value = serde_json::to_value(valid_manifest()).unwrap();
         value["schema_version"] = serde_json::json!(AUDIT_SESSION_V1_SCHEMA_VERSION);
         value.as_object_mut().unwrap().remove("coverage_manifest");
+        value.as_object_mut().unwrap().remove("host_context");
         let parsed = parse_manifest(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(parsed.schema_version, AUDIT_SESSION_V1_SCHEMA_VERSION);
         assert_eq!(parsed.coverage_manifest, None);
@@ -735,6 +806,7 @@ mod tests {
         assert_eq!(v2.validate(), Err(ValidationError::InvalidCoverageManifest));
         let mut v2_value = serde_json::to_value(valid_manifest()).unwrap();
         v2_value["schema_version"] = serde_json::json!(AUDIT_SESSION_V2_SCHEMA_VERSION);
+        v2_value.as_object_mut().unwrap().remove("host_context");
         let parsed_v2 = parse_manifest(&serde_json::to_vec(&v2_value).unwrap()).unwrap();
         assert_eq!(parsed_v2.schema_version, AUDIT_SESSION_V2_SCHEMA_VERSION);
         v2_value["sources"][0]["requested_settings"] = serde_json::json!([{
@@ -744,6 +816,46 @@ mod tests {
         assert_eq!(
             parse_manifest(&serde_json::to_vec(&v2_value).unwrap()),
             Err(ValidationError::InvalidSourceSettings)
+        );
+    }
+
+    #[test]
+    fn v3_manifests_remain_readable_without_host_context() {
+        let mut value = serde_json::to_value(valid_manifest()).unwrap();
+        value["schema_version"] = serde_json::json!(super::AUDIT_SESSION_V3_SCHEMA_VERSION);
+        value.as_object_mut().unwrap().remove("host_context");
+        let parsed = parse_manifest(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            parsed.schema_version,
+            super::AUDIT_SESSION_V3_SCHEMA_VERSION
+        );
+        assert_eq!(parsed.host_context, None);
+    }
+
+    #[test]
+    fn host_context_accepts_known_and_unknown_facts_and_enforces_bounds() {
+        let mut manifest = valid_manifest();
+        manifest.host_context.as_mut().unwrap().os_version = super::ContextFact {
+            status: super::ContextFactStatus::Unknown,
+            value: None,
+        };
+        manifest.validate().unwrap();
+        manifest.host_context.as_mut().unwrap().os_name = super::ContextFact {
+            status: super::ContextFactStatus::NotChecked,
+            value: None,
+        };
+        manifest.validate().unwrap();
+        manifest.host_context.as_mut().unwrap().os_version.value = Some("x".repeat(129));
+        manifest.host_context.as_mut().unwrap().os_version.status =
+            super::ContextFactStatus::Observed;
+        assert_eq!(
+            manifest.validate(),
+            Err(ValidationError::InvalidMetadata("host context value"))
+        );
+        manifest.host_context.as_mut().unwrap().os_version.value = None;
+        assert_eq!(
+            manifest.validate(),
+            Err(ValidationError::InvalidHostContext)
         );
     }
 

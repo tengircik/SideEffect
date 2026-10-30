@@ -52,7 +52,9 @@ fn windows_session_publishes_and_inspects_selected_source_with_private_acl() {
     );
     let value: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
     assert_eq!(value["schema"], "sideeffect.audit_session_review");
-    assert_eq!(value["schema_version"], 3);
+    assert_eq!(value["schema_version"], 4);
+    assert_eq!(value["host_context"]["os_name"]["value"], "Windows");
+    assert!(value["host_context"]["privilege"].is_string());
     assert_eq!(value["platform"], "windows");
     fs::remove_dir_all(root).unwrap();
 }

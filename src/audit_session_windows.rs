@@ -2,8 +2,9 @@
 
 use crate::audit_session::{
     AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, ArtifactKind, AuditSessionManifest,
-    AuditSessionSource, CoverageManifest, IntervalSemantics, SessionArtifactRef, SessionStatus,
-    SourceRole, SourceStatus,
+    AuditSessionSource, ContextFact, ContextFactStatus, CoverageManifest, HostContext,
+    IntervalSemantics, PrivilegeContext, SessionArtifactRef, SessionStatus, SourceRole,
+    SourceStatus,
 };
 use crate::fingerprint::sha256_hex;
 use crate::inventory::{
@@ -308,12 +309,13 @@ pub fn collect_and_publish(
         ));
     }
 
+    let context = host_context();
     let ended = now_ms()?;
     let mut files: Vec<(&str, &[u8])> = artifacts
         .iter()
         .map(|a| (a.file_name, a.bytes.as_slice()))
         .collect();
-    let manifest = build_manifest(started, ended, sources, &artifacts)?;
+    let manifest = build_manifest(started, ended, context, sources, &artifacts)?;
     let manifest_bytes = serde_json::to_vec(&manifest)
         .map_err(|e| format!("could not serialize audit manifest: {e}"))?;
     files.push(("session.json", manifest_bytes.as_slice()));
@@ -410,6 +412,7 @@ fn artifact(
 fn build_manifest(
     started: u128,
     ended: u128,
+    host_context: HostContext,
     mut sources: Vec<AuditSessionSource>,
     artifacts: &[Artifact],
 ) -> Result<AuditSessionManifest, String> {
@@ -444,6 +447,7 @@ fn build_manifest(
             "unknown"
         }
         .to_owned(),
+        host_context: Some(host_context),
         started_at_unix_ms: started,
         ended_at_unix_ms: ended,
         interval_semantics: IntervalSemantics::BestEffortNonAtomic,
@@ -459,6 +463,113 @@ fn build_manifest(
         .validate()
         .map_err(|e| format!("constructed audit session is invalid: {e:?}"))?;
     Ok(manifest)
+}
+
+fn host_context() -> HostContext {
+    let version = windows_version();
+    let os_version = version.map_or(
+        ContextFact {
+            status: ContextFactStatus::Unknown,
+            value: None,
+        },
+        |value| ContextFact {
+            status: ContextFactStatus::Observed,
+            value: Some(value),
+        },
+    );
+    HostContext {
+        os_name: ContextFact {
+            status: ContextFactStatus::Observed,
+            value: Some("Windows".to_owned()),
+        },
+        os_version,
+        privilege: windows_privilege(),
+    }
+}
+
+#[repr(C)]
+struct OsVersionInfo {
+    size: u32,
+    major: u32,
+    minor: u32,
+    build: u32,
+    platform: u32,
+    service_pack: [u16; 128],
+}
+
+fn windows_version() -> Option<String> {
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn RtlGetVersion(info: *mut OsVersionInfo) -> i32;
+    }
+    let mut info = OsVersionInfo {
+        size: std::mem::size_of::<OsVersionInfo>() as u32,
+        major: 0,
+        minor: 0,
+        build: 0,
+        platform: 0,
+        service_pack: [0; 128],
+    };
+    // RtlGetVersion reports the native OS version without the compatibility
+    // version masking applied to some higher-level version APIs.
+    (unsafe { RtlGetVersion(&mut info) } == 0)
+        .then(|| format!("{}.{}.{}", info.major, info.minor, info.build))
+}
+
+fn windows_privilege() -> PrivilegeContext {
+    use std::ffi::c_void;
+    type Handle = *mut c_void;
+    #[repr(C)]
+    struct TokenElevation {
+        elevated: u32,
+    }
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenProcessToken(process: Handle, access: u32, token: *mut Handle) -> i32;
+        fn GetTokenInformation(
+            token: Handle,
+            class: u32,
+            info: *mut c_void,
+            len: u32,
+            needed: *mut u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> Handle;
+        fn CloseHandle(handle: Handle) -> i32;
+    }
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), 0x0008, &mut token) } == 0 {
+        return PrivilegeContext::Unknown;
+    }
+    struct Token(Handle);
+    impl Drop for Token {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+    let token = Token(token);
+    let mut elevation = TokenElevation { elevated: 0 };
+    let mut needed = 0;
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            20,
+            (&mut elevation as *mut TokenElevation).cast(),
+            std::mem::size_of::<TokenElevation>() as u32,
+            &mut needed,
+        )
+    } == 0
+    {
+        PrivilegeContext::Unknown
+    } else if elevation.elevated != 0 {
+        PrivilegeContext::Elevated
+    } else {
+        PrivilegeContext::NotElevated
+    }
 }
 
 fn role_kind(role: SourceRole) -> Option<ArtifactKind> {
@@ -481,7 +592,10 @@ fn now_ms() -> Result<u128, String> {
 #[cfg(test)]
 mod tests {
     use super::{artifact, build_manifest, source};
-    use crate::audit_session::{ArtifactKind, SessionStatus, SourceRole, SourceStatus};
+    use crate::audit_session::{
+        ArtifactKind, ContextFact, ContextFactStatus, HostContext, PrivilegeContext, SessionStatus,
+        SourceRole, SourceStatus,
+    };
 
     #[test]
     fn windows_runtime_source_manifest_binds_capture_bytes_and_stays_partial() {
@@ -503,7 +617,24 @@ mod tests {
             vec![("max_events", 50_000)],
         );
 
-        let manifest = build_manifest(1_000, 1_003, vec![runtime_source], &artifacts).unwrap();
+        let manifest = build_manifest(
+            1_000,
+            1_003,
+            HostContext {
+                os_name: ContextFact {
+                    status: ContextFactStatus::Observed,
+                    value: Some("Windows".to_owned()),
+                },
+                os_version: ContextFact {
+                    status: ContextFactStatus::Unknown,
+                    value: None,
+                },
+                privilege: PrivilegeContext::Unknown,
+            },
+            vec![runtime_source],
+            &artifacts,
+        )
+        .unwrap();
         assert_eq!(manifest.status, SessionStatus::Partial);
         let reference = &manifest.sources[0].artifacts[0];
         assert_eq!(reference.kind, ArtifactKind::WindowsRuntimeCapture);

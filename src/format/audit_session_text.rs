@@ -3,7 +3,8 @@ use std::io::{self, Write};
 use serde::Serialize;
 
 use crate::audit_session::{
-    AppliedLimit, AuditSessionManifest, CoverageStatus, SessionStatus, SourceRole, SourceStatus,
+    AppliedLimit, AuditSessionManifest, CoverageStatus, HostContext, SessionStatus, SourceRole,
+    SourceStatus,
 };
 
 /// Render verified session metadata without copying inventory rows into terminal output.
@@ -22,6 +23,7 @@ pub fn write_audit_session_text<W: Write>(
         escape_ascii(&manifest.architecture)
     )?;
     writeln!(writer, "Status: {}", session_status_name(manifest.status))?;
+    write_host_context(writer, manifest.host_context.as_ref())?;
     writeln!(
         writer,
         "Session interval (Unix milliseconds): {}..={}",
@@ -140,6 +142,40 @@ pub fn write_audit_session_text<W: Write>(
     Ok(())
 }
 
+fn write_host_context<W: Write>(writer: &mut W, context: Option<&HostContext>) -> io::Result<()> {
+    let Some(context) = context else {
+        return writer
+            .write_all(b"Host OS/version and privilege context: not recorded (legacy session)\n");
+    };
+    writer.write_all(b"Host context:\n")?;
+    for (label, fact) in [
+        ("OS", &context.os_name),
+        ("OS version", &context.os_version),
+    ] {
+        write!(writer, "  {label}: ")?;
+        match (&fact.status, fact.value.as_deref()) {
+            (crate::audit_session::ContextFactStatus::Observed, Some(value)) => {
+                write_quoted_ascii(writer, value)?
+            }
+            (crate::audit_session::ContextFactStatus::Unknown, _) => {
+                writer.write_all(b"unknown")?
+            }
+            (crate::audit_session::ContextFactStatus::NotChecked, _) => {
+                writer.write_all(b"not_checked")?
+            }
+            _ => writer.write_all(b"unknown")?,
+        }
+        writer.write_all(b"\n")?;
+    }
+    let privilege = match context.privilege {
+        crate::audit_session::PrivilegeContext::Elevated => "elevated",
+        crate::audit_session::PrivilegeContext::NotElevated => "not_elevated",
+        crate::audit_session::PrivilegeContext::Unknown => "unknown",
+        crate::audit_session::PrivilegeContext::NotChecked => "not_checked",
+    };
+    writeln!(writer, "  Process privilege context: {privilege}")
+}
+
 /// Serialize a bounded review document with user-influenced scope strings made ASCII-safe.
 pub fn write_audit_session_json<W: Write>(
     manifest: &AuditSessionManifest,
@@ -192,11 +228,12 @@ pub fn write_audit_session_json<W: Write>(
         .collect();
     let review = SessionReview {
         schema: "sideeffect.audit_session_review",
-        schema_version: 3,
+        schema_version: 4,
         session_id: &manifest.session_id,
         platform: &manifest.platform,
         architecture: escape_ascii(&manifest.architecture),
         architecture_encoding: "non_ascii_and_controls_escaped_as_ascii",
+        host_context: &manifest.host_context,
         status: session_status_name(manifest.status),
         interval_semantics: "best_effort_non_atomic",
         started_at_unix_ms: manifest.started_at_unix_ms,
@@ -216,6 +253,7 @@ struct SessionReview<'a> {
     platform: &'a str,
     architecture: String,
     architecture_encoding: &'static str,
+    host_context: &'a Option<HostContext>,
     status: &'static str,
     interval_semantics: &'static str,
     started_at_unix_ms: u128,
@@ -397,6 +435,17 @@ mod tests {
             session_id: "0123456789abcdef0123456789abcdef".to_owned(),
             platform: "linux".to_owned(),
             architecture: "x86_64".to_owned(),
+            host_context: Some(crate::audit_session::HostContext {
+                os_name: crate::audit_session::ContextFact {
+                    status: crate::audit_session::ContextFactStatus::Observed,
+                    value: Some("Linux".to_owned()),
+                },
+                os_version: crate::audit_session::ContextFact {
+                    status: crate::audit_session::ContextFactStatus::Observed,
+                    value: Some("6.1".to_owned()),
+                },
+                privilege: crate::audit_session::PrivilegeContext::NotElevated,
+            }),
             started_at_unix_ms: 1,
             ended_at_unix_ms: 2,
             interval_semantics: IntervalSemantics::BestEffortNonAtomic,
@@ -460,16 +509,35 @@ mod tests {
         assert!(output.is_ascii());
         let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(value["schema"], "sideeffect.audit_session_review");
-        assert_eq!(value["schema_version"], 3);
+        assert_eq!(value["schema_version"], 4);
         assert_eq!(value["authenticity"], "not_established");
         assert_eq!(value["architecture"], "x86\\u{202e}_64");
         assert_eq!(
             value["architecture_encoding"],
             "non_ascii_and_controls_escaped_as_ascii"
         );
+        assert_eq!(value["host_context"]["os_name"]["value"], "Linux");
         assert_eq!(value["sources"][0]["scope"], "safe\\n\\u{202e}path");
         assert_eq!(value["sources"][0]["status"], "partial");
         assert_eq!(value["sources"][0]["coverage_status"], "partial");
+    }
+
+    #[test]
+    fn text_review_renders_unknown_and_not_checked_host_facts_explicitly() {
+        let mut fixture = manifest("bounded context fixture", SourceStatus::Complete);
+        fixture.host_context.as_mut().unwrap().os_name = crate::audit_session::ContextFact {
+            status: crate::audit_session::ContextFactStatus::Unknown,
+            value: None,
+        };
+        fixture.host_context.as_mut().unwrap().os_version = crate::audit_session::ContextFact {
+            status: crate::audit_session::ContextFactStatus::NotChecked,
+            value: None,
+        };
+        let mut output = Vec::new();
+        write_audit_session_text(&fixture, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("OS: unknown"));
+        assert!(output.contains("OS version: not_checked"));
     }
 
     #[test]
@@ -477,6 +545,7 @@ mod tests {
         let mut fixture = manifest("legacy v1", SourceStatus::Complete);
         fixture.schema_version = crate::audit_session::AUDIT_SESSION_V1_SCHEMA_VERSION;
         fixture.coverage_manifest = None;
+        fixture.host_context = None;
         let mut output = Vec::new();
         write_audit_session_json(&fixture, &mut output).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
