@@ -93,7 +93,10 @@ jobs:
       - name: Regenerate and compare third-party notices
         run: |
           cargo about generate --locked --config about.toml \
-            --output-file "$RUNNER_TEMP/THIRD_PARTY_NOTICES.txt" about.hbs
+            --output-file "$RUNNER_TEMP/THIRD_PARTY_NOTICES.raw.txt" about.hbs
+          python3 scripts/normalize_third_party_notices.py \
+            "$RUNNER_TEMP/THIRD_PARTY_NOTICES.raw.txt" \
+            "$RUNNER_TEMP/THIRD_PARTY_NOTICES.txt"
           cmp THIRD_PARTY_NOTICES.txt "$RUNNER_TEMP/THIRD_PARTY_NOTICES.txt"
           test -s THIRD_PARTY_NOTICES.txt
 
