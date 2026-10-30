@@ -210,7 +210,7 @@ Milestones are ordered by dependency. Work may be split into independently revie
 
 ### R9 — Optional AI investigation evaluation and reopening decision
 
-**Status:** deferred by user direction; it does not gate the core product and must not be resumed until the user explicitly reopens the workstream. Nothing here approves or recommends a model.
+**Status:** reopened by the user on 2026-10-30; implementation and model qualification are now requested. It remains optional to the core product, and no model is approved until it passes the gates below.
 
 **Purpose if reopened:** evaluate whether an optional local model can help a user navigate already validated evidence without becoming a collector, fact source, or required runtime.
 
@@ -228,7 +228,7 @@ Milestones are ordered by dependency. Work may be split into independently revie
 - Treat all evidence as untrusted data, delimit it from instructions, prevent prompt injection from changing tool behavior, and constrain output to validated structured claims or navigation suggestions. Every output must cite existing evidence IDs and preserve source facts, unknowns, and conflict status. The model cannot decide “safe,” “malicious,” root cause, or effective access.
 - Agent Skills remain an orchestration interface under the user's chosen agent/provider. Their documentation must warn that provider handling is controlled by that agent configuration, preserve user-confirmed runtime scope, and prevent evidence text from authorizing new actions. A user-selected agent/model is not a SideEffect core dependency.
 
-**Dependencies:** explicit reopening by user; R3–R7 deterministic data and privacy controls; an approved benchmark protocol.
+**Dependencies:** R3–R7 deterministic data and privacy controls; an approved benchmark protocol. The user has reopened this workstream, but dependent capabilities must still be established before integration.
 
 **Acceptance gate if reopened:** independently reviewed benchmark and privacy threat model; reproducible task-specific results; verified evidence references; no unsupported factual or safety claims; user-visible model/runtime/data-flow consent; test coverage for injection and refusal; clear opt-out and no model-required CLI path. Results qualify only that named model/runtime/task.
 
@@ -341,4 +341,4 @@ Status describes the coverage in current repository documentation as reviewed fo
 
 ## Relationship to existing planning documents
 
-`PLAN.md` remains the historical and current implementation record for M0–M13 and release status. This document adds future work after those bounded milestones; it does not rewrite acceptance already met, silently upgrade claims, or replace the compatibility matrix. Update this roadmap's status and the relevant source documentation when a future milestone is implemented and validated. Keep optional M8 local-model work deferred unless the user explicitly reopens it.
+`PLAN.md` remains the historical and current implementation record for M0–M13 and release status. This document adds future work after those bounded milestones; it does not rewrite acceptance already met, silently upgrade claims, or replace the compatibility matrix. Update this roadmap's status and the relevant source documentation when a future milestone is implemented and validated. The user reopened M8 and the broader optional AI workstream on 2026-10-30. This request does not waive the quality, privacy, security, or core-independence gates defined under R9.
