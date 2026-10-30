@@ -7,6 +7,7 @@ use crate::limits::{
     MAX_INVENTORY_ROW_BYTES, MAX_INVENTORY_ROWS, MAX_INVENTORY_STDERR_BYTES,
     MAX_INVENTORY_STDOUT_BYTES,
 };
+use std::collections::HashMap;
 use std::io::{self, Read};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -23,6 +24,7 @@ pub(crate) enum PackageSourceKind {
     Rpm,
     Pacman,
     Apk,
+    Flatpak,
 }
 
 pub(crate) struct PackageSourceRun {
@@ -281,6 +283,15 @@ pub(crate) fn parse_package_source_output(
     stdout_limit: usize,
     row_limit: usize,
 ) -> InventoryDocument {
+    if kind == PackageSourceKind::Flatpak {
+        return parse_flatpak_refs(
+            source_id,
+            bytes,
+            captured_at_unix_ms,
+            stdout_limit,
+            row_limit,
+        );
+    }
     let mut document = empty_document(source_id, captured_at_unix_ms);
     let source = &mut document.sources[0];
     let bounded_bytes = &bytes[..bytes.len().min(stdout_limit)];
@@ -371,6 +382,170 @@ pub(crate) fn parse_package_source_output(
     document
 }
 
+/// Parse the documented single-column `flatpak list --columns=ref` output.
+/// The header and every reference are checked strictly; repeated refs remain as separate,
+/// ambiguous rows because this output does not identify their installation.
+fn parse_flatpak_refs(
+    source_id: &'static str,
+    bytes: &[u8],
+    captured_at_unix_ms: u128,
+    stdout_limit: usize,
+    row_limit: usize,
+) -> InventoryDocument {
+    let mut document = empty_document(source_id, captured_at_unix_ms);
+    let source = &mut document.sources[0];
+    let bounded_bytes = &bytes[..bytes.len().min(stdout_limit)];
+    let mut offset = 0usize;
+    let mut line = 1usize;
+    let mut header_seen = false;
+    let mut first_ref_rows = HashMap::<String, usize>::new();
+
+    while offset < bounded_bytes.len() {
+        let rest = &bounded_bytes[offset..];
+        let newline = rest.iter().position(|byte| *byte == b'\n');
+        let terminated = newline.is_some();
+        let raw = &rest[..newline.unwrap_or(rest.len())];
+        let record_offset = offset;
+        let next_offset = offset + raw.len() + usize::from(terminated);
+
+        if !header_seen {
+            header_seen = true;
+            if raw == b"Ref" && terminated {
+                offset = next_offset;
+                line += 1;
+                continue;
+            }
+            source.diagnostics.push(InventoryDiagnostic {
+                code: "flatpak_header_missing_or_malformed",
+                line: Some(line),
+                byte_offset: Some(record_offset),
+                byte_length: Some(raw.len()),
+                record_sha256: Some(sha256_hex(raw)),
+            });
+            source.status = InventorySourceStatus::Partial;
+        }
+
+        if source.records_seen >= row_limit {
+            let remainder = &bounded_bytes[offset..];
+            source.diagnostics.push(InventoryDiagnostic {
+                code: "row_count_limit_exceeded",
+                line: Some(line),
+                byte_offset: Some(offset),
+                byte_length: Some(remainder.len()),
+                record_sha256: Some(sha256_hex(remainder)),
+            });
+            source.status = InventorySourceStatus::Partial;
+            break;
+        }
+        source.records_seen += 1;
+
+        if raw.len() > MAX_INVENTORY_ROW_BYTES {
+            let package = malformed_row(
+                source_id,
+                raw,
+                line,
+                record_offset,
+                "row_length_limit_exceeded",
+            );
+            add_row_diagnostic(source, &package);
+            document.packages.push(package);
+            source.status = InventorySourceStatus::Partial;
+        } else if !terminated {
+            let package = malformed_row(
+                source_id,
+                raw,
+                line,
+                record_offset,
+                "missing_line_terminator",
+            );
+            add_row_diagnostic(source, &package);
+            document.packages.push(package);
+            source.status = InventorySourceStatus::Partial;
+        } else if let Some(reference) = parse_flatpak_ref(raw) {
+            let mut package = InventoryPackage {
+                source_id,
+                name: Some(reference.clone()),
+                version: None,
+                architecture: None,
+                status_abbrev: None,
+                evidence: evidence(raw, line, record_offset, true),
+                diagnostic_code: None,
+            };
+            if let Some(first_index) = first_ref_rows.get(&reference).copied() {
+                let first = &mut document.packages[first_index];
+                if first.diagnostic_code.is_none() {
+                    first.diagnostic_code = Some("duplicate_ref_ambiguous");
+                    add_row_diagnostic(source, first);
+                }
+                package.diagnostic_code = Some("duplicate_ref_ambiguous");
+                add_row_diagnostic(source, &package);
+                source.status = InventorySourceStatus::Partial;
+            } else {
+                first_ref_rows.insert(reference, document.packages.len());
+            }
+            document.packages.push(package);
+        } else {
+            let package =
+                malformed_row(source_id, raw, line, record_offset, "malformed_flatpak_ref");
+            add_row_diagnostic(source, &package);
+            document.packages.push(package);
+            source.status = InventorySourceStatus::Partial;
+        }
+
+        offset = next_offset;
+        line += 1;
+    }
+
+    if !header_seen {
+        source.status = InventorySourceStatus::Partial;
+        source.diagnostics.push(diagnostic("flatpak_output_empty"));
+    }
+    if bytes.len() > stdout_limit {
+        source.status = InventorySourceStatus::OutputLimitExceeded;
+        source.diagnostics.push(InventoryDiagnostic {
+            code: "stdout_limit_exceeded",
+            line: None,
+            byte_offset: Some(stdout_limit),
+            byte_length: Some(bytes.len() - stdout_limit),
+            record_sha256: None,
+        });
+    }
+    document.status = if source.status == InventorySourceStatus::Complete {
+        InventoryStatus::Complete
+    } else {
+        InventoryStatus::Partial
+    };
+    document
+}
+
+fn parse_flatpak_ref(raw: &[u8]) -> Option<String> {
+    if raw.is_empty() || !raw.is_ascii() || raw.iter().any(|byte| !byte.is_ascii_graphic()) {
+        return None;
+    }
+    let reference = std::str::from_utf8(raw).ok()?;
+    let mut parts = reference.split('/');
+    let kind = parts.next()?;
+    let app_id = parts.next()?;
+    let arch = parts.next()?;
+    let branch = parts.next()?;
+    if !matches!(kind, "app" | "runtime")
+        || !valid_ref_component(app_id)
+        || !valid_ref_component(arch)
+        || !valid_ref_component(branch)
+        || parts.next().is_some()
+    {
+        return None;
+    }
+    Some(reference.to_owned())
+}
+
+fn valid_ref_component(component: &str) -> bool {
+    !component.is_empty()
+        && component
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+'))
+}
+
 fn parse_row(
     kind: PackageSourceKind,
     raw: &[u8],
@@ -452,6 +627,7 @@ fn parse_row(
             }
             Some((utf8(name)?, utf8(version)?, None, None))
         }
+        PackageSourceKind::Flatpak => None,
     }
 }
 

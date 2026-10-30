@@ -94,3 +94,46 @@ fn live_dpkg_query_writes_a_private_point_in_time_inventory() {
         bytes
     );
 }
+
+#[test]
+fn live_flatpak_list_cli_smoke_runs_only_when_flatpak_is_already_installed() {
+    if !PathBuf::from("/usr/bin/flatpak").is_file() {
+        eprintln!("SKIP: live Flatpak inventory check requires /usr/bin/flatpak");
+        return;
+    }
+
+    let directory = TempDirectory::new();
+    let output = directory.0.join("inventory.json");
+    let result = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["inventory", "packages", "--output"])
+        .arg(&output)
+        .output()
+        .expect("start SideEffect inventory CLI");
+    assert!(matches!(result.status.code(), Some(0 | 2)));
+    let inventory: serde_json::Value =
+        serde_json::from_slice(&fs::read(&output).expect("inventory output exists"))
+            .expect("inventory output is valid JSON");
+    let flatpak = inventory["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["id"] == "flatpak")
+        .expect("Flatpak source is reported");
+    assert_ne!(flatpak["status"], "unsupported");
+    assert!(matches!(
+        flatpak["status"].as_str(),
+        Some(
+            "complete"
+                | "partial"
+                | "access_denied"
+                | "failed"
+                | "timed_out"
+                | "output_limit_exceeded"
+        )
+    ));
+    assert!(
+        inventory["packages"].as_array().unwrap().iter().all(
+            |row| row["source_id"] != "flatpak" || row["evidence"]["record_sha256"].is_string()
+        )
+    );
+}
