@@ -316,31 +316,189 @@ pub fn from_linux_strace(
 
 #[cfg(windows)]
 pub fn from_windows_etw(capture: &crate::record::WindowsRuntimeCapture) -> CommonEventEnvelope {
-    use crate::record::WindowsRuntimeCollectionStatus;
+    from_windows_etw_source(capture)
+}
+
+#[cfg(windows)]
+pub fn from_windows_runtime_capture(
+    capture: &crate::windows_runtime::WindowsRuntimeCapture,
+) -> CommonEventEnvelope {
+    from_windows_etw_source(capture)
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EtwStopReason {
+    TargetExited,
+    DurationLimitReached,
+    EventLimitReached,
+    LossReported,
+    StatisticsUnavailable,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct EtwLossView {
+    events_lost: u32,
+    log_buffers_lost: u32,
+    real_time_buffers_lost: u32,
+    loss_statistics_available: bool,
+    final_snapshot_available: bool,
+}
+
+#[cfg(windows)]
+struct EtwEventView<'a> {
+    record_ordinal: u64,
+    event_kind: &'a str,
+    header_process_id: u32,
+    timestamp_qpc: i64,
+    raw_payload_hex: &'a str,
+}
+
+#[cfg(windows)]
+trait EtwCaptureView {
+    fn document_sha256(&self) -> &str;
+    fn collection_is_partial(&self) -> bool;
+    fn capture_completeness(&self) -> &str;
+    fn stop_reason(&self) -> EtwStopReason;
+    fn event_loss(&self) -> EtwLossView;
+    fn diagnostics(&self) -> &[String];
+    fn event_count(&self) -> usize;
+    fn event(&self, index: usize) -> Option<EtwEventView<'_>>;
+}
+
+#[cfg(windows)]
+impl EtwCaptureView for crate::record::WindowsRuntimeCapture {
+    fn document_sha256(&self) -> &str {
+        &self.document_sha256
+    }
+    fn collection_is_partial(&self) -> bool {
+        self.collection_status == crate::record::WindowsRuntimeCollectionStatus::Partial
+    }
+    fn capture_completeness(&self) -> &str {
+        self.capture_completeness
+    }
+    fn stop_reason(&self) -> EtwStopReason {
+        match self.stop_reason {
+            crate::record::WindowsRuntimeStopReason::TargetExited => EtwStopReason::TargetExited,
+            crate::record::WindowsRuntimeStopReason::DurationLimitReached => {
+                EtwStopReason::DurationLimitReached
+            }
+            crate::record::WindowsRuntimeStopReason::EventLimitReached => {
+                EtwStopReason::EventLimitReached
+            }
+            crate::record::WindowsRuntimeStopReason::EtwLossReported => EtwStopReason::LossReported,
+            crate::record::WindowsRuntimeStopReason::EtwStatisticsUnavailable => {
+                EtwStopReason::StatisticsUnavailable
+            }
+        }
+    }
+    fn event_loss(&self) -> EtwLossView {
+        EtwLossView {
+            events_lost: self.event_loss.events_lost,
+            log_buffers_lost: self.event_loss.log_buffers_lost,
+            real_time_buffers_lost: self.event_loss.real_time_buffers_lost,
+            loss_statistics_available: self.event_loss.loss_statistics_available,
+            final_snapshot_available: self.event_loss.final_snapshot_available,
+        }
+    }
+    fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
+    }
+    fn event_count(&self) -> usize {
+        self.events.len()
+    }
+    fn event(&self, index: usize) -> Option<EtwEventView<'_>> {
+        let event = self.events.get(index)?;
+        Some(EtwEventView {
+            record_ordinal: event.record_ordinal,
+            event_kind: event.event_kind,
+            header_process_id: event.header_process_id,
+            timestamp_qpc: event.timestamp_qpc,
+            raw_payload_hex: &event.raw_payload_hex,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl EtwCaptureView for crate::windows_runtime::WindowsRuntimeCapture {
+    fn document_sha256(&self) -> &str {
+        &self.document_sha256
+    }
+    fn collection_is_partial(&self) -> bool {
+        self.collection_status == crate::windows_runtime::CollectionStatus::Partial
+    }
+    fn capture_completeness(&self) -> &str {
+        &self.capture_completeness
+    }
+    fn stop_reason(&self) -> EtwStopReason {
+        match self.stop_reason {
+            crate::windows_runtime::StopReason::TargetExited => EtwStopReason::TargetExited,
+            crate::windows_runtime::StopReason::DurationLimitReached => {
+                EtwStopReason::DurationLimitReached
+            }
+            crate::windows_runtime::StopReason::EventLimitReached => {
+                EtwStopReason::EventLimitReached
+            }
+            crate::windows_runtime::StopReason::EtwLossReported => EtwStopReason::LossReported,
+            crate::windows_runtime::StopReason::EtwStatisticsUnavailable => {
+                EtwStopReason::StatisticsUnavailable
+            }
+        }
+    }
+    fn event_loss(&self) -> EtwLossView {
+        EtwLossView {
+            events_lost: self.event_loss.events_lost,
+            log_buffers_lost: self.event_loss.log_buffers_lost,
+            real_time_buffers_lost: self.event_loss.real_time_buffers_lost,
+            loss_statistics_available: self.event_loss.loss_statistics_available,
+            final_snapshot_available: self.event_loss.final_snapshot_available,
+        }
+    }
+    fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
+    }
+    fn event_count(&self) -> usize {
+        self.events.len()
+    }
+    fn event(&self, index: usize) -> Option<EtwEventView<'_>> {
+        let event = self.events.get(index)?;
+        Some(EtwEventView {
+            record_ordinal: event.record_ordinal,
+            event_kind: &event.event_kind,
+            header_process_id: event.header_process_id,
+            timestamp_qpc: event.timestamp_qpc,
+            raw_payload_hex: &event.raw_payload_hex,
+        })
+    }
+}
+
+#[cfg(windows)]
+fn from_windows_etw_source(capture: &impl EtwCaptureView) -> CommonEventEnvelope {
     use sha2::{Digest, Sha256};
 
-    let mut events = Vec::with_capacity(capture.events.len().min(MAX_ETW_EVENTS));
+    let mut events = Vec::with_capacity(capture.event_count().min(MAX_ETW_EVENTS));
     let mut diagnostics = Vec::new();
     let mut source_diagnostics = capture
-        .diagnostics
+        .diagnostics()
         .iter()
         .take(MAX_CAPTURE_DIAGNOSTICS)
         .map(|diagnostic| truncate_utf8(diagnostic, MAX_CAPTURE_DIAGNOSTIC_BYTES))
         .collect::<Vec<String>>();
     let any_diagnostic_text_truncated = capture
-        .diagnostics
+        .diagnostics()
         .iter()
         .take(MAX_CAPTURE_DIAGNOSTICS)
         .any(|diagnostic| diagnostic.len() > MAX_CAPTURE_DIAGNOSTIC_BYTES);
-    if capture.diagnostics.len() > MAX_CAPTURE_DIAGNOSTICS || any_diagnostic_text_truncated {
+    if capture.diagnostics().len() > MAX_CAPTURE_DIAGNOSTICS || any_diagnostic_text_truncated {
         source_diagnostics.push("source_diagnostics_truncated".to_owned());
     }
-    let source_fingerprint_valid = is_sha256_hex(&capture.document_sha256);
+    let source_fingerprint_valid = is_sha256_hex(capture.document_sha256());
     if !source_fingerprint_valid {
         source_diagnostics.push("invalid_source_fingerprint".to_owned());
     }
     let mut payload_bytes = 0_usize;
-    for (index, event) in capture.events.iter().enumerate() {
+    for index in 0..capture.event_count() {
         if index >= MAX_ETW_EVENTS {
             diagnostics.push(EventDiagnostic {
                 code: "event_limit_reached".to_owned(),
@@ -351,6 +509,16 @@ pub fn from_windows_etw(capture: &crate::record::WindowsRuntimeCapture) -> Commo
             source_diagnostics.push("event_limit_reached".to_owned());
             break;
         }
+        let Some(event) = capture.event(index) else {
+            diagnostics.push(EventDiagnostic {
+                code: "invalid_evidence_reference".to_owned(),
+                message: "ETW source row is unavailable".to_owned(),
+                source_local_ordinal: Some(index as u64 + 1),
+                evidence: None,
+            });
+            source_diagnostics.push("invalid_evidence_reference".to_owned());
+            continue;
+        };
         let expected = index as u64 + 1;
         if event.record_ordinal != expected {
             diagnostics.push(EventDiagnostic {
@@ -404,7 +572,7 @@ pub fn from_windows_etw(capture: &crate::record::WindowsRuntimeCapture) -> Commo
             break;
         }
         payload_bytes = total_payload_bytes;
-        let bytes = match decode_hex(&event.raw_payload_hex) {
+        let bytes = match decode_hex(event.raw_payload_hex) {
             Some(bytes) => bytes,
             None => {
                 diagnostics.push(EventDiagnostic {
@@ -442,14 +610,14 @@ pub fn from_windows_etw(capture: &crate::record::WindowsRuntimeCapture) -> Commo
             identity_context,
         });
     }
-    let loss = &capture.event_loss;
+    let loss = capture.event_loss();
     let loss_metadata = Some(LossMetadata {
         reported_events_lost: u64::from(loss.events_lost),
         reported_buffers_lost: u64::from(loss.log_buffers_lost)
             + u64::from(loss.real_time_buffers_lost),
         statistics_available: loss.loss_statistics_available && loss.final_snapshot_available,
     });
-    if capture.collection_status == WindowsRuntimeCollectionStatus::Partial {
+    if capture.collection_is_partial() {
         source_diagnostics.push("windows_etw_collection_partial".to_owned());
     }
     let has_losses =
@@ -462,9 +630,9 @@ pub fn from_windows_etw(capture: &crate::record::WindowsRuntimeCapture) -> Commo
     }
     let loss_statistics_complete = loss.loss_statistics_available && loss.final_snapshot_available;
     let statistics_unavailable_only = !loss_statistics_complete
-        && capture.stop_reason == crate::record::WindowsRuntimeStopReason::EtwStatisticsUnavailable
+        && capture.stop_reason() == EtwStopReason::StatisticsUnavailable
         && capture
-            .diagnostics
+            .diagnostics()
             .iter()
             .take(MAX_CAPTURE_DIAGNOSTICS)
             .all(|diagnostic| {
@@ -474,7 +642,7 @@ pub fn from_windows_etw(capture: &crate::record::WindowsRuntimeCapture) -> Commo
                 )
             });
     let has_other_capture_diagnostic = capture
-        .diagnostics
+        .diagnostics()
         .iter()
         .take(MAX_CAPTURE_DIAGNOSTICS)
         .any(|diagnostic| {
@@ -485,20 +653,19 @@ pub fn from_windows_etw(capture: &crate::record::WindowsRuntimeCapture) -> Commo
         });
     let known_partial_reason = has_losses
         || matches!(
-            capture.stop_reason,
-            crate::record::WindowsRuntimeStopReason::DurationLimitReached
-                | crate::record::WindowsRuntimeStopReason::EventLimitReached
-                | crate::record::WindowsRuntimeStopReason::EtwLossReported
+            capture.stop_reason(),
+            EtwStopReason::DurationLimitReached
+                | EtwStopReason::EventLimitReached
+                | EtwStopReason::LossReported
         )
         || has_other_capture_diagnostic
-        || (capture.collection_status == WindowsRuntimeCollectionStatus::Partial
-            && !statistics_unavailable_only)
+        || (capture.collection_is_partial() && !statistics_unavailable_only)
         || !diagnostics.is_empty()
         || !source_fingerprint_valid
-        || capture.diagnostics.len() > MAX_CAPTURE_DIAGNOSTICS;
+        || capture.diagnostics().len() > MAX_CAPTURE_DIAGNOSTICS;
     let completeness = if known_partial_reason {
         SourceCompleteness::Partial
-    } else if capture.capture_completeness == "complete" && loss_statistics_complete {
+    } else if capture.capture_completeness() == "complete" && loss_statistics_complete {
         SourceCompleteness::Complete
     } else {
         SourceCompleteness::Unknown
@@ -511,7 +678,8 @@ pub fn from_windows_etw(capture: &crate::record::WindowsRuntimeCapture) -> Commo
             schema: WINDOWS_RUNTIME_SCHEMA.to_owned(),
             schema_version: WINDOWS_RUNTIME_SCHEMA_VERSION,
             artifact: "runtime.windows.json".to_owned(),
-            sha256: source_fingerprint_valid.then(|| capture.document_sha256.to_ascii_lowercase()),
+            sha256: source_fingerprint_valid
+                .then(|| capture.document_sha256().to_ascii_lowercase()),
         },
         source_state: SourceState {
             completeness,

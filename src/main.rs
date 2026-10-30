@@ -115,7 +115,7 @@ fn read_model_confirmation() -> Result<String, String> {
 fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
     match arguments.as_slice() {
         [flag] if flag == "--help" || flag == "-h" => {
-            println!("{USAGE}");
+            print_usage();
             Ok(ExitCode::SUCCESS)
         }
         [flag] if flag == "--version" => {
@@ -162,6 +162,15 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         }
         [command, flag, path] if command == "inspect" && flag == "--windows-runtime" => {
             inspect_windows_runtime_with_format(&OsString::from("json"), path)
+        }
+        [command, flag, path] if command == "events" && flag == "--trace" => events_trace(path),
+        #[cfg(windows)]
+        [command, flag, path] if command == "events" && flag == "--windows-runtime" => {
+            events_windows_runtime(path)
+        }
+        #[cfg(not(windows))]
+        [command, flag, path] if command == "events" && flag == "--windows-runtime" => {
+            events_windows_runtime(path)
         }
         [command, flag, path] if command == "attribute" && flag == "--windows-runtime" => {
             attribute_windows_runtime(path)
@@ -1265,6 +1274,12 @@ fn print_version() {
     println!("sideeffect {}", env!("CARGO_PKG_VERSION"));
 }
 
+fn print_usage() {
+    println!(
+        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)"
+    );
+}
+
 fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
     let topic = topics
         .iter()
@@ -1275,7 +1290,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         .collect::<Result<Vec<_>, _>>()?
         .join(" ");
     if topic.is_empty() {
-        println!("{USAGE}");
+        print_usage();
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -1296,6 +1311,9 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         }
         "inspect" => {
             "Usage: sideeffect inspect [--format json|text] TRACE\n       sideeffect inspect [--format json|text] --bundle DIR\n       sideeffect inspect [--format json|text] --session DIR\n       sideeffect inspect [--format json|text] --windows-runtime FILE\n       sideeffect inspect --format html --output NEW_REPORT.html --windows-runtime FILE (native Windows)\nReads bounded local strace evidence, a validated run bundle, a verified audit session, or a Windows ETW capture. It never runs represented commands. JSON is the default; text output escapes terminal controls and user-influenced fields. Windows runtime inspection accepts schema v3, validates its document fingerprint and bounds, and does not authenticate authorship or establish capture completeness. HTML file export uses the protected current-user publisher and is available only on native Windows. Partial input is labeled and exits with status 2."
+        }
+        "events" => {
+            "Usage: sideeffect events --trace TRACE\n       sideeffect events --windows-runtime CAPTURE.json (native Windows)\nAdapts one local runtime source into a versioned common event envelope and writes JSON only. Source-local order and timestamps are preserved; no cross-platform ordering, parentage, ownership, or causation is inferred. Partial or unknown source status exits with status 2. Windows runtime input is strictly bounded and schema-validated before adaptation."
         }
         "diff" => {
             "Usage: sideeffect diff [--format json|text] LEFT RIGHT\n       sideeffect diff --format html --output REPORT.html LEFT RIGHT\n       sideeffect diff --bundles [--format json|text] LEFT_DIR RIGHT_DIR\n       sideeffect diff --windows-runtime [--format json|text] BEFORE.json AFTER.json\n       sideeffect diff --format html --output REPORT.html --windows-runtime BEFORE.json AFTER.json (native Windows)\nCompares complete parsed strace observations or validated Windows ETW captures. Windows summary v2 preserves category counts, compares exact normalized record multisets, and labels unique supported changed identities as candidates with source references. One-sided observations are not removals or additions; capture completeness remains unknown, and no causal or system-level absence claims are made. Windows HTML uses the protected current-user publisher and a static offline report. Input and report data may be sensitive."
@@ -1434,6 +1452,46 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
 
 fn inspect(path: &OsString) -> Result<ExitCode, String> {
     inspect_with_format(&OsString::from("json"), path)
+}
+
+fn events_trace(path: &OsString) -> Result<ExitCode, String> {
+    let bytes = read_bounded(path)?;
+    let trace = parse_trace_bytes(&bytes, ParseLimits::default())
+        .map_err(|error| format!("trace event adaptation failed: {error}"))?;
+    let envelope = sideeffect::event::from_linux_strace(&trace, &bytes, "trace");
+    let complete =
+        envelope.source_state.completeness == sideeffect::event::SourceCompleteness::Complete;
+    write_json(&envelope, "common event envelope")?;
+    Ok(if complete {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
+#[cfg(windows)]
+fn events_windows_runtime(path: &OsString) -> Result<ExitCode, String> {
+    let bytes = read_input_file(
+        Path::new(path),
+        sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
+        "Windows runtime capture",
+    )?;
+    let capture = sideeffect::windows_runtime::inspect_windows_runtime_bytes(&bytes)
+        .map_err(|error| format!("Windows runtime event adaptation failed: {error}"))?;
+    let envelope = sideeffect::event::from_windows_runtime_capture(&capture);
+    let complete =
+        envelope.source_state.completeness == sideeffect::event::SourceCompleteness::Complete;
+    write_json(&envelope, "common event envelope")?;
+    Ok(if complete {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
+#[cfg(not(windows))]
+fn events_windows_runtime(_path: &OsString) -> Result<ExitCode, String> {
+    Err("events --windows-runtime is supported only in native Windows builds".to_owned())
 }
 
 fn inspect_session_with_format(format: &OsString, path: &OsString) -> Result<ExitCode, String> {

@@ -19,6 +19,7 @@ fn help_command_and_flag_show_command_list() {
             "sideeffect associated-behavior <startup-inventory.json> <runtime-evidence-file>"
         ));
         assert!(text.contains("sideeffect attribute --windows-runtime <capture.json>"));
+        assert!(text.contains("sideeffect events --trace <strace-trace-file>"));
         assert!(text.contains("--session <audit-session-directory>"));
     }
 }
@@ -37,6 +38,12 @@ fn focused_help_covers_command_and_nested_inventory_topics() {
     let inspect = run(&["inspect", "--help"]);
     assert!(inspect.status.success());
     assert!(String::from_utf8_lossy(&inspect.stdout).contains("--session DIR"));
+
+    let events = run(&["events", "--help"]);
+    assert!(events.status.success());
+    let events_help = String::from_utf8_lossy(&events.stdout);
+    assert!(events_help.contains("events --trace TRACE"));
+    assert!(events_help.contains("writes JSON only"));
 
     let diff = run(&["help", "diff"]);
     assert!(diff.status.success());

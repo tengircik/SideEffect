@@ -82,7 +82,11 @@ fn fixture(status: CollectionStatus) -> Vec<u8> {
             }),
             observation_decoding: None,
         }],
-        diagnostics: Vec::new(),
+        diagnostics: if status == CollectionStatus::Partial {
+            vec!["synthetic_fixture_partial_source".to_owned()]
+        } else {
+            Vec::new()
+        },
     };
     let canonical = serde_json::to_vec(&capture).unwrap();
     capture.document_sha256 = format!("{:x}", Sha256::digest(canonical));
@@ -154,6 +158,110 @@ fn inspect_rejects_capture_with_mismatched_representation_fingerprint() {
     fs::remove_file(path).unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("SHA-256 mismatch"));
+}
+
+#[cfg(windows)]
+#[test]
+fn events_windows_runtime_validates_capture_and_preserves_source_context() {
+    let input = fixture(CollectionStatus::Complete);
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-events-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, &input).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["events", "--windows-runtime"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["schema"], "sideeffect.common_event_envelope");
+    assert_eq!(envelope["source"]["platform"], "windows");
+    assert_eq!(envelope["source"]["schema"], WINDOWS_RUNTIME_CAPTURE_SCHEMA);
+    assert_eq!(
+        envelope["source"]["schema_version"],
+        WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION
+    );
+    assert_eq!(envelope["source_state"]["completeness"], "unknown");
+    assert_eq!(envelope["events"][0]["source_local_ordinal"], 1);
+    assert_eq!(envelope["events"][0]["source_timestamp"]["value"], "10");
+    assert_eq!(
+        envelope["events"][0]["source_timestamp"]["clock_unit"],
+        "ETW_QPC_ticks"
+    );
+    assert_eq!(envelope["events"][0]["identity_context"][0]["value"], "8");
+    assert!(
+        envelope["events"][0]["identity_context"][0]["ambiguity"]
+            .as_str()
+            .unwrap()
+            .contains("header context only")
+    );
+    assert_eq!(
+        envelope["events"][0]["evidence"]["json_pointer"],
+        "/events/0"
+    );
+    assert_eq!(
+        envelope["events"][0]["evidence"]["raw_payload_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn events_windows_runtime_rejects_unverified_capture_bytes() {
+    let mut value: Value = serde_json::from_slice(&fixture(CollectionStatus::Complete)).unwrap();
+    value["target"]["process_id"] = json!(99);
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-events-invalid-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["events", "--windows-runtime"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("SHA-256 mismatch"));
+    assert!(output.stdout.is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn events_windows_runtime_preserves_partial_source_status_and_diagnostics() {
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-events-partial-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, fixture(CollectionStatus::Partial)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["events", "--windows-runtime"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["source_state"]["completeness"], "partial");
+    assert!(
+        envelope["source_state"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic == "synthetic_fixture_partial_source")
+    );
 }
 
 fn html_paths() -> (PathBuf, PathBuf) {
