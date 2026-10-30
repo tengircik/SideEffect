@@ -246,7 +246,7 @@ fn audit_cli_includes_bounded_runtime_bundle_and_preserves_argument_boundaries()
         runtime.requested_settings[0].code,
         "runtime_duration_seconds"
     );
-    assert_eq!(runtime.requested_settings[0].value, 2);
+    assert_eq!(runtime.requested_settings[0].value, 10);
     assert_eq!(
         runtime.loss.as_ref().unwrap().status,
         sideeffect::audit_session::LossStatus::Unknown

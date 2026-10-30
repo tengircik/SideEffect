@@ -533,7 +533,6 @@ fn diag(
     ProcessDiagnostic {
         code,
         pid,
-        start_time: empty_start_time(ProcessStartTimeStatus::NotChecked),
         field,
         message,
         evidence: None,
@@ -543,6 +542,7 @@ fn diag(
 fn parse_status(pid: u32, bytes: &[u8]) -> (ProcessRow, Vec<ProcessDiagnostic>) {
     let mut row = ProcessRow {
         pid,
+        start_time: empty_start_time(ProcessStartTimeStatus::NotChecked),
         executable_link: empty_executable_link(ProcessExecutableLinkStatus::Unsupported),
         name: None,
         tgid: None,
