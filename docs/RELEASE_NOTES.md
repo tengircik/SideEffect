@@ -4,6 +4,14 @@ There is no tagged release yet. This page records the current source-candidate s
 
 ## Unreleased — Windows runtime evidence and schema compatibility
 
+### Portable Agent Skill
+
+- Added the `sideeffect-audit` Agent Skill for Codex, Claude Code, OpenCode, and compatible agents, with separate native installation guidance for Oh My Pi (OMP).
+- The skill uses the installed deterministic SideEffect CLI and the user's selected agent/model; SideEffect's optional local-model commands are not a prerequisite.
+- Added a telemetry-opt-out installer command pinned to the reviewed skill commit, update/removal/privacy guidance, a CI validator for package structure and safety requirements, and a capability-led README with local SVG visuals.
+- Source-candidate commit [`984a2f8`](https://github.com/tengircik/SideEffect/commit/984a2f8fb65835a0caa01c872ae98858cd4bf424) passed the full [CI run](https://github.com/tengircik/SideEffect/actions/runs/40873617494) and [dependency checks](https://github.com/tengircik/SideEffect/actions/runs/40873617184), including live ETW acceptance on hosted Windows Server 2022 and 2025.
+- There is not yet a tagged release or prebuilt binary distribution. The documented installation builds from source; Windows 11 desktop live ETW remains unverified.
+
 ### Windows runtime workflows
 
 - Added `attribute --windows-runtime` as a separate evidence-linked view over a validated ETW v3 capture.

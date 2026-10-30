@@ -19,6 +19,8 @@ SideEffect turns selected local software sources and bounded runtime captures in
 
 Install the `sideeffect-audit` Agent Skill for Codex, Claude Code, OpenCode, and other compatible agents. The skill lets your chosen agent use SideEffect's deterministic CLI; it does not require SideEffect's experimental local-model commands.
 
+The community skill installer requires Node.js 22.20 or later. The SideEffect CLI is installed separately from source below.
+
 ```sh
 DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/c5c57f7bbfcad0a5c16c6499c0f2a7c1fb5b2a1f/.agents/skills/sideeffect-audit --skill sideeffect-audit -g --copy
 ```
