@@ -8,10 +8,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 pub const AUDIT_SESSION_SCHEMA: &str = "sideeffect.audit_session";
-pub const AUDIT_SESSION_SCHEMA_VERSION: u32 = 4;
+pub const AUDIT_SESSION_SCHEMA_VERSION: u32 = 5;
 pub const AUDIT_SESSION_V1_SCHEMA_VERSION: u32 = 1;
 pub const AUDIT_SESSION_V2_SCHEMA_VERSION: u32 = 2;
 pub const AUDIT_SESSION_V3_SCHEMA_VERSION: u32 = 3;
+pub const AUDIT_SESSION_V4_SCHEMA_VERSION: u32 = 4;
 pub const COVERAGE_MANIFEST_VERSION: u32 = 1;
 pub const MAX_AUDIT_SESSION_MANIFEST_BYTES: usize = 512 * 1024;
 pub const MAX_SESSION_SOURCES: usize = 8;
@@ -45,7 +46,7 @@ pub struct AuditSessionManifest {
     /// Host identity and caller privilege facts. Absent from v1-v3 manifests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_context: Option<HostContext>,
-    /// Missing in v1 manifests; v2 and v3 producers include an explicit bounded map.
+    /// Missing in v1 manifests; v2-v5 producers include an explicit bounded map.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_manifest: Option<CoverageManifest>,
 }
@@ -194,6 +195,9 @@ pub enum SourceStatus {
 #[serde(deny_unknown_fields)]
 pub struct AuditSessionSource {
     pub role: SourceRole,
+    /// Collector implementation identity. Absent from v1-v4 manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collector: Option<CollectorIdentity>,
     pub platform: String,
     pub scope: String,
     pub started_at_unix_ms: u128,
@@ -212,6 +216,18 @@ pub struct AuditSessionSource {
     pub loss: Option<LossMetadata>,
     pub diagnostic_codes: Vec<String>,
     pub artifacts: Vec<SessionArtifactRef>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectorIdentity {
+    /// Stable platform+role implementation ID.
+    pub id: String,
+    /// SideEffect package version implementing the collector.
+    pub version: String,
+    /// Present only for a provider-backed Windows ETW runtime source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -312,10 +328,7 @@ impl AuditSessionManifest {
         if self.schema != AUDIT_SESSION_SCHEMA
             || !matches!(
                 self.schema_version,
-                AUDIT_SESSION_V1_SCHEMA_VERSION
-                    | AUDIT_SESSION_V2_SCHEMA_VERSION
-                    | AUDIT_SESSION_V3_SCHEMA_VERSION
-                    | AUDIT_SESSION_SCHEMA_VERSION
+                AUDIT_SESSION_V1_SCHEMA_VERSION..=AUDIT_SESSION_SCHEMA_VERSION
             )
         {
             return Err(ValidationError::InvalidSchema);
@@ -327,7 +340,7 @@ impl AuditSessionManifest {
         validate_token(&self.architecture, MAX_PLATFORM_BYTES, "architecture")?;
         match (&self.host_context, self.schema_version) {
             (None, 1..=3) => {}
-            (Some(context), AUDIT_SESSION_SCHEMA_VERSION) => {
+            (Some(context), AUDIT_SESSION_V4_SCHEMA_VERSION | AUDIT_SESSION_SCHEMA_VERSION) => {
                 for fact in [&context.os_name, &context.os_version] {
                     match (fact.status, &fact.value) {
                         (ContextFactStatus::Observed, Some(value)) => {
@@ -350,6 +363,7 @@ impl AuditSessionManifest {
                 Some(coverage),
                 AUDIT_SESSION_V2_SCHEMA_VERSION
                 | AUDIT_SESSION_V3_SCHEMA_VERSION
+                | AUDIT_SESSION_V4_SCHEMA_VERSION
                 | AUDIT_SESSION_SCHEMA_VERSION,
             ) => {
                 if coverage.version != COVERAGE_MANIFEST_VERSION
@@ -388,6 +402,13 @@ impl AuditSessionManifest {
                 return Err(ValidationError::SourcePlatformMismatch);
             }
             validate_bounded_text(&source.scope, MAX_SCOPE_BYTES, "scope")?;
+            match (&source.collector, self.schema_version) {
+                (None, 1..=AUDIT_SESSION_V4_SCHEMA_VERSION) => {}
+                (Some(identity), AUDIT_SESSION_SCHEMA_VERSION) => {
+                    validate_collector_identity(identity, &source.platform, source.role)?;
+                }
+                _ => return Err(ValidationError::InvalidCollectorIdentity),
+            }
             validate_interval(source.started_at_unix_ms, source.ended_at_unix_ms)?;
             if source.started_at_unix_ms < self.started_at_unix_ms
                 || source.ended_at_unix_ms > self.ended_at_unix_ms
@@ -540,6 +561,8 @@ pub enum ComparabilityReason {
     SourceSettingsUnknown,
     ArtifactSetMismatch,
     ArtifactContractMismatch,
+    CollectorIdentityMismatch,
+    CollectorIdentityUnknown,
     CoverageUnknown,
     CoverageMismatch,
     RuntimeLossMismatch,
@@ -566,6 +589,8 @@ impl ComparabilityReason {
             Self::SourceSettingsUnknown => "source_settings_unknown",
             Self::ArtifactSetMismatch => "artifact_set_mismatch",
             Self::ArtifactContractMismatch => "artifact_contract_mismatch",
+            Self::CollectorIdentityMismatch => "collector_identity_mismatch",
+            Self::CollectorIdentityUnknown => "collector_identity_unknown",
             Self::CoverageUnknown => "coverage_unknown",
             Self::CoverageMismatch => "coverage_mismatch",
             Self::RuntimeLossMismatch => "runtime_loss_mismatch",
@@ -621,8 +646,8 @@ pub fn compare_sessions(
         _ => add(R::HostOsUnknown, true),
     }
 
-    if left.schema_version < AUDIT_SESSION_SCHEMA_VERSION
-        || right.schema_version < AUDIT_SESSION_SCHEMA_VERSION
+    if left.schema_version < AUDIT_SESSION_V4_SCHEMA_VERSION
+        || right.schema_version < AUDIT_SESSION_V4_SCHEMA_VERSION
     {
         // Host context did not exist in those versions, even if deserialized
         // defaults happen to look alike.
@@ -668,6 +693,11 @@ pub fn compare_sessions(
         };
         if a.platform != b.platform {
             add(R::SourcePlatformMismatch, true);
+        }
+        match (&a.collector, &b.collector) {
+            (Some(x), Some(y)) if x == y => {}
+            (Some(_), Some(_)) => add(R::CollectorIdentityMismatch, true),
+            _ => add(R::CollectorIdentityUnknown, true),
         }
         if a.scope != b.scope {
             add(R::SourceScopeMismatch, true);
@@ -870,6 +900,46 @@ fn validate_platform(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
+pub fn collector_identity(platform: &str, role: SourceRole) -> CollectorIdentity {
+    let id = match (platform, role) {
+        ("linux", SourceRole::Packages) => "linux.debian_packages",
+        ("linux", SourceRole::Processes) => "linux.procfs_processes",
+        ("linux", SourceRole::Permissions) => "linux.selected_path_permissions",
+        ("linux", SourceRole::Startup) => "linux.curated_startup_sources",
+        ("linux", SourceRole::Runtime) => "linux.strace_runtime",
+        ("windows", SourceRole::Packages) => "windows.software_registry",
+        ("windows", SourceRole::Processes) => "windows.toolhelp_processes",
+        ("windows", SourceRole::Permissions) => "windows.selected_path_permissions",
+        ("windows", SourceRole::Startup) => "windows.curated_startup_sources",
+        ("windows", SourceRole::Runtime) => "windows.etw_runtime",
+        _ => "unknown",
+    };
+    CollectorIdentity {
+        id: id.to_owned(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        provider_id: (platform == "windows" && role == SourceRole::Runtime)
+            .then(|| "nt_kernel_logger".to_owned()),
+    }
+}
+
+fn validate_collector_identity(
+    identity: &CollectorIdentity,
+    platform: &str,
+    role: SourceRole,
+) -> Result<(), ValidationError> {
+    let expected = collector_identity(platform, role);
+    validate_token(&identity.id, 96, "collector id")?;
+    validate_token(&identity.version, 64, "collector version")?;
+    if !identity.id.bytes().all(|b| {
+        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_' || b == b'-'
+    }) || identity.id != expected.id
+        || identity.provider_id != expected.provider_id
+    {
+        return Err(ValidationError::InvalidCollectorIdentity);
+    }
+    Ok(())
+}
+
 fn validate_token(
     value: &str,
     max_bytes: usize,
@@ -941,6 +1011,7 @@ pub enum ValidationError {
     InvalidLossMetadata,
     InvalidHostContext,
     InvalidSourceSettings,
+    InvalidCollectorIdentity,
     InvalidCode,
     UnsupportedArtifactPlatform,
     ArtifactSetMismatch,
@@ -991,6 +1062,10 @@ mod tests {
             status: SessionStatus::Complete,
             coverage_manifest: Some(CoverageManifest::from_sources(&[AuditSessionSource {
                 role: SourceRole::Packages,
+                collector: Some(crate::audit_session::collector_identity(
+                    "linux",
+                    SourceRole::Packages,
+                )),
                 platform: "linux".to_owned(),
                 scope: "available package databases".to_owned(),
                 started_at_unix_ms: 1000,
@@ -1005,6 +1080,10 @@ mod tests {
             }])),
             sources: vec![AuditSessionSource {
                 role: SourceRole::Packages,
+                collector: Some(crate::audit_session::collector_identity(
+                    "linux",
+                    SourceRole::Packages,
+                )),
                 platform: "linux".to_owned(),
                 scope: "available package databases".to_owned(),
                 started_at_unix_ms: 1000,
@@ -1039,9 +1118,46 @@ mod tests {
     }
 
     #[test]
+    fn legacy_collector_identity_is_incomparable_and_v5_identity_is_strict() {
+        let current = valid_manifest();
+        let mut legacy = current.clone();
+        legacy.schema_version = super::AUDIT_SESSION_V4_SCHEMA_VERSION;
+        legacy.host_context = Some(current.host_context.clone().unwrap());
+        legacy.sources[0].collector = None;
+        assert!(legacy.validate().is_ok());
+        let result = compare_sessions(&current, &legacy);
+        assert!(!result.comparable);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|r| r.code() == "collector_identity_unknown")
+        );
+
+        let mut invalid_id = current.clone();
+        invalid_id.sources[0].collector.as_mut().unwrap().id = "linux.unknown".to_owned();
+        assert_eq!(
+            invalid_id.validate(),
+            Err(ValidationError::InvalidCollectorIdentity)
+        );
+
+        let mut invalid_provider = current;
+        invalid_provider.sources[0]
+            .collector
+            .as_mut()
+            .unwrap()
+            .provider_id = Some("nt_kernel_logger".to_owned());
+        assert_eq!(
+            invalid_provider.validate(),
+            Err(ValidationError::InvalidCollectorIdentity)
+        );
+    }
+
+    #[test]
     fn comparability_reports_mismatch_categories() {
         let mut left = valid_manifest();
         left.sources[0].role = SourceRole::Processes;
+        left.sources[0].collector = Some(super::collector_identity("linux", SourceRole::Processes));
         left.sources[0].artifacts[0] = SessionArtifactRef {
             kind: ArtifactKind::Processes,
             path: "processes.json".to_owned(),
@@ -1103,6 +1219,8 @@ mod tests {
         assert!(status_codes.contains(&"effective_settings_mismatch"));
 
         right.sources[0].role = SourceRole::Processes;
+        right.sources[0].collector =
+            Some(super::collector_identity("linux", SourceRole::Processes));
         right.sources[0].artifacts[0].kind = ArtifactKind::Processes;
         right.sources[0].artifacts[0].path = "processes.json".to_owned();
         right.sources[0].artifacts[0].schema = "sideeffect.process_inventory".to_owned();
@@ -1141,6 +1259,8 @@ mod tests {
     fn runtime_loss_and_legacy_metadata_are_incomparable_when_unknown() {
         let mut runtime = valid_manifest();
         runtime.sources[0].role = SourceRole::Runtime;
+        runtime.sources[0].collector =
+            Some(super::collector_identity("linux", SourceRole::Runtime));
         runtime.sources[0].status = SourceStatus::Partial;
         runtime.status = SessionStatus::Partial;
         runtime.sources[0].loss = Some(super::LossMetadata::unknown());
@@ -1260,6 +1380,10 @@ mod tests {
         value["schema_version"] = serde_json::json!(AUDIT_SESSION_V1_SCHEMA_VERSION);
         value.as_object_mut().unwrap().remove("coverage_manifest");
         value.as_object_mut().unwrap().remove("host_context");
+        value["sources"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("collector");
         let parsed = parse_manifest(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(parsed.schema_version, AUDIT_SESSION_V1_SCHEMA_VERSION);
         assert_eq!(parsed.coverage_manifest, None);
@@ -1270,6 +1394,10 @@ mod tests {
         let mut v2_value = serde_json::to_value(valid_manifest()).unwrap();
         v2_value["schema_version"] = serde_json::json!(AUDIT_SESSION_V2_SCHEMA_VERSION);
         v2_value.as_object_mut().unwrap().remove("host_context");
+        v2_value["sources"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("collector");
         let parsed_v2 = parse_manifest(&serde_json::to_vec(&v2_value).unwrap()).unwrap();
         assert_eq!(parsed_v2.schema_version, AUDIT_SESSION_V2_SCHEMA_VERSION);
         v2_value["sources"][0]["requested_settings"] = serde_json::json!([{
@@ -1287,6 +1415,10 @@ mod tests {
         let mut value = serde_json::to_value(valid_manifest()).unwrap();
         value["schema_version"] = serde_json::json!(super::AUDIT_SESSION_V3_SCHEMA_VERSION);
         value.as_object_mut().unwrap().remove("host_context");
+        value["sources"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("collector");
         let parsed = parse_manifest(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(
             parsed.schema_version,
@@ -1342,6 +1474,10 @@ mod tests {
         );
         let startup = AuditSessionSource {
             role: SourceRole::Startup,
+            collector: Some(crate::audit_session::collector_identity(
+                "linux",
+                SourceRole::Startup,
+            )),
             platform: "linux".to_owned(),
             scope: "curated startup paths".to_owned(),
             started_at_unix_ms: 1000,
@@ -1360,6 +1496,10 @@ mod tests {
         );
         let inaccessible = AuditSessionSource {
             role: SourceRole::Processes,
+            collector: Some(crate::audit_session::collector_identity(
+                "linux",
+                SourceRole::Processes,
+            )),
             platform: "linux".to_owned(),
             scope: "visible procfs".to_owned(),
             started_at_unix_ms: 1000,
@@ -1397,6 +1537,10 @@ mod tests {
         manifest.status = SessionStatus::Partial;
         manifest.sources.push(AuditSessionSource {
             role: SourceRole::Processes,
+            collector: Some(crate::audit_session::collector_identity(
+                "linux",
+                SourceRole::Processes,
+            )),
             platform: "linux".to_owned(),
             scope: "visible procfs entries".to_owned(),
             started_at_unix_ms: 1001,
@@ -1441,6 +1585,8 @@ mod tests {
         manifest.platform = "windows".to_owned();
         manifest.architecture = "x86_64".to_owned();
         manifest.sources[0].platform = "windows".to_owned();
+        manifest.sources[0].collector =
+            Some(super::collector_identity("windows", SourceRole::Packages));
         manifest.sources[0].scope = "bounded native software registrations".to_owned();
         manifest.sources[0].artifacts = vec![SessionArtifactRef {
             kind: ArtifactKind::WindowsSoftware,
@@ -1452,6 +1598,10 @@ mod tests {
         }];
         manifest.sources.push(AuditSessionSource {
             role: SourceRole::Runtime,
+            collector: Some(crate::audit_session::collector_identity(
+                "windows",
+                SourceRole::Runtime,
+            )),
             platform: "windows".to_owned(),
             scope: "bounded system-wide ETW observations; completeness unknown".to_owned(),
             started_at_unix_ms: 1001,
@@ -1514,6 +1664,10 @@ mod tests {
         let mut manifest = valid_manifest();
         let processes = AuditSessionSource {
             role: SourceRole::Processes,
+            collector: Some(crate::audit_session::collector_identity(
+                "linux",
+                SourceRole::Processes,
+            )),
             platform: "linux".to_owned(),
             scope: "visible procfs entries".to_owned(),
             started_at_unix_ms: 1001,
@@ -1535,6 +1689,10 @@ mod tests {
         };
         let unavailable = AuditSessionSource {
             role: SourceRole::Startup,
+            collector: Some(crate::audit_session::collector_identity(
+                "linux",
+                SourceRole::Startup,
+            )),
             platform: "linux".to_owned(),
             scope: "selected startup locations".to_owned(),
             started_at_unix_ms: 1002,
@@ -1614,6 +1772,7 @@ mod tests {
         let mut manifest = valid_manifest();
         let mut source = manifest.sources[0].clone();
         source.role = SourceRole::Runtime;
+        source.collector = Some(super::collector_identity("linux", SourceRole::Runtime));
         source.status = SourceStatus::Partial;
         source.artifacts = vec![
             SessionArtifactRef {
@@ -1674,6 +1833,7 @@ mod tests {
         manifest.sources[0].artifacts[0].byte_length = super::MAX_SESSION_ARTIFACT_BYTES;
         let source = |role, kind, path: &str, schema: &str| AuditSessionSource {
             role,
+            collector: Some(super::collector_identity("linux", role)),
             platform: "linux".to_owned(),
             scope: "bounded test source".to_owned(),
             started_at_unix_ms: 1000,

@@ -373,6 +373,7 @@ fn source(
 ) -> AuditSessionSource {
     AuditSessionSource {
         role,
+        collector: Some(crate::audit_session::collector_identity("windows", role)),
         platform: "windows".to_owned(),
         scope: scope.to_owned(),
         started_at_unix_ms: start,

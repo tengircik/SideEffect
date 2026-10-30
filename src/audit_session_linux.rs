@@ -214,6 +214,7 @@ pub fn collect_and_publish(
                 }
                 sources.push(AuditSessionSource {
                     role: SourceRole::Runtime,
+                    collector: Some(crate::audit_session::collector_identity("linux", SourceRole::Runtime)),
                     platform: "linux".to_owned(),
                     scope: "selected command and traced descendants; command arguments are not copied into the session manifest".to_owned(),
                     started_at_unix_ms: started,
@@ -244,6 +245,7 @@ pub fn collect_and_publish(
                 let target_may_have_run = error.target_may_have_run();
                 sources.push(AuditSessionSource {
                     role: SourceRole::Runtime,
+                    collector: Some(crate::audit_session::collector_identity("linux", SourceRole::Runtime)),
                     platform: "linux".to_owned(),
                     scope: "selected command and traced descendants; command arguments are not copied into the session manifest".to_owned(),
                     started_at_unix_ms: started,
@@ -440,6 +442,7 @@ fn build_source(
     let diagnostic_codes = collect_codes(document);
     Ok(AuditSessionSource {
         role,
+        collector: Some(crate::audit_session::collector_identity("linux", role)),
         platform: platform.to_owned(),
         scope: scope.to_owned(),
         started_at_unix_ms,

@@ -142,7 +142,8 @@ fn audit_cli_publishes_private_session_with_verified_source_intervals_and_hashes
         if format == "json" {
             let review: serde_json::Value = serde_json::from_slice(&reviewed.stdout).unwrap();
             assert_eq!(review["schema"], "sideeffect.audit_session_review");
-            assert_eq!(review["schema_version"], 4);
+            assert_eq!(review["schema_version"], 5);
+            assert!(review["sources"][0]["collector"]["id"].is_string());
             assert_eq!(review["host_context"]["os_name"]["status"], "observed");
             assert!(review["host_context"]["privilege"].is_string());
             assert_eq!(review["authenticity"], "not_established");

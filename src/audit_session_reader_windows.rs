@@ -723,6 +723,10 @@ mod tests {
             coverage_manifest: Some(crate::audit_session::CoverageManifest::from_sources(&[
                 crate::audit_session::AuditSessionSource {
                     role: SourceRole::Runtime,
+                    collector: Some(crate::audit_session::collector_identity(
+                        "windows",
+                        SourceRole::Runtime,
+                    )),
                     platform: "windows".to_owned(),
                     scope: "synthetic ETW artifact contract fixture".to_owned(),
                     started_at_unix_ms: 1_000,
@@ -738,6 +742,10 @@ mod tests {
             ])),
             sources: vec![AuditSessionSource {
                 role: SourceRole::Runtime,
+                collector: Some(crate::audit_session::collector_identity(
+                    "windows",
+                    SourceRole::Runtime,
+                )),
                 platform: "windows".to_owned(),
                 scope: "synthetic ETW artifact contract fixture".to_owned(),
                 started_at_unix_ms: 1_000,

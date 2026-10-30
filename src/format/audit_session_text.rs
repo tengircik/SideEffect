@@ -57,6 +57,20 @@ pub fn write_audit_session_text<W: Write>(
             )
         )?;
         writeln!(writer, "  Platform: {}", source.platform)?;
+        if let Some(collector) = &source.collector {
+            writeln!(
+                writer,
+                "  Collector: {} v{}",
+                collector.id, collector.version
+            )?;
+            writeln!(
+                writer,
+                "  Provider: {}",
+                collector.provider_id.as_deref().unwrap_or("not applicable")
+            )?;
+        } else {
+            writer.write_all(b"  Collector identity: not recorded (legacy session)\n")?;
+        }
         writer.write_all(b"  Scope: ")?;
         write_quoted_ascii(writer, &source.scope)?;
         writer.write_all(b"\n")?;
@@ -188,6 +202,7 @@ pub fn write_audit_session_json<W: Write>(
             role: source_role_name(source.role),
             platform: &source.platform,
             status: source_status_name(source.status),
+            collector: &source.collector,
             coverage_status: coverage_status_name(
                 manifest
                     .coverage_manifest
@@ -228,7 +243,7 @@ pub fn write_audit_session_json<W: Write>(
         .collect();
     let review = SessionReview {
         schema: "sideeffect.audit_session_review",
-        schema_version: 4,
+        schema_version: 5,
         session_id: &manifest.session_id,
         platform: &manifest.platform,
         architecture: escape_ascii(&manifest.architecture),
@@ -268,6 +283,7 @@ struct SessionSourceReview<'a> {
     role: &'static str,
     platform: &'a str,
     status: &'static str,
+    collector: &'a Option<crate::audit_session::CollectorIdentity>,
     coverage_status: &'static str,
     scope: String,
     scope_encoding: &'static str,
@@ -467,6 +483,10 @@ mod tests {
             }),
             sources: vec![AuditSessionSource {
                 role: SourceRole::Packages,
+                collector: Some(crate::audit_session::collector_identity(
+                    "linux",
+                    SourceRole::Packages,
+                )),
                 platform: "linux".to_owned(),
                 scope: scope.to_owned(),
                 started_at_unix_ms: 1,
@@ -509,7 +529,7 @@ mod tests {
         assert!(output.is_ascii());
         let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(value["schema"], "sideeffect.audit_session_review");
-        assert_eq!(value["schema_version"], 4);
+        assert_eq!(value["schema_version"], 5);
         assert_eq!(value["authenticity"], "not_established");
         assert_eq!(value["architecture"], "x86\\u{202e}_64");
         assert_eq!(

@@ -617,6 +617,10 @@ mod tests {
             }),
             sources: vec![AuditSessionSource {
                 role: SourceRole::Packages,
+                collector: Some(crate::audit_session::collector_identity(
+                    "linux",
+                    SourceRole::Packages,
+                )),
                 platform: "linux".to_owned(),
                 scope: "fixture source".to_owned(),
                 started_at_unix_ms: 100,
