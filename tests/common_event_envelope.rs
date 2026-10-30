@@ -13,7 +13,7 @@ fn adapts_syscall_attempt_with_failure_and_exact_source_reference() {
     let envelope = from_linux_strace(&parsed, SYNTHETIC_TRACE, "trace.txt");
 
     assert_eq!(envelope.schema, "sideeffect.common_event_envelope");
-    assert_eq!(envelope.schema_version, 1);
+    assert_eq!(envelope.schema_version, 2);
     assert_eq!(envelope.source.schema_version, 7);
     assert_eq!(
         envelope.source.sha256.as_deref(),
@@ -46,6 +46,147 @@ fn adapts_syscall_attempt_with_failure_and_exact_source_reference() {
     );
     assert_eq!(envelope.diagnostics[0].code, "unsupported_source_row");
     assert_eq!(envelope.diagnostics[0].source_local_ordinal, Some(2));
+}
+
+#[test]
+fn process_creation_links_caller_task_to_returned_child_pid_without_parentage_claim() {
+    let bytes = b"[pid 500] 1700000000.000001 fork() = 501\n";
+    let parsed = parse_trace_bytes(bytes, ParseLimits::default()).unwrap();
+    let envelope = from_linux_strace(&parsed, bytes, "synthetic-fork.trace");
+
+    assert_eq!(envelope.schema_version, 2);
+    assert_eq!(envelope.process_observations.len(), 2);
+    assert!(matches!(
+        envelope.process_observations[0].identity,
+        sideeffect::event::ProcessIdentity::LinuxTraceTaskContext {
+            task_id: 500,
+            identity_status: sideeffect::event::ProcessIdentityStatus::TaskIdOnlyGenerationUnknown
+        }
+    ));
+    assert!(matches!(
+        envelope.process_observations[1].identity,
+        sideeffect::event::ProcessIdentity::LinuxReturnedChildPid {
+            process_id: 501,
+            identity_status: sideeffect::event::ProcessIdentityStatus::ReturnedChildPidOnly
+        }
+    ));
+    let relation = &envelope.process_relationships[0];
+    assert_eq!(
+        relation.kind,
+        sideeffect::event::ProcessRelationshipKind::StraceCallerTaskReturnedChildPid
+    );
+    assert_eq!(relation.from_observation_id, Some(1));
+    assert_eq!(relation.to_observation_id, 2);
+    assert_eq!(relation.reported_from_process_id, None);
+    assert!(relation.basis.contains("returned_child_pid"));
+    assert_eq!(
+        envelope.source_state.completeness,
+        SourceCompleteness::Complete
+    );
+}
+
+#[test]
+fn invalid_supplied_process_lineage_is_partial_and_omitted() {
+    let bytes = b"[pid 500] 1700000000.000001 fork() = 501\n";
+    let mut parsed = parse_trace_bytes(bytes, ParseLimits::default()).unwrap();
+    parsed.process_lineage.relations[0].evidence.byte_offset += 1;
+    let envelope = from_linux_strace(&parsed, bytes, "synthetic-invalid-lineage.trace");
+
+    assert!(envelope.process_relationships.is_empty());
+    assert_eq!(
+        envelope.source_state.completeness,
+        SourceCompleteness::Partial
+    );
+    assert!(
+        envelope
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "process_lineage_mismatch")
+    );
+}
+
+#[test]
+fn mismatched_child_result_and_non_creation_rows_cannot_support_relationships() {
+    let bytes = b"[pid 500] 1700000000.000001 fork() = 501\n";
+    let parsed = parse_trace_bytes(bytes, ParseLimits::default()).unwrap();
+
+    let mut mismatched_child = parsed.clone();
+    mismatched_child.process_lineage.relations[0].child_pid = 502;
+    let mismatch = from_linux_strace(&mismatched_child, bytes, "synthetic-mismatched-child.trace");
+    assert!(mismatch.process_relationships.is_empty());
+    assert_eq!(
+        mismatch.source_state.completeness,
+        SourceCompleteness::Partial
+    );
+    assert!(
+        mismatch
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "process_lineage_mismatch" })
+    );
+
+    let mut non_creation = parsed;
+    non_creation.records[0].syscall = Some("execve".to_owned());
+    let invalid = from_linux_strace(&non_creation, bytes, "synthetic-non-creation.trace");
+    assert!(invalid.process_relationships.is_empty());
+    assert_eq!(
+        invalid.source_state.completeness,
+        SourceCompleteness::Partial
+    );
+    assert!(
+        invalid
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "process_lineage_mismatch" })
+    );
+}
+
+#[test]
+fn unknown_clone3_prefixed_syscall_cannot_create_a_process_relationship() {
+    let bytes = b"[pid 500] 1700000000.000001 clone3_extra({flags=CLONE_VM|SIGCHLD}, 88) = 501\n";
+    let parsed = parse_trace_bytes(bytes, ParseLimits::default()).unwrap();
+    assert_eq!(parsed.records[0].syscall.as_deref(), Some("clone3_extra"));
+    assert!(parsed.process_lineage.relations.is_empty());
+
+    let envelope = from_linux_strace(&parsed, bytes, "synthetic-unknown-clone3.trace");
+    assert!(envelope.process_relationships.is_empty());
+    assert!(
+        envelope
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "process_lineage_mismatch")
+    );
+}
+
+#[test]
+fn mutated_supporting_reference_must_match_unfinished_creation_caller_and_syscall() {
+    let bytes = b"[pid 500] 1700000000.000001 clone3({flags=CLONE_VM|CLONE_VFORK|CLONE_CLEAR_SIGHAND, exit_signal=SIGCHLD}, 88 <unfinished ...>\n[pid 500] 1700000000.000002 <... clone3 resumed>) = 501\n[pid 500] 1700000000.000003 read(3, <unfinished ...>\n[pid 500] 1700000000.000004 clone3({flags=CLONE_VM|CLONE_VFORK|CLONE_CLEAR_SIGHAND, exit_signal=SIGCHLD}, 88 <unfinished ...>\n";
+    let parsed = parse_trace_bytes(bytes, ParseLimits::default()).unwrap();
+    assert_eq!(parsed.process_lineage.relations.len(), 1);
+    assert_eq!(
+        parsed.process_lineage.relations[0]
+            .supporting_evidence
+            .len(),
+        1
+    );
+    for wrong_support_index in [2, 3] {
+        let mut mutated = parsed.clone();
+        mutated.process_lineage.relations[0].supporting_evidence[0] =
+            parsed.records[wrong_support_index].evidence.clone();
+
+        let envelope = from_linux_strace(&mutated, bytes, "synthetic-mutated-support.trace");
+        assert!(envelope.process_relationships.is_empty());
+        assert_eq!(
+            envelope.source_state.completeness,
+            SourceCompleteness::Partial
+        );
+        assert!(
+            envelope
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "process_lineage_mismatch")
+        );
+    }
 }
 
 #[test]

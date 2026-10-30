@@ -48,7 +48,7 @@ fn events_trace_writes_versioned_json_in_source_order() {
     );
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["schema"], "sideeffect.common_event_envelope");
-    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["schema_version"], 2);
     assert_eq!(envelope["source_state"]["completeness"], "complete");
     assert_eq!(envelope["events"].as_array().unwrap().len(), 1);
     assert_eq!(envelope["events"][0]["source_local_ordinal"], 1);
@@ -58,6 +58,16 @@ fn events_trace_writes_versioned_json_in_source_order() {
         "1700000000.123456"
     );
     assert_eq!(envelope["events"][0]["evidence"]["line_number"], 1);
+    assert_eq!(
+        envelope["process_observations"].as_array().unwrap().len(),
+        1
+    );
+    assert!(
+        envelope["process_relationships"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

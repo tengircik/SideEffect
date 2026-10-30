@@ -119,7 +119,7 @@ On native Windows, a validated ETW capture can also be adapted:
 sideeffect.exe events --windows-runtime .\runtime.windows.json
 ```
 
-The command writes versioned JSON to stdout and never runs represented commands or modifies the input. Events keep their source-local order, timestamps, outcome/status, and evidence links. A partial or unknown source exits with status `2`; the envelope does not infer one global clock, process ownership, parentage, or causation.
+The command writes versioned JSON to stdout and never runs represented commands or modifies the input. Events keep their source-local order, timestamps, outcome/status, and evidence links. Envelope v2 adds source-local process observations and event links: Linux process-creation rows link the caller task ID to the returned child PID, while Windows process relationships require validated lifecycle evidence for unique instances. Windows file/disk header PIDs remain context candidates. These links do not form a merged process graph or causal view. A partial or unknown source exits with status `2`; the envelope does not infer one global clock or process ownership.
 
 ## What you can do
 
