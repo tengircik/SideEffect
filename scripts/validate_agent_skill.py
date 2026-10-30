@@ -91,7 +91,12 @@ def main() -> None:
         fail("README must link to the Agent Skill guide and audit workflow visual")
 
     guide = (ROOT / "docs" / "AGENT_SKILL.md").read_text(encoding="utf-8")
-    for relative, document in (("README.md", readme), ("docs/AGENT_SKILL.md", guide)):
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    for relative, document in (
+        ("README.md", readme),
+        ("docs/AGENT_SKILL.md", guide),
+        (".github/workflows/ci.yml", workflow),
+    ):
         if SKILL_SOURCE_URL not in document:
             fail(f"{relative} must install the skill from the reviewed immutable source")
 

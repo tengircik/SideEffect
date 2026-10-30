@@ -1,0 +1,30 @@
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "Unicode-3.0",
+    "ISC",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+]
+
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+
+ignore-build-dependencies = false
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false
+
+[version_check.clarify]
+license = "MIT OR Apache-2.0"
+
+[[version_check.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+
+[[version_check.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "b7e650f3fce5c53249d1cdc608b54df156a97edd636cf9d23498d0cfe7aec63e"

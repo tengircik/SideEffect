@@ -2,9 +2,49 @@
 
 ## Scope and prerequisites
 
-This repository provides source code; it does not currently publish prebuilt binaries or a package repository. Linux x86_64 provides the runtime tracing workflow using external `strace`. Native Windows provides bounded M10 software, process, explicit-path permission, and startup inventory slices plus Windows audit sessions. Its experimental ETW process/FileIo/DiskIo/TCP/UDP workflow supports bounded capture, offline inspection, category and event-level comparison, conservative evidence-linked attribution candidates, and static HTML reports. The live process/file/loopback integration test passed on hosted Windows Server 2022 and 2025 for exact source commit [`797ba86`](https://github.com/tengircik/SideEffect/commit/797ba86dc41d024129da35b2fc4be7ad5eca6756) ([CI run](https://github.com/tengircik/SideEffect/actions/runs/40867530573)). Native Windows ETW is not an evidence-complete or exhaustive system audit. Linux `record --trace` and trace-diff HTML file export are Linux-only; Windows has a separate ETW HTML report.
+Versioned binary archives, when published, are available from [GitHub Releases](https://github.com/tengircik/SideEffect/releases/latest). Verify the archive checksum and build provenance before installation. If no release is available for your platform, use the source-build instructions below. Linux x86_64 provides the runtime tracing workflow using external `strace`. Native Windows provides bounded software, process, explicit-path permission, and startup inventory slices plus Windows audit sessions. Its ETW process/FileIo/DiskIo/TCP/UDP workflow supports bounded capture, offline inspection, category and event-level comparison, conservative evidence-linked attribution candidates, and static HTML reports. The live process/file/loopback integration test passed on hosted Windows Server 2022 and 2025 for exact source commit [`797ba86`](https://github.com/tengircik/SideEffect/commit/797ba86dc41d024129da35b2fc4be7ad5eca6756) ([CI run](https://github.com/tengircik/SideEffect/actions/runs/40867530573)). Native Windows ETW is not an evidence-complete or exhaustive system audit. Linux `record --trace` and trace-diff HTML file export are Linux-only; Windows has a separate ETW HTML report.
 
 For agent-assisted workflows, use the portable [SideEffect Agent Skill](AGENT_SKILL.md). The skill runs the local CLI through an agent and model selected by the user; it does not require a SideEffect local model.
+
+## Install a published release archive
+
+Release archives do not require Rust. Download the release assets to a temporary directory, verify `SHA256SUMS`, and verify the archive's GitHub build-provenance attestation before extracting it. These examples use GitHub CLI (`gh`); browser downloads are also available from the [release page](https://github.com/tengircik/SideEffect/releases/latest).
+
+Linux x86_64:
+
+```sh
+release_dir="$(mktemp -d)"
+gh release download --repo tengircik/SideEffect --dir "$release_dir"
+(cd "$release_dir" && sha256sum --check SHA256SUMS)
+archive="$(find "$release_dir" -maxdepth 1 -type f -name 'sideeffect-*-linux-x86_64.tar.gz' -print -quit)"
+test -n "$archive"
+gh attestation verify "$archive" --repo tengircik/SideEffect
+tar -tzf "$archive"
+```
+
+After verification, extract the archive to a new versioned directory under `~/.local/opt/SideEffect/`. Copy its `sideeffect` executable to `~/.local/bin/sideeffect` only if that destination does not already exist. Add `~/.local/bin` to the current agent or shell `PATH`, then run `sideeffect version`. Do not overwrite an existing CLI without checking its version and location first.
+
+Windows x64 PowerShell:
+
+```powershell
+$releaseDir = Join-Path $env:TEMP ("sideeffect-release-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $releaseDir | Out-Null
+gh release download --repo tengircik/SideEffect --dir $releaseDir
+$sumFile = Join-Path $releaseDir "SHA256SUMS"
+$archives = @(Get-ChildItem $releaseDir -Filter "sideeffect-*-windows-x86_64.zip")
+if ($archives.Count -ne 1) { throw "Expected exactly one Windows release archive" }
+$archive = $archives[0]
+$sumLine = Get-Content $sumFile | Where-Object { $_ -match ("  " + [regex]::Escape($archive.Name) + "$") }
+if (-not $sumLine) { throw "Expected Windows archive checksum is missing" }
+$expected = ($sumLine -split "\s+")[0]
+$actual = (Get-FileHash $archive.FullName -Algorithm SHA256).Hash
+if ($actual -ne $expected) { throw "Release archive SHA-256 mismatch" }
+gh attestation verify $archive.FullName --repo tengircik/SideEffect
+```
+
+After verification, expand the archive into a new versioned directory under `$env:LOCALAPPDATA\Programs\SideEffect`. Do not extract over an existing installation. Run `sideeffect.exe version` from that directory; add that directory to the current agent process `PATH` if you want to invoke `sideeffect` by name. A user-level PATH entry can be added separately for future sessions; administrator access is not required.
+
+The Linux and Windows binary archives contain the CLI, README, installation and Agent Skill guides, project license, third-party notices, and the version-specific release notes. A separate `sideeffect-<version>-source.tar.gz` archive contains the corresponding tagged source tree. All published archives and notices appear in `SHA256SUMS`; the Linux and Windows binaries and source archive carry GitHub build-provenance attestations. Linux release archives target x86_64 GNU and are built on Ubuntu 22.04; Windows archives target x64 MSVC. The compatibility matrix below lists the exact validation boundaries.
 
 Windows is a first-class product target. The documented bounded M10 inventory criteria have passed deterministic tests, native Windows smoke tests, and hosted Windows Server 2022/2025 CI. These results validate only the listed source slices, not exhaustive inventory coverage. The ETW acceptance job runs a real bounded process, file, and loopback capture on hosted Windows Server images; it does not establish Windows 11 desktop compatibility or exhaustive observation. WSL2 runs count only as Linux-environment validation.
 
