@@ -72,7 +72,7 @@ The minimums below describe declared support requirements, while the validation 
 | Derived syscall outcomes | Strict results for `execve`, `execveat`, `openat`, `openat2`, and `connect` only | Parser fixtures and the narrow real-tracer workflow | Higher-level effects, unsupported result spellings, or outcomes for other syscalls |
 | Lexical path hints | Narrow `openat`/`openat2` argument subset only; display-only | Deterministic parser fixtures | Filesystem resolution, symlink behavior, descriptor identity, or canonical paths |
 | Linux permission inventory | Explicit paths; metadata, supported POSIX ACL xattrs, and Linux VFS file-capability revisions 1–3 | Deterministic ACL/capability byte fixtures, metadata/path handling, and xattr-backed filesystem tests when supported | Recursive or complete inventory, effective access decisions, and other ACL/permission sources |
-| Linux package inventory | dpkg, RPM, pacman, and APK adapters at fixed system paths; other detected managers are unsupported | Adapter/parser fixtures and live dpkg CLI inventory in Linux CI | Complete software inventory, custom/user manager paths, and all distributions or package formats |
+| Linux package inventory | dpkg, RPM, pacman, APK, and optional Flatpak refs at fixed system paths; XBPS, Nix, Guix, and Snap are unsupported | Adapter/parser fixtures and live dpkg CLI inventory in Linux CI; Flatpak live smoke runs only when already installed | Complete software inventory, custom/user manager paths, and all distributions or package formats |
 | Linux process inventory | Visible `/proc` status fields and bounded `/proc/PID/exe` link text | Synthetic procfs fixtures and Linux CLI tests | Atomic or exhaustive process coverage; command lines or executable contents |
 | Linux startup configuration | Aggregate schema v2: curated XDG, systemd, SysV, and cron source snapshots with inert evidence | CLI tests and deterministic source/parser fixtures | Effective applicability, manager runtime state, all distribution-specific paths, or exhaustive startup coverage |
 | Diff | Exact multiset comparison of parsed syscall rows; PID/timestamp prefixes alone are ignored | Synthetic pairs plus real integration trace pair | Root cause, causal links, normalized paths/FDs, or complete OS observation |
@@ -253,6 +253,20 @@ Then record a command by passing the program and its arguments after `--`:
 SideEffect runs the selected program with your permissions; it is not a sandbox. The program can modify files, access the network, and perform actions otherwise available to your account. Recording is bounded. If the trace exceeds its byte limit, the direct `strace` process is terminated and the partial trace is discarded. Add `--duration-seconds <seconds>` with an integer from 1 to 3600 for an optional wall-clock limit; if reached, the available nonempty partial trace is published (bundle mode publishes a partial bundle) and the command exits `2`, with target outcome and capture completeness unknown. Inspecting a timed bundle also exits `2` and warns that absence is not evidence of non-occurrence; bundle diff refuses timed bundles. After a nonempty trace is finalized and published, SideEffect propagates `strace`'s reported exit code or signal. In bundle mode, a duration-limited run records `time_limit_reached` in schema v2; schema v1 bundles remain readable. The `strace(1)` manual says it normally mirrors the wrapped command's outcome. Capture errors take precedence; a propagated status does not prove tracer success or capture completeness.
 
 Raw traces may contain command arguments, file paths, socket addresses, and other sensitive values. Keep them local unless you have reviewed them. Detailed diff reports retain event-level values. `diff-summary` omits event strings and source references but still exposes category/count patterns, which may also be sensitive; it is not a safe-to-share verdict. These commands do not upload data.
+
+## Adapt runtime evidence into a common event envelope
+
+```sh
+./target/release/sideeffect events --trace ./run.trace
+```
+
+On native Windows, adapt a saved ETW v3 capture after the strict bounded schema and fingerprint checks:
+
+```powershell
+.\target\release\sideeffect.exe events --windows-runtime .\runtime.windows.json
+```
+
+Both commands write JSON only to stdout and read the selected file without modifying it or running represented commands. The envelope preserves source-local row order, timestamps, attempt/result or observation semantics, diagnostics, and evidence references. Its status is `partial` or `unknown` when the source or adapter cannot establish a complete supported result; those outcomes exit `2`. ETW header PID is event context and is not ownership or an actor identity. Neither adapter creates global event order, parentage, or causation. The common envelope is an output format, not a persisted capture or event graph; see [schema compatibility](SCHEMA_COMPATIBILITY.md).
 
 ## Use an existing WSL2 installation
 

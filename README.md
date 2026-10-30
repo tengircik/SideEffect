@@ -105,6 +105,20 @@ sideeffect.exe inspect --format text --session .\session
 
 The bounded ETW window records selected process, file, and network event families. Controlling the Windows Kernel Logger requires an already-administrative token; SideEffect never elevates automatically.
 
+### Adapt runtime evidence into a common event envelope
+
+```sh
+sideeffect events --trace ./capture.trace
+```
+
+On native Windows, a validated ETW capture can also be adapted:
+
+```powershell
+sideeffect.exe events --windows-runtime .\runtime.windows.json
+```
+
+The command writes versioned JSON to stdout and never runs represented commands or modifies the input. Events keep their source-local order, timestamps, outcome/status, and evidence links. A partial or unknown source exits with status `2`; the envelope does not infer one global clock, process ownership, parentage, or causation.
+
 ## What you can do
 
 | Workflow | Evidence and output |

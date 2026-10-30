@@ -8,6 +8,7 @@ This document describes the versioned formats currently emitted by SideEffect an
 | --- | --- | --- | --- |
 | Trace inspection JSON | No `schema` name field; `schema_version` 7 | `inspect TRACE`, `inspect --bundle DIR` | Not imported as JSON. `inspect` and `diff` read bounded raw `strace` text. |
 | Trace diff JSON | No `schema` name field; `schema_version` 3 | `diff` and `diff --bundles` | Not imported as JSON by current commands. |
+| Common event envelope | `sideeffect.common_event_envelope` v1 | `events --trace`; native Windows `events --windows-runtime` | JSON-only output. Linux accepts bounded raw strace text; Windows accepts a strictly validated ETW v3 capture. Source order and clocks remain local, and no event graph or timeline is implied. |
 | Linux package inventory | `sideeffect.inventory` v2 | Linux `inventory packages` | Package inventory comparison accepts v2 only. Session inspection checks the declared header/version and hash, not every inventory field. |
 | Linux process inventory | `sideeffect.process_inventory` v2 (session readers also accept v1) | Linux `inventory processes` | No standalone semantic importer. Session inspection checks the declared header/version and hash. |
 | Linux permission inventory | `sideeffect.permission_inventory` v1 | Linux `inventory permissions` | No standalone semantic importer. Session inspection checks the declared header/version and hash. |
