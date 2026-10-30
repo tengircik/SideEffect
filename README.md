@@ -6,6 +6,7 @@
   <p>
     <a href="https://github.com/tengircik/SideEffect/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/tengircik/SideEffect/actions/workflows/ci.yml/badge.svg?branch=main"></a>
     <a href="LICENSE"><img alt="Apache 2.0 license" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+    <a href="https://github.com/tengircik/SideEffect/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/tengircik/SideEffect"></a>
     <img alt="Rust 1.85+" src="https://img.shields.io/badge/Rust-1.85%2B-orange.svg">
     <img alt="Linux and Windows" src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-1f6feb.svg">
   </p>
@@ -29,7 +30,7 @@ In Codex, Claude Code, Cursor, Gemini CLI, GitHub Copilot, OpenCode, Windsurf, o
 
 The agent reads the repository's installation guide, installs the skill for its current client, installs the CLI using the supported method for your computer, and verifies both. It does not start an audit. This requires an agent that can access GitHub and run local setup commands. CLI installation from source requires Rust/Cargo 1.85 or later to already be installed; the agent must tell you if a prerequisite is missing. See the complete [Agent Skill installation guide](docs/AGENT_SKILL.md).
 
-The community skill installer requires Node.js 22.20 or later. Install the CLI from a verified [GitHub release archive](https://github.com/tengircik/SideEffect/releases/latest) when one is available; that does not require Rust. If a release is not yet available for your platform, build the CLI from source below. The [installation guide](docs/INSTALL.md) shows checksum and provenance verification.
+The community skill installer requires Node.js 22.20 or later. The [v0.1.0 release](https://github.com/tengircik/SideEffect/releases/tag/v0.1.0) provides verified Linux x86_64 and Windows x64 CLI archives; installing a release binary does not require Rust. The [installation guide](docs/INSTALL.md) shows checksum and build-provenance verification. To build from source instead, use the instructions below.
 
 ```sh
 DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/ea7c5ef17ca16263afb62026e36c42d135bf6de8/.agents/skills/sideeffect-audit -g --copy
