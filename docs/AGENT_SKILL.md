@@ -8,21 +8,27 @@ SideEffect ships a portable [Agent Skills](https://agentskills.io/specification)
 - Install Node.js 22.20 or later to use the community `skills` installer.
 - Review the skill source before installing it: [SKILL.md](../.agents/skills/sideeffect-audit/SKILL.md).
 
-## Codex, Claude Code, OpenCode, and other supported agents
+## Codex, Claude Code, Cursor, Gemini CLI, GitHub Copilot, OpenCode, Windsurf, and other supported agents
 
 The `skills` CLI detects installed agents, lets you choose one or more destinations, and installs the selected skill in each agent's native location. Install globally for your user:
 
 ```sh
-DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/c5c57f7bbfcad0a5c16c6499c0f2a7c1fb5b2a1f/.agents/skills/sideeffect-audit --skill sideeffect-audit -g --copy
+DISABLE_TELEMETRY=1 npx skills add tengircik/SideEffect --skill sideeffect-audit -g --copy
+```
+
+To install for every client supported by the installer:
+
+```sh
+DISABLE_TELEMETRY=1 npx skills add tengircik/SideEffect --skill sideeffect-audit --agent '*' -g --copy
 ```
 
 To select destinations explicitly:
 
 ```sh
-DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/c5c57f7bbfcad0a5c16c6499c0f2a7c1fb5b2a1f/.agents/skills/sideeffect-audit --skill sideeffect-audit -a codex -a claude-code -a opencode -g --copy
+DISABLE_TELEMETRY=1 npx skills add tengircik/SideEffect --skill sideeffect-audit --agent codex --agent claude-code --agent cursor --agent opencode -g --copy
 ```
 
-The installer is maintained by Vercel and is separate from SideEffect. Its anonymous telemetry is disabled in the commands above. Use the installer's interactive choice or consult its current [CLI reference](https://github.com/vercel-labs/skills) and [supported-agent list](https://github.com/vercel-labs/skills/blob/main/docs/agents.md) for additional clients. The installer may change supported agent IDs and options over time.
+The installer is maintained by Vercel and is separate from SideEffect. Its anonymous telemetry is disabled in the commands above. To install the skill for every agent it supports, use `--agent '*'`; to choose specific clients, pass their IDs after `--agent`. Consult the installer's current [CLI reference](https://github.com/vercel-labs/skills/blob/main/docs/commands.md) and [supported-agent list](https://github.com/vercel-labs/skills/blob/main/docs/agents.md) for additional clients. The installer may change supported agent IDs and options over time.
 
 For a project-only installation, omit `-g` and run the command from the project directory. That writes the skill into project configuration paths; review the proposed files before sharing that project.
 
@@ -49,6 +55,12 @@ Oh My Pi's skill paths are documented in its [skills guide](https://github.com/c
 ## Verify installation and try it
 
 Start a new agent session, ask it to list its available skills, and invoke `sideeffect-audit`. The skill first checks `sideeffect version` and the installed CLI help. Try a narrow inventory request such as “Show the startup entries visible to this account.” The agent should select `inventory startup`, explain its output path, run only that collector, and summarize the returned status and diagnostics.
+
+To ask an agent to install both components, say **“Install SideEffect for me”**, share `tengircik/SideEffect`, and use this prompt:
+
+> Set up SideEffect from the GitHub repository `tengircik/SideEffect` for this agent. Read its README and Agent Skill installation guide, install the `sideeffect-audit` skill for the current agent, and install the SideEffect CLI using the official instructions for this computer. Verify that `sideeffect version` works and that this agent discovers the skill. Do not run an audit. Do not install system toolchains or request administrator/root access; tell me if a prerequisite is missing.
+
+The agent uses the method documented for its current client. The community installer supports many clients, including Codex, Claude Code, Cursor, Gemini CLI, GitHub Copilot, OpenCode, and Windsurf; Oh My Pi uses its native skill directory. CLI installation from source requires Rust/Cargo 1.85 or later to already be present. The setup request does not authorize a system-wide toolchain or system package installation. If the agent cannot safely install a component or a prerequisite is missing, it must explain that instead of claiming setup succeeded.
 
 Runtime capture requires a separate confirmation of the exact command, duration, capture scope, and destination. Linux uses external `strace` 6.8 or later. Windows ETW requires an already-administrative token and uses the shared NT Kernel Logger. The skill never asks SideEffect to elevate.
 
