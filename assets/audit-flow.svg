@@ -35,7 +35,7 @@
     <g transform="translate(440 174)" filter="url(#shadow)">
       <rect x="-119" y="-72" width="238" height="139" rx="18" fill="#142435" stroke="#315775"/>
       <circle cx="0" cy="0" r="35" fill="#142f46" stroke="#60a5fa" stroke-width="2"/>
-      <path d="M-11-13h22v26h-22zM-6-6h12M-6 0h12M-6 6h8" fill="none" stroke="#bfdbfe" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M0-16v13m-6-6 6 6 6-6M-15 3h8l3 4h8l3-4h8v13h-30z" fill="none" stroke="#bfdbfe" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
       <text x="0" y="-46" fill="#93c5fd" font-size="13" font-weight="700" letter-spacing="1.4">02 · COLLECT</text>
       <text x="0" y="53" fill="#f1f5f9" font-size="21" font-weight="700">Collect locally</text>
       <text x="0" y="87" fill="#b8c7d8" font-size="15">Bounded source snapshots</text>
@@ -44,7 +44,9 @@
     <g transform="translate(720 174)" filter="url(#shadow)">
       <rect x="-119" y="-72" width="238" height="139" rx="18" fill="#1b2239" stroke="#484d83"/>
       <circle cx="0" cy="0" r="35" fill="#24294c" stroke="#818cf8" stroke-width="2"/>
-      <path d="M-12-14h20l7 7v21h-27zM-7-3h16M-7 4h16M-7 11h10" fill="none" stroke="#c7d2fe" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M-13-14h18v23h-18zM-9-8h10M-9-3h7M-9 2h3" fill="none" stroke="#c7d2fe" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="7" cy="6" r="8" fill="#24294c" stroke="#c7d2fe" stroke-width="2.5"/>
+      <path d="m13 12 7 7" fill="none" stroke="#c7d2fe" stroke-width="3" stroke-linecap="round"/>
       <text x="0" y="-46" fill="#a5b4fc" font-size="13" font-weight="700" letter-spacing="1.2">03 · INSPECT</text>
       <text x="0" y="53" fill="#f1f5f9" font-size="21" font-weight="700">Follow evidence</text>
       <text x="0" y="87" fill="#b8c7d8" font-size="15">Open source-linked details</text>
