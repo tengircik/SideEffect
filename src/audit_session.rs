@@ -509,6 +509,273 @@ impl AuditSessionManifest {
     }
 }
 
+/// Result of the metadata-only audit-session comparability check.
+///
+/// A comparable result means the manifests describe matching declared
+/// collection contexts. It does not establish complete capture, equal event
+/// sets, or the absence of activity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComparabilityResult {
+    pub comparable: bool,
+    /// Stable, bounded reason codes. The list is ordered by comparison stage.
+    pub reasons: Vec<ComparabilityReason>,
+}
+
+/// Stable reason codes returned by [`compare_sessions`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComparabilityReason {
+    PlatformMismatch,
+    ArchitectureMismatch,
+    HostOsMismatch,
+    HostOsUnknown,
+    SourceRolesMismatch,
+    SourcePlatformMismatch,
+    SourceScopeMismatch,
+    SourceStatusMismatch,
+    PartialSource,
+    UnknownSourceStatus,
+    AppliedLimitsMismatch,
+    RequestedSettingsMismatch,
+    EffectiveSettingsMismatch,
+    SourceSettingsUnknown,
+    ArtifactSetMismatch,
+    ArtifactContractMismatch,
+    CoverageUnknown,
+    CoverageMismatch,
+    RuntimeLossMismatch,
+    RuntimeLossReported,
+    RuntimeLossUnknown,
+}
+
+impl ComparabilityReason {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::PlatformMismatch => "platform_mismatch",
+            Self::ArchitectureMismatch => "architecture_mismatch",
+            Self::HostOsMismatch => "host_os_mismatch",
+            Self::HostOsUnknown => "host_os_unknown",
+            Self::SourceRolesMismatch => "source_roles_mismatch",
+            Self::SourcePlatformMismatch => "source_platform_mismatch",
+            Self::SourceScopeMismatch => "source_scope_mismatch",
+            Self::SourceStatusMismatch => "source_status_mismatch",
+            Self::PartialSource => "partial_source",
+            Self::UnknownSourceStatus => "unknown_source_status",
+            Self::AppliedLimitsMismatch => "applied_limits_mismatch",
+            Self::RequestedSettingsMismatch => "requested_settings_mismatch",
+            Self::EffectiveSettingsMismatch => "effective_settings_mismatch",
+            Self::SourceSettingsUnknown => "source_settings_unknown",
+            Self::ArtifactSetMismatch => "artifact_set_mismatch",
+            Self::ArtifactContractMismatch => "artifact_contract_mismatch",
+            Self::CoverageUnknown => "coverage_unknown",
+            Self::CoverageMismatch => "coverage_mismatch",
+            Self::RuntimeLossMismatch => "runtime_loss_mismatch",
+            Self::RuntimeLossReported => "runtime_loss_reported",
+            Self::RuntimeLossUnknown => "runtime_loss_unknown",
+        }
+    }
+}
+
+/// Compare two already-validated manifests using only their declared metadata.
+/// Missing host context or v1-v2 source settings are treated as unknown, never
+/// as evidence that the sessions used matching settings.
+pub fn compare_sessions(
+    left: &AuditSessionManifest,
+    right: &AuditSessionManifest,
+) -> ComparabilityResult {
+    use ComparabilityReason as R;
+    let mut reasons = Vec::new();
+    let mut comparable = true;
+    let mut add = |reason: R, makes_incomparable: bool| {
+        if !reasons.contains(&reason) && reasons.len() < 32 {
+            reasons.push(reason);
+        }
+        if makes_incomparable {
+            comparable = false;
+        }
+    };
+
+    if left.platform != right.platform {
+        add(R::PlatformMismatch, true);
+    }
+    if left.architecture != right.architecture {
+        add(R::ArchitectureMismatch, true);
+    }
+    match (&left.host_context, &right.host_context) {
+        (Some(a), Some(b)) => {
+            for (a, b) in [(&a.os_name, &b.os_name), (&a.os_version, &b.os_version)] {
+                match (a.status, &a.value, b.status, &b.value) {
+                    (
+                        ContextFactStatus::Observed,
+                        Some(av),
+                        ContextFactStatus::Observed,
+                        Some(bv),
+                    ) => {
+                        if av != bv {
+                            add(R::HostOsMismatch, true);
+                        }
+                    }
+                    _ => add(R::HostOsUnknown, true),
+                }
+            }
+        }
+        _ => add(R::HostOsUnknown, true),
+    }
+
+    if left.schema_version < AUDIT_SESSION_SCHEMA_VERSION
+        || right.schema_version < AUDIT_SESSION_SCHEMA_VERSION
+    {
+        // Host context did not exist in those versions, even if deserialized
+        // defaults happen to look alike.
+        add(R::HostOsUnknown, true);
+    }
+
+    let mut left_sources: Vec<_> = left.sources.iter().collect();
+    let mut right_sources: Vec<_> = right.sources.iter().collect();
+    left_sources.sort_by_key(|s| s.role as u8);
+    right_sources.sort_by_key(|s| s.role as u8);
+    if left_sources
+        .iter()
+        .map(|s| s.role)
+        .ne(right_sources.iter().map(|s| s.role))
+    {
+        add(R::SourceRolesMismatch, true);
+    }
+
+    if left.schema_version < AUDIT_SESSION_V3_SCHEMA_VERSION
+        || right.schema_version < AUDIT_SESSION_V3_SCHEMA_VERSION
+    {
+        add(R::SourceSettingsUnknown, true);
+    }
+    if left.schema_version == AUDIT_SESSION_V1_SCHEMA_VERSION
+        || right.schema_version == AUDIT_SESSION_V1_SCHEMA_VERSION
+        || left.coverage_manifest.is_none()
+        || right.coverage_manifest.is_none()
+    {
+        add(R::CoverageUnknown, true);
+    } else if let (Some(a), Some(b)) = (&left.coverage_manifest, &right.coverage_manifest) {
+        let mut a_coverage: Vec<_> = a.sources.iter().map(|s| (s.role, s.status)).collect();
+        let mut b_coverage: Vec<_> = b.sources.iter().map(|s| (s.role, s.status)).collect();
+        a_coverage.sort_unstable_by_key(|(role, _)| *role as u8);
+        b_coverage.sort_unstable_by_key(|(role, _)| *role as u8);
+        if a.version != b.version || a_coverage != b_coverage {
+            add(R::CoverageMismatch, true);
+        }
+    }
+
+    for a in &left_sources {
+        let Some(b) = right.sources.iter().find(|s| s.role == a.role) else {
+            continue;
+        };
+        if a.platform != b.platform {
+            add(R::SourcePlatformMismatch, true);
+        }
+        if a.scope != b.scope {
+            add(R::SourceScopeMismatch, true);
+        }
+        if a.status != b.status {
+            add(R::SourceStatusMismatch, true);
+        }
+        match a.status {
+            SourceStatus::Partial => add(R::PartialSource, false),
+            SourceStatus::Unknown
+            | SourceStatus::NotChecked
+            | SourceStatus::NotApplicable
+            | SourceStatus::Unavailable
+            | SourceStatus::AccessDenied
+            | SourceStatus::Failed
+            | SourceStatus::TimedOut
+            | SourceStatus::OutputLimitExceeded => add(R::UnknownSourceStatus, true),
+            SourceStatus::Complete | SourceStatus::Unsupported => {}
+        }
+        let mut a_limits: Vec<_> = a
+            .applied_limits
+            .iter()
+            .map(|v| (&v.code, v.value))
+            .collect();
+        let mut b_limits: Vec<_> = b
+            .applied_limits
+            .iter()
+            .map(|v| (&v.code, v.value))
+            .collect();
+        a_limits.sort_unstable();
+        b_limits.sort_unstable();
+        if a_limits != b_limits {
+            add(R::AppliedLimitsMismatch, true);
+        }
+        let mut a_requested: Vec<_> = a
+            .requested_settings
+            .iter()
+            .map(|v| (&v.code, v.value))
+            .collect();
+        let mut b_requested: Vec<_> = b
+            .requested_settings
+            .iter()
+            .map(|v| (&v.code, v.value))
+            .collect();
+        a_requested.sort_unstable();
+        b_requested.sort_unstable();
+        if a_requested != b_requested {
+            add(R::RequestedSettingsMismatch, true);
+        }
+        let mut a_effective: Vec<_> = a
+            .effective_settings
+            .iter()
+            .map(|v| (&v.code, v.value))
+            .collect();
+        let mut b_effective: Vec<_> = b
+            .effective_settings
+            .iter()
+            .map(|v| (&v.code, v.value))
+            .collect();
+        a_effective.sort_unstable();
+        b_effective.sort_unstable();
+        if a_effective != b_effective {
+            add(R::EffectiveSettingsMismatch, true);
+        }
+
+        let mut aa: Vec<_> = a.artifacts.iter().collect();
+        let mut ba: Vec<_> = b.artifacts.iter().collect();
+        aa.sort_by_key(|x| (x.kind as u8, x.path.as_str()));
+        ba.sort_by_key(|x| (x.kind as u8, x.path.as_str()));
+        if aa.len() != ba.len()
+            || aa
+                .iter()
+                .map(|x| (x.kind, x.path.as_str()))
+                .ne(ba.iter().map(|x| (x.kind, x.path.as_str())))
+        {
+            add(R::ArtifactSetMismatch, true);
+        } else if aa
+            .iter()
+            .zip(&ba)
+            .any(|(x, y)| x.schema != y.schema || x.schema_version != y.schema_version)
+        {
+            add(R::ArtifactContractMismatch, true);
+        }
+
+        if a.role == SourceRole::Runtime {
+            match (&a.loss, &b.loss) {
+                (None, None) => add(R::RuntimeLossUnknown, true),
+                (Some(x), Some(y)) => {
+                    if x.status != y.status || x != y {
+                        add(R::RuntimeLossMismatch, true);
+                    }
+                    match x.status {
+                        LossStatus::Reported => add(R::RuntimeLossReported, true),
+                        LossStatus::Unknown => add(R::RuntimeLossUnknown, true),
+                        LossStatus::NoneReported => {}
+                    }
+                }
+                _ => add(R::RuntimeLossMismatch, true),
+            }
+        }
+    }
+
+    ComparabilityResult {
+        comparable,
+        reasons,
+    }
+}
+
 fn artifact_version_supported(kind: ArtifactKind, observed: u32, current: u32) -> bool {
     observed == current
         || (observed == 1
@@ -694,9 +961,10 @@ pub enum ValidationError {
 mod tests {
     use super::{
         AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, AUDIT_SESSION_V1_SCHEMA_VERSION,
-        AUDIT_SESSION_V2_SCHEMA_VERSION, AppliedLimit, ArtifactKind, AuditSessionManifest,
-        AuditSessionSource, CoverageManifest, IntervalSemantics, SessionArtifactRef, SessionStatus,
-        SourceRole, SourceStatus, ValidationError, parse_manifest,
+        AUDIT_SESSION_V2_SCHEMA_VERSION, AUDIT_SESSION_V3_SCHEMA_VERSION, AppliedLimit,
+        ArtifactKind, AuditSessionManifest, AuditSessionSource, CoverageManifest,
+        IntervalSemantics, SessionArtifactRef, SessionStatus, SourceRole, SourceStatus,
+        ValidationError, compare_sessions, parse_manifest,
     };
 
     fn valid_manifest() -> AuditSessionManifest {
@@ -759,6 +1027,201 @@ mod tests {
                     sha256: "0".repeat(64),
                 }],
             }],
+        }
+    }
+
+    #[test]
+    fn comparability_accepts_equal_known_metadata() {
+        let manifest = valid_manifest();
+        let result = compare_sessions(&manifest, &manifest);
+        assert!(result.comparable);
+        assert!(result.reasons.is_empty());
+    }
+
+    #[test]
+    fn comparability_reports_mismatch_categories() {
+        let mut left = valid_manifest();
+        left.sources[0].role = SourceRole::Processes;
+        left.sources[0].artifacts[0] = SessionArtifactRef {
+            kind: ArtifactKind::Processes,
+            path: "processes.json".to_owned(),
+            schema: "sideeffect.process_inventory".to_owned(),
+            schema_version: 1,
+            byte_length: 1,
+            sha256: "0".repeat(64),
+        };
+        left.coverage_manifest = Some(CoverageManifest::from_sources(&left.sources));
+        assert!(left.validate().is_ok());
+        let mut right = left.clone();
+        right.architecture = "aarch64".to_owned();
+        right.host_context.as_mut().unwrap().os_version.value = Some("6.2".to_owned());
+        right.sources[0].scope = "different package scope".to_owned();
+        right.sources[0].applied_limits[0].value += 1;
+        right.sources[0].artifacts[0].schema_version = 2;
+        assert!(right.validate().is_ok());
+        let result = compare_sessions(&left, &right);
+        assert!(!result.comparable);
+        let codes: Vec<_> = result.reasons.iter().map(|r| r.code()).collect();
+        assert!(codes.contains(&"architecture_mismatch"));
+        assert!(codes.contains(&"host_os_mismatch"));
+        assert!(codes.contains(&"source_scope_mismatch"));
+        assert!(codes.contains(&"applied_limits_mismatch"));
+        assert!(codes.contains(&"artifact_contract_mismatch"));
+    }
+
+    #[test]
+    fn comparability_checks_settings_roles_and_source_statuses() {
+        let mut left = valid_manifest();
+        let mut right = valid_manifest();
+        left.sources[0].requested_settings.push(super::Setting {
+            code: "requested_duration_seconds".to_owned(),
+            value: 5,
+        });
+        right.sources[0].requested_settings.push(super::Setting {
+            code: "requested_duration_seconds".to_owned(),
+            value: 10,
+        });
+        left.sources[0].effective_settings.push(super::Setting {
+            code: "effective_buffer_count".to_owned(),
+            value: 16,
+        });
+        right.sources[0].effective_settings.push(super::Setting {
+            code: "effective_buffer_count".to_owned(),
+            value: 32,
+        });
+        left.sources[0].status = SourceStatus::Partial;
+        left.status = SessionStatus::Partial;
+        left.coverage_manifest = Some(CoverageManifest::from_sources(&left.sources));
+        let status_and_settings = compare_sessions(&left, &right);
+        let status_codes: Vec<_> = status_and_settings
+            .reasons
+            .iter()
+            .map(|r| r.code())
+            .collect();
+        assert!(status_codes.contains(&"source_status_mismatch"));
+        assert!(status_codes.contains(&"requested_settings_mismatch"));
+        assert!(status_codes.contains(&"effective_settings_mismatch"));
+
+        right.sources[0].role = SourceRole::Processes;
+        right.sources[0].artifacts[0].kind = ArtifactKind::Processes;
+        right.sources[0].artifacts[0].path = "processes.json".to_owned();
+        right.sources[0].artifacts[0].schema = "sideeffect.process_inventory".to_owned();
+        right.coverage_manifest = Some(CoverageManifest::from_sources(&right.sources));
+        let result = compare_sessions(&left, &right);
+        let codes: Vec<_> = result.reasons.iter().map(|r| r.code()).collect();
+        assert!(!result.comparable);
+        assert!(codes.contains(&"source_roles_mismatch"));
+    }
+
+    #[test]
+    fn partial_sources_are_comparable_with_partial_reason_but_unknown_is_not() {
+        let mut partial = valid_manifest();
+        partial.sources[0].status = SourceStatus::Partial;
+        partial.status = SessionStatus::Partial;
+        partial.coverage_manifest = Some(CoverageManifest::from_sources(&partial.sources));
+        let result = compare_sessions(&partial, &partial);
+        assert!(result.comparable);
+        assert!(result.reasons.iter().any(|r| r.code() == "partial_source"));
+
+        let mut unknown = valid_manifest();
+        unknown.sources[0].status = SourceStatus::Unknown;
+        unknown.status = SessionStatus::Partial;
+        unknown.coverage_manifest = Some(CoverageManifest::from_sources(&unknown.sources));
+        let result = compare_sessions(&unknown, &unknown);
+        assert!(!result.comparable);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|r| r.code() == "unknown_source_status")
+        );
+    }
+
+    #[test]
+    fn runtime_loss_and_legacy_metadata_are_incomparable_when_unknown() {
+        let mut runtime = valid_manifest();
+        runtime.sources[0].role = SourceRole::Runtime;
+        runtime.sources[0].status = SourceStatus::Partial;
+        runtime.status = SessionStatus::Partial;
+        runtime.sources[0].loss = Some(super::LossMetadata::unknown());
+        runtime.sources[0].artifacts = vec![
+            SessionArtifactRef {
+                kind: ArtifactKind::RuntimeManifest,
+                path: "run.json".to_owned(),
+                schema: "sideeffect.run".to_owned(),
+                schema_version: 2,
+                byte_length: 1,
+                sha256: "0".repeat(64),
+            },
+            SessionArtifactRef {
+                kind: ArtifactKind::RuntimeTrace,
+                path: "trace.strace".to_owned(),
+                schema: "strace_text".to_owned(),
+                schema_version: 1,
+                byte_length: 1,
+                sha256: "0".repeat(64),
+            },
+        ];
+        runtime.coverage_manifest = Some(CoverageManifest::from_sources(&runtime.sources));
+        assert!(runtime.validate().is_ok());
+        let result = compare_sessions(&runtime, &runtime);
+        assert!(!result.comparable);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|r| r.code() == "runtime_loss_unknown")
+        );
+
+        let mut lost = runtime.clone();
+        lost.sources[0].loss = Some(super::LossMetadata {
+            status: super::LossStatus::Reported,
+            statistics_available: true,
+            final_snapshot_available: true,
+            events_lost: Some(1),
+            log_buffers_lost: Some(0),
+            real_time_buffers_lost: Some(0),
+        });
+        let result = compare_sessions(&lost, &lost);
+        assert!(!result.comparable);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|r| r.code() == "runtime_loss_reported")
+        );
+
+        for version in [
+            AUDIT_SESSION_V1_SCHEMA_VERSION,
+            AUDIT_SESSION_V2_SCHEMA_VERSION,
+            AUDIT_SESSION_V3_SCHEMA_VERSION,
+        ] {
+            let mut legacy = valid_manifest();
+            legacy.schema_version = version;
+            if version == AUDIT_SESSION_V1_SCHEMA_VERSION {
+                legacy.coverage_manifest = None;
+            }
+            if version < AUDIT_SESSION_V3_SCHEMA_VERSION {
+                legacy.sources[0].requested_settings.clear();
+                legacy.sources[0].effective_settings.clear();
+            }
+            if version < AUDIT_SESSION_SCHEMA_VERSION {
+                legacy.host_context = None;
+            }
+            let result = compare_sessions(&legacy, &legacy);
+            assert!(
+                !result.comparable,
+                "v{version} must not guess absent metadata equal"
+            );
+            assert!(result.reasons.iter().any(|r| r.code() == "host_os_unknown"));
+            if version < AUDIT_SESSION_V3_SCHEMA_VERSION {
+                assert!(
+                    result
+                        .reasons
+                        .iter()
+                        .any(|r| r.code() == "source_settings_unknown")
+                );
+            }
         }
     }
 

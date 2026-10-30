@@ -8,6 +8,14 @@ V3 retains that coverage map and adds bounded per-source requested settings, sou
 
 V4 adds bounded `host_context`: OS name, OS version, and the caller process privilege context. Linux reads the OS name/release through `uname` and checks the effective UID; Windows reads the native version through `RtlGetVersion` and the current token's elevation state through `GetTokenInformation(TokenElevation)`. Failed reads are explicit `unknown`; `not_checked` is valid for future producers that skip a fact. Linux `elevated` means effective UID 0, while Windows `elevated` reflects the current token flag. Neither status describes all capabilities or access to every resource. Architecture is a separate field and is never used to infer privilege. Values are bounded to 128 UTF-8 bytes; unknown and not-checked facts carry no value. V1-v3 remain readable with host context absent rather than synthesized.
 
+## Read-only session comparability
+
+`compare_sessions` accepts two validated `AuditSessionManifest` values and returns `comparable` with a bounded list of stable reason codes. It compares host platform and architecture; known OS name/version; the selected source-role set, each source's platform, scope, and status; applied limits; requested and effective settings; coverage metadata; and each source's artifact kinds and native schema/version contracts. Artifact bytes, digests, timestamps, session IDs, diagnostic text/codes, and caller privilege are not comparability keys: they may differ between valid observations without changing the declared collection shape.
+
+Missing metadata is not treated as equal. V1-v3 have no host context, and v1-v2 do not define requested/effective source settings, so any pair containing those omissions is incomparable with an `*_unknown` reason. V1 also lacks coverage metadata and is incomparable on that basis. Explicit unknown/not-checked host OS facts, unknown source states, and absent/unknown runtime loss also make a pair incomparable. Matching `partial` source statuses remain comparable with `partial_source`; the result still says nothing about capture completeness. A runtime source is comparable only when both manifests report `none_reported` with matching loss metadata. `reported` or `unknown` loss makes it incomparable. A comparable pair is only a metadata-level basis for comparison; it does not establish equal event sets or support claims that an event did not occur.
+
+Reason codes are machine-stable snake_case values, deduplicated and capped at 32 per result. Current codes cover platform/architecture/host OS, source role/platform/scope/status, partial or unknown status, applied limits and settings, artifacts, coverage, and runtime loss. Consumers should preserve unknown future codes when persisting results.
+
 | Platform | Source role | Fixed artifact | Native schema | Version |
 | --- | --- | --- | --- | ---: |
 | Linux | packages | `packages.json` | `sideeffect.inventory` | 2 |
