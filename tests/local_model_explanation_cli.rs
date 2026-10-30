@@ -41,18 +41,70 @@ fn run_preview(
     backend: &str,
     trace: &TempTrace,
 ) -> std::process::Output {
+    run_preview_with_question(model, backend, trace, "What file access was observed?")
+}
+
+fn run_preview_with_question(
+    model: &SelectedTestModel,
+    backend: &str,
+    trace: &TempTrace,
+    question: &str,
+) -> std::process::Output {
     model
         .command()
         .args([
             "model-explain-preview",
             "--question",
-            "What file access was observed?",
+            question,
             "--backend",
             backend,
         ])
         .arg(&trace.0)
         .output()
         .unwrap()
+}
+
+#[test]
+fn deterministic_scope_abstention_does_not_start_runtime() {
+    let model = SelectedTestModel::new("explanation");
+    let question = "Does this prove the program is safe to run?";
+    let trace = TempTrace::with_contents(
+        b"55 connect(7, {sa_family=AF_INET}, 16) = -1 ECONNREFUSED (Connection refused)\n",
+    );
+    let preview_output = run_preview_with_question(&model, "cpu", &trace, question);
+    assert!(
+        preview_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview_output.stderr)
+    );
+    let preview: serde_json::Value = serde_json::from_slice(&preview_output.stdout).unwrap();
+    assert_eq!(preview["deterministic_abstain_reason"], "unsupported_scope");
+
+    let output = model
+        .command()
+        .args([
+            "model-explain",
+            "--question",
+            question,
+            "--backend",
+            "cpu",
+            "--runtime",
+            "missing-llama-runtime",
+            "--confirm-sha256",
+            preview["request_sha256"].as_str().unwrap(),
+        ])
+        .arg(&trace.0)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let analysis: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(analysis["backend_used"], "not_run");
+    assert_eq!(analysis["backend_status"], "deterministic_scope_abstention");
+    assert_eq!(analysis["interpretation"]["status"], "abstained");
+    assert_eq!(
+        analysis["interpretation"]["abstain_reason"],
+        "unsupported_scope"
+    );
 }
 
 #[test]
@@ -72,7 +124,11 @@ fn preview_shows_exact_bounded_evidence_and_coverage_for_confirmation() {
         preview["schema"],
         "sideeffect.local_model_explanation_preview"
     );
-    assert_eq!(preview["schema_version"], 1);
+    assert_eq!(preview["schema_version"], 2);
+    assert_eq!(
+        preview["deterministic_abstain_reason"],
+        serde_json::Value::Null
+    );
     assert_eq!(preview["backend_preference"], "auto");
     assert_eq!(preview["model_sha256"], model.sha256());
     assert_eq!(preview["model_id"], model.id());

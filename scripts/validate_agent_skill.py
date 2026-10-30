@@ -14,6 +14,10 @@ SKILL_DIR = ROOT / ".agents" / "skills" / "sideeffect-audit"
 SKILL_FILE = SKILL_DIR / "SKILL.md"
 REFERENCE = SKILL_DIR / "references" / "workflows.md"
 NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+SKILL_SOURCE_URL = (
+    "https://github.com/tengircik/SideEffect/tree/"
+    "ea7c5ef17ca16263afb62026e36c42d135bf6de8/.agents/skills/sideeffect-audit"
+)
 
 
 def fail(message: str) -> None:
@@ -70,6 +74,8 @@ def main() -> None:
         "obtain explicit confirmation",
         "Do not upload evidence",
         "unknowns, and evidence references",
+        "## Explicit installation requests",
+        "Do not run an inventory, audit, or runtime capture during installation",
     ):
         if required not in body:
             fail(f"missing required safety instruction: {required}")
@@ -83,6 +89,16 @@ def main() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     if "docs/AGENT_SKILL.md" not in readme or "assets/audit-flow.svg" not in readme:
         fail("README must link to the Agent Skill guide and audit workflow visual")
+
+    guide = (ROOT / "docs" / "AGENT_SKILL.md").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    for relative, document in (
+        ("README.md", readme),
+        ("docs/AGENT_SKILL.md", guide),
+        (".github/workflows/ci.yml", workflow),
+    ):
+        if SKILL_SOURCE_URL not in document:
+            fail(f"{relative} must install the skill from the reviewed immutable source")
 
     print("agent skill and README assets validated: sideeffect-audit")
 

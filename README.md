@@ -17,25 +17,41 @@ SideEffect turns selected local software sources and bounded runtime captures in
 
 ## Start with your AI agent
 
-Install the `sideeffect-audit` Agent Skill for Codex, Claude Code, OpenCode, and other compatible agents. The skill lets your chosen agent use SideEffect's deterministic CLI; it does not require SideEffect's experimental local-model commands.
+Install the `sideeffect-audit` Agent Skill for Codex, Claude Code, Cursor, Gemini CLI, GitHub Copilot, OpenCode, Windsurf, and other agents supported by the Agent Skills installer. The skill lets your chosen agent use SideEffect's deterministic CLI; it does not require SideEffect's experimental local-model commands.
 
-The community skill installer requires Node.js 22.20 or later. The SideEffect CLI is installed separately from source below.
+The install commands below pin the skill source to commit `ea7c5ef17ca16263afb62026e36c42d135bf6de8` so the reviewed instructions cannot silently change during installation.
+
+### Install SideEffect through Codex, Claude Code, Cursor, or another agent
+
+In Codex, Claude Code, Cursor, Gemini CLI, GitHub Copilot, OpenCode, Windsurf, or another compatible coding agent, share the repository **`tengircik/SideEffect`** and say **“Install this repo and leave SideEffect ready to use.”** Use the same request on each supported client, then paste the setup instructions below. The agent installs the skill for that client and the CLI for your operating system, then verifies both:
+
+> Set up SideEffect from the GitHub repository `tengircik/SideEffect` for this agent. Read the repository's README, Agent Skill installation guide, and platform installation guide. Install the `sideeffect-audit` skill using the documented method for this agent, then install the SideEffect CLI using the documented method for this computer. Verify that `sideeffect version` works and that this agent discovers the skill. Do not run an audit. Do not install system toolchains or request administrator/root access; tell me if a prerequisite is missing.
+
+The agent reads the repository's installation guide, installs the skill for its current client, installs the CLI using the supported method for your computer, and verifies both. It does not start an audit. This requires an agent that can access GitHub and run local setup commands. CLI installation from source requires Rust/Cargo 1.85 or later to already be installed; the agent must tell you if a prerequisite is missing. See the complete [Agent Skill installation guide](docs/AGENT_SKILL.md).
+
+The community skill installer requires Node.js 22.20 or later. Install the CLI from a verified [GitHub release archive](https://github.com/tengircik/SideEffect/releases/latest) when one is available; that does not require Rust. If a release is not yet available for your platform, build the CLI from source below. The [installation guide](docs/INSTALL.md) shows checksum and provenance verification.
 
 ```sh
-DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/c5c57f7bbfcad0a5c16c6499c0f2a7c1fb5b2a1f/.agents/skills/sideeffect-audit --skill sideeffect-audit -g --copy
+DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/ea7c5ef17ca16263afb62026e36c42d135bf6de8/.agents/skills/sideeffect-audit -g --copy
 ```
 
 PowerShell:
 
 ```powershell
 $env:DISABLE_TELEMETRY = "1"
-npx skills add https://github.com/tengircik/SideEffect/tree/c5c57f7bbfcad0a5c16c6499c0f2a7c1fb5b2a1f/.agents/skills/sideeffect-audit --skill sideeffect-audit -g --copy
+npx skills add https://github.com/tengircik/SideEffect/tree/ea7c5ef17ca16263afb62026e36c42d135bf6de8/.agents/skills/sideeffect-audit -g --copy
 ```
 
-The community `skills` installer detects available clients and installs the skill in their native location. To select Codex, Claude Code, and OpenCode explicitly:
+The community `skills` installer detects supported clients and installs the skill in their native locations. To install it for every agent supported by that installer:
 
 ```sh
-DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/c5c57f7bbfcad0a5c16c6499c0f2a7c1fb5b2a1f/.agents/skills/sideeffect-audit --skill sideeffect-audit -a codex -a claude-code -a opencode -g --copy
+DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/ea7c5ef17ca16263afb62026e36c42d135bf6de8/.agents/skills/sideeffect-audit --agent '*' -g --copy
+```
+
+To choose specific agents, for example Codex, Claude Code, Cursor, and OpenCode:
+
+```sh
+DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/ea7c5ef17ca16263afb62026e36c42d135bf6de8/.agents/skills/sideeffect-audit --agent codex --agent claude-code --agent cursor --agent opencode -g --copy
 ```
 
 For Oh My Pi (OMP), copy the reviewed skill folder to `.omp/skills/sideeffect-audit/`. Follow the complete [Agent Skill installation guide](docs/AGENT_SKILL.md) for OMP, project-local installation, updating, privacy, and verification.

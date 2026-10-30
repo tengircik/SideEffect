@@ -1,6 +1,7 @@
 name: Dependency audit
 
 on:
+  workflow_call:
   schedule:
     - cron: '17 4 * * 1'
   workflow_dispatch:
@@ -22,7 +23,7 @@ permissions:
 jobs:
   dependency-advisories:
     name: Dependency advisories
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Check out source
@@ -39,7 +40,7 @@ jobs:
 
   dependency-licenses:
     name: Dependency licenses
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Check out source

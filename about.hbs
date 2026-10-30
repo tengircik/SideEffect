@@ -1,0 +1,15 @@
+SideEffect third-party notices
+Generated from Cargo.lock for Linux x86_64 GNU and Windows x64 MSVC release targets.
+
+{{#each licenses}}
+===============================================================================
+{{name}} ({{id}})
+
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

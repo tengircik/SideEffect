@@ -1,0 +1,270 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Verify release tag and source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Require a version-matched tag on main and release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REPOSITORY" != "tengircik/SideEffect" ]]; then
+            echo "Release publication is restricted to tengircik/SideEffect" >&2
+            exit 1
+          fi
+          tag="$GITHUB_REF_NAME"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Expected a semantic version tag such as v0.1.0, got: $tag" >&2
+            exit 1
+          fi
+          tag_commit="$(git rev-parse "${GITHUB_REF}^{commit}")"
+          if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
+            echo "Resolved tag commit does not match the event commit" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
+            echo "Release tags must point to a commit already reachable from origin/main" >&2
+            exit 1
+          fi
+          tag_version="${tag#v}"
+          package_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          if [[ "$tag_version" != "$package_version" ]]; then
+            echo "Tag version $tag_version does not match Cargo.toml version $package_version" >&2
+            exit 1
+          fi
+          notes="docs/releases/${tag}.md"
+          if [[ ! -s "$notes" ]]; then
+            echo "Missing version-specific release notes: $notes" >&2
+            exit 1
+          fi
+
+  ci:
+    name: Full CI
+    needs: preflight
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  dependency-audit:
+    name: Dependency audit
+    needs: preflight
+    permissions:
+      contents: read
+    uses: ./.github/workflows/dependency-audit.yml
+
+  license-notices:
+    name: Verify third-party notices
+    needs: [preflight, ci, dependency-audit]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install pinned cargo-about
+        run: cargo install cargo-about --version 0.9.3 --locked --features cli
+
+      - name: Regenerate and compare third-party notices
+        run: |
+          cargo about generate --locked --config about.toml \
+            --output-file "$RUNNER_TEMP/THIRD_PARTY_NOTICES.raw.txt" about.hbs
+          python3 scripts/normalize_third_party_notices.py \
+            "$RUNNER_TEMP/THIRD_PARTY_NOTICES.raw.txt" \
+            "$RUNNER_TEMP/THIRD_PARTY_NOTICES.txt"
+          cmp THIRD_PARTY_NOTICES.txt "$RUNNER_TEMP/THIRD_PARTY_NOTICES.txt"
+          test -s THIRD_PARTY_NOTICES.txt
+
+      - name: Upload verified notice file
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: third-party-notices
+          path: THIRD_PARTY_NOTICES.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  build-linux:
+    name: Linux x86_64 GNU release asset
+    needs: [preflight, ci, dependency-audit, license-notices]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      attestations: write
+      artifact-metadata: write
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Build optimized CLI
+        run: cargo build --locked --release --bin sideeffect
+
+      - name: Smoke-check release binary
+        run: |
+          ./target/release/sideeffect --help
+          ./target/release/sideeffect version
+
+      - name: Assemble Linux archive
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          package="sideeffect-${RELEASE_TAG}-linux-x86_64"
+          mkdir "$RUNNER_TEMP/$package"
+          install -m 0755 target/release/sideeffect "$RUNNER_TEMP/$package/sideeffect"
+          install -m 0644 README.md LICENSE THIRD_PARTY_NOTICES.txt "$RUNNER_TEMP/$package/"
+          install -m 0644 docs/INSTALL.md docs/AGENT_SKILL.md "$RUNNER_TEMP/$package/"
+          install -m 0644 "docs/releases/${RELEASE_TAG}.md" "$RUNNER_TEMP/$package/RELEASE_NOTES.md"
+          tar -C "$RUNNER_TEMP" -czf "${package}.tar.gz" "$package"
+          tar -tzf "${package}.tar.gz"
+
+      - name: Assemble source archive
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          package="sideeffect-${RELEASE_TAG}-source"
+          git archive --format=tar.gz --prefix="${package}/" "$GITHUB_SHA" > "${package}.tar.gz"
+          tar -tzf "${package}.tar.gz" >/dev/null
+
+      - name: Attest Linux and source archive provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: sideeffect-${{ github.ref_name }}-*.tar.gz
+
+      - name: Upload Linux archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-x86_64
+          path: |
+            sideeffect-${{ github.ref_name }}-linux-x86_64.tar.gz
+            sideeffect-${{ github.ref_name }}-source.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  build-windows:
+    name: Windows x64 MSVC release asset
+    needs: [preflight, ci, dependency-audit, license-notices]
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      attestations: write
+      artifact-metadata: write
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Build optimized CLI
+        run: cargo build --locked --release --bin sideeffect
+
+      - name: Smoke-check release binary
+        run: |
+          .\target\release\sideeffect.exe --help
+          .\target\release\sideeffect.exe version
+
+      - name: Assemble Windows archive
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $packageName = "sideeffect-$env:RELEASE_TAG-windows-x86_64"
+          $packageRoot = Join-Path $env:RUNNER_TEMP $packageName
+          New-Item -ItemType Directory -Path $packageRoot | Out-Null
+          Copy-Item target\release\sideeffect.exe $packageRoot
+          Copy-Item README.md, LICENSE, THIRD_PARTY_NOTICES.txt, docs\INSTALL.md, docs\AGENT_SKILL.md $packageRoot
+          Copy-Item "docs\releases\$env:RELEASE_TAG.md" (Join-Path $packageRoot "RELEASE_NOTES.md")
+          $archive = "$packageName.zip"
+          Compress-Archive -Path (Join-Path $packageRoot "*") -DestinationPath $archive
+          if (-not (Test-Path $archive) -or (Get-Item $archive).Length -eq 0) {
+            throw "Release archive is missing or empty"
+          }
+
+      - name: Attest Windows archive provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: sideeffect-${{ github.ref_name }}-windows-x86_64.zip
+
+      - name: Upload Windows archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-x86_64
+          path: sideeffect-${{ github.ref_name }}-windows-x86_64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: [preflight, ci, dependency-audit, license-notices, build-linux, build-windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release notes
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Download release assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify asset set and generate checksums
+        run: |
+          set -euo pipefail
+          cd release-assets
+          test -s "sideeffect-${GITHUB_REF_NAME}-linux-x86_64.tar.gz"
+          test -s "sideeffect-${GITHUB_REF_NAME}-source.tar.gz"
+          test -s "sideeffect-${GITHUB_REF_NAME}-windows-x86_64.zip"
+          test -s THIRD_PARTY_NOTICES.txt
+          sha256sum sideeffect-*.tar.gz sideeffect-*.zip THIRD_PARTY_NOTICES.txt > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Publish versioned release and verified assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            release-assets/sideeffect-* \
+            release-assets/THIRD_PARTY_NOTICES.txt \
+            release-assets/SHA256SUMS \
+            --verify-tag \
+            --title "SideEffect ${GITHUB_REF_NAME}" \
+            --notes-file "docs/releases/${GITHUB_REF_NAME}.md"

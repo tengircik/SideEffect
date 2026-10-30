@@ -26,7 +26,7 @@
     {"path": "permutation-2.trace", "size_bytes": 333, "sha256": "c5583661bc9e82f61c832b627bc8293a3ca1cc63bc219c44597d362b9d8767e7"},
     {"path": "permutation-3.trace", "size_bytes": 333, "sha256": "3d0e9c493a21d23d4a723f35d8f212c6b54b615fdcf4b07b8e1a5dec11be52c0"},
     {"path": "permutation-4.trace", "size_bytes": 333, "sha256": "c7f50a3792a6af4a8cf26c6f0fb79851459faa57682f8abba3c4097877f90df5"},
-    {"path": "process-relation.trace", "size_bytes": 123, "sha256": "6f3f0cdea5fb4587cb187630bb6687d13ab8c5a9042135062004845c70931acb"},
+    {"path": "process-relation.trace", "size_bytes": 151, "sha256": "a14857d8ea957b9d1770c1da23a8ea07fa8c0017d862009aa01d58481dcd06e4"},
     {"path": "two-file-events.trace", "size_bytes": 181, "sha256": "7579c338ace4b59f0632b9bcc3877c4259249c60360d5c49c6c21978bb3dc0cb"}
   ],
   "permutation_groups": [

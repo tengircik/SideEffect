@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:
@@ -50,7 +51,7 @@ jobs:
 
   linux:
     name: Linux
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Check out source
@@ -89,10 +90,60 @@ jobs:
         run: |
           ./target/release/sideeffect --help
           ./target/release/sideeffect --version
+      - name: Smoke-check Cargo installation
+        run: |
+          cargo install --locked --path . --root "$RUNNER_TEMP/sideeffect-install"
+          "$RUNNER_TEMP/sideeffect-install/bin/sideeffect" version
+
+  agent-skill-install:
+    name: Agent Skill installation (supported coding agents)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Node.js 22.20
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22.20.0
+
+      - name: Install the skill into isolated agent profiles
+        env:
+          HOME: ${{ runner.temp }}/sideeffect-agent-home
+          DISABLE_TELEMETRY: "1"
+          DO_NOT_TRACK: "1"
+        run: |
+          mkdir -p "$HOME"
+          npx --yes skills@1.7.4 add \
+            https://github.com/tengircik/SideEffect/tree/ea7c5ef17ca16263afb62026e36c42d135bf6de8/.agents/skills/sideeffect-audit \
+            --skill sideeffect-audit \
+            --agent codex --agent claude-code --agent cursor \
+            --agent gemini-cli --agent github-copilot --agent opencode \
+            --agent windsurf \
+            --global --copy --yes
+
+      - name: Verify each native skill installation
+        env:
+          HOME: ${{ runner.temp }}/sideeffect-agent-home
+        run: |
+          source="$GITHUB_WORKSPACE/.agents/skills/sideeffect-audit"
+          for installed in \
+            "$HOME/.agents/skills/sideeffect-audit" \
+            "$HOME/.claude/skills/sideeffect-audit" \
+            "$HOME/.codeium/windsurf/skills/sideeffect-audit"; do
+            test -f "$installed/SKILL.md"
+            diff -qr "$source" "$installed"
+          done
 
   msrv:
     name: Linux MSRV (Rust 1.85)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Check out source
@@ -171,3 +222,10 @@ jobs:
 
       - name: Build CLI
         run: cargo build --locked --bin sideeffect
+
+      - name: Smoke-check Cargo installation
+        shell: pwsh
+        run: |
+          $installRoot = Join-Path $env:RUNNER_TEMP "sideeffect-install"
+          cargo install --locked --path . --root $installRoot
+          & (Join-Path $installRoot "bin\sideeffect.exe") version

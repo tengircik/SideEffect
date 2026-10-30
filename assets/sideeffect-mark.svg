@@ -1,20 +1,25 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="140" height="140" viewBox="0 0 140 140" role="img" aria-labelledby="title desc">
   <title id="title">SideEffect mark</title>
-  <desc id="desc">A terminal prompt and evidence ring form the SideEffect mark.</desc>
+  <desc id="desc">A magnifying glass inspecting a connected process trace.</desc>
   <defs>
-    <linearGradient id="surface" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#101827"/>
-      <stop offset="1" stop-color="#1b2b3e"/>
+    <linearGradient id="surface" x1="16" y1="12" x2="124" y2="130" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1c2b40"/>
+      <stop offset="1" stop-color="#101a29"/>
     </linearGradient>
-    <linearGradient id="signal" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#5eead4"/>
-      <stop offset="1" stop-color="#60a5fa"/>
+    <linearGradient id="trace" x1="48" y1="50" x2="92" y2="83" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#65e5d1"/>
+      <stop offset="1" stop-color="#69b8ff"/>
     </linearGradient>
   </defs>
-  <rect x="5" y="5" width="130" height="130" rx="36" fill="url(#surface)" stroke="#334155" stroke-width="2"/>
-  <path d="m35 46 18 16-18 16" fill="none" stroke="url(#signal)" stroke-linecap="round" stroke-linejoin="round" stroke-width="8"/>
-  <path d="M62 79h18" fill="none" stroke="#e2e8f0" stroke-linecap="round" stroke-width="8"/>
-  <circle cx="88" cy="58" r="24" fill="none" stroke="#e2e8f0" stroke-width="6"/>
-  <path d="m105 75 13 13" fill="none" stroke="#e2e8f0" stroke-linecap="round" stroke-width="7"/>
-  <circle cx="88" cy="58" r="7" fill="url(#signal)"/>
+
+  <rect x="5" y="5" width="130" height="130" rx="35" fill="url(#surface)"/>
+  <rect x="5.75" y="5.75" width="128.5" height="128.5" rx="34.25" stroke="#91a8c4" stroke-opacity=".26" stroke-width="1.5"/>
+
+  <circle cx="67" cy="63" r="34" fill="#18273a" stroke="#e4edf8" stroke-width="5.5"/>
+  <path d="m49 69 12-13 11 12 14-17" fill="none" stroke="url(#trace)" stroke-linecap="round" stroke-linejoin="round" stroke-width="5"/>
+  <circle cx="49" cy="69" r="3.5" fill="#65e5d1"/>
+  <circle cx="61" cy="56" r="3.5" fill="#6bd8df"/>
+  <circle cx="72" cy="68" r="3.5" fill="#6cc9ed"/>
+  <circle cx="86" cy="51" r="3.5" fill="#69b8ff"/>
+  <path d="m92 88 21 21" fill="none" stroke="#e4edf8" stroke-linecap="round" stroke-width="8"/>
 </svg>
