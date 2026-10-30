@@ -17,6 +17,26 @@ pub struct LexicalPathHint {
     pub basis: LexicalPathBasis,
 }
 
+/// Derive the literal executable path argument from a strictly split `execve` or `execveat` row.
+///
+/// This does not resolve the path, inspect the filesystem, or expose argv/environment values.
+pub fn derive_executable_path_hint<'a>(syscall: &str, raw_arguments: &'a str) -> Option<&'a str> {
+    let (maximum_arguments, path_index) = match syscall {
+        "execve" => (3, 0),
+        "execveat" => (5, 1),
+        _ => return None,
+    };
+    if raw_arguments.len() > MAX_RECORD_BYTES {
+        return None;
+    }
+    let arguments = split_top_level_arguments(raw_arguments, maximum_arguments)?;
+    if arguments.len() != maximum_arguments {
+        return None;
+    }
+    let path = decode_plain_quoted_path(arguments[path_index].trim())?;
+    (!path.is_empty()).then_some(path)
+}
+
 /// Derive a narrowly scoped lexical path hint from `openat` or `openat2` arguments.
 ///
 /// This does not resolve `.` or `..`, inspect filesystem state, follow symlinks,
@@ -152,7 +172,33 @@ fn parse_directory_base(argument: &str) -> Option<(&str, LexicalPathBasis)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LexicalPathBasis as Basis, derive_lexical_path_hint};
+    use super::{LexicalPathBasis as Basis, derive_executable_path_hint, derive_lexical_path_hint};
+
+    #[test]
+    fn executable_path_hint_reads_only_plain_execve_path_argument() {
+        assert_eq!(
+            derive_executable_path_hint(
+                "execve",
+                "\"/usr/bin/sideeffect-worker\", [\"worker\", \"secret,arg\"], [\"TOKEN=x\"]"
+            ),
+            Some("/usr/bin/sideeffect-worker")
+        );
+        assert_eq!(
+            derive_executable_path_hint(
+                "execveat",
+                "AT_FDCWD, \"relative/worker\", [\"worker\"], [], 0"
+            ),
+            Some("relative/worker")
+        );
+        assert_eq!(
+            derive_executable_path_hint("execve", "\"/tmp/escaped\\x2fpath\", [], []"),
+            None
+        );
+        assert_eq!(
+            derive_executable_path_hint("openat", "AT_FDCWD, \"/tmp/file\", O_RDONLY"),
+            None
+        );
+    }
 
     #[test]
     fn absolute_paths_are_emitted_as_spelled_for_openat_and_openat2() {

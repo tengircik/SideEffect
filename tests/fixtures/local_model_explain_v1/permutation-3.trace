@@ -1,0 +1,3 @@
+1001 11.100000 openat(AT_FDCWD, "/etc/sideeffect-agent.toml", O_RDONLY) = -1 EACCES (Permission denied)
+1001 11.200000 connect(7, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("203.0.113.52")}, 16) = -1 ECONNREFUSED (Connection refused)
+1001 11.000000 execve("/usr/bin/sideeffect-agent", ["sideeffect-agent"], 0x0) = 0

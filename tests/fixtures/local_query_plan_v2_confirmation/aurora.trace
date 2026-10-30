@@ -1,0 +1,6 @@
+[pid 9101] 1724000000.000001 openat(AT_FDCWD, "/etc/aurora/agent.ini", {flags=O_RDONLY}, 7) = 7
+[pid 9101] 1724000000.000002 openat2(AT_FDCWD, "/opt/aurora/chunks/base.pack", {flags=O_RDONLY}, 8) = -1 ENOENT (No such file or directory)
+[pid 9102] 1724000000.000003 connect(3, {sa_family=AF_INET, sin_port=htons(9551), sin_addr=inet_addr("203.0.113.77")}, 16) = -1 ECONNRESET (Connection reset by peer)
+[pid 9102] 1724000000.000004 connect(4, {sa_family=AF_INET, sin_port=htons(9552), sin_addr=inet_addr("203.0.113.78")}, 16) = -1 EINPROGRESS (Operation now in progress)
+[pid 9103] 1724000000.000005 vfork() = 9104
+[pid 9105] 1724000000.000006 execve("/usr/bin/aurora-indexer", ["aurora-indexer"], 0x0) = 0

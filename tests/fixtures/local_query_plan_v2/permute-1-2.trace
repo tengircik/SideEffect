@@ -1,0 +1,4 @@
+[pid 1100] 1710000000.000002 connect(4, {sa_family=AF_INET, sin_port=htons(9443), sin_addr=inet_addr("192.0.2.81")}, 16) = -1 ECONNREFUSED (Connection refused)
+[pid 1100] 1710000000.000003 execve("/opt/aurora/bin/runner", ["runner"], 0x0) = 0
+[pid 1100] 1710000000.000004 clone(child_stack=NULL, flags=SIGCHLD) = 1101
+[pid 1100] 1710000000.000001 openat2(AT_FDCWD, "/srv/aurora/queue/item.bin", {flags=O_RDONLY}, 24) = -1 EACCES (Permission denied)

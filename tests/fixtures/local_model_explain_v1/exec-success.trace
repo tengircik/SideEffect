@@ -1,0 +1,1 @@
+101 10.000000 execve("/usr/bin/sideeffect-worker", ["sideeffect-worker", "--serve"], 0x0) = 0

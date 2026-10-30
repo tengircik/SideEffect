@@ -653,144 +653,145 @@ pub(crate) fn parse_linux_errno_result(raw_result: &str) -> Option<&str> {
     Some(errno)
 }
 
+pub(crate) const LINUX_ERRNO_NAMES: &[&str] = &[
+    "EPERM",
+    "ENOENT",
+    "ESRCH",
+    "EINTR",
+    "EIO",
+    "ENXIO",
+    "E2BIG",
+    "ENOEXEC",
+    "EBADF",
+    "ECHILD",
+    "EAGAIN",
+    "EWOULDBLOCK",
+    "ENOMEM",
+    "EACCES",
+    "EFAULT",
+    "ENOTBLK",
+    "EBUSY",
+    "EEXIST",
+    "EXDEV",
+    "ENODEV",
+    "ENOTDIR",
+    "EISDIR",
+    "EINVAL",
+    "ENFILE",
+    "EMFILE",
+    "ENOTTY",
+    "ETXTBSY",
+    "EFBIG",
+    "ENOSPC",
+    "ESPIPE",
+    "EROFS",
+    "EMLINK",
+    "EPIPE",
+    "EDOM",
+    "ERANGE",
+    "EDEADLK",
+    "EDEADLOCK",
+    "ENAMETOOLONG",
+    "ENOLCK",
+    "ENOSYS",
+    "ENOTEMPTY",
+    "ELOOP",
+    "ENOMSG",
+    "EIDRM",
+    "ECHRNG",
+    "EL2NSYNC",
+    "EL3HLT",
+    "EL3RST",
+    "ELNRNG",
+    "EUNATCH",
+    "ENOCSI",
+    "EL2HLT",
+    "EBADE",
+    "EBADR",
+    "EXFULL",
+    "ENOANO",
+    "EBADRQC",
+    "EBADSLT",
+    "EBFONT",
+    "ENOSTR",
+    "ENODATA",
+    "ETIME",
+    "ENOSR",
+    "ENONET",
+    "ENOPKG",
+    "EREMOTE",
+    "ENOLINK",
+    "EADV",
+    "ESRMNT",
+    "ECOMM",
+    "EPROTO",
+    "EMULTIHOP",
+    "EDOTDOT",
+    "EBADMSG",
+    "EOVERFLOW",
+    "ENOTUNIQ",
+    "EBADFD",
+    "EREMCHG",
+    "ELIBACC",
+    "ELIBBAD",
+    "ELIBSCN",
+    "ELIBMAX",
+    "ELIBEXEC",
+    "EILSEQ",
+    "ERESTART",
+    "ESTRPIPE",
+    "EUSERS",
+    "ENOTSOCK",
+    "EDESTADDRREQ",
+    "EMSGSIZE",
+    "EPROTOTYPE",
+    "ENOPROTOOPT",
+    "EPROTONOSUPPORT",
+    "ESOCKTNOSUPPORT",
+    "EOPNOTSUPP",
+    "ENOTSUP",
+    "EPFNOSUPPORT",
+    "EAFNOSUPPORT",
+    "EADDRINUSE",
+    "EADDRNOTAVAIL",
+    "ENETDOWN",
+    "ENETUNREACH",
+    "ENETRESET",
+    "ECONNABORTED",
+    "ECONNRESET",
+    "ENOBUFS",
+    "EISCONN",
+    "ENOTCONN",
+    "ESHUTDOWN",
+    "ETOOMANYREFS",
+    "ETIMEDOUT",
+    "ECONNREFUSED",
+    "EHOSTDOWN",
+    "EHOSTUNREACH",
+    "EALREADY",
+    "EINPROGRESS",
+    "ESTALE",
+    "EUCLEAN",
+    "ENOTNAM",
+    "ENAVAIL",
+    "EISNAM",
+    "EREMOTEIO",
+    "EDQUOT",
+    "ENOMEDIUM",
+    "EMEDIUMTYPE",
+    "ECANCELED",
+    "ENOKEY",
+    "EKEYEXPIRED",
+    "EKEYREVOKED",
+    "EKEYREJECTED",
+    "EOWNERDEAD",
+    "ENOTRECOVERABLE",
+    "ERFKILL",
+    "EHWPOISON",
+];
+
 pub(crate) fn is_linux_errno(value: &str) -> bool {
-    matches!(
-        value,
-        "EPERM"
-            | "ENOENT"
-            | "ESRCH"
-            | "EINTR"
-            | "EIO"
-            | "ENXIO"
-            | "E2BIG"
-            | "ENOEXEC"
-            | "EBADF"
-            | "ECHILD"
-            | "EAGAIN"
-            | "EWOULDBLOCK"
-            | "ENOMEM"
-            | "EACCES"
-            | "EFAULT"
-            | "ENOTBLK"
-            | "EBUSY"
-            | "EEXIST"
-            | "EXDEV"
-            | "ENODEV"
-            | "ENOTDIR"
-            | "EISDIR"
-            | "EINVAL"
-            | "ENFILE"
-            | "EMFILE"
-            | "ENOTTY"
-            | "ETXTBSY"
-            | "EFBIG"
-            | "ENOSPC"
-            | "ESPIPE"
-            | "EROFS"
-            | "EMLINK"
-            | "EPIPE"
-            | "EDOM"
-            | "ERANGE"
-            | "EDEADLK"
-            | "EDEADLOCK"
-            | "ENAMETOOLONG"
-            | "ENOLCK"
-            | "ENOSYS"
-            | "ENOTEMPTY"
-            | "ELOOP"
-            | "ENOMSG"
-            | "EIDRM"
-            | "ECHRNG"
-            | "EL2NSYNC"
-            | "EL3HLT"
-            | "EL3RST"
-            | "ELNRNG"
-            | "EUNATCH"
-            | "ENOCSI"
-            | "EL2HLT"
-            | "EBADE"
-            | "EBADR"
-            | "EXFULL"
-            | "ENOANO"
-            | "EBADRQC"
-            | "EBADSLT"
-            | "EBFONT"
-            | "ENOSTR"
-            | "ENODATA"
-            | "ETIME"
-            | "ENOSR"
-            | "ENONET"
-            | "ENOPKG"
-            | "EREMOTE"
-            | "ENOLINK"
-            | "EADV"
-            | "ESRMNT"
-            | "ECOMM"
-            | "EPROTO"
-            | "EMULTIHOP"
-            | "EDOTDOT"
-            | "EBADMSG"
-            | "EOVERFLOW"
-            | "ENOTUNIQ"
-            | "EBADFD"
-            | "EREMCHG"
-            | "ELIBACC"
-            | "ELIBBAD"
-            | "ELIBSCN"
-            | "ELIBMAX"
-            | "ELIBEXEC"
-            | "EILSEQ"
-            | "ERESTART"
-            | "ESTRPIPE"
-            | "EUSERS"
-            | "ENOTSOCK"
-            | "EDESTADDRREQ"
-            | "EMSGSIZE"
-            | "EPROTOTYPE"
-            | "ENOPROTOOPT"
-            | "EPROTONOSUPPORT"
-            | "ESOCKTNOSUPPORT"
-            | "EOPNOTSUPP"
-            | "ENOTSUP"
-            | "EPFNOSUPPORT"
-            | "EAFNOSUPPORT"
-            | "EADDRINUSE"
-            | "EADDRNOTAVAIL"
-            | "ENETDOWN"
-            | "ENETUNREACH"
-            | "ENETRESET"
-            | "ECONNABORTED"
-            | "ECONNRESET"
-            | "ENOBUFS"
-            | "EISCONN"
-            | "ENOTCONN"
-            | "ESHUTDOWN"
-            | "ETOOMANYREFS"
-            | "ETIMEDOUT"
-            | "ECONNREFUSED"
-            | "EHOSTDOWN"
-            | "EHOSTUNREACH"
-            | "EALREADY"
-            | "EINPROGRESS"
-            | "ESTALE"
-            | "EUCLEAN"
-            | "ENOTNAM"
-            | "ENAVAIL"
-            | "EISNAM"
-            | "EREMOTEIO"
-            | "EDQUOT"
-            | "ENOMEDIUM"
-            | "EMEDIUMTYPE"
-            | "ECANCELED"
-            | "ENOKEY"
-            | "EKEYEXPIRED"
-            | "EKEYREVOKED"
-            | "EKEYREJECTED"
-            | "EOWNERDEAD"
-            | "ENOTRECOVERABLE"
-            | "ERFKILL"
-            | "EHWPOISON"
-    )
+    LINUX_ERRNO_NAMES.contains(&value)
 }
 
 fn record(
@@ -962,10 +963,13 @@ fn continuation_diagnostic(
 
 #[cfg(test)]
 mod scanner_tests {
-    use super::{parse_linux_errno_result, scan_angle_annotation};
+    use super::{is_linux_errno, parse_linux_errno_result, scan_angle_annotation};
 
     #[test]
     fn linux_errno_parser_accepts_only_recognized_well_formed_results() {
+        assert!(is_linux_errno("ENOENT"));
+        assert!(is_linux_errno("EHWPOISON"));
+        assert!(!is_linux_errno("EFAKE"));
         assert_eq!(
             parse_linux_errno_result("-1 ENOENT (No such file or directory)"),
             Some("ENOENT")

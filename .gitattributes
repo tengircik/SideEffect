@@ -1,1 +1,2 @@
 *.trace text eol=lf
+tests/fixtures/local_query_plan_v2_confirmation/experimental-two-shot-system-prompt.txt -text whitespace=cr-at-eol,-blank-at-eol

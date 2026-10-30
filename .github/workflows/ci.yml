@@ -67,6 +67,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y strace python3
 
+      - name: Validate portable agent skill
+        run: python3 scripts/validate_agent_skill.py
+
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -119,8 +122,12 @@ jobs:
         run: cargo +1.85.0 build --locked --bin sideeffect
 
   windows:
-    name: Windows
-    runs-on: windows-latest
+    name: Windows (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
     timeout-minutes: 20
     steps:
       - name: Check out source
@@ -128,6 +135,14 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+
+      - name: Report Windows version
+        shell: pwsh
+        run: |
+          $os = Get-CimInstance -ClassName Win32_OperatingSystem
+          Write-Output "Windows caption: $($os.Caption)"
+          Write-Output "Windows version: $($os.Version)"
+          Write-Output "Windows build: $($os.BuildNumber)"
 
       - name: Install Rust components
         run: rustup component add rustfmt clippy
@@ -140,6 +155,19 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --all-targets
+
+      - name: Verify live ETW acceptance prerequisites
+        shell: pwsh
+        run: |
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw "Live ETW acceptance requires an already-administrative Windows runner token."
+          }
+          Write-Output "ETW acceptance runner token is administrative: $($identity.Name)"
+
+      - name: Run live ETW acceptance
+        run: cargo test --locked --test windows_runtime_etw_integration -- --ignored --exact captures_process_file_and_loopback_network_observations_and_reports_loss_state
 
       - name: Build CLI
         run: cargo build --locked --bin sideeffect

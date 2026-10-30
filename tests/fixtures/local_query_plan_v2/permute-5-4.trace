@@ -1,0 +1,4 @@
+[pid 5500] 1710000400.000004 clone(child_stack=NULL, flags=SIGCHLD) = 5501
+[pid 5500] 1710000400.000001 openat(AT_FDCWD, "/home/selene/state/session.dat", O_WRONLY) = -1 EROFS (Read-only file system)
+[pid 5500] 1710000400.000002 connect(8, {sa_family=AF_INET, sin_port=htons(9447), sin_addr=inet_addr("192.0.2.85")}, 16) = -1 ENETUNREACH (Network is unreachable)
+[pid 5500] 1710000400.000003 execve("/usr/local/libexec/selene-sync", ["selene-sync"], 0x0) = 0

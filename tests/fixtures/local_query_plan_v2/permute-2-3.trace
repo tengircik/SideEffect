@@ -1,0 +1,4 @@
+[pid 2200] 1710000100.000003 connect(5, {sa_family=AF_INET, sin_port=htons(9444), sin_addr=inet_addr("192.0.2.82")}, 16) = -1 EINPROGRESS (Operation now in progress)
+[pid 2200] 1710000100.000004 vfork() = 2201
+[pid 2200] 1710000100.000001 execveat(AT_FDCWD, "/opt/borealis/worker", ["worker"], 0x0, 0) = -1 ENOENT (No such file or directory)
+[pid 2200] 1710000100.000002 openat(AT_FDCWD, "/etc/borealis/policy.toml", O_RDONLY|O_CLOEXEC) = 3

@@ -3,7 +3,7 @@ use std::ffi::OsString;
 #[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -13,10 +13,13 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use serde::Deserialize;
 use serde::Serialize;
-#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
 use sideeffect::audit_session_linux::{AuditOptions, collect_and_publish};
+#[cfg(windows)]
+use sideeffect::audit_session_windows::{
+    WindowsAuditOptions, collect_and_publish as collect_windows_audit_and_publish,
+};
 use sideeffect::diff::compare_traces;
 use sideeffect::explain::{explain_diff, explain_trace};
 #[cfg(target_os = "linux")]
@@ -47,6 +50,7 @@ use sideeffect::inventory::{WindowsStartupStatus, collect_windows_startup};
 use sideeffect::limits::MAX_BUNDLE_MANIFEST_BYTES;
 use sideeffect::limits::{MAX_REPORT_BYTES, MAX_TRACE_BYTES, ParseLimits};
 use sideeffect::model::{BundleCaptureContext, ParseCompleteness, TraceDiff, TraceRecordKind};
+use sideeffect::model_manager::{EvaluationStatus, ModelTask, ResolvedModel};
 #[cfg(target_os = "linux")]
 use sideeffect::record::AnchoredOutput;
 #[cfg(target_os = "linux")]
@@ -56,18 +60,25 @@ use sideeffect::record::publish_private_windows_file;
 use sideeffect::startup_correlation::correlate_startup_bytes;
 use sideeffect::trace::strace::parse_trace_bytes;
 
-const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect inspect [--format json|text] --bundle <run-bundle-directory>\n       sideeffect inspect [--format json|text] --session <audit-session-directory>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff --bundles [--format json|text] <baseline-bundle> <candidate-bundle>\n       sideeffect diff --bundles --format html --output <report.html> <baseline-bundle> <candidate-bundle>\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect inventory packages --output <new-inventory.json>\n\
+const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect inspect [--format json|text] --bundle <run-bundle-directory>\n       sideeffect inspect [--format json|text] --session <audit-session-directory>\n       sideeffect inspect [--format json|text] --windows-runtime <capture.json>\n       sideeffect inspect --format html --output <report.html> --windows-runtime <capture.json>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff --bundles [--format json|text] <baseline-bundle> <candidate-bundle>\n       sideeffect diff --bundles --format html --output <report.html> <baseline-bundle> <candidate-bundle>\n       sideeffect diff --windows-runtime [--format json|text] <before-capture.json> <after-capture.json>\n       sideeffect diff --format html --output <report.html> --windows-runtime <before-capture.json> <after-capture.json> (native Windows)\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect inventory packages --output <new-inventory.json>\n\
        sideeffect explain <strace-trace-file>\n\
        sideeffect explain --diff <baseline-trace> <candidate-trace>\n\
        sideeffect explain --inventory-diff <before.json> <after.json>\n\
        sideeffect model-preview --question <question> <strace-trace-file>\n\
-       sideeffect model-analyze --question <question> --runtime <llama-cli> --model <model.gguf> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
+       sideeffect model-analyze --question <question> --runtime <llama-cli> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
+       sideeffect model-explain-preview --question <question> --backend auto|cpu|cuda <strace-trace-file>\n\
+       sideeffect model-explain --question <question> --backend auto|cpu|cuda --runtime <llama-completion> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
+       sideeffect model-query-preview --question <question> <strace-trace-file>\n\
+       sideeffect model-query --question <question> --runtime <llama-completion> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
+       sideeffect model list | show <id> | install <id> | setup <id> | add | select <task> <id> | remove <id>\n\
        sideeffect correlate-startup <startup-inventory.json> <strace-trace-file>\n\
+       sideeffect associated-behavior <startup-inventory.json> <runtime-evidence-file>\n\
+       sideeffect attribute --windows-runtime <capture.json>\n\
        sideeffect inventory processes --output <new-inventory.json>\n\
        sideeffect inventory startup --output <new-inventory.json>\n\
        sideeffect inventory permissions --output <new-inventory.json> <path>...\n\
-       sideeffect audit --output <new-session-directory> [--packages] [--processes] [--startup] [--permission <path>]...\n\
-       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect record --trace <new-trace-file> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect help [command [subcommand]]\n       sideeffect version\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. On Linux, inventory packages reads available local dpkg, RPM, pacman, and APK databases; on Windows, it reads selected current-user and machine-wide Uninstall registry entries. Both are bounded source snapshots and can miss unregistered software. Windows does not use Win32_Product or launch uninstall commands. On Linux, inventory processes reads bounded numeric /proc status entries and executable-link identities; on Windows, it reads a Tool Help snapshot and queries accessible image paths. Neither adapter reads command lines or promises atomic or exhaustive coverage. On Linux, inventory startup discovers curated sources; on Windows, it inventories selected Run/RunOnce values, Startup folders, and visible service configuration and boot/logon triggers in tasks visible to the current token. Task actions and XML are not collected. Neither platform establishes that a configured entry ran. Inventory permissions inspects only explicit Linux paths and records ownership/type/mode, supported POSIX ACLs, and Linux file-capability xattrs; it never follows the final path symlink or calculates effective access. Record follows a selected command's traced descendants and may enforce a requested wall-clock limit; this is observation, not isolation or a safety check.";
+       sideeffect audit --output <new-session-directory> [--packages] [--processes] [--startup] [--permission <path>]... [--runtime-duration-seconds <1..3600> -- <program> [args...]]\n\
+       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect record --trace <new-trace-file> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect help [command [subcommand]]\n       sideeffect version\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. On Linux, inventory packages reads available local dpkg, RPM, pacman, and APK databases; on Windows, it reads selected current-user and machine-wide Uninstall registry entries. Both are bounded source snapshots and can miss unregistered software. Windows does not use Win32_Product or launch uninstall commands. On Linux, inventory processes reads bounded numeric /proc status entries and executable-link identities; on Windows, it reads a Tool Help snapshot and queries accessible image paths. Neither adapter reads command lines or promises atomic or exhaustive coverage. On Linux, inventory startup discovers curated sources; on Windows, it inventories selected Run/RunOnce values, Startup folders, and visible service configuration and boot/logon triggers in tasks visible to the current token. For tasks, bounded Exec-action executable paths, arguments, and working directories are recorded as inert text; other action types remain unsupported with unknown action-specific fields. Neither platform establishes that a configured entry ran. Inventory permissions inspects only explicit Linux paths and records ownership/type/mode, supported POSIX ACLs, and Linux file-capability xattrs; it never follows the final path symlink or calculates effective access. Record follows a selected command's traced descendants and may enforce a requested wall-clock limit; this is observation, not isolation or a safety check.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -77,6 +88,26 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+const MAX_MODEL_CONFIRMATION_BYTES: usize = 256;
+
+fn read_model_confirmation() -> Result<String, String> {
+    let stdin = io::stdin();
+    let mut bytes = Vec::with_capacity(128);
+    let mut limited = Read::take(stdin.lock(), (MAX_MODEL_CONFIRMATION_BYTES + 1) as u64);
+    limited
+        .read_until(b'\n', &mut bytes)
+        .map_err(|error| format!("could not read model confirmation: {error}"))?;
+    if bytes.len() > MAX_MODEL_CONFIRMATION_BYTES {
+        return Err(format!(
+            "model confirmation exceeds the {MAX_MODEL_CONFIRMATION_BYTES}-byte limit"
+        ));
+    }
+    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        bytes.pop();
+    }
+    String::from_utf8(bytes).map_err(|_| "model confirmation must be valid UTF-8".to_owned())
 }
 
 fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
@@ -104,6 +135,21 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         [command, subcommand, flag] if flag == "--help" || flag == "-h" => {
             command_help(&[command.clone(), subcommand.clone()])
         }
+        [command, operation] if command == "model" && operation == "list" => model_list(),
+        [command, operation, id] if command == "model" && operation == "show" => model_show(id),
+        [command, operation, id] if command == "model" && operation == "install" => {
+            model_install(id, false)
+        }
+        [command, operation, id] if command == "model" && operation == "setup" => {
+            model_install(id, true)
+        }
+        [command, operation, task, id] if command == "model" && operation == "select" => {
+            model_select(task, id)
+        }
+        [command, operation, id] if command == "model" && operation == "remove" => model_remove(id),
+        [command, operation, arguments @ ..] if command == "model" && operation == "add" => {
+            model_add(arguments)
+        }
         [command, flag, path] if command == "inspect" && flag == "--session" => {
             inspect_session_with_format(&OsString::from("json"), path)
         }
@@ -112,6 +158,35 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         {
             inspect_session_with_format(format, path)
         }
+        [command, flag, path] if command == "inspect" && flag == "--windows-runtime" => {
+            inspect_windows_runtime_with_format(&OsString::from("json"), path)
+        }
+        [command, flag, path] if command == "attribute" && flag == "--windows-runtime" => {
+            attribute_windows_runtime(path)
+        }
+        [command, format_flag, format, windows_flag, path]
+            if command == "inspect"
+                && format_flag == "--format"
+                && windows_flag == "--windows-runtime" =>
+        {
+            inspect_windows_runtime_with_format(format, path)
+        }
+        [
+            command,
+            format_flag,
+            format,
+            output_flag,
+            output,
+            windows_flag,
+            capture,
+        ] if command == "inspect"
+            && format_flag == "--format"
+            && format == "html"
+            && output_flag == "--output"
+            && windows_flag == "--windows-runtime" =>
+        {
+            inspect_windows_runtime_html(output, capture)
+        }
         [command, path] if command == "inspect" => inspect(path),
         [command, path] if command == "explain" => explain_trace_file(path),
         [command, question_flag, question, path]
@@ -119,24 +194,74 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         {
             model_preview_file(question, path)
         }
+        [command, question_flag, question, path]
+            if command == "model-query-preview" && question_flag == "--question" =>
+        {
+            model_query_preview_file(question, path)
+        }
+        [
+            command,
+            question_flag,
+            question,
+            backend_flag,
+            backend,
+            path,
+        ] if command == "model-explain-preview"
+            && question_flag == "--question"
+            && backend_flag == "--backend" =>
+        {
+            model_explanation_preview_file(question, backend, path)
+        }
+        [
+            command,
+            question_flag,
+            question,
+            backend_flag,
+            backend,
+            runtime_flag,
+            runtime,
+            confirm_flag,
+            digest,
+            trace,
+        ] if command == "model-explain"
+            && question_flag == "--question"
+            && backend_flag == "--backend"
+            && runtime_flag == "--runtime"
+            && confirm_flag == "--confirm-sha256" =>
+        {
+            model_explanation_file(question, backend, runtime, digest, trace)
+        }
         [
             command,
             question_flag,
             question,
             runtime_flag,
             runtime,
-            model_flag,
-            model,
             confirm_flag,
             digest,
             trace,
         ] if command == "model-analyze"
             && question_flag == "--question"
             && runtime_flag == "--runtime"
-            && model_flag == "--model"
             && confirm_flag == "--confirm-sha256" =>
         {
-            model_analyze_file(question, runtime, model, digest, trace)
+            model_analyze_file(question, runtime, digest, trace)
+        }
+        [
+            command,
+            question_flag,
+            question,
+            runtime_flag,
+            runtime,
+            confirm_flag,
+            digest,
+            trace,
+        ] if command == "model-query"
+            && question_flag == "--question"
+            && runtime_flag == "--runtime"
+            && confirm_flag == "--confirm-sha256" =>
+        {
+            model_query_file(question, runtime, digest, trace)
         }
         [command, diff_flag, left, right] if command == "explain" && diff_flag == "--diff" => {
             explain_diff_files(left, right)
@@ -148,6 +273,9 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         }
         [command, startup_path, trace_path] if command == "correlate-startup" => {
             correlate_startup(startup_path, trace_path)
+        }
+        [command, startup_path, trace_path] if command == "associated-behavior" => {
+            associated_behavior(startup_path, trace_path)
         }
         [command, subcommand, option, output]
             if command == "inventory" && subcommand == "packages" && option == "--output" =>
@@ -187,6 +315,59 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             evidence(path, digest, line, byte_offset, byte_length)
         }
         [command, left, right] if command == "diff" => diff(left, right),
+        [command, runtime_flag, before, after]
+            if command == "diff" && runtime_flag == "--windows-runtime" =>
+        {
+            diff_windows_runtime_with_format(&OsString::from("json"), before, after, None)
+        }
+        [command, runtime_flag, format_flag, format, before, after]
+            if command == "diff"
+                && runtime_flag == "--windows-runtime"
+                && format_flag == "--format" =>
+        {
+            diff_windows_runtime_with_format(format, before, after, None)
+        }
+        [command, format_flag, format, runtime_flag, before, after]
+            if command == "diff"
+                && format_flag == "--format"
+                && runtime_flag == "--windows-runtime" =>
+        {
+            diff_windows_runtime_with_format(format, before, after, None)
+        }
+        [
+            command,
+            runtime_flag,
+            format_flag,
+            format,
+            output_flag,
+            output,
+            before,
+            after,
+        ] if command == "diff"
+            && runtime_flag == "--windows-runtime"
+            && format_flag == "--format"
+            && format == "html"
+            && output_flag == "--output" =>
+        {
+            diff_windows_runtime_with_format(format, before, after, Some(output))
+        }
+        [
+            command,
+            format_flag,
+            format,
+            output_flag,
+            output,
+            runtime_flag,
+            before,
+            after,
+        ] if command == "diff"
+            && format_flag == "--format"
+            && format == "html"
+            && output_flag == "--output"
+            && runtime_flag == "--windows-runtime" =>
+        {
+            diff_windows_runtime_with_format(format, before, after, Some(output))
+        }
         [command, bundles_flag, left, right]
             if command == "diff" && bundles_flag == "--bundles" =>
         {
@@ -340,6 +521,20 @@ fn audit_command(arguments: &[OsString]) -> Result<ExitCode, String> {
         let mut index = 0;
         while index < arguments.len() {
             let argument = &arguments[index];
+            if argument == "--" {
+                if options.runtime_duration.is_none() {
+                    return Err(
+                        "audit runtime command requires --runtime-duration-seconds before --"
+                            .to_owned(),
+                    );
+                }
+                let Some(program) = arguments.get(index + 1) else {
+                    return Err("audit runtime command is missing after --".to_owned());
+                };
+                options.runtime_program = Some(program.clone());
+                options.runtime_arguments = arguments[index + 2..].to_vec();
+                break;
+            }
             if argument == "--output" {
                 if destination.is_some() || index + 1 >= arguments.len() {
                     return Err("audit requires exactly one --output DIRECTORY".to_owned());
@@ -380,10 +575,26 @@ fn audit_command(arguments: &[OsString]) -> Result<ExitCode, String> {
                 index += 2;
                 continue;
             }
+            if argument == "--runtime-duration-seconds" {
+                if options.runtime_duration.is_some() || index + 1 >= arguments.len() {
+                    return Err(
+                        "audit requires exactly one --runtime-duration-seconds value".to_owned(),
+                    );
+                }
+                options.runtime_duration = Some(parse_duration_seconds(&arguments[index + 1])?);
+                index += 2;
+                continue;
+            }
             return Err(format!(
                 "unsupported audit argument: {}",
                 terminal_safe_path(Path::new(argument))
             ));
+        }
+        if options.runtime_duration.is_some() && options.runtime_program.is_none() {
+            return Err(
+                "audit --runtime-duration-seconds must be followed by -- <program> [args...]"
+                    .to_owned(),
+            );
         }
         let destination =
             destination.ok_or_else(|| "audit requires --output DIRECTORY".to_owned())?;
@@ -404,18 +615,110 @@ fn audit_command(arguments: &[OsString]) -> Result<ExitCode, String> {
                 "Warning: the session directory was published, but syncing its parent directory failed; persistence across sudden power loss is uncertain."
             );
         }
-        return Ok(
+        Ok(
             if result.manifest.status == sideeffect::audit_session::SessionStatus::Complete {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(2)
             },
-        );
+        )
     }
     #[cfg(windows)]
     {
-        let _ = arguments;
-        Err("audit sessions are not yet supported on Windows; native Windows source contracts and private directory publication remain incomplete".to_owned())
+        let mut destination: Option<&OsString> = None;
+        let mut options = WindowsAuditOptions::default();
+        let mut selected = std::collections::HashSet::new();
+        let mut index = 0;
+        while index < arguments.len() {
+            match arguments[index].to_str() {
+                Some("--output") if destination.is_none() && index + 1 < arguments.len() => {
+                    destination = Some(&arguments[index + 1]);
+                    index += 2;
+                }
+                Some("--packages") if selected.insert("packages") => {
+                    options.software = true;
+                    index += 1;
+                }
+                Some("--processes") if selected.insert("processes") => {
+                    options.processes = true;
+                    index += 1;
+                }
+                Some("--startup") if selected.insert("startup") => {
+                    options.startup = true;
+                    index += 1;
+                }
+                Some("--runtime-source")
+                    if selected.insert("runtime")
+                        && arguments
+                            .get(index + 1)
+                            .is_some_and(|value| value == "windows-etw") =>
+                {
+                    options.include_runtime = true;
+                    index += 2;
+                }
+                Some("--runtime-duration-seconds")
+                    if options.runtime_duration.is_none() && index + 1 < arguments.len() =>
+                {
+                    options.runtime_duration =
+                        Some(parse_windows_duration_seconds(&arguments[index + 1])?);
+                    index += 2;
+                }
+                Some("--") if options.include_runtime => {
+                    let Some(program) = arguments.get(index + 1) else {
+                        return Err("Windows runtime command is missing after --".to_owned());
+                    };
+                    options.runtime_program = Some(program.clone());
+                    options.runtime_arguments = arguments[index + 2..].to_vec();
+                    break;
+                }
+                Some("--permission") if index + 1 < arguments.len() => {
+                    options
+                        .permission_paths
+                        .push(Path::new(&arguments[index + 1]).to_path_buf());
+                    index += 2;
+                }
+                _ => {
+                    return Err(format!(
+                        "unsupported audit argument: {}",
+                        terminal_safe_path(Path::new(&arguments[index]))
+                    ));
+                }
+            }
+        }
+        if options.include_runtime
+            && (options.runtime_duration.is_none() || options.runtime_program.is_none())
+        {
+            return Err("Windows runtime capture requires --runtime-duration-seconds 1..60 -- PROGRAM [ARGS...]".to_owned());
+        }
+        if options.runtime_duration.is_some() && !options.include_runtime {
+            return Err(
+                "Windows --runtime-duration-seconds requires --runtime-source windows-etw"
+                    .to_owned(),
+            );
+        }
+        let destination =
+            destination.ok_or_else(|| "audit requires --output DIRECTORY".to_owned())?;
+        let result = collect_windows_audit_and_publish(Path::new(destination), &options)?;
+        let state = if result.manifest.status == sideeffect::audit_session::SessionStatus::Complete
+        {
+            "complete"
+        } else {
+            "partial"
+        };
+        eprintln!(
+            "Published a {state} best-effort Windows audit session to {} ({} sources, {}–{} Unix milliseconds). Each source was collected in its own interval; this is not an atomic snapshot. Review the local artifacts before sharing.",
+            terminal_safe_path(&result.path),
+            result.manifest.sources.len(),
+            result.manifest.started_at_unix_ms,
+            result.manifest.ended_at_unix_ms
+        );
+        Ok(
+            if result.manifest.status == sideeffect::audit_session::SessionStatus::Complete {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(2)
+            },
+        )
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
@@ -686,14 +989,14 @@ fn record_windows_etw(
 ) -> Result<ExitCode, String> {
     #[cfg(windows)]
     {
-        let capture = sideeffect::record::record_windows_process_capture(
+        let capture = sideeffect::record::record_windows_runtime_capture(
             Path::new(output),
             program,
             args,
             duration,
         )?;
         eprintln!(
-            "Saved {} Windows process lifecycle records to {} (collection: {:?}; capture completeness: unknown; ETW loss stats available: {}, final snapshot: {}, observation: {}).",
+            "Saved {} Windows process/file/network ETW records to {} (collection: {:?}; capture completeness: unknown; ETW loss stats available: {}, final snapshot: {}, observation: {}).",
             capture.events.len(),
             terminal_safe_path(Path::new(output)),
             capture.collection_status,
@@ -948,12 +1251,11 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         "audit" => {
             #[cfg(target_os = "linux")]
             {
-                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages] [--processes] [--startup] [--permission PATH]...
-Collects selected Linux inventory sources into one local, private session directory. Each source has its own interval; the session is not an atomic snapshot. Permission paths must be explicitly selected. Partial sources are preserved and cause exit status 2. Runtime capture and Windows sessions are not yet included."
+                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages] [--processes] [--startup] [--permission PATH]... [--runtime-duration-seconds 1..3600 -- PROGRAM [ARGS...]]\nCollects explicitly selected Linux inventory sources and an optional bounded command capture into one local, private session directory. Linux runtime uses external strace. Runtime command arguments stay separate and are passed without a shell. The session stores the native run manifest and raw trace, which may contain sensitive arguments and paths. Each source has its own interval; the session is not an atomic snapshot. Runtime completeness remains unknown, so runtime sources and sessions containing runtime are partial. Partial and unavailable selected sources are preserved and cause exit status 2."
             }
             #[cfg(windows)]
             {
-                "Audit sessions are not yet supported on Windows."
+                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages] [--processes] [--startup] [--permission PATH]... [--runtime-source windows-etw --runtime-duration-seconds 1..60 -- PROGRAM [ARGS...]]\nCollects selected bounded native Windows inventories and optional system-wide ETW observations into one current-user-private session directory. --permission inspects explicitly selected paths only. ETW requires permission to control the shared NT Kernel Logger; SideEffect never elevates. The command is passed as separate arguments and is not started unless ETW setup succeeds. Capture completeness is unknown, so runtime-containing sessions are partial."
             }
             #[cfg(not(any(target_os = "linux", windows)))]
             {
@@ -961,10 +1263,10 @@ Collects selected Linux inventory sources into one local, private session direct
             }
         }
         "inspect" => {
-            "Usage: sideeffect inspect [--format json|text] TRACE\n       sideeffect inspect [--format json|text] --bundle DIR\n       sideeffect inspect [--format json|text] --session DIR\nReads bounded local strace evidence, a validated run bundle, or a verified Linux audit session. It never runs represented commands. JSON is the default; text output escapes terminal controls and user-influenced scope text. Session inspection checks the manifest, private file layout, artifact schemas, byte lengths, and SHA-256 values; hashes do not authenticate the source. Partial input is labeled and exits with status 2."
+            "Usage: sideeffect inspect [--format json|text] TRACE\n       sideeffect inspect [--format json|text] --bundle DIR\n       sideeffect inspect [--format json|text] --session DIR\n       sideeffect inspect [--format json|text] --windows-runtime FILE\n       sideeffect inspect --format html --output NEW_REPORT.html --windows-runtime FILE (native Windows)\nReads bounded local strace evidence, a validated run bundle, a verified audit session, or a Windows ETW capture. It never runs represented commands. JSON is the default; text output escapes terminal controls and user-influenced fields. Windows runtime inspection accepts schema v3, validates its document fingerprint and bounds, and does not authenticate authorship or establish capture completeness. HTML file export uses the protected current-user publisher and is available only on native Windows. Partial input is labeled and exits with status 2."
         }
         "diff" => {
-            "Usage: sideeffect diff [--format json|text] LEFT RIGHT\n       sideeffect diff --format html --output REPORT.html LEFT RIGHT\n       sideeffect diff --bundles [--format json|text] LEFT_DIR RIGHT_DIR\nCompares complete parsed observations. HTML reports are available on Linux and are static, offline, and private. Trace values may be sensitive."
+            "Usage: sideeffect diff [--format json|text] LEFT RIGHT\n       sideeffect diff --format html --output REPORT.html LEFT RIGHT\n       sideeffect diff --bundles [--format json|text] LEFT_DIR RIGHT_DIR\n       sideeffect diff --windows-runtime [--format json|text] BEFORE.json AFTER.json\n       sideeffect diff --format html --output REPORT.html --windows-runtime BEFORE.json AFTER.json (native Windows)\nCompares complete parsed strace observations or validated Windows ETW captures. Windows summary v2 preserves category counts, compares exact normalized record multisets, and labels unique supported changed identities as candidates with source references. One-sided observations are not removals or additions; capture completeness remains unknown, and no causal or system-level absence claims are made. Windows HTML uses the protected current-user publisher and a static offline report. Input and report data may be sensitive."
         }
         "diff-summary" => {
             "Usage: sideeffect diff-summary [--format json] LEFT RIGHT\n       sideeffect diff-summary --format html --output REPORT.html LEFT RIGHT\nWrites aggregate change counts without event strings or evidence references. Counts may still be sensitive; the output is not a safe-to-share verdict."
@@ -978,7 +1280,7 @@ Collects selected Linux inventory sources into one local, private session direct
         "record" => {
             #[cfg(windows)]
             {
-                "Usage: sideeffect record --windows-etw OUTPUT.json --duration-seconds 1..60 -- PROGRAM [ARGS...]\nStarts a bounded native ETW process-lifecycle capture. The NT Kernel Logger observes system-wide process events for the capture window; records are not attributed to the selected command or its descendants. Controlling the NT Kernel Logger requires administrative privileges. No automatic elevation is requested. This is observation, not isolation or a safety check."
+                "Usage: sideeffect record --windows-etw OUTPUT.json --duration-seconds 1..60 -- PROGRAM [ARGS...]\nStarts a bounded native ETW capture for process lifecycle, selected file activity, and TCP/UDP observations. The NT Kernel Logger observes system-wide events during the capture window. A separate attribute command provides only candidate process lineage and network PID associations; file/disk header PIDs remain event-context candidates. File records describe observed requests/operations, not guaranteed success. Controlling the NT Kernel Logger requires administrative privileges. No automatic elevation is requested. This is observation, not isolation or a safety check."
             }
             #[cfg(not(windows))]
             {
@@ -995,7 +1297,7 @@ Collects selected Linux inventory sources into one local, private session direct
             }
             #[cfg(windows)]
             {
-                "Usage: sideeffect inventory startup --output FILE\nReads current-user and accessible machine Run/RunOnce registry values, current/common Startup folders, service configuration, and boot/logon triggers in tasks visible to the current token. Values, paths, and task metadata remain inert; task actions/XML are not collected. It does not establish that a configured entry ran."
+                "Usage: sideeffect inventory startup --output FILE\nReads current-user and accessible machine Run/RunOnce registry values, current/common Startup folders, service configuration, and boot/logon triggers in tasks visible to the current token. It records bounded Exec-action executable paths, arguments, and working directories as inert text; unsupported action types remain labeled unsupported with unknown action-specific fields. Values and paths are not executed or interpreted. It does not establish that a configured entry ran."
             }
             #[cfg(not(any(target_os = "linux", windows)))]
             {
@@ -1047,11 +1349,47 @@ Collects selected Linux inventory sources into one local, private session direct
         "correlate-startup" => {
             "Usage: sideeffect correlate-startup STARTUP_INVENTORY.json TRACE\nFinds narrow exact-path candidate matches between supported saved startup configuration and successful exec evidence. A match does not prove that a hook caused or initiated execution."
         }
-        "model" | "model-preview" => {
-            "Usage: sideeffect model-preview --question QUESTION TRACE\nPreviews the bounded typed facts, question, JSON schema, and request digest. Review this exact request before confirming local analysis. Partial parsing is visible and exits with status 2."
+        "associated-behavior" => {
+            "Usage: sideeffect associated-behavior STARTUP_INVENTORY.json RUNTIME_EVIDENCE\nWrites a versioned, evidence-linked candidate summary. Linux accepts startup inventory v2 plus raw strace text. Windows accepts startup inventory v4 plus a validated ETW capture v3 and compares only identical drive-rooted path strings from observed Exec task actions and decoded process-start events. It does not normalize or basename-match paths. Candidate matches do not prove startup execution or causation. No match is insufficient evidence, not a negative finding. Partial input or coverage exits with status 2."
+        }
+        "attribute" => {
+            "Usage: sideeffect attribute --windows-runtime CAPTURE.json\nWrites a separate evidence-linked candidate view over a validated Windows ETW v3 capture. Descendant process links require supported process-start payloads and observed active parent IDs. Network association uses the decoded payload process ID. File and disk header PIDs remain context candidates, not ownership. Capture bytes are unchanged. Missing lifecycle data, ambiguity, unsupported records, or reported/unavailable loss is surfaced as partial or unassigned evidence; no causal or absence claims are made."
+        }
+        "model" => {
+            "Usage: sideeffect model list\n       sideeffect model show ID\n       sideeffect model install ID\n       sideeffect model setup ID\n       sideeffect model add --name NAME --path FILE --for evidence|explanation|query [--license ID]\n       sideeffect model select evidence|explanation|query ID\n       sideeffect model remove ID\n\nLists pinned catalog candidates and user-provided models. Catalog evaluation status is shown separately from runtime compatibility. Installing a catalog model requires explicit license acceptance; analysis never downloads weights implicitly. The setup command installs and selects the catalog model for its declared task. Registering a local model records its size and SHA-256, but does not verify task compatibility, licensing, or quality. Removing a custom registration leaves the model file untouched. Select a model for its task before running a model preview."
+        }
+        "model setup" => {
+            "Usage: sideeffect model setup MODEL_ID\nShows the catalog license and model evaluation status, downloads the exact pinned file after explicit typed acceptance, verifies its size and SHA-256, then selects it for its declared task. The local inference runtime is installed or built separately and its path is still supplied to analysis commands."
+        }
+        "model list" => {
+            "Usage: sideeffect model list\nLists pinned catalog candidates, installation status, task, license, exact size, evaluation status, and selected model per task. Every listed model's SHA-256 is rechecked before use."
+        }
+        "model add" => {
+            "Usage: sideeffect model add --name NAME --path FILE --for evidence|explanation|query[,TASK...] [--license ID]\nRegisters an existing local GGUF by bounded size and SHA-256. The path and optional license ID are user-provided metadata; task compatibility and answer quality are not verified. The model remains opt-in and unreviewed until selected."
+        }
+        "model select" => {
+            "Usage: sideeffect model select evidence|explanation|query MODEL_ID\nSelects a registered or installed model for one analysis task. The exact model identity is included in each preview digest and checked again before inference."
+        }
+        "model remove" => {
+            "Usage: sideeffect model remove MODEL_ID\nFor a catalog model, requires typing the exact ID and removes only that verified catalog file plus task selections. For a user-provided model, removes only its registration; the original file is left untouched."
+        }
+        "model-preview" => {
+            "Usage: sideeffect model-preview --question QUESTION TRACE\nPreviews the bounded typed facts, selected evidence model identity, JSON schema, and request digest. Select and install a model first with the model commands. Review this exact request before confirming local analysis. Partial parsing is visible and exits with status 2."
         }
         "model-analyze" => {
-            "Usage: sideeffect model-analyze --question QUESTION --runtime LLAMA_CLI --model MODEL.gguf --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the pinned optional local model on Linux x86_64 after explicit digest confirmation. It does not download weights or upload evidence. The model may select at most one source evidence ID as an unverified hint; it can be wrong and is not a finding. See docs/LOCAL_MODEL_EVALUATION.md."
+            "Usage: sideeffect model-analyze --question QUESTION --runtime LLAMA_CLI --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the selected local evidence model on Linux x86_64 after explicit digest confirmation. The model may select at most one source evidence ID as an unverified hint; it can be wrong and is not a finding. SideEffect does not upload evidence. See docs/LOCAL_MODEL_EVALUATION.md."
+        }
+        "model-explain-preview" => {
+            "Usage: sideeffect model-explain-preview --question QUESTION --backend auto|cpu|cuda TRACE\nPreviews the bounded typed evidence, coverage, and selected explanation model identity. Review the exact prompt and digest before inference. 'auto' prefers a supported GPU and otherwise reports CPU use; it does not silently fall back after a GPU failure. This command does not run a model."
+        }
+        "model-explain" => {
+            "Usage: sideeffect model-explain --question QUESTION --backend auto|cpu|cuda --runtime LLAMA_COMPLETION --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the selected local explanation model after confirmation of the exact evidence preview. The model receives bounded typed evidence and coverage; every generated statement must cite a source evidence ID and remains unverified. 'auto' prefers CUDA when the pinned runtime reports a device; CUDA errors do not silently fall back to CPU. SideEffect does not upload data or auto-download a model during analysis. The selected runtime is executable code that must be trusted separately; see docs/LOCAL_MODEL_EXPLANATION_EVALUATION.md."
+        }
+        "model-query-preview" => {
+            "Usage: sideeffect model-query-preview --question QUESTION TRACE\nPreviews the bounded local query request, selected model identity, and typed evidence facts. Queryable facts are shown for review but are not sent to the model. Review this exact question, scope, and digest before optional local inference. Partial input exits with status 2."
+        }
+        "model-query" => {
+            "Usage: sideeffect model-query --question QUESTION --runtime LLAMA_COMPLETION --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the selected optional local query model on Linux x86_64 only after explicit preview-digest confirmation. It executes only validated exact-match AND filters over observed typed facts, never commands or model-authored expressions. No model is downloaded during analysis or evidence uploaded. Model results are unverified review aids. See docs/LOCAL_QUERY_PLAN_EVALUATION.md."
         }
         _ => return Err(format!("unknown help topic: {topic}\n\n{USAGE}")),
     };
@@ -1107,16 +1445,47 @@ fn inspect_session_with_format(format: &OsString, path: &OsString) -> Result<Exi
             }
             _ => unreachable!("format was checked above"),
         }
-        return Ok(if partial {
+        Ok(if partial {
             ExitCode::from(2)
         } else {
             ExitCode::SUCCESS
-        });
+        })
     }
     #[cfg(windows)]
     {
-        let _ = path;
-        Err("audit-session inspection is not yet supported on Windows".to_owned())
+        let session =
+            sideeffect::audit_session_reader_windows::read_verified_session(Path::new(path))
+                .map_err(|error| format!("audit session verification failed: {error}"))?;
+        let partial =
+            session.manifest().status == sideeffect::audit_session::SessionStatus::Partial;
+        match format.to_str() {
+            Some("json") => {
+                let mut output = CappedBuffer::new(MAX_REPORT_BYTES);
+                sideeffect::format::write_audit_session_json(session.manifest(), &mut output)
+                    .map_err(|error| {
+                        format!("could not serialize audit session review: {error}")
+                    })?;
+                output
+                    .write_all(b"\n")
+                    .map_err(|_| "audit session review output limit exceeded".to_owned())?;
+                write_buffer(&output, "audit session review")?;
+            }
+            Some("text") => {
+                let mut output = CappedBuffer::new(MAX_REPORT_BYTES);
+                sideeffect::format::write_audit_session_text(session.manifest(), &mut output)
+                    .map_err(|error| format!("could not render audit session review: {error}"))?;
+                output
+                    .write_all(b"\n")
+                    .map_err(|_| "audit session review output limit exceeded".to_owned())?;
+                write_buffer(&output, "audit session review")?;
+            }
+            _ => unreachable!("format was checked above"),
+        }
+        Ok(if partial {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        })
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
@@ -1153,6 +1522,76 @@ fn correlate_startup(startup_path: &OsString, trace_path: &OsString) -> Result<E
             "Saved partial startup-correlation results with {match_count} candidate path-match group(s). Check input statuses and diagnostics; missing matches remain unknown."
         );
         Ok(ExitCode::from(2))
+    }
+}
+
+fn associated_behavior(startup_path: &OsString, trace_path: &OsString) -> Result<ExitCode, String> {
+    let startup_bytes = read_input_file(
+        Path::new(startup_path),
+        MAX_REPORT_BYTES,
+        "startup inventory",
+    )?;
+    let runtime_bytes =
+        read_input_file(Path::new(trace_path), MAX_TRACE_BYTES, "runtime evidence")?;
+    let startup_schema = serde_json::from_slice::<serde_json::Value>(&startup_bytes)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("schema")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    if startup_schema.as_deref()
+        == Some(sideeffect::windows_startup_correlation::WINDOWS_STARTUP_INVENTORY_SCHEMA)
+    {
+        let report = sideeffect::windows_startup_correlation::summarize_windows_startup_behavior(
+            &startup_bytes,
+            &runtime_bytes,
+        )?;
+        let partial = report.status == "partial";
+        let candidate_count = report.summary.candidate_path_group_count;
+        let association_status = report.association_status;
+        return write_associated_behavior_report(
+            &report,
+            partial,
+            candidate_count,
+            association_status,
+        );
+    }
+    let report = sideeffect::startup_correlation::summarize_associated_startup_behavior(
+        &startup_bytes,
+        &runtime_bytes,
+    )?;
+    let partial = report.status == "partial";
+    let candidate_count = report.summary.candidate_match_count;
+    let association_status = report.association_status;
+    write_associated_behavior_report(&report, partial, candidate_count, association_status)
+}
+
+fn write_associated_behavior_report<T: Serialize>(
+    report: &T,
+    partial: bool,
+    candidate_count: usize,
+    association_status: &str,
+) -> Result<ExitCode, String> {
+    let mut json = CappedBuffer::new(MAX_REPORT_BYTES);
+    serde_json::to_writer(&mut json, &report).map_err(|error| {
+        format!("associated-behavior output exceeds the {MAX_REPORT_BYTES} byte limit: {error}")
+    })?;
+    json.write_all(b"\n").map_err(|_| {
+        format!("associated-behavior output exceeds the {MAX_REPORT_BYTES} byte limit")
+    })?;
+    write_buffer(&json, "associated-behavior summary")?;
+    if partial {
+        eprintln!(
+            "Saved partial associated-behavior results with {candidate_count} candidate match(es); check diagnostics and source status."
+        );
+        Ok(ExitCode::from(2))
+    } else {
+        eprintln!(
+            "Processed the supported associated-behavior subset: {candidate_count} candidate match(es), association status {association_status}. Capture completeness remains unknown."
+        );
+        Ok(ExitCode::SUCCESS)
     }
 }
 
@@ -1268,6 +1707,151 @@ fn inspect_with_format(format: &OsString, path: &OsString) -> Result<ExitCode, S
     inspect_bytes_with_format(format, read_bounded(path)?)
 }
 
+fn attribute_windows_runtime(path: &OsString) -> Result<ExitCode, String> {
+    let bytes = read_input_file(
+        Path::new(path),
+        sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
+        "Windows runtime capture",
+    )?;
+    let summary =
+        sideeffect::windows_runtime_attribution::summarize_windows_runtime_attribution(&bytes)
+            .map_err(|error| format!("Windows runtime attribution failed: {error}"))?;
+    let partial = summary.status == "partial";
+    write_json(&summary, "Windows runtime attribution summary")?;
+    Ok(if partial {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn inspect_windows_runtime_with_format(
+    format: &OsString,
+    path: &OsString,
+) -> Result<ExitCode, String> {
+    if !matches!(format.to_str(), Some("json" | "text")) {
+        return Err("inspect format must be either 'json' or 'text'".to_owned());
+    }
+    let bytes = read_input_file(
+        Path::new(path),
+        sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
+        "Windows runtime capture",
+    )?;
+    let source_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let capture = sideeffect::windows_runtime::inspect_windows_runtime_bytes(&bytes)?;
+    let partial =
+        capture.collection_status == sideeffect::windows_runtime::CollectionStatus::Partial;
+    match format.to_str() {
+        Some("json") => {
+            let inspection = sideeffect::windows_runtime::WindowsRuntimeInspection {
+                schema: sideeffect::windows_runtime::WINDOWS_RUNTIME_INSPECTION_SCHEMA,
+                schema_version:
+                    sideeffect::windows_runtime::WINDOWS_RUNTIME_INSPECTION_SCHEMA_VERSION,
+                validation_status: "validated_untrusted_document",
+                source_sha256: &source_sha256,
+                representation_fingerprint_verified: true,
+                authenticity: "not_verified",
+                capture_completeness: &capture.capture_completeness,
+                capture_claimed_status: capture.collection_status,
+                capture: &capture,
+            };
+            write_json(&inspection, "Windows runtime inspection")?;
+        }
+        Some("text") => {
+            let mut output = CappedBuffer::new(MAX_REPORT_BYTES);
+            sideeffect::format::write_windows_runtime_text(&capture, &mut output).map_err(
+                |error| {
+                    if output.exceeded {
+                        format!(
+                            "Windows runtime text exceeds the {MAX_REPORT_BYTES} byte output limit"
+                        )
+                    } else {
+                        format!("could not render Windows runtime inspection: {error}")
+                    }
+                },
+            )?;
+            output.write_all(b"Source file SHA-256: ").map_err(|_| {
+                format!("Windows runtime text exceeds the {MAX_REPORT_BYTES} byte output limit")
+            })?;
+            output.write_all(source_sha256.as_bytes()).map_err(|_| {
+                format!("Windows runtime text exceeds the {MAX_REPORT_BYTES} byte output limit")
+            })?;
+            output.write_all(b"\n").map_err(|_| {
+                format!("Windows runtime text exceeds the {MAX_REPORT_BYTES} byte output limit")
+            })?;
+            write_buffer(&output, "Windows runtime inspection")?;
+        }
+        _ => unreachable!("format was checked above"),
+    }
+    Ok(if partial {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn inspect_windows_runtime_html(
+    output_path: &OsString,
+    capture_path: &OsString,
+) -> Result<ExitCode, String> {
+    #[cfg(windows)]
+    {
+        let output_path = Path::new(output_path);
+        match fs::symlink_metadata(output_path) {
+            Ok(_) => {
+                return Err(
+                    "HTML report destination already exists; refusing to replace it".to_owned(),
+                );
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect HTML report destination: {error}"
+                ));
+            }
+        }
+        let bytes = read_input_file(
+            Path::new(capture_path),
+            sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
+            "Windows runtime capture",
+        )?;
+        let source_sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let capture = sideeffect::windows_runtime::inspect_windows_runtime_bytes(&bytes)?;
+        let partial =
+            capture.collection_status == sideeffect::windows_runtime::CollectionStatus::Partial;
+        let mut html = CappedBuffer::new(MAX_REPORT_BYTES);
+        sideeffect::format::write_windows_runtime_html(&capture, &source_sha256, &mut html)
+            .map_err(|error| {
+                if html.exceeded {
+                    format!("Windows runtime HTML report exceeds the {MAX_REPORT_BYTES} byte output limit")
+                } else {
+                    format!("could not render Windows runtime HTML report: {error}")
+                }
+            })?;
+        let published = publish_private_windows_file(output_path, &html.bytes, MAX_REPORT_BYTES)
+            .map_err(|error| {
+                format!("could not publish HTML report without replacing a file: {error}")
+            })?;
+        eprintln!(
+            "Offline Windows runtime HTML report written to {}. Capture data may be sensitive; review before sharing. This is one capture review, not a comparison.",
+            terminal_safe_path(&published)
+        );
+        Ok(if partial {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (output_path, capture_path);
+        Err(
+            "Windows runtime HTML file export is available only in native Windows builds"
+                .to_owned(),
+        )
+    }
+}
+
 fn explain_trace_file(path: &OsString) -> Result<ExitCode, String> {
     let document = read_and_parse(path)?;
     let partial = document.parse_status == ParseCompleteness::Partial;
@@ -1323,9 +1907,143 @@ fn model_preview_file(question: &OsString, path: &OsString) -> Result<ExitCode, 
         .to_str()
         .ok_or("local model question must be valid UTF-8")?;
     let bytes = read_bounded(path)?;
-    let preview = sideeffect::local_model::preview_trace_bytes(&bytes, question)?;
+    let model = selected_model(ModelTask::EvidenceSelection)?;
+    let preview = sideeffect::local_model::preview_trace_bytes_for_model(&bytes, question, &model)?;
     let partial = preview.evidence_summary["parse_status"] == "partial";
     write_json(&preview, "local model request preview")?;
+    Ok(if partial {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn model_query_preview_file(question: &OsString, path: &OsString) -> Result<ExitCode, String> {
+    let question = question
+        .to_str()
+        .ok_or("local query question must be valid UTF-8")?;
+    let bytes = read_bounded(path)?;
+    let model = selected_model(ModelTask::QueryPlan)?;
+    let preview =
+        sideeffect::local_query_plan::preview_query_plan_bytes_for_model(&bytes, question, &model)?;
+    let partial = preview.evidence_summary["parse_status"] == "partial";
+    write_json(&preview, "local query-plan preview")?;
+    Ok(if partial {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn model_explanation_preview_file(
+    question: &OsString,
+    backend: &OsString,
+    path: &OsString,
+) -> Result<ExitCode, String> {
+    let question = question
+        .to_str()
+        .ok_or("local model question must be valid UTF-8")?;
+    let backend = match backend.to_str() {
+        Some("auto") => sideeffect::local_model_explanation::ExplanationBackendPreference::Auto,
+        Some("cpu") => sideeffect::local_model_explanation::ExplanationBackendPreference::Cpu,
+        Some("cuda") => sideeffect::local_model_explanation::ExplanationBackendPreference::Cuda,
+        _ => return Err("model explanation backend must be auto, cpu, or cuda".to_owned()),
+    };
+    let bytes = read_bounded(path)?;
+    let model = selected_model(ModelTask::Explanation)?;
+    let preview = sideeffect::local_model_explanation::preview_model_explanation_bytes_for_model(
+        &bytes, question, backend, &model,
+    )?;
+    let partial = preview.evidence_summary["parse_status"] == "partial";
+    write_json(
+        &preview,
+        "local evidence-grounded model explanation preview",
+    )?;
+    Ok(if partial {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn model_query_file(
+    question: &OsString,
+    runtime: &OsString,
+    digest: &OsString,
+    trace: &OsString,
+) -> Result<ExitCode, String> {
+    let question = question
+        .to_str()
+        .ok_or("local query question must be valid UTF-8")?;
+    let Some(digest) = digest.to_str() else {
+        return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
+    }
+    let bytes = read_bounded(trace)?;
+    let model = selected_model(ModelTask::QueryPlan)?;
+    let analysis = sideeffect::local_query_plan::analyze_query_plan_bytes_for_model(
+        &bytes,
+        question,
+        Path::new(runtime),
+        &model,
+        digest,
+    )?;
+    let partial = analysis.coverage["parse_status"] == "partial";
+    write_json(&analysis, "local query-plan analysis")?;
+    Ok(if partial {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn model_explanation_file(
+    question: &OsString,
+    backend: &OsString,
+    runtime: &OsString,
+    digest: &OsString,
+    trace: &OsString,
+) -> Result<ExitCode, String> {
+    let question = question
+        .to_str()
+        .ok_or("local model question must be valid UTF-8")?;
+    let backend = match backend.to_str() {
+        Some("auto") => sideeffect::local_model_explanation::ExplanationBackendPreference::Auto,
+        Some("cpu") => sideeffect::local_model_explanation::ExplanationBackendPreference::Cpu,
+        Some("cuda") => sideeffect::local_model_explanation::ExplanationBackendPreference::Cuda,
+        _ => return Err("model explanation backend must be auto, cpu, or cuda".to_owned()),
+    };
+    let Some(digest) = digest.to_str() else {
+        return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
+    }
+    let bytes = read_bounded(trace)?;
+    let model = selected_model(ModelTask::Explanation)?;
+    let analysis =
+        sideeffect::local_model_explanation_runtime::analyze_model_explanation_bytes_for_model(
+            &bytes,
+            question,
+            backend,
+            Path::new(runtime),
+            &model,
+            digest,
+        )?;
+    let partial = analysis.evidence_summary["parse_status"] == "partial"
+        || analysis.interpretation.status
+            != sideeffect::local_model_explanation::ExplanationStatus::Answered;
+    write_json(&analysis, "local evidence-grounded model explanation")?;
     Ok(if partial {
         ExitCode::from(2)
     } else {
@@ -1336,7 +2054,6 @@ fn model_preview_file(question: &OsString, path: &OsString) -> Result<ExitCode, 
 fn model_analyze_file(
     question: &OsString,
     runtime: &OsString,
-    model: &OsString,
     digest: &OsString,
     trace: &OsString,
 ) -> Result<ExitCode, String> {
@@ -1354,11 +2071,12 @@ fn model_analyze_file(
         return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
     }
     let bytes = read_bounded(trace)?;
-    let analysis = sideeffect::local_model::analyze_trace_bytes(
+    let model = selected_model(ModelTask::EvidenceSelection)?;
+    let analysis = sideeffect::local_model::analyze_trace_bytes_for_model(
         &bytes,
         question,
         Path::new(runtime),
-        Path::new(model),
+        &model,
         digest,
     )?;
     let partial = analysis.evidence_summary["parse_status"] == "partial";
@@ -1368,6 +2086,421 @@ fn model_analyze_file(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn selected_model(task: ModelTask) -> Result<ResolvedModel, String> {
+    if !model_task_supported_here(task) {
+        return Err(format!(
+            "local model task '{}' is not supported on this platform",
+            model_task_label(task)
+        ));
+    }
+    sideeffect::model_manager::load_registry()?.selected(task)
+}
+
+fn model_list() -> Result<ExitCode, String> {
+    use sideeffect::model_manager::{CATALOG, model_store_directory};
+
+    let registry = sideeffect::model_manager::load_registry()?;
+    println!("Pinned catalog (runtime compatibility is separate from model quality):");
+    let model_directory = model_store_directory()?.join("models");
+    for model in CATALOG {
+        let path = model_directory.join(model.filename);
+        let installed = match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && metadata.len() == model.size_bytes
+                    && !metadata.file_type().is_symlink() =>
+            {
+                "installed; SHA-256 is rechecked before use"
+            }
+            Ok(_) => "present but does not match the pinned file metadata",
+            Err(error) if error.kind() == io::ErrorKind::NotFound => "not installed",
+            Err(_) => "installation status unavailable",
+        };
+        let selected = registry
+            .selected_by_task
+            .get(&model.task)
+            .is_some_and(|id| id == model.id);
+        let license_accepted = registry.accepted_licenses.iter().any(|accepted| {
+            accepted.model_id == model.id
+                && accepted.revision == model.revision
+                && accepted.license_id == model.license_id
+                && accepted.license_url == model.license_url
+        });
+        println!(
+            "- {} — {}\n  task: {}; platform: {}; size: {}; license: {} ({})\n  evaluation: {}; source: {} @ {}\n  license accepted: {}; status: {}{}",
+            model.id,
+            terminal_safe_text(model.name),
+            model_task_label(model.task),
+            model_task_platform(model.task),
+            human_file_size(model.size_bytes),
+            model.license_id,
+            model.license_url,
+            evaluation_status_label(model.evaluation),
+            model.repository,
+            model.revision,
+            license_accepted,
+            installed,
+            if selected { "; selected" } else { "" }
+        );
+    }
+    if registry.custom_models.is_empty() {
+        println!("No user-provided models are registered.");
+    } else {
+        println!("User-provided models (unreviewed):");
+        for model in &registry.custom_models {
+            let tasks = model
+                .tasks
+                .iter()
+                .map(|task| model_task_label(*task))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "- {} — {}\n  tasks: {}; size: {}; SHA-256: {}\n  license: {}; evaluation: not assessed{}",
+                model.id,
+                terminal_safe_text(&model.name),
+                tasks,
+                human_file_size(model.size_bytes),
+                model.sha256,
+                model
+                    .license_id
+                    .as_deref()
+                    .map(terminal_safe_text)
+                    .unwrap_or_else(|| "not provided".to_owned()),
+                if model.path.exists() {
+                    ""
+                } else {
+                    " (registered file is missing; selection will fail)"
+                }
+            );
+        }
+    }
+    for task in [
+        ModelTask::EvidenceSelection,
+        ModelTask::Explanation,
+        ModelTask::QueryPlan,
+    ] {
+        println!(
+            "Selected for {}: {}",
+            model_task_label(task),
+            registry
+                .selected_by_task
+                .get(&task)
+                .map(String::as_str)
+                .unwrap_or("none")
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn model_show(id: &OsString) -> Result<ExitCode, String> {
+    let id = id.to_str().ok_or("model ID must be valid UTF-8")?;
+    let registry = sideeffect::model_manager::load_registry()?;
+    if let Some(model) = sideeffect::model_manager::catalog_model(id) {
+        let path = sideeffect::model_manager::model_store_directory()?
+            .join("models")
+            .join(model.filename);
+        let installation = match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.len() == model.size_bytes =>
+            {
+                "file size matches catalog; SHA-256 is rechecked before use"
+            }
+            Ok(_) => "present but not the pinned size or file type",
+            Err(error) if error.kind() == io::ErrorKind::NotFound => "not installed",
+            Err(_) => "installation status unavailable",
+        };
+        let value = serde_json::json!({
+            "catalog_entry": model,
+            "installation_status": installation,
+            "license_terms_url": model.license_url,
+            "recommended_for_accuracy": false,
+        });
+        write_json(&value, "model catalog entry")?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let model = registry
+        .custom_models
+        .iter()
+        .find(|model| model.id == id)
+        .ok_or_else(|| "model ID is not present in the catalog or user registry".to_owned())?;
+    write_json(model, "registered user-provided model")?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn model_install(id: &OsString, select_after_install: bool) -> Result<ExitCode, String> {
+    let id = id.to_str().ok_or("model ID must be valid UTF-8")?;
+    let model = sideeffect::model_manager::catalog_model(id).ok_or_else(|| {
+        "model ID is not in the pinned catalog; install accepts catalog IDs only".to_owned()
+    })?;
+    println!("Model: {}", terminal_safe_text(model.name));
+    println!(
+        "Source: {} at revision {}",
+        model.repository, model.revision
+    );
+    println!(
+        "File: {} ({})",
+        model.filename,
+        human_file_size(model.size_bytes)
+    );
+    println!("License: {}", model.license_id);
+    println!("Review license terms at: {}", model.license_url);
+    println!("Platform support: {}", model_task_platform(model.task));
+    println!("Evaluation: {}", evaluation_status_label(model.evaluation));
+    println!(
+        "Evaluation note: {}",
+        terminal_safe_text(model.evaluation_note)
+    );
+    if !model_task_supported_here(model.task) {
+        return Err("this model task is not supported on the current platform".to_owned());
+    }
+    println!(
+        "This download sends no trace or prompt data. It contacts Hugging Face hosts only to fetch the pinned model file."
+    );
+    print!(
+        "After reviewing the linked terms, type ACCEPT {} to continue: ",
+        model.license_id
+    );
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("could not display license confirmation prompt: {error}"))?;
+    let answer = read_model_confirmation()?;
+    if answer.trim() != format!("ACCEPT {}", model.license_id) {
+        return Err("model download cancelled; license acceptance was not confirmed".to_owned());
+    }
+    let mut last_reported = 0_u64;
+    let receipt = sideeffect::model_installer::install_catalog_model(
+        id,
+        model.license_id,
+        model.license_url,
+        true,
+        |progress| {
+            if progress.received_bytes == progress.expected_bytes
+                || progress.received_bytes.saturating_sub(last_reported) >= 64 * 1024 * 1024
+            {
+                last_reported = progress.received_bytes;
+                print!(
+                    "\rDownloaded {} of {}",
+                    human_file_size(progress.received_bytes),
+                    human_file_size(progress.expected_bytes)
+                );
+                io::stdout().flush().is_ok()
+            } else {
+                true
+            }
+        },
+    )?;
+    if select_after_install {
+        sideeffect::model_manager::update_registry(|registry| {
+            registry.resolve(id, model.task)?;
+            registry.select(model.task, id)
+        })?;
+        println!(
+            "\nInstalled and selected {} for {} ({} bytes, SHA-256 {}).",
+            receipt.id,
+            model_task_label(model.task),
+            receipt.size_bytes,
+            receipt.sha256
+        );
+    } else {
+        println!(
+            "\nInstalled {} ({} bytes, SHA-256 {}). Select it with `sideeffect model select {} {}` before analysis.",
+            receipt.id,
+            receipt.size_bytes,
+            receipt.sha256,
+            match model.task {
+                ModelTask::EvidenceSelection => "evidence",
+                ModelTask::Explanation => "explanation",
+                ModelTask::QueryPlan => "query",
+            },
+            receipt.id
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn model_add(arguments: &[OsString]) -> Result<ExitCode, String> {
+    let mut name = None;
+    let mut path = None;
+    let mut tasks = Vec::new();
+    let mut license = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let option = arguments[index]
+            .to_str()
+            .ok_or("model registration option must be valid UTF-8")?;
+        let value = arguments
+            .get(index + 1)
+            .ok_or_else(|| format!("missing value for model registration option {option}"))?;
+        match option {
+            "--name" => {
+                name = Some(
+                    value
+                        .to_str()
+                        .ok_or("model name must be valid UTF-8")?
+                        .to_owned(),
+                );
+            }
+            "--path" => path = Some(Path::new(value).to_path_buf()),
+            "--for" => {
+                let value = value
+                    .to_str()
+                    .ok_or("model task list must be valid UTF-8")?;
+                for task in value.split(',') {
+                    let task = parse_model_task(task)?;
+                    if !tasks.contains(&task) {
+                        tasks.push(task);
+                    }
+                }
+            }
+            "--license" => {
+                license = Some(
+                    value
+                        .to_str()
+                        .ok_or("model license ID must be valid UTF-8")?
+                        .to_owned(),
+                );
+            }
+            _ => return Err(format!("unknown model registration option: {option}")),
+        }
+        index += 2;
+    }
+    let name = name.ok_or("model add requires --name NAME")?;
+    let path = path.ok_or("model add requires --path FILE")?;
+    if tasks.iter().any(|task| !model_task_supported_here(*task)) {
+        return Err(
+            "one or more requested model tasks are not supported on this platform".to_owned(),
+        );
+    }
+    let id = sideeffect::model_manager::update_registry(|registry| {
+        registry.register_custom(&name, &path, license.as_deref(), tasks)
+    })?;
+    println!(
+        "Registered {} as {}. It is user-provided and unreviewed; its SHA-256 will be rechecked before use.",
+        terminal_safe_path(&path),
+        id
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn model_select(task: &OsString, id: &OsString) -> Result<ExitCode, String> {
+    let task = parse_model_task(task.to_str().ok_or("model task must be valid UTF-8")?)?;
+    if !model_task_supported_here(task) {
+        return Err(format!(
+            "local model task '{}' is not supported on this platform",
+            model_task_label(task)
+        ));
+    }
+    let id = id.to_str().ok_or("model ID must be valid UTF-8")?;
+    let model = sideeffect::model_manager::update_registry(|registry| {
+        // Resolve before changing persistent selection. This checks installation,
+        // current file bounds, and its digest for catalog and custom models.
+        let model = registry.resolve(id, task)?;
+        registry.select(task, id)?;
+        Ok(model)
+    })?;
+    println!(
+        "Selected {} for {}. Evaluation status: {}; this does not certify answer quality.",
+        model.id,
+        model_task_label(task),
+        evaluation_status_label(model.evaluation)
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn model_remove(id: &OsString) -> Result<ExitCode, String> {
+    let id = id.to_str().ok_or("model ID must be valid UTF-8")?;
+    if sideeffect::model_manager::catalog_model(id).is_some() {
+        println!("This will delete the installed, hash-verified catalog model file for {id}.");
+        print!("Type DELETE {id} to confirm: ");
+        io::stdout()
+            .flush()
+            .map_err(|error| format!("could not display model removal prompt: {error}"))?;
+        let answer = read_model_confirmation()?;
+        if answer.trim() != format!("DELETE {id}") {
+            return Err("model removal cancelled".to_owned());
+        }
+        let path = sideeffect::model_installer::remove_catalog_model(id, true)?;
+        println!(
+            "Removed verified catalog model {}.",
+            terminal_safe_path(&path)
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    sideeffect::model_manager::update_registry(|registry| registry.unregister(id))?;
+    println!("Unregistered {id}. The model file was left untouched.");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn parse_model_task(task: &str) -> Result<ModelTask, String> {
+    match task {
+        "evidence" | "evidence-selection" => Ok(ModelTask::EvidenceSelection),
+        "explanation" => Ok(ModelTask::Explanation),
+        "query" | "query-plan" => Ok(ModelTask::QueryPlan),
+        _ => Err("model task must be evidence, explanation, or query".to_owned()),
+    }
+}
+
+fn model_task_label(task: ModelTask) -> &'static str {
+    match task {
+        ModelTask::EvidenceSelection => "evidence selection",
+        ModelTask::Explanation => "explanation",
+        ModelTask::QueryPlan => "query plan",
+    }
+}
+
+fn model_task_platform(task: ModelTask) -> &'static str {
+    match task {
+        ModelTask::EvidenceSelection | ModelTask::QueryPlan => "Linux x86_64 only",
+        ModelTask::Explanation => "Linux x86_64 and native Windows",
+    }
+}
+
+fn model_task_supported_here(task: ModelTask) -> bool {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let _ = task;
+        true
+    }
+    #[cfg(windows)]
+    {
+        task == ModelTask::Explanation
+    }
+    #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), windows)))]
+    {
+        let _ = task;
+        false
+    }
+}
+
+fn evaluation_status_label(status: EvaluationStatus) -> &'static str {
+    match status {
+        EvaluationStatus::FailedTriage => "failed a triage check; not recommended",
+        EvaluationStatus::FailedFrozenGate => "failed the frozen evaluation gate; not recommended",
+        EvaluationStatus::FailedDevelopmentCheck => "failed a development check; not recommended",
+        EvaluationStatus::NotAssessed => "not assessed; not recommended",
+    }
+}
+
+fn human_file_size(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    format!("{} MiB ({bytes} bytes)", bytes.div_ceil(MIB))
+}
+
+fn terminal_safe_text(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut escaped = String::new();
+    for character in value.chars() {
+        if character.is_ascii() && !character.is_control() && character != '\\' {
+            escaped.push(character);
+        } else {
+            let _ = write!(escaped, "\\u{{{:x}}}", character as u32);
+        }
+    }
+    escaped
 }
 
 fn inspect_bundle_with_format(format: &OsString, path: &OsString) -> Result<ExitCode, String> {
@@ -1673,6 +2806,116 @@ fn diff_with_output_format(
         DiffOutputFormat::Text => write_text(&result)?,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn diff_windows_runtime_with_format(
+    format: &OsString,
+    before_path: &OsString,
+    after_path: &OsString,
+    output_path: Option<&OsString>,
+) -> Result<ExitCode, String> {
+    let format = format
+        .to_str()
+        .ok_or("Windows runtime diff format must be valid UTF-8")?;
+    if !matches!(format, "json" | "text" | "html") {
+        return Err("Windows runtime diff format must be json, text, or html".to_owned());
+    }
+    match (format, output_path) {
+        ("html", None) => {
+            return Err("Windows runtime HTML diff requires --output REPORT.html".to_owned());
+        }
+        ("json" | "text", Some(_)) => {
+            return Err("--output is supported only for Windows runtime HTML diff".to_owned());
+        }
+        ("html", Some(_)) if !cfg!(windows) => {
+            return Err(
+                "Windows runtime HTML diff is available only in native Windows builds".to_owned(),
+            );
+        }
+        _ => {}
+    }
+
+    let before_bytes = read_input_file(
+        Path::new(before_path),
+        sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
+        "before Windows runtime capture",
+    )?;
+    let after_bytes = read_input_file(
+        Path::new(after_path),
+        sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
+        "after Windows runtime capture",
+    )?;
+    let before = sideeffect::windows_runtime::inspect_windows_runtime_bytes(&before_bytes)
+        .map_err(|error| format!("before Windows runtime validation failed: {error}"))?;
+    let after = sideeffect::windows_runtime::inspect_windows_runtime_bytes(&after_bytes)
+        .map_err(|error| format!("after Windows runtime validation failed: {error}"))?;
+    let summary =
+        sideeffect::windows_runtime_diff::compare_windows_runtime_captures(&before, &after)?;
+    let partial =
+        summary.comparison_status == sideeffect::windows_runtime_diff::ComparisonStatus::Partial;
+
+    match format {
+        "json" => write_json(&summary, "Windows runtime comparison")?,
+        "text" => {
+            let mut text = CappedBuffer::new(MAX_REPORT_BYTES);
+            sideeffect::format::write_windows_runtime_diff_text(
+                &summary, &before, &after, &mut text,
+            )
+            .map_err(|error| {
+                if text.exceeded {
+                    format!(
+                        "Windows runtime diff text exceeds the {MAX_REPORT_BYTES} byte output limit"
+                    )
+                } else {
+                    format!("could not render Windows runtime diff text: {error}")
+                }
+            })?;
+            text.write_all(b"\n").map_err(|_| {
+                format!(
+                    "Windows runtime diff text exceeds the {MAX_REPORT_BYTES} byte output limit"
+                )
+            })?;
+            write_buffer(&text, "Windows runtime comparison")?;
+        }
+        "html" => {
+            #[cfg(windows)]
+            {
+                let mut html = CappedBuffer::new(MAX_REPORT_BYTES);
+                sideeffect::format::write_windows_runtime_diff_html(&summary, &mut html)
+                    .map_err(|error| {
+                        if html.exceeded {
+                            format!("Windows runtime diff HTML exceeds the {MAX_REPORT_BYTES} byte output limit")
+                        } else {
+                            format!("could not render Windows runtime diff HTML: {error}")
+                        }
+                    })?;
+                let output = output_path.expect("HTML output path was validated above");
+                let published = publish_private_windows_file(
+                    Path::new(output),
+                    &html.bytes,
+                    MAX_REPORT_BYTES,
+                )
+                .map_err(|error| {
+                    format!(
+                        "could not publish Windows runtime diff without replacing a file: {error}"
+                    )
+                })?;
+                eprintln!(
+                    "Offline Windows runtime comparison written to {}. The report contains sensitive capture fingerprints, event details, and source references; review before sharing.",
+                    terminal_safe_path(&published)
+                );
+            }
+            #[cfg(not(windows))]
+            unreachable!("unsupported HTML diff was rejected above");
+        }
+        _ => unreachable!("format was validated above"),
+    }
+
+    Ok(if partial {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn read_and_parse(path: &OsString) -> Result<sideeffect::model::TraceDocument, String> {

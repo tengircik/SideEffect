@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="224" viewBox="0 0 1120 224" role="img" aria-labelledby="title desc">
+  <title id="title">SideEffect audit workflow</title>
+  <desc id="desc">Choose an audit scope, collect local evidence, inspect source references, and compare results.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1220"/>
+      <stop offset="1" stop-color="#111c2d"/>
+    </linearGradient>
+    <linearGradient id="line" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2dd4bf"/>
+      <stop offset="1" stop-color="#60a5fa"/>
+    </linearGradient>
+  </defs>
+  <rect width="1120" height="224" rx="24" fill="url(#bg)" stroke="#263449"/>
+  <path d="M200 112h720" stroke="url(#line)" stroke-width="3" stroke-dasharray="8 10" opacity=".8"/>
+  <g font-family="Inter,Segoe UI,Arial,sans-serif" text-anchor="middle">
+    <g transform="translate(140 112)">
+      <circle r="38" fill="#102b32" stroke="#2dd4bf" stroke-width="2"/>
+      <path d="M-12-9h24M-12 0h17M-12 9h20" stroke="#99f6e4" stroke-width="3" stroke-linecap="round"/>
+      <text y="72" fill="#e2e8f0" font-size="16" font-weight="700">Choose scope</text>
+      <text y="94" fill="#94a3b8" font-size="12">User-selected sources</text>
+    </g>
+    <g transform="translate(420 112)">
+      <circle r="38" fill="#14283c" stroke="#60a5fa" stroke-width="2"/>
+      <path d="M-12-12h24v24h-24zM-6-5h12M-6 1h12M-6 7h7" fill="none" stroke="#bfdbfe" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text y="72" fill="#e2e8f0" font-size="16" font-weight="700">Collect locally</text>
+      <text y="94" fill="#94a3b8" font-size="12">Bounded source snapshots</text>
+    </g>
+    <g transform="translate(700 112)">
+      <circle r="38" fill="#1c2440" stroke="#818cf8" stroke-width="2"/>
+      <path d="M-14-14h22l7 7v21h-29zM-8-3h17M-8 4h17M-8 11h11" fill="none" stroke="#c7d2fe" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text y="72" fill="#e2e8f0" font-size="16" font-weight="700">Follow evidence</text>
+      <text y="94" fill="#94a3b8" font-size="12">Source-linked observations</text>
+    </g>
+    <g transform="translate(980 112)">
+      <circle r="38" fill="#20253a" stroke="#a78bfa" stroke-width="2"/>
+      <path d="M-14-10h10v20h-10zM4-10h10v20H4zM-2-4h4M-2 4h4" fill="none" stroke="#ddd6fe" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text y="72" fill="#e2e8f0" font-size="16" font-weight="700">Compare runs</text>
+      <text y="94" fill="#94a3b8" font-size="12">Review evidence-backed change</text>
+    </g>
+  </g>
+</svg>

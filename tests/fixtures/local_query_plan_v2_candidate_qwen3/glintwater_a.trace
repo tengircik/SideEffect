@@ -1,0 +1,6 @@
+[pid 64121] openat(AT_FDCWD, "/srv/orbitvale/cache/vault.bin", O_RDONLY) = -1 EACCES (Permission denied)
+[pid 64122] openat(AT_FDCWD, "/srv/orbitvale/cache/index.map", O_RDONLY) = 3
+[pid 64123] connect(8, {sa_family=AF_INET, sin_port=htons(15431), sin_addr=inet_addr("192.0.2.71")}, 16) = -1 ECONNREFUSED (Connection refused)
+[pid 64124] execve("/opt/orbitvale/bin/packd", ["packd"], 0x0) = 0
+[pid 64125] clone(child_stack=NULL, flags=SIGCHLD) = 64126
+[pid 64127] connect(9, {sa_family=AF_INET, sin_port=htons(15432), sin_addr=inet_addr("192.0.2.72")}, 16) = 0

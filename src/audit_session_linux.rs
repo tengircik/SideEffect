@@ -8,13 +8,14 @@ use crate::audit_session::{
 };
 use crate::fingerprint::sha256_hex;
 use crate::inventory::{collect_packages, collect_permissions, collect_processes, collect_startup};
-use crate::record::SessionOutput;
+use crate::record::{SessionOutput, record_bundle_artifacts};
 use serde::Serialize;
 use serde_json::Value;
+use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_DIAGNOSTICS: usize = 256;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
@@ -25,6 +26,9 @@ pub struct AuditOptions {
     pub processes: bool,
     pub startup: bool,
     pub permission_paths: Vec<PathBuf>,
+    pub runtime_program: Option<OsString>,
+    pub runtime_arguments: Vec<OsString>,
+    pub runtime_duration: Option<Duration>,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +52,7 @@ pub fn collect_and_publish(
         && !options.processes
         && !options.startup
         && options.permission_paths.is_empty()
+        && options.runtime_program.is_none()
     {
         return Err("select at least one source for the audit session".to_owned());
     }
@@ -56,6 +61,26 @@ pub fn collect_and_publish(
             "permission path count exceeds the {} path limit",
             crate::inventory::MAX_PERMISSION_PATHS
         ));
+    }
+    if options.runtime_program.is_some() != options.runtime_duration.is_some() {
+        return Err("runtime audit requires both a command and a duration limit".to_owned());
+    }
+    if options
+        .runtime_program
+        .as_ref()
+        .is_some_and(|program| program.is_empty())
+    {
+        return Err("runtime audit command must not be empty".to_owned());
+    }
+    if options.runtime_program.is_none() && !options.runtime_arguments.is_empty() {
+        return Err("runtime audit arguments require a command".to_owned());
+    }
+    if options.runtime_duration.is_some_and(|duration| {
+        duration.as_secs() == 0 || duration.as_secs() > 3600 || duration.subsec_nanos() != 0
+    }) {
+        return Err(
+            "runtime audit duration must be a whole number of seconds from 1 to 3600".to_owned(),
+        );
     }
 
     let mut output = SessionOutput::prepare(destination)
@@ -172,6 +197,74 @@ pub fn collect_and_publish(
         artifacts.push(artifact("permissions.json", &document)?);
     }
 
+    if let Some(program) = &options.runtime_program {
+        let started = now_unix_ms()?;
+        let duration = options
+            .runtime_duration
+            .expect("runtime options were validated above");
+        let runtime_result =
+            record_bundle_artifacts(destination, program, &options.runtime_arguments, duration);
+        let ended = now_unix_ms()?;
+        match runtime_result {
+            Ok(bundle) => {
+                let mut diagnostic_codes = vec!["runtime_capture_completeness_unknown".to_owned()];
+                if bundle.time_limit_reached {
+                    diagnostic_codes.push("runtime_time_limit_reached".to_owned());
+                }
+                sources.push(AuditSessionSource {
+                    role: SourceRole::Runtime,
+                    platform: "linux".to_owned(),
+                    scope: "selected command and traced descendants; command arguments are not copied into the session manifest".to_owned(),
+                    started_at_unix_ms: started,
+                    ended_at_unix_ms: ended,
+                    status: SourceStatus::Partial,
+                    applied_limits: vec![
+                        limit("max_trace_bytes", crate::limits::MAX_TRACE_BYTES as u64),
+                        limit("runtime_duration_seconds", duration.as_secs()),
+                    ],
+                    diagnostic_codes,
+                    artifacts: Vec::new(),
+                });
+                artifacts.push(Artifact {
+                    file_name: "run.json",
+                    bytes: bundle.manifest_bytes,
+                });
+                artifacts.push(Artifact {
+                    file_name: "trace.strace",
+                    bytes: bundle.trace_bytes,
+                });
+            }
+            Err(error) => {
+                let target_may_have_run = error.target_may_have_run();
+                sources.push(AuditSessionSource {
+                    role: SourceRole::Runtime,
+                    platform: "linux".to_owned(),
+                    scope: "selected command and traced descendants; command arguments are not copied into the session manifest".to_owned(),
+                    started_at_unix_ms: started,
+                    ended_at_unix_ms: ended,
+                    status: if target_may_have_run {
+                        SourceStatus::Partial
+                    } else {
+                        SourceStatus::Unavailable
+                    },
+                    applied_limits: vec![
+                        limit("max_trace_bytes", crate::limits::MAX_TRACE_BYTES as u64),
+                        limit("runtime_duration_seconds", duration.as_secs()),
+                    ],
+                    diagnostic_codes: if target_may_have_run {
+                        vec![
+                            "runtime_capture_failed".to_owned(),
+                            "runtime_target_may_have_run".to_owned(),
+                        ]
+                    } else {
+                        vec!["runtime_capture_unavailable".to_owned()]
+                    },
+                    artifacts: Vec::new(),
+                });
+            }
+        }
+    }
+
     let session_end = now_unix_ms()?;
     if sources.is_empty() || sources.len() > MAX_SESSION_SOURCES {
         return Err("selected audit sources exceed the session source limit".to_owned());
@@ -188,9 +281,29 @@ pub fn collect_and_publish(
         .iter()
         .all(|source| source.status == SourceStatus::Complete);
     let session_id = new_session_id(session_start)?;
-    for (source, artifact) in sources.iter_mut().zip(artifacts.iter()) {
-        let (schema, schema_version) = artifact_schema(&artifact.bytes)?;
+    for artifact in &artifacts {
+        let (schema, schema_version) = artifact_schema(artifact.file_name, &artifact.bytes)?;
         let kind = artifact_kind(artifact.file_name)?;
+        let role = match kind {
+            ArtifactKind::Packages => SourceRole::Packages,
+            ArtifactKind::Processes => SourceRole::Processes,
+            ArtifactKind::Permissions => SourceRole::Permissions,
+            ArtifactKind::Startup => SourceRole::Startup,
+            ArtifactKind::WindowsSoftware
+            | ArtifactKind::WindowsProcesses
+            | ArtifactKind::WindowsPermissions
+            | ArtifactKind::WindowsStartup
+            | ArtifactKind::WindowsRuntimeCapture => {
+                return Err(
+                    "Windows artifacts are not supported in Linux audit collection".to_owned(),
+                );
+            }
+            ArtifactKind::RuntimeManifest | ArtifactKind::RuntimeTrace => SourceRole::Runtime,
+        };
+        let source = sources
+            .iter_mut()
+            .find(|source| source.role == role)
+            .ok_or_else(|| "audit artifact has no matching selected source".to_owned())?;
         source.artifacts.push(SessionArtifactRef {
             kind,
             path: artifact.file_name.to_owned(),
@@ -321,7 +434,10 @@ fn serialize_bounded<T: Serialize>(value: &T, max: usize, label: &str) -> Result
     Ok(writer.bytes)
 }
 
-fn artifact_schema(bytes: &[u8]) -> Result<(String, u32), String> {
+fn artifact_schema(file_name: &str, bytes: &[u8]) -> Result<(String, u32), String> {
+    if file_name == "trace.strace" {
+        return Ok(("strace_text".to_owned(), 1));
+    }
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("could not read serialized artifact schema: {error}"))?;
     let schema = value
@@ -342,6 +458,12 @@ fn artifact_kind(file_name: &str) -> Result<ArtifactKind, String> {
         "processes.json" => Ok(ArtifactKind::Processes),
         "startup.json" => Ok(ArtifactKind::Startup),
         "permissions.json" => Ok(ArtifactKind::Permissions),
+        "run.json" => Ok(ArtifactKind::RuntimeManifest),
+        "trace.strace" => Ok(ArtifactKind::RuntimeTrace),
+        "software.windows.json" => Ok(ArtifactKind::WindowsSoftware),
+        "processes.windows.json" => Ok(ArtifactKind::WindowsProcesses),
+        "permissions.windows.json" => Ok(ArtifactKind::WindowsPermissions),
+        "startup.windows.json" => Ok(ArtifactKind::WindowsStartup),
         _ => Err("unknown audit artifact name".to_owned()),
     }
 }

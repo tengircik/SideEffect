@@ -1,0 +1,2 @@
+606 10.000000 openat(AT_FDCWD, "/etc/sideeffect-public.conf", O_RDONLY) = 3
+606 10.100000 openat(AT_FDCWD, "/etc/sideeffect-private.conf", O_RDONLY) = -1 EACCES (Permission denied)

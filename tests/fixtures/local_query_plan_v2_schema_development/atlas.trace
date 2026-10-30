@@ -1,0 +1,7 @@
+[pid 8831] openat(AT_FDCWD, "/usr/share/atlas/config.toml", {flags=O_RDONLY}, 3) = 5
+[pid 8832] connect(5, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("198.51.100.31")}, 16) = 0
+[pid 8833] execveat(AT_FDCWD, "/opt/atlas/bin/indexer", ["indexer"], 0x0, 0) = -1 EACCES (Permission denied)
+[pid 8834] clone3({flags=CLONE_VM|CLONE_VFORK, exit_signal=SIGCHLD}, 88) = 8835
+[pid 8836] openat(AT_FDCWD, "/var/lib/atlas/readonly.map", {flags=O_WRONLY}, 6) = -1 EROFS (Read-only file system)
+[pid 8837] connect(7, {sa_family=AF_INET, sin_port=htons(8443), sin_addr=inet_addr("198.51.100.32")}, 16) = -1 ECONNRESET (Connection reset by peer)
+[pid 8838] vfork() = 8839

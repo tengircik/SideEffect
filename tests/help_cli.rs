@@ -15,6 +15,10 @@ fn help_command_and_flag_show_command_list() {
         let text = String::from_utf8_lossy(&output.stdout);
         assert!(text.contains("sideeffect help [command [subcommand]]"));
         assert!(text.contains("sideeffect model-preview"));
+        assert!(text.contains(
+            "sideeffect associated-behavior <startup-inventory.json> <runtime-evidence-file>"
+        ));
+        assert!(text.contains("sideeffect attribute --windows-runtime <capture.json>"));
         assert!(text.contains("--session <audit-session-directory>"));
     }
 }
@@ -27,12 +31,27 @@ fn focused_help_covers_command_and_nested_inventory_topics() {
     #[cfg(target_os = "linux")]
     assert!(record_help.contains("current user's permissions"));
     #[cfg(windows)]
-    assert!(record_help.contains("system-wide process events"));
+    assert!(record_help.contains("system-wide events"));
     assert!(record_help.contains("not isolation") || record_help.contains("not a safety check"));
 
     let inspect = run(&["inspect", "--help"]);
     assert!(inspect.status.success());
     assert!(String::from_utf8_lossy(&inspect.stdout).contains("--session DIR"));
+
+    let diff = run(&["help", "diff"]);
+    assert!(diff.status.success());
+    let diff_help = String::from_utf8_lossy(&diff.stdout);
+    assert!(diff_help.contains("diff --windows-runtime"));
+    assert!(diff_help.contains("Windows summary v2"));
+    assert!(diff_help.contains("unique supported changed identities as candidates"));
+
+    let associated = run(&["help", "associated-behavior"]);
+    assert!(associated.status.success());
+    let associated_help = String::from_utf8_lossy(&associated.stdout);
+    assert!(
+        associated_help.contains("Candidate matches do not prove startup execution or causation")
+    );
+    assert!(associated_help.contains("No match is insufficient evidence"));
 
     let startup = run(&["help", "inventory", "startup"]);
     assert!(startup.status.success());
@@ -43,7 +62,12 @@ fn focused_help_covers_command_and_nested_inventory_topics() {
     #[cfg(windows)]
     assert!(startup_help.contains("boot/logon triggers in tasks visible to the current token"));
     #[cfg(windows)]
-    assert!(startup_help.contains("task actions/XML are not collected"));
+    assert!(
+        startup_help
+            .contains("bounded Exec-action executable paths, arguments, and working directories")
+    );
+    #[cfg(windows)]
+    assert!(startup_help.contains("unsupported action types remain labeled unsupported"));
 
     let packages = run(&["help", "inventory", "packages"]);
     assert!(packages.status.success());

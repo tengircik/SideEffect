@@ -1,0 +1,2 @@
+909 10.000000 clone3({flags=0}, 88) = 910
+910 10.100000 execve("/usr/bin/sideeffect-child", ["sideeffect-child"], 0x0) = 0

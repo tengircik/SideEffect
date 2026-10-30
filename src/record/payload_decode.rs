@@ -8,9 +8,11 @@ use windows_sys::Win32::System::Diagnostics::Etw::{
     EVENT_PROPERTY_INFO, EVENT_RECORD, EVENT_TRACE_TYPE_DC_END, EVENT_TRACE_TYPE_DC_START,
     EVENT_TRACE_TYPE_END, EVENT_TRACE_TYPE_START, PROPERTY_DATA_DESCRIPTOR, ProcessGuid,
     PropertyHasTags, PropertyParamCount, PropertyParamFixedCount, PropertyParamFixedLength,
-    PropertyParamLength, PropertyStruct, TDH_INTYPE_POINTER, TDH_INTYPE_UINT32,
-    TDH_INTYPE_UNICODESTRING, TDH_OUTTYPE_HEXINT32, TDH_OUTTYPE_HEXINT64, TDH_OUTTYPE_NULL,
-    TDH_OUTTYPE_STRING, TRACE_EVENT_INFO, TdhGetEventInformation, TdhGetProperty,
+    PropertyParamLength, PropertyStruct, TDH_INTYPE_ANSISTRING, TDH_INTYPE_COUNTEDANSISTRING,
+    TDH_INTYPE_COUNTEDSTRING, TDH_INTYPE_NONNULLTERMINATEDANSISTRING,
+    TDH_INTYPE_NONNULLTERMINATEDSTRING, TDH_INTYPE_POINTER, TDH_INTYPE_REVERSEDCOUNTEDSTRING,
+    TDH_INTYPE_UINT32, TDH_INTYPE_UNICODESTRING, TDH_OUTTYPE_HEXINT32, TDH_OUTTYPE_HEXINT64,
+    TDH_OUTTYPE_NULL, TDH_OUTTYPE_STRING, TRACE_EVENT_INFO, TdhGetEventInformation, TdhGetProperty,
     TdhGetPropertySize,
 };
 
@@ -18,7 +20,7 @@ const MAX_TDH_METADATA_BYTES: usize = 256 * 1024;
 const MAX_TDH_PROPERTIES: usize = 128;
 const MAX_PROPERTY_BYTES: usize = 64 * 1024;
 const MAX_IMAGE_FILE_NAME_UTF16_UNITS: usize = 32 * 1024;
-const SUPPORTED_EVENT_VERSIONS: std::ops::RangeInclusive<u8> = 0..=3;
+const SUPPORTED_EVENT_VERSIONS: std::ops::RangeInclusive<u8> = 0..=4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -150,11 +152,8 @@ pub(super) fn decode_event_payload(event: &EVENT_RECORD) -> DecodedProcessPayloa
             "tdh_schema_does_not_match_process_event",
         );
     }
-    if validate_selected_properties(&metadata, pointer_size).is_err() {
-        return DecodedProcessPayload::undecoded(
-            DecodeStatus::SchemaMismatch,
-            "process_property_schema_is_unexpected",
-        );
+    if let Err(diagnostic) = validate_selected_properties(&metadata, pointer_size) {
+        return DecodedProcessPayload::undecoded(DecodeStatus::SchemaMismatch, diagnostic);
     }
 
     let process_id = match query_property(event, "ProcessId") {
@@ -184,6 +183,15 @@ pub(super) fn decode_event_payload(event: &EVENT_RECORD) -> DecodedProcessPayloa
             );
         }
     };
+    let image_input_type = match find_property(&metadata, "ImageFileName") {
+        Ok(property) => property.input_type,
+        Err(_) => {
+            return DecodedProcessPayload::undecoded(
+                DecodeStatus::SchemaMismatch,
+                "image_file_name_property_is_missing_or_ambiguous",
+            );
+        }
+    };
     decode_validated_properties(
         &metadata,
         pointer_size,
@@ -201,6 +209,7 @@ pub(super) fn decode_event_payload(event: &EVENT_RECORD) -> DecodedProcessPayloa
                 bytes: image_file_name,
             },
         ],
+        image_input_type,
     )
 }
 
@@ -417,20 +426,51 @@ fn validate_event_key(version: u8, opcode: u8) -> Result<(), DecodeStatus> {
     Ok(())
 }
 
-fn validate_selected_properties(metadata: &EventMetadata, pointer_size: usize) -> Result<(), ()> {
-    let process_id = find_property(metadata, "ProcessId")?;
-    let parent_id = find_property(metadata, "ParentId")?;
-    let image = find_property(metadata, "ImageFileName")?;
-    validate_id_property(process_id, pointer_size)?;
-    validate_id_property(parent_id, pointer_size)?;
-    if !property_flags_supported(image.flags)
-        || image.count != 1
-        || image.length != 0
-        || image.input_type != TDH_INTYPE_UNICODESTRING as u16
-        || (image.output_type != TDH_OUTTYPE_NULL as u16
-            && image.output_type != TDH_OUTTYPE_STRING as u16)
+fn validate_selected_properties(
+    metadata: &EventMetadata,
+    pointer_size: usize,
+) -> Result<(), &'static str> {
+    let process_id = find_property(metadata, "ProcessId")
+        .map_err(|_| "process_id_property_is_missing_or_ambiguous")?;
+    let parent_id = find_property(metadata, "ParentId")
+        .map_err(|_| "parent_process_id_property_is_missing_or_ambiguous")?;
+    let image = find_property(metadata, "ImageFileName")
+        .map_err(|_| "image_file_name_property_is_missing_or_ambiguous")?;
+    validate_id_property(process_id, pointer_size)
+        .map_err(|_| "process_id_property_schema_is_unexpected")?;
+    validate_id_property(parent_id, pointer_size)
+        .map_err(|_| "parent_process_id_property_schema_is_unexpected")?;
+    if !property_flags_supported(image.flags) {
+        return Err("image_file_name_property_flags_are_unsupported");
+    }
+    if image.count != 1 {
+        return Err("image_file_name_property_count_is_unsupported");
+    }
+    if image.length != 0 {
+        return Err("image_file_name_property_length_is_unsupported");
+    }
+    if image.input_type != TDH_INTYPE_UNICODESTRING as u16
+        && image.input_type != TDH_INTYPE_ANSISTRING as u16
     {
-        return Err(());
+        return Err(match i32::from(image.input_type) {
+            TDH_INTYPE_COUNTEDSTRING => "image_file_name_type_is_counted_utf16_string",
+            TDH_INTYPE_COUNTEDANSISTRING => "image_file_name_type_is_counted_ansi_string",
+            TDH_INTYPE_NONNULLTERMINATEDSTRING => {
+                "image_file_name_type_is_non_null_terminated_utf16_string"
+            }
+            TDH_INTYPE_NONNULLTERMINATEDANSISTRING => {
+                "image_file_name_type_is_non_null_terminated_ansi_string"
+            }
+            TDH_INTYPE_REVERSEDCOUNTEDSTRING => {
+                "image_file_name_type_is_reversed_counted_utf16_string"
+            }
+            _ => "image_file_name_property_type_is_unsupported",
+        });
+    }
+    if image.output_type != TDH_OUTTYPE_NULL as u16
+        && image.output_type != TDH_OUTTYPE_STRING as u16
+    {
+        return Err("image_file_name_property_format_is_unsupported");
     }
     Ok(())
 }
@@ -507,6 +547,7 @@ fn decode_validated_properties(
     metadata: &EventMetadata,
     pointer_size: usize,
     values: &[PropertyBytes],
+    image_input_type: u16,
 ) -> DecodedProcessPayload {
     let property_value = |name: &'static str| {
         let mut found = values.iter().filter(|property| property.name == name);
@@ -520,7 +561,8 @@ fn decode_validated_properties(
         .and_then(|value| decode_id(find_property(metadata, "ProcessId")?, pointer_size, value));
     let parent_id = property_value("ParentId")
         .and_then(|value| decode_id(find_property(metadata, "ParentId")?, pointer_size, value));
-    let image = property_value("ImageFileName").and_then(decode_image_file_name);
+    let image = property_value("ImageFileName")
+        .and_then(|value| decode_image_file_name(image_input_type, value));
     match (process_id, parent_id, image) {
         (Ok(process_id), Ok(parent_process_id), Ok(image_file_name)) => DecodedProcessPayload {
             status: DecodeStatus::Decoded,
@@ -557,7 +599,22 @@ fn decode_id(property: &PropertyMetadata, pointer_size: usize, bytes: &[u8]) -> 
     }
 }
 
-fn decode_image_file_name(bytes: &[u8]) -> Result<String, ()> {
+fn decode_image_file_name(input_type: u16, bytes: &[u8]) -> Result<String, ()> {
+    if input_type == TDH_INTYPE_ANSISTRING as u16 {
+        if bytes.len() < 2
+            || bytes.len() > MAX_PROPERTY_BYTES
+            || bytes.len() > MAX_IMAGE_FILE_NAME_UTF16_UNITS
+            || bytes.last() != Some(&0)
+            || bytes[..bytes.len() - 1].contains(&0)
+            || bytes[..bytes.len() - 1].iter().any(|byte| !byte.is_ascii())
+        {
+            return Err(());
+        }
+        return String::from_utf8(bytes[..bytes.len() - 1].to_vec()).map_err(|_| ());
+    }
+    if input_type != TDH_INTYPE_UNICODESTRING as u16 {
+        return Err(());
+    }
     if bytes.len() < 2
         || bytes.len() > MAX_PROPERTY_BYTES
         || bytes.len() % 2 != 0
@@ -714,6 +771,7 @@ mod tests {
             &metadata,
             4,
             &values(42_u32.to_le_bytes().to_vec(), 7_u32.to_le_bytes().to_vec()),
+            TDH_INTYPE_UNICODESTRING as u16,
         );
         assert_eq!(decoded.status, DecodeStatus::Decoded);
         assert_eq!(decoded.process_id, Some(42));
@@ -722,14 +780,24 @@ mod tests {
     }
 
     #[test]
-    fn documented_process_v2_v3_uint32_fields_decode() {
-        for version in [1, 2, 3] {
-            let metadata = schema(version, false);
-            let decoded = decode_validated_properties(
-                &metadata,
-                8,
-                &values(42_u32.to_le_bytes().to_vec(), 7_u32.to_le_bytes().to_vec()),
-            );
+    fn validated_process_v1_through_v4_uint32_fields_decode() {
+        for version in [1, 2, 3, 4] {
+            let mut metadata = schema(version, false);
+            let mut values = values(42_u32.to_le_bytes().to_vec(), 7_u32.to_le_bytes().to_vec());
+            let image_input_type = {
+                let image_property = metadata
+                    .properties
+                    .iter_mut()
+                    .find(|property| property.name == "ImageFileName")
+                    .unwrap();
+                if version == 4 {
+                    image_property.input_type = TDH_INTYPE_ANSISTRING as u16;
+                    values[2].bytes = b"powershell.exe\0".to_vec();
+                }
+                image_property.input_type
+            };
+            assert!(validate_selected_properties(&metadata, 8).is_ok());
+            let decoded = decode_validated_properties(&metadata, 8, &values, image_input_type);
             assert_eq!(decoded.status, DecodeStatus::Decoded);
             assert_eq!(decoded.schema_version, Some(version));
             assert_eq!(decoded.process_id, Some(42));
@@ -739,11 +807,11 @@ mod tests {
 
     #[test]
     fn unknown_version_opcode_metadata_types_and_duplicate_properties_fail_closed() {
-        let mut metadata = schema(4, false);
-        assert!(validate_metadata(&metadata, 0, 4, EVENT_TRACE_TYPE_START as u8).is_ok());
+        let mut metadata = schema(5, false);
+        assert!(validate_metadata(&metadata, 0, 5, EVENT_TRACE_TYPE_START as u8).is_ok());
         assert!(!SUPPORTED_EVENT_VERSIONS.contains(&metadata.event_version));
         assert_eq!(
-            validate_event_key(4, EVENT_TRACE_TYPE_START as u8),
+            validate_event_key(5, EVENT_TRACE_TYPE_START as u8),
             Err(DecodeStatus::UnsupportedVersion)
         );
         assert_eq!(
@@ -811,9 +879,22 @@ mod tests {
         let pointer = property("ProcessId", TDH_INTYPE_POINTER, TDH_OUTTYPE_HEXINT32, 0);
         assert!(decode_id(&pointer, 4, &[1, 2, 3]).is_err());
         assert!(decode_id(&pointer, 8, &u64::MAX.to_le_bytes()).is_err());
-        assert!(decode_image_file_name(&[b'x', 0]).is_err());
-        assert!(decode_image_file_name(&[0, 0, b'x', 0]).is_err());
-        assert!(decode_image_file_name(&vec![0; MAX_PROPERTY_BYTES + 2]).is_err());
-        assert!(decode_image_file_name(&[0x00, 0xD8, 0, 0]).is_err());
+        assert!(decode_image_file_name(TDH_INTYPE_UNICODESTRING as u16, &[b'x', 0]).is_err());
+        assert!(decode_image_file_name(TDH_INTYPE_UNICODESTRING as u16, &[0, 0, b'x', 0]).is_err());
+        assert!(
+            decode_image_file_name(
+                TDH_INTYPE_UNICODESTRING as u16,
+                &vec![0; MAX_PROPERTY_BYTES + 2]
+            )
+            .is_err()
+        );
+        assert!(
+            decode_image_file_name(TDH_INTYPE_UNICODESTRING as u16, &[0x00, 0xD8, 0, 0]).is_err()
+        );
+        assert_eq!(
+            decode_image_file_name(TDH_INTYPE_ANSISTRING as u16, b"powershell.exe\0").unwrap(),
+            "powershell.exe"
+        );
+        assert!(decode_image_file_name(TDH_INTYPE_ANSISTRING as u16, b"non-ascii-\xE9\0").is_err());
     }
 }

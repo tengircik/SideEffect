@@ -1,0 +1,7 @@
+[pid 29641] execve("/opt/harborflax/sbin/brokerd", ["brokerd"], 0x0) = 0
+[pid 29642] connect(23, {sa_family=AF_INET, sin_port=htons(22443), sin_addr=inet_addr("198.51.100.247")}, 16) = -1 ECONNREFUSED (Connection refused)
+[pid 29643] openat(AT_FDCWD, "/etc/harborflax/sockets/broker.auth", {flags=O_RDONLY}, 3) = -1 EACCES (Permission denied)
+[pid 29644] clone3({flags=CLONE_VM|CLONE_VFORK, exit_signal=SIGCHLD}, 88) = 29645
+[pid 29646] openat(AT_FDCWD, "/run/harborflax/work/items/idx-9", {flags=O_WRONLY|O_CREAT}, 6) = 7
+[pid 29647] execveat(AT_FDCWD, "/usr/libexec/harborflax/compact", ["compact"], 0x0, 0) = -1 ENOENT (No such file or directory)
+[pid 29648] connect(24, {sa_family=AF_INET, sin_port=htons(23443), sin_addr=inet_addr("198.51.100.248")}, 16) = 0

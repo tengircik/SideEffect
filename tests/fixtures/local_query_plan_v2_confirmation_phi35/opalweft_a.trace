@@ -1,0 +1,4 @@
+[pid 18461] openat2(AT_FDCWD, "/opt/opalweft/queue/river.sst", {flags=O_RDONLY}, 6) = -1 ELOOP (Too many levels of symbolic links)
+[pid 18462] connect(21, {sa_family=AF_INET, sin_port=htons(21443), sin_addr=inet_addr("203.0.113.247")}, 16) = -1 EHOSTUNREACH (No route to host)
+[pid 18463] execve("/usr/bin/opalweft-worker", ["opalweft-worker"], 0x0) = 0
+[pid 18464] clone(child_stack=NULL, flags=SIGCHLD) = 18465

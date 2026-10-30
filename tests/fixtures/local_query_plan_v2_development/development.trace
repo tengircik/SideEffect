@@ -1,0 +1,8 @@
+[pid 7201] 1721000000.000001 openat(AT_FDCWD, "/var/lib/orbit/cache.db", {flags=O_RDONLY}, 3) = -1 EACCES (Permission denied)
+[pid 7201] 1721000000.000002 execve("/opt/orbit/bin/rotate", ["rotate"], 0x0) = 0
+[pid 7202] 1721000000.000003 openat2(AT_FDCWD, "/etc/orbit/worker.ini", {flags=O_RDONLY}, 4) = 7
+[pid 7203] 1721000000.000004 connect(8, {sa_family=AF_INET, sin_port=htons(9448), sin_addr=inet_addr("203.0.113.41")}, 16) = -1 ECONNREFUSED (Connection refused)
+[pid 7204] 1721000000.000005 connect(9, {sa_family=AF_INET, sin_port=htons(9449), sin_addr=inet_addr("203.0.113.42")}, 16) = -1 EINPROGRESS (Operation now in progress)
+[pid 7205] 1721000000.000006 execveat(AT_FDCWD, "/usr/libexec/orbit-scan", ["orbit-scan"], 0x0, 0) = -1 ENOENT (No such file or directory)
+[pid 7201] 1721000000.000007 clone(child_stack=NULL, flags=SIGCHLD) = 7206
+[pid 7202] 1721000000.000008 vfork() = 7207

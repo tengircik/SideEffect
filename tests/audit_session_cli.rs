@@ -192,3 +192,164 @@ fn audit_cli_rejects_an_empty_source_selection_without_publishing() {
     assert!(!output.exists());
     assert!(String::from_utf8_lossy(&result.stderr).contains("select at least one source"));
 }
+
+#[test]
+fn audit_cli_includes_bounded_runtime_bundle_and_preserves_argument_boundaries() {
+    let directory = TestDirectory::new();
+    let output = directory.0.join("runtime.session");
+    let script = "import sys; raise SystemExit(0 if sys.argv[1:] == ['alpha beta', ''] else 9)";
+    let result = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&output)
+        .arg("--runtime-duration-seconds")
+        .arg("10")
+        .arg("--")
+        .arg("python3")
+        .arg("-c")
+        .arg(script)
+        .arg("alpha beta")
+        .arg("")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        result.status.code(),
+        Some(2),
+        "runtime completeness must remain unknown: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let manifest = parse_manifest(&fs::read(output.join("session.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest.status,
+        sideeffect::audit_session::SessionStatus::Partial
+    );
+    let runtime = manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::Runtime)
+        .unwrap();
+    assert_eq!(runtime.status, SourceStatus::Partial);
+    assert!(runtime.started_at_unix_ms <= runtime.ended_at_unix_ms);
+    assert!(
+        runtime
+            .diagnostic_codes
+            .contains(&"runtime_capture_completeness_unknown".to_owned())
+    );
+    assert_eq!(runtime.artifacts.len(), 2);
+
+    let run: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("run.json")).unwrap()).unwrap();
+    let trace = fs::read(output.join("trace.strace")).unwrap();
+    assert_eq!(run["schema"], "sideeffect.run");
+    assert_eq!(run["schema_version"], 2);
+    assert_eq!(run["capture"]["completeness"], "unknown");
+    assert_eq!(run["capture"]["stop_reason"], "tracer_exited");
+    assert_eq!(
+        run["capture"]["strace_reported_status"]["kind"],
+        "exit_code"
+    );
+    assert_eq!(run["capture"]["strace_reported_status"]["value"], 0);
+    assert!(String::from_utf8_lossy(&trace).contains("alpha beta"));
+    assert_eq!(
+        run["trace"]["sha256"],
+        format!("{:x}", Sha256::digest(&trace))
+    );
+
+    let reviewed = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("inspect")
+        .arg("--format")
+        .arg("text")
+        .arg("--session")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_eq!(reviewed.status.code(), Some(2));
+    let review = String::from_utf8(reviewed.stdout).unwrap();
+    assert!(review.contains("runtime"));
+    assert!(review.contains("runtime_capture_completeness_unknown"));
+    assert!(review.contains("no atomic system snapshot is claimed"));
+}
+
+#[test]
+fn audit_cli_preserves_unavailable_runtime_source_alongside_other_sources() {
+    let directory = TestDirectory::new();
+    let output = directory.0.join("partial.session");
+    let result = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&output)
+        .arg("--processes")
+        .arg("--runtime-duration-seconds")
+        .arg("1")
+        .arg("--")
+        .arg("python3")
+        .env("PATH", &directory.0)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(2));
+    let manifest = parse_manifest(&fs::read(output.join("session.json")).unwrap()).unwrap();
+    let processes = manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::Processes)
+        .unwrap();
+    assert!(matches!(
+        processes.status,
+        SourceStatus::Complete | SourceStatus::Partial
+    ));
+    assert_eq!(processes.artifacts.len(), 1);
+    let runtime = manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::Runtime)
+        .unwrap();
+    assert_eq!(runtime.status, SourceStatus::Unavailable);
+    assert!(runtime.artifacts.is_empty());
+    assert!(
+        runtime
+            .diagnostic_codes
+            .contains(&"runtime_capture_unavailable".to_owned())
+    );
+    assert!(!output.join("run.json").exists());
+    assert!(!output.join("trace.strace").exists());
+}
+
+#[test]
+fn audit_cli_time_limited_runtime_is_explicitly_incomplete() {
+    let directory = TestDirectory::new();
+    let output = directory.0.join("timed.session");
+    let script = "import time; time.sleep(5)";
+    let result = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&output)
+        .arg("--runtime-duration-seconds")
+        .arg("1")
+        .arg("--")
+        .arg("python3")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(2));
+    let manifest = parse_manifest(&fs::read(output.join("session.json")).unwrap()).unwrap();
+    let runtime = manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::Runtime)
+        .unwrap();
+    assert_eq!(runtime.status, SourceStatus::Partial);
+    assert!(
+        runtime
+            .diagnostic_codes
+            .contains(&"runtime_time_limit_reached".to_owned())
+    );
+    let run: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("run.json")).unwrap()).unwrap();
+    assert_eq!(run["capture"]["time_limit_milliseconds"], 1000);
+    assert_eq!(run["capture"]["stop_reason"], "time_limit_reached");
+    assert_eq!(run["capture"]["completeness"], "unknown");
+}

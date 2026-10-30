@@ -46,11 +46,28 @@ fn windows_package_command_reports_registered_software_and_refuses_overwrite() {
     );
     assert_eq!(document["sources"].as_array().unwrap().len(), 4);
     assert!(document["registrations"].as_array().is_some());
-    for source in document["sources"].as_array().unwrap() {
+    let sources = document["sources"].as_array().unwrap();
+    let mut incomplete_source_seen = false;
+    for source in sources {
         assert!(source["status"].is_string());
         assert!(source["hive"].is_string());
         assert!(source["registry_view"].is_string());
+        if matches!(
+            source["status"].as_str(),
+            Some("partial" | "inaccessible" | "error")
+        ) {
+            incomplete_source_seen = true;
+        }
     }
+    assert_eq!(
+        document["status"],
+        if incomplete_source_seen {
+            "partial"
+        } else {
+            "complete"
+        },
+        "an inaccessible, erroneous, or partial registry view must make the aggregate partial"
+    );
     for registration in document["registrations"].as_array().unwrap() {
         assert!(registration["registry_subkey"].is_string());
         assert!(registration["evidence"]["registry_key"].is_string());
@@ -58,6 +75,14 @@ fn windows_package_command_reports_registered_software_and_refuses_overwrite() {
             assert!(value["name"].is_string());
             assert!(value["raw_data_hex"].is_string());
             assert!(value["text"].is_null() || value["text"].is_string());
+            if matches!(
+                value["name"].as_str(),
+                Some("UninstallString" | "QuietUninstallString")
+            ) {
+                assert!(value["registry_type"].is_number());
+                assert!(value["type_name"].is_string());
+                // Command text is inventory data; this test never launches it.
+            }
         }
     }
 

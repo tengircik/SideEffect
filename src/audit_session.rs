@@ -111,8 +111,13 @@ pub enum ArtifactKind {
     Processes,
     Permissions,
     Startup,
+    WindowsSoftware,
+    WindowsProcesses,
+    WindowsPermissions,
+    WindowsStartup,
     RuntimeManifest,
     RuntimeTrace,
+    WindowsRuntimeCapture,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -247,16 +252,23 @@ fn expected_artifacts(
     role: SourceRole,
     platform: &str,
 ) -> Result<Vec<ArtifactKind>, ValidationError> {
-    if platform != "linux" {
-        return Err(ValidationError::UnsupportedArtifactPlatform);
+    match platform {
+        "linux" => Ok(match role {
+            SourceRole::Packages => vec![ArtifactKind::Packages],
+            SourceRole::Processes => vec![ArtifactKind::Processes],
+            SourceRole::Permissions => vec![ArtifactKind::Permissions],
+            SourceRole::Startup => vec![ArtifactKind::Startup],
+            SourceRole::Runtime => vec![ArtifactKind::RuntimeManifest, ArtifactKind::RuntimeTrace],
+        }),
+        "windows" => Ok(match role {
+            SourceRole::Packages => vec![ArtifactKind::WindowsSoftware],
+            SourceRole::Processes => vec![ArtifactKind::WindowsProcesses],
+            SourceRole::Permissions => vec![ArtifactKind::WindowsPermissions],
+            SourceRole::Startup => vec![ArtifactKind::WindowsStartup],
+            SourceRole::Runtime => vec![ArtifactKind::WindowsRuntimeCapture],
+        }),
+        _ => Err(ValidationError::UnsupportedArtifactPlatform),
     }
-    Ok(match role {
-        SourceRole::Packages => vec![ArtifactKind::Packages],
-        SourceRole::Processes => vec![ArtifactKind::Processes],
-        SourceRole::Permissions => vec![ArtifactKind::Permissions],
-        SourceRole::Startup => vec![ArtifactKind::Startup],
-        SourceRole::Runtime => vec![ArtifactKind::RuntimeManifest, ArtifactKind::RuntimeTrace],
-    })
 }
 
 fn artifact_contract(
@@ -267,8 +279,33 @@ fn artifact_contract(
         ArtifactKind::Processes => ("processes.json", "sideeffect.process_inventory", 1),
         ArtifactKind::Permissions => ("permissions.json", "sideeffect.permission_inventory", 1),
         ArtifactKind::Startup => ("startup.json", "sideeffect.startup_inventory", 2),
+        ArtifactKind::WindowsSoftware => (
+            "software.windows.json",
+            "sideeffect.windows_software_inventory",
+            1,
+        ),
+        ArtifactKind::WindowsProcesses => (
+            "processes.windows.json",
+            "sideeffect.windows_process_inventory",
+            1,
+        ),
+        ArtifactKind::WindowsPermissions => (
+            "permissions.windows.json",
+            "sideeffect.windows_permission_inventory",
+            1,
+        ),
+        ArtifactKind::WindowsStartup => (
+            "startup.windows.json",
+            "sideeffect.windows_startup_inventory",
+            4,
+        ),
         ArtifactKind::RuntimeManifest => ("run.json", "sideeffect.run", 2),
         ArtifactKind::RuntimeTrace => ("trace.strace", "strace_text", 1),
+        ArtifactKind::WindowsRuntimeCapture => (
+            "runtime.windows.json",
+            "sideeffect.windows_runtime_capture",
+            3,
+        ),
     })
 }
 
@@ -384,7 +421,7 @@ mod tests {
     use super::{
         AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, AppliedLimit, ArtifactKind,
         AuditSessionManifest, AuditSessionSource, IntervalSemantics, SessionArtifactRef,
-        SessionStatus, SourceRole, SourceStatus, parse_manifest,
+        SessionStatus, SourceRole, SourceStatus, ValidationError, parse_manifest,
     };
 
     fn valid_manifest() -> AuditSessionManifest {
@@ -445,6 +482,10 @@ mod tests {
             parse_manifest(bytes),
             Err(super::ValidationError::InvalidManifestJson)
         );
+        assert_eq!(
+            parse_manifest(b"{"),
+            Err(super::ValidationError::InvalidManifestJson)
+        );
     }
 
     #[test]
@@ -496,6 +537,189 @@ mod tests {
         assert_eq!(
             parse_manifest(&bytes),
             Err(super::ValidationError::ManifestTooLarge)
+        );
+    }
+
+    #[test]
+    fn windows_manifest_has_fixed_native_artifact_contracts_and_mixed_statuses() {
+        let mut manifest = valid_manifest();
+        manifest.platform = "windows".to_owned();
+        manifest.architecture = "x86_64".to_owned();
+        manifest.sources[0].platform = "windows".to_owned();
+        manifest.sources[0].scope = "bounded native software registrations".to_owned();
+        manifest.sources[0].artifacts = vec![SessionArtifactRef {
+            kind: ArtifactKind::WindowsSoftware,
+            path: "software.windows.json".to_owned(),
+            schema: "sideeffect.windows_software_inventory".to_owned(),
+            schema_version: 1,
+            byte_length: 1,
+            sha256: "0".repeat(64),
+        }];
+        manifest.sources.push(AuditSessionSource {
+            role: SourceRole::Runtime,
+            platform: "windows".to_owned(),
+            scope: "bounded system-wide ETW observations; completeness unknown".to_owned(),
+            started_at_unix_ms: 1001,
+            ended_at_unix_ms: 1002,
+            status: SourceStatus::Partial,
+            applied_limits: vec![AppliedLimit {
+                code: "max_events".to_owned(),
+                value: 50_000,
+            }],
+            diagnostic_codes: vec!["capture_completeness_unknown".to_owned()],
+            artifacts: vec![SessionArtifactRef {
+                kind: ArtifactKind::WindowsRuntimeCapture,
+                path: "runtime.windows.json".to_owned(),
+                schema: "sideeffect.windows_runtime_capture".to_owned(),
+                schema_version: 3,
+                byte_length: 1,
+                sha256: "1".repeat(64),
+            }],
+        });
+        manifest.status = SessionStatus::Partial;
+        assert!(manifest.validate().is_ok());
+
+        manifest.sources[1].status = SourceStatus::Complete;
+        manifest.status = SessionStatus::Partial;
+        assert_eq!(
+            manifest.validate(),
+            Err(ValidationError::RuntimeCompletenessNotEstablished)
+        );
+        manifest.sources[1].status = SourceStatus::Partial;
+
+        manifest.sources[0].artifacts[0].schema_version = 99;
+        assert_eq!(
+            manifest.validate(),
+            Err(ValidationError::ArtifactContractMismatch)
+        );
+    }
+
+    #[test]
+    fn one_session_preserves_complete_partial_and_unavailable_sources() {
+        let mut manifest = valid_manifest();
+        let processes = AuditSessionSource {
+            role: SourceRole::Processes,
+            platform: "linux".to_owned(),
+            scope: "visible procfs entries".to_owned(),
+            started_at_unix_ms: 1001,
+            ended_at_unix_ms: 1002,
+            status: SourceStatus::Partial,
+            applied_limits: Vec::new(),
+            diagnostic_codes: vec!["process_entry_inaccessible".to_owned()],
+            artifacts: vec![SessionArtifactRef {
+                kind: ArtifactKind::Processes,
+                path: "processes.json".to_owned(),
+                schema: "sideeffect.process_inventory".to_owned(),
+                schema_version: 1,
+                byte_length: 1,
+                sha256: "1".repeat(64),
+            }],
+        };
+        let unavailable = AuditSessionSource {
+            role: SourceRole::Startup,
+            platform: "linux".to_owned(),
+            scope: "selected startup locations".to_owned(),
+            started_at_unix_ms: 1002,
+            ended_at_unix_ms: 1002,
+            status: SourceStatus::Unavailable,
+            applied_limits: Vec::new(),
+            diagnostic_codes: vec!["startup_source_unavailable".to_owned()],
+            artifacts: Vec::new(),
+        };
+        manifest.sources.push(processes);
+        manifest.sources.push(unavailable);
+        manifest.status = SessionStatus::Partial;
+
+        assert!(manifest.validate().is_ok());
+        assert_eq!(manifest.status, SessionStatus::Partial);
+        assert_eq!(manifest.sources[0].status, SourceStatus::Complete);
+        assert_eq!(manifest.sources[0].artifacts.len(), 1);
+        assert_eq!(manifest.sources[1].status, SourceStatus::Partial);
+        assert_eq!(manifest.sources[1].started_at_unix_ms, 1001);
+        assert_eq!(manifest.sources[1].ended_at_unix_ms, 1002);
+        assert_eq!(manifest.sources[1].artifacts[0].path, "processes.json");
+        assert_eq!(manifest.sources[2].status, SourceStatus::Unavailable);
+        assert_eq!(manifest.sources[2].started_at_unix_ms, 1002);
+        assert!(manifest.sources[2].artifacts.is_empty());
+    }
+
+    #[test]
+    fn manifest_rejects_source_and_metadata_counts_over_their_bounds() {
+        let mut manifest = valid_manifest();
+        manifest.sources = vec![manifest.sources[0].clone(); super::MAX_SESSION_SOURCES + 1];
+        assert_eq!(
+            manifest.validate(),
+            Err(ValidationError::SourceCountOutOfBounds)
+        );
+
+        let mut manifest = valid_manifest();
+        manifest.sources[0].applied_limits = vec![
+            AppliedLimit {
+                code: "max_test_limit".to_owned(),
+                value: 1,
+            };
+            super::MAX_LIMITS_PER_SOURCE + 1
+        ];
+        assert_eq!(
+            manifest.validate(),
+            Err(ValidationError::MetadataCountOutOfBounds)
+        );
+
+        let mut manifest = valid_manifest();
+        manifest.sources[0].diagnostic_codes =
+            vec!["test_diagnostic".to_owned(); super::MAX_DIAGNOSTIC_CODES_PER_SOURCE + 1];
+        assert_eq!(
+            manifest.validate(),
+            Err(ValidationError::MetadataCountOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_per_artifact_and_aggregate_size_overages() {
+        let mut manifest = valid_manifest();
+        manifest.sources[0].artifacts[0].byte_length = super::MAX_SESSION_ARTIFACT_BYTES + 1;
+        assert_eq!(
+            manifest.validate(),
+            Err(ValidationError::ArtifactSizeOutOfBounds)
+        );
+
+        let mut manifest = valid_manifest();
+        manifest.status = SessionStatus::Partial;
+        manifest.sources[0].status = SourceStatus::Partial;
+        manifest.sources[0].artifacts[0].byte_length = super::MAX_SESSION_ARTIFACT_BYTES;
+        let source = |role, kind, path: &str, schema: &str| AuditSessionSource {
+            role,
+            platform: "linux".to_owned(),
+            scope: "bounded test source".to_owned(),
+            started_at_unix_ms: 1000,
+            ended_at_unix_ms: 1002,
+            status: SourceStatus::Partial,
+            applied_limits: Vec::new(),
+            diagnostic_codes: Vec::new(),
+            artifacts: vec![SessionArtifactRef {
+                kind,
+                path: path.to_owned(),
+                schema: schema.to_owned(),
+                schema_version: 1,
+                byte_length: super::MAX_SESSION_ARTIFACT_BYTES,
+                sha256: "0".repeat(64),
+            }],
+        };
+        manifest.sources.push(source(
+            SourceRole::Processes,
+            ArtifactKind::Processes,
+            "processes.json",
+            "sideeffect.process_inventory",
+        ));
+        manifest.sources.push(source(
+            SourceRole::Permissions,
+            ArtifactKind::Permissions,
+            "permissions.json",
+            "sideeffect.permission_inventory",
+        ));
+        assert_eq!(
+            manifest.validate(),
+            Err(ValidationError::AggregateSizeOutOfBounds)
         );
     }
 }

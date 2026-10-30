@@ -99,6 +99,70 @@ pub struct RuntimeEvidenceReference {
     pub evidence: EvidenceReference,
 }
 
+/// Additive cross-source view for the first Linux M12 adapter. This is a
+/// candidate association format, not a causal or execution-attribution claim.
+#[derive(Clone, Debug, Serialize)]
+pub struct AssociatedBehaviorSummary {
+    pub schema: &'static str,
+    pub schema_version: u32,
+    pub algorithm: AssociationAlgorithm,
+    pub platform_adapter: &'static str,
+    pub capture_completeness: &'static str,
+    pub status: &'static str,
+    /// `candidate_match` is never promoted to a causal or execution claim.
+    pub association_status: &'static str,
+    pub inputs: AssociatedBehaviorInputs,
+    pub summary: AssociatedBehaviorCounts,
+    pub diagnostics: Vec<&'static str>,
+    pub limitations: Vec<&'static str>,
+    pub associations: Vec<AssociatedBehavior>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AssociationAlgorithm {
+    pub id: &'static str,
+    pub version: u32,
+    pub basis: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AssociatedBehaviorInputs {
+    pub startup_inventory: AssociatedInputIdentity,
+    pub runtime_trace: AssociatedInputIdentity,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AssociatedInputIdentity {
+    pub source_format: &'static str,
+    pub sha256: String,
+    pub source_status: String,
+    pub capture_completeness: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AssociatedBehaviorCounts {
+    pub candidate_match_count: usize,
+    pub unmatched_config_path_count: usize,
+    pub unmatched_runtime_path_count: usize,
+    pub unsupported_xdg_exec_count: usize,
+    pub unsupported_systemd_exec_count: usize,
+    pub successful_exec_rows_without_supported_path_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AssociatedBehavior {
+    /// Literal path equality is still only a candidate association.
+    pub status: &'static str,
+    /// This is a qualitative evidence state, not a probability or safety score.
+    pub confidence: &'static str,
+    pub basis: &'static str,
+    pub executable_path: String,
+    pub multiple_startup_references: bool,
+    pub multiple_runtime_observations: bool,
+    pub startup_evidence: Vec<StartupEvidenceReference>,
+    pub runtime_evidence: Vec<RuntimeEvidenceReference>,
+}
+
 #[derive(Deserialize)]
 struct StartupInput {
     schema: String,
@@ -556,6 +620,104 @@ pub fn correlate_startup_bytes(
     })
 }
 
+/// Produce the additive M12 associated-behavior envelope for the initial
+/// Linux startup/exec path adapter. The original `startup_correlation` schema
+/// and command behavior remain unchanged. Limits are enforced by the underlying
+/// bounded correlation operation.
+pub fn summarize_associated_startup_behavior(
+    startup_bytes: &[u8],
+    trace_bytes: &[u8],
+) -> Result<AssociatedBehaviorSummary, String> {
+    let source = correlate_startup_bytes(startup_bytes, trace_bytes)?;
+    let partial = source.status != "complete";
+    let associations = source
+        .candidate_matches
+        .into_iter()
+        .map(|candidate| AssociatedBehavior {
+            status: "candidate_match",
+            confidence: "limited_candidate",
+            basis: "same_exact_literal_absolute_executable_path",
+            executable_path: candidate.executable_path,
+            multiple_startup_references: candidate.multiple_startup_references,
+            multiple_runtime_observations: candidate.multiple_runtime_observations,
+            startup_evidence: candidate.startup_evidence,
+            runtime_evidence: candidate.runtime_evidence,
+        })
+        .collect::<Vec<_>>();
+    let mut diagnostics = Vec::new();
+    if partial {
+        diagnostics.push("source_or_supported_match_coverage_is_partial");
+    }
+    if source.summary.unmatched_config_path_count > 0
+        || source.summary.unmatched_runtime_path_count > 0
+    {
+        diagnostics.push("unmatched_paths_are_not_evidence_of_non_occurrence");
+    }
+    if source
+        .summary
+        .successful_exec_rows_without_supported_path_count
+        > 0
+        || source.summary.unsupported_xdg_exec_count > 0
+        || source.summary.unsupported_systemd_exec_count > 0
+    {
+        diagnostics.push("unsupported_path_forms_were_not_associated");
+    }
+    Ok(AssociatedBehaviorSummary {
+        schema: "sideeffect.associated_behavior_summary",
+        schema_version: 1,
+        algorithm: AssociationAlgorithm {
+            id: "linux_startup_exec_literal_path_association",
+            version: 1,
+            basis: "exact_literal_absolute_path_string_equality",
+        },
+        platform_adapter: "linux_startup_inventory_v2_strace_v1",
+        capture_completeness: "unknown",
+        status: if partial { "partial" } else { "complete" },
+        association_status: if associations.is_empty() {
+            "insufficient_evidence"
+        } else {
+            "candidate_match"
+        },
+        inputs: AssociatedBehaviorInputs {
+            startup_inventory: AssociatedInputIdentity {
+                source_format: "sideeffect.startup_inventory_v2",
+                sha256: source.startup_inventory_sha256,
+                source_status: source.startup_inventory_status,
+                capture_completeness: "unknown",
+            },
+            runtime_trace: AssociatedInputIdentity {
+                source_format: "strace_text",
+                sha256: source.trace_sha256,
+                source_status: match source.trace_parse_status {
+                    ParseCompleteness::Complete => "complete".to_owned(),
+                    ParseCompleteness::Partial => "partial".to_owned(),
+                },
+                capture_completeness: source.trace_capture_completeness,
+            },
+        },
+        summary: AssociatedBehaviorCounts {
+            candidate_match_count: associations.len(),
+            unmatched_config_path_count: source.summary.unmatched_config_path_count,
+            unmatched_runtime_path_count: source.summary.unmatched_runtime_path_count,
+            unsupported_xdg_exec_count: source.summary.unsupported_xdg_exec_count,
+            unsupported_systemd_exec_count: source.summary.unsupported_systemd_exec_count,
+            successful_exec_rows_without_supported_path_count: source
+                .summary
+                .successful_exec_rows_without_supported_path_count,
+        },
+        diagnostics,
+        limitations: vec![
+            "A candidate match means only that an exact literal executable-path string was observed in both supplied inputs.",
+            "The association does not establish that a startup hook executed or caused a process to start.",
+            "This adapter covers only the existing narrow Linux XDG/systemd path subset; it is not cross-platform coverage.",
+            "The two inputs are separate snapshots and may describe different system states.",
+            "Input fingerprints identify bytes but do not authenticate their origin or contents.",
+            "Missing matches do not establish that an event or startup source did not exist.",
+        ],
+        associations,
+    })
+}
+
 fn systemd_exec_evidence_key(key: &str) -> Option<&'static str> {
     Some(match key {
         "ExecStart" => "Service.ExecStart",
@@ -758,7 +920,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::MAX_STARTUP_CORRELATION_METADATA_BYTES;
-    use super::{correlate_startup_bytes, literal_executable, strace_argument};
+    use super::{
+        correlate_startup_bytes, literal_executable, strace_argument,
+        summarize_associated_startup_behavior,
+    };
     use crate::limits::MAX_RECORD_BYTES;
     use crate::model::ParseCompleteness;
     use serde_json::json;
@@ -1000,5 +1165,112 @@ mod tests {
         assert_eq!(report.summary.unsupported_xdg_exec_count, 1);
         let oversized = format!("/{}", "a".repeat(MAX_RECORD_BYTES));
         assert_eq!(literal_executable(&oversized), None);
+    }
+
+    #[test]
+    fn associated_behavior_v1_preserves_exact_candidate_evidence_and_ambiguity() {
+        let inventory = startup(&[
+            ("user", "/usr/bin/example --one"),
+            ("system", "/usr/bin/example --two"),
+        ]);
+        let trace = b"100 execve(\"/usr/bin/example\", [], []) = 0\n101 execve(\"/usr/bin/example\", [], []) = 0\n";
+        let summary = summarize_associated_startup_behavior(&inventory, trace).unwrap();
+        let json = serde_json::to_value(&summary).unwrap();
+
+        assert_eq!(summary.schema, "sideeffect.associated_behavior_summary");
+        assert_eq!(summary.schema_version, 1);
+        assert_eq!(summary.algorithm.version, 1);
+        assert_eq!(
+            summary.platform_adapter,
+            "linux_startup_inventory_v2_strace_v1"
+        );
+        assert_eq!(summary.capture_completeness, "unknown");
+        assert_eq!(summary.status, "complete");
+        assert_eq!(summary.association_status, "candidate_match");
+        assert_eq!(summary.associations.len(), 1);
+        let association = &summary.associations[0];
+        assert_eq!(association.status, "candidate_match");
+        assert_eq!(association.confidence, "limited_candidate");
+        assert!(association.multiple_startup_references);
+        assert!(association.multiple_runtime_observations);
+        assert_eq!(association.startup_evidence.len(), 2);
+        assert_eq!(association.runtime_evidence.len(), 2);
+        assert!(
+            association
+                .runtime_evidence
+                .iter()
+                .all(|reference| reference.trace_sha256 == summary.inputs.runtime_trace.sha256)
+        );
+        assert_eq!(json["associations"][0]["startup_evidence"][0]["line"], 4);
+        assert_eq!(
+            json["associations"][0]["runtime_evidence"][0]["evidence"]["line_number"],
+            1
+        );
+    }
+
+    #[test]
+    fn associated_behavior_marks_partial_inputs_and_unsupported_forms() {
+        let mut inventory: serde_json::Value = serde_json::from_slice(&startup(&[
+            ("user", "/usr/bin/example"),
+            ("user", "/usr/bin/tool %U"),
+        ]))
+        .unwrap();
+        inventory["status"] = json!("partial");
+        inventory["xdg_autostart"]["status"] = json!("partial");
+        let inventory = serde_json::to_vec(&inventory).unwrap();
+        let trace = b"unparsed source row\n100 execve(\"/usr/bin/example\", [], []) = 0\n";
+
+        let summary = summarize_associated_startup_behavior(&inventory, trace).unwrap();
+        assert_eq!(summary.status, "partial");
+        assert_eq!(summary.inputs.startup_inventory.source_status, "partial");
+        assert_eq!(summary.inputs.runtime_trace.source_status, "partial");
+        assert!(
+            summary
+                .diagnostics
+                .contains(&"source_or_supported_match_coverage_is_partial")
+        );
+        assert!(
+            summary
+                .diagnostics
+                .contains(&"unsupported_path_forms_were_not_associated")
+        );
+        assert_eq!(summary.associations.len(), 1);
+    }
+
+    #[test]
+    fn no_match_is_insufficient_evidence_not_a_negative_finding() {
+        let inventory = startup(&[("user", "/usr/bin/configured")]);
+        let trace = b"100 execve(\"/usr/bin/other\", [], []) = 0\n";
+        let summary = summarize_associated_startup_behavior(&inventory, trace).unwrap();
+
+        assert_eq!(summary.status, "complete");
+        assert_eq!(summary.capture_completeness, "unknown");
+        assert_eq!(summary.association_status, "insufficient_evidence");
+        assert!(summary.associations.is_empty());
+        assert_eq!(summary.summary.unmatched_config_path_count, 1);
+        assert_eq!(summary.summary.unmatched_runtime_path_count, 1);
+        assert!(
+            summary
+                .diagnostics
+                .contains(&"unmatched_paths_are_not_evidence_of_non_occurrence")
+        );
+    }
+
+    #[test]
+    fn associated_behavior_claims_exclude_startup_execution_and_causation() {
+        let summary = summarize_associated_startup_behavior(
+            &startup(&[("user", "/usr/bin/example")]),
+            b"100 execve(\"/usr/bin/example\", [], []) = 0\n",
+        )
+        .unwrap();
+        assert!(summary.limitations.iter().any(|item| {
+            item.contains("does not establish that a startup hook executed or caused")
+        }));
+        assert!(
+            summary
+                .limitations
+                .iter()
+                .any(|item| item.contains("exact literal executable-path string"))
+        );
     }
 }

@@ -1,0 +1,6 @@
+[pid 64451] connect(10, {sa_family=AF_INET, sin_port=htons(23148), sin_addr=inet_addr("192.0.2.119")}, 16) = -1 EINPROGRESS (Operation now in progress)
+[pid 64452] connect(11, {sa_family=AF_INET, sin_port=htons(23149), sin_addr=inet_addr("192.0.2.120")}, 16) = -1 EHOSTUNREACH (No route to host)
+[pid 64453] openat(AT_FDCWD, "/var/cache/sundial/rebuild.idx", O_RDONLY) = 6
+[pid 64454] execveat(AT_FDCWD, "/usr/libexec/sundial/refresh", ["refresh"], 0x0, 0) = 0
+[pid 64455] clone(child_stack=NULL, flags=SIGCHLD) = 64456
+[pid 64457] openat2(AT_FDCWD, "/var/cache/sundial/lock", {flags=O_RDWR}, 5) = -1 EROFS (Read-only file system)

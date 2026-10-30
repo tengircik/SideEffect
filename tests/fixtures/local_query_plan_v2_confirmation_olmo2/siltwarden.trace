@@ -1,0 +1,7 @@
+[pid 60910] execve("/usr/local/siltwarden/bin/patcher", ["patcher"], 0x0) = 0
+[pid 60911] connect(4, {sa_family=AF_INET, sin_port=htons(12443), sin_addr=inet_addr("198.51.100.252")}, 16) = -1 ECONNRESET (Connection reset by peer)
+[pid 60912] openat(AT_FDCWD, "/etc/siltwarden/dispatch/secret.env", {flags=O_RDONLY}, 3) = -1 EACCES (Permission denied)
+[pid 60913] clone3({flags=CLONE_VM|CLONE_VFORK, exit_signal=SIGCHLD}, 88) = 60914
+[pid 60915] openat(AT_FDCWD, "/var/tmp/siltwarden/job.queue", {flags=O_WRONLY|O_CREAT}, 6) = 7
+[pid 60916] execveat(AT_FDCWD, "/usr/libexec/siltwarden/schedule", ["schedule"], 0x0, 0) = -1 ENOENT (No such file or directory)
+[pid 60917] connect(5, {sa_family=AF_INET, sin_port=htons(13443), sin_addr=inet_addr("198.51.100.253")}, 16) = 0

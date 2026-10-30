@@ -22,6 +22,9 @@ const INVALID_HANDLE_VALUE: isize = -1;
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_PATH_NOT_FOUND: u32 = 3;
+const ERROR_INVALID_DATA: u32 = 13;
+#[cfg(test)]
+const ERROR_INVALID_PARAMETER: u32 = 87;
 const SE_FILE_OBJECT: u32 = 1;
 const OWNER_SECURITY_INFORMATION: u32 = 0x1;
 const GROUP_SECURITY_INFORMATION: u32 = 0x2;
@@ -197,7 +200,114 @@ impl Drop for OwnedDescriptor {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum DescriptorReadError {
+    Win32(u32),
+    Limit,
+}
+
+trait WindowsPermissionApi {
+    type Handle;
+
+    fn open_path(&mut self, wide: &[u16]) -> Result<Self::Handle, u32>;
+    fn metadata(&mut self, handle: &Self::Handle) -> Result<WindowsPermissionMetadata, u32>;
+    fn is_disk_file(&mut self, handle: &Self::Handle) -> bool;
+    fn security_descriptor(
+        &mut self,
+        handle: &Self::Handle,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, DescriptorReadError>;
+}
+
+struct NativeWindowsPermissionApi;
+
+impl WindowsPermissionApi for NativeWindowsPermissionApi {
+    type Handle = OwnedHandle;
+
+    fn open_path(&mut self, wide: &[u16]) -> Result<Self::Handle, u32> {
+        let mut terminated = wide.to_vec();
+        terminated.push(0);
+        let raw = unsafe {
+            CreateFileW(
+                terminated.as_ptr(),
+                GENERIC_READ_CONTROL | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_ALL,
+                null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                null_mut(),
+            )
+        };
+        if raw as isize == INVALID_HANDLE_VALUE {
+            Err(unsafe { GetLastError() })
+        } else {
+            Ok(OwnedHandle(raw))
+        }
+    }
+
+    fn metadata(&mut self, handle: &Self::Handle) -> Result<WindowsPermissionMetadata, u32> {
+        let mut info = ByHandleFileInformation::default();
+        if unsafe { GetFileInformationByHandle(handle.0, &mut info) } == 0 {
+            return Err(unsafe { GetLastError() });
+        }
+        Ok(WindowsPermissionMetadata {
+            attributes: info.attributes,
+            is_directory: info.attributes & 0x10 != 0,
+            is_reparse_point: info.attributes & 0x400 != 0,
+            volume_serial_number: info.volume_serial_number,
+            file_index: (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low),
+            size_bytes: (u64::from(info.file_size_high) << 32) | u64::from(info.file_size_low),
+            last_write_filetime: (u64::from(info.last_write_time[1]) << 32)
+                | u64::from(info.last_write_time[0]),
+        })
+    }
+
+    fn is_disk_file(&mut self, handle: &Self::Handle) -> bool {
+        unsafe { GetFileType(handle.0) == FILE_TYPE_DISK }
+    }
+
+    fn security_descriptor(
+        &mut self,
+        handle: &Self::Handle,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, DescriptorReadError> {
+        let mut descriptor = null_mut();
+        let result = unsafe {
+            GetSecurityInfo(
+                handle.0,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if result != 0 {
+            return Err(DescriptorReadError::Win32(result));
+        }
+        if descriptor.is_null() {
+            return Err(DescriptorReadError::Win32(ERROR_INVALID_DATA));
+        }
+        let descriptor = OwnedDescriptor(descriptor);
+        let length = unsafe { GetSecurityDescriptorLength(descriptor.0.cast_const()) } as usize;
+        if !(20..=MAX_DESCRIPTOR_BYTES).contains(&length) || length > max_bytes {
+            return Err(DescriptorReadError::Limit);
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(descriptor.0.cast::<u8>(), length) };
+        Ok(bytes.to_vec())
+    }
+}
+
 pub fn collect_windows_permissions(paths: &[PathBuf]) -> WindowsPermissionInventoryDocument {
+    collect_windows_permissions_with_api(paths, &mut NativeWindowsPermissionApi)
+}
+
+fn collect_windows_permissions_with_api<A: WindowsPermissionApi>(
+    paths: &[PathBuf],
+    api: &mut A,
+) -> WindowsPermissionInventoryDocument {
     let started = unix_ms();
     let timer = Instant::now();
     let mut objects = Vec::new();
@@ -251,7 +361,7 @@ pub fn collect_windows_permissions(paths: &[PathBuf]) -> WindowsPermissionInvent
             status = WindowsPermissionStatus::Partial;
             continue;
         }
-        match collect_one(&wide, index, &mut aggregate_descriptor_bytes) {
+        match collect_one_with_api(&wide, index, &mut aggregate_descriptor_bytes, api) {
             Ok(object) => {
                 if object.status != WindowsPermissionStatus::Complete {
                     status = WindowsPermissionStatus::Partial;
@@ -310,68 +420,52 @@ pub fn collect_windows_permissions(paths: &[PathBuf]) -> WindowsPermissionInvent
     }
 }
 
-fn collect_one(
+fn collect_one_with_api<A: WindowsPermissionApi>(
     wide: &[u16],
     index: usize,
     aggregate: &mut usize,
+    api: &mut A,
 ) -> Result<WindowsPermissionObject, (WindowsPermissionStatus, WindowsPermissionDiagnostic)> {
-    let mut terminated = wide.to_vec();
-    terminated.push(0);
-    let raw = unsafe {
-        CreateFileW(
-            terminated.as_ptr(),
-            GENERIC_READ_CONTROL | FILE_READ_ATTRIBUTES,
-            FILE_SHARE_ALL,
-            null_mut(),
-            OPEN_EXISTING,
-            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
-            null_mut(),
-        )
+    let handle = match api.open_path(wide) {
+        Ok(handle) => handle,
+        Err(error) => {
+            let state = if error == ERROR_ACCESS_DENIED {
+                WindowsPermissionStatus::Inaccessible
+            } else if error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND {
+                WindowsPermissionStatus::NotPresent
+            } else {
+                WindowsPermissionStatus::Error
+            };
+            return Err((
+                state,
+                diag(
+                    "open_failed",
+                    Some(index),
+                    "Could not open the selected path with read-control and file-attribute access.",
+                    Some(error),
+                ),
+            ));
+        }
     };
-    if raw as isize == INVALID_HANDLE_VALUE {
-        let error = unsafe { GetLastError() };
-        let state = if error == ERROR_ACCESS_DENIED {
-            WindowsPermissionStatus::Inaccessible
-        } else if error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND {
-            WindowsPermissionStatus::NotPresent
-        } else {
-            WindowsPermissionStatus::Error
-        };
-        return Err((
-            state,
-            diag(
-                "open_failed",
-                Some(index),
-                "Could not open the selected path with read-control and file-attribute access.",
-                Some(error),
-            ),
-        ));
-    }
-    let handle = OwnedHandle(raw);
-    let mut info = ByHandleFileInformation::default();
-    if unsafe { GetFileInformationByHandle(handle.0, &mut info) } == 0 {
-        let error = unsafe { GetLastError() };
-        return Err((
-            WindowsPermissionStatus::Error,
-            diag(
-                "metadata_failed",
-                Some(index),
-                "Could not read metadata from the opened path handle.",
-                Some(error),
-            ),
-        ));
-    }
-    let metadata = WindowsPermissionMetadata {
-        attributes: info.attributes,
-        is_directory: info.attributes & 0x10 != 0,
-        is_reparse_point: info.attributes & 0x400 != 0,
-        volume_serial_number: info.volume_serial_number,
-        file_index: (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low),
-        size_bytes: (u64::from(info.file_size_high) << 32) | u64::from(info.file_size_low),
-        last_write_filetime: (u64::from(info.last_write_time[1]) << 32)
-            | u64::from(info.last_write_time[0]),
+    let metadata = match api.metadata(&handle) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Err((
+                if error == ERROR_ACCESS_DENIED {
+                    WindowsPermissionStatus::Inaccessible
+                } else {
+                    WindowsPermissionStatus::Error
+                },
+                diag(
+                    "metadata_failed",
+                    Some(index),
+                    "Could not read metadata from the opened path handle.",
+                    Some(error),
+                ),
+            ));
+        }
     };
-    if unsafe { GetFileType(handle.0) } != FILE_TYPE_DISK {
+    if !api.is_disk_file(&handle) {
         return Err((
             WindowsPermissionStatus::Partial,
             diag(
@@ -382,39 +476,39 @@ fn collect_one(
             ),
         ));
     }
-    let mut descriptor = null_mut();
-    let result = unsafe {
-        GetSecurityInfo(
-            handle.0,
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            &mut descriptor,
-        )
+    let aggregate_remaining = MAX_AGGREGATE_DESCRIPTOR_BYTES.saturating_sub(*aggregate);
+    let descriptor_limit = MAX_DESCRIPTOR_BYTES.min(aggregate_remaining);
+    let bytes = match api.security_descriptor(&handle, descriptor_limit) {
+        Ok(bytes) => bytes,
+        Err(DescriptorReadError::Win32(error)) => {
+            return Err((
+                if error == ERROR_ACCESS_DENIED {
+                    WindowsPermissionStatus::Inaccessible
+                } else {
+                    WindowsPermissionStatus::Error
+                },
+                diag(
+                    "security_descriptor_failed",
+                    Some(index),
+                    "Could not read owner, group, and DACL from the opened path handle; no SACL was requested.",
+                    Some(error),
+                ),
+            ));
+        }
+        Err(DescriptorReadError::Limit) => {
+            return Err((
+                WindowsPermissionStatus::LimitReached,
+                diag(
+                    "descriptor_limit",
+                    Some(index),
+                    "Security descriptor size exceeds a configured per-object or aggregate bound.",
+                    None,
+                ),
+            ));
+        }
     };
-    if result != 0 || descriptor.is_null() {
-        return Err((
-            if result == ERROR_ACCESS_DENIED {
-                WindowsPermissionStatus::Inaccessible
-            } else {
-                WindowsPermissionStatus::Error
-            },
-            diag(
-                "security_descriptor_failed",
-                Some(index),
-                "Could not read owner, group, and DACL from the opened path handle; no SACL was requested.",
-                Some(result),
-            ),
-        ));
-    }
-    let descriptor = OwnedDescriptor(descriptor);
-    let length = unsafe { GetSecurityDescriptorLength(descriptor.0.cast_const()) } as usize;
-    if !(20..=MAX_DESCRIPTOR_BYTES).contains(&length)
-        || aggregate.saturating_add(length) > MAX_AGGREGATE_DESCRIPTOR_BYTES
-    {
+    let length = bytes.len();
+    if !(20..=MAX_DESCRIPTOR_BYTES).contains(&length) || length > aggregate_remaining {
         return Err((
             WindowsPermissionStatus::LimitReached,
             diag(
@@ -426,15 +520,14 @@ fn collect_one(
         ));
     }
     *aggregate += length;
-    let bytes = unsafe { std::slice::from_raw_parts(descriptor.0.cast::<u8>(), length) };
-    let (security, parse_diagnostic) = match parse_descriptor(bytes) {
+    let (security, parse_diagnostic) = match parse_descriptor(&bytes) {
         Ok(security) => (security, None),
         Err(code) => (
             WindowsSecurityDescriptorEvidence {
                 descriptor_length: bytes.len(),
-                descriptor_sha256: sha256_hex(bytes),
-                descriptor_raw_hex: hex(bytes),
-                control: le16(bytes, 2).unwrap_or_default(),
+                descriptor_sha256: sha256_hex(&bytes),
+                descriptor_raw_hex: hex(&bytes),
+                control: le16(&bytes, 2).unwrap_or_default(),
                 owner_sid_raw_hex: None,
                 group_sid_raw_hex: None,
                 dacl_state: "malformed_or_unsupported",
@@ -656,7 +749,67 @@ fn unix_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::os::windows::ffi::OsStringExt;
+
+    struct FakePermissionApi {
+        opens: VecDeque<Result<usize, u32>>,
+        metadata: VecDeque<Result<WindowsPermissionMetadata, u32>>,
+        disk_results: VecDeque<bool>,
+        descriptors: VecDeque<Result<Vec<u8>, DescriptorReadError>>,
+    }
+
+    impl FakePermissionApi {
+        fn successful_open_with_descriptor(bytes: Vec<u8>) -> Self {
+            Self {
+                opens: VecDeque::from([Ok(1)]),
+                metadata: VecDeque::from([Ok(WindowsPermissionMetadata {
+                    attributes: 0,
+                    is_directory: false,
+                    is_reparse_point: false,
+                    volume_serial_number: 1,
+                    file_index: 2,
+                    size_bytes: 3,
+                    last_write_filetime: 4,
+                })]),
+                disk_results: VecDeque::from([true]),
+                descriptors: VecDeque::from([Ok(bytes)]),
+            }
+        }
+    }
+
+    impl WindowsPermissionApi for FakePermissionApi {
+        type Handle = usize;
+
+        fn open_path(&mut self, _wide: &[u16]) -> Result<Self::Handle, u32> {
+            self.opens.pop_front().unwrap_or(Err(ERROR_FILE_NOT_FOUND))
+        }
+
+        fn metadata(&mut self, _handle: &Self::Handle) -> Result<WindowsPermissionMetadata, u32> {
+            self.metadata
+                .pop_front()
+                .unwrap_or(Err(ERROR_INVALID_PARAMETER))
+        }
+
+        fn is_disk_file(&mut self, _handle: &Self::Handle) -> bool {
+            self.disk_results.pop_front().unwrap_or(false)
+        }
+
+        fn security_descriptor(
+            &mut self,
+            _handle: &Self::Handle,
+            max_bytes: usize,
+        ) -> Result<Vec<u8>, DescriptorReadError> {
+            let result = self
+                .descriptors
+                .pop_front()
+                .unwrap_or(Err(DescriptorReadError::Win32(ERROR_INVALID_PARAMETER)))?;
+            if result.len() > max_bytes {
+                return Err(DescriptorReadError::Limit);
+            }
+            Ok(result)
+        }
+    }
 
     fn fixture(control: u16, dacl_offset: u32, acl: &[u8]) -> Vec<u8> {
         let mut bytes = vec![0u8; 20];
@@ -754,5 +907,152 @@ mod tests {
             "path_contains_nul"
         );
         assert!(document.objects[0].metadata.is_none());
+    }
+
+    #[test]
+    fn permission_collection_retains_observed_path_when_later_open_is_denied() {
+        let mut api = FakePermissionApi::successful_open_with_descriptor(fixture(0x8000, 0, &[]));
+        api.opens.push_back(Err(ERROR_ACCESS_DENIED));
+        api.metadata.push_back(Err(ERROR_INVALID_PARAMETER));
+        api.disk_results.push_back(true);
+        api.descriptors
+            .push_back(Err(DescriptorReadError::Win32(ERROR_ACCESS_DENIED)));
+        let paths = [PathBuf::from("observed.txt"), PathBuf::from("denied.txt")];
+
+        let document = collect_windows_permissions_with_api(&paths, &mut api);
+
+        assert_eq!(document.objects.len(), 2);
+        assert_eq!(
+            document.objects[0].status,
+            WindowsPermissionStatus::Complete
+        );
+        assert_eq!(
+            document.objects[0].security.as_ref().unwrap().dacl_state,
+            "absent"
+        );
+        assert_eq!(
+            document.objects[1].status,
+            WindowsPermissionStatus::Inaccessible
+        );
+        assert_eq!(
+            document.objects[1].diagnostic.as_ref().unwrap().code,
+            "open_failed"
+        );
+        assert_eq!(
+            document.objects[1].diagnostic.as_ref().unwrap().win32_error,
+            Some(ERROR_ACCESS_DENIED)
+        );
+    }
+
+    #[test]
+    fn permission_collection_reports_metadata_failure_without_inventing_security_evidence() {
+        let mut api = FakePermissionApi::successful_open_with_descriptor(fixture(0x8000, 0, &[]));
+        api.metadata.clear();
+        api.metadata.push_back(Ok(WindowsPermissionMetadata {
+            attributes: 0,
+            is_directory: false,
+            is_reparse_point: false,
+            volume_serial_number: 1,
+            file_index: 2,
+            size_bytes: 3,
+            last_write_filetime: 4,
+        }));
+        api.opens.push_back(Ok(2));
+        api.metadata.push_back(Err(ERROR_ACCESS_DENIED));
+        api.disk_results.push_back(true);
+
+        let paths = [
+            PathBuf::from("observed.txt"),
+            PathBuf::from("metadata-denied.txt"),
+        ];
+        let document = collect_windows_permissions_with_api(&paths, &mut api);
+
+        assert_eq!(
+            document.objects[0].status,
+            WindowsPermissionStatus::Complete
+        );
+        assert_eq!(
+            document.objects[1].status,
+            WindowsPermissionStatus::Inaccessible
+        );
+        assert!(document.objects[1].metadata.is_none());
+        assert!(document.objects[1].security.is_none());
+        let diagnostic = document.objects[1].diagnostic.as_ref().unwrap();
+        assert_eq!(diagnostic.code, "metadata_failed");
+        assert_eq!(diagnostic.win32_error, Some(ERROR_ACCESS_DENIED));
+    }
+
+    #[test]
+    fn generic_metadata_failure_remains_error_and_preserves_native_code() {
+        let mut api = FakePermissionApi::successful_open_with_descriptor(fixture(0x8000, 0, &[]));
+        api.metadata.clear();
+        api.metadata.push_back(Err(ERROR_INVALID_PARAMETER));
+        let paths = [PathBuf::from("metadata-error.txt")];
+
+        let document = collect_windows_permissions_with_api(&paths, &mut api);
+
+        assert_eq!(document.objects[0].status, WindowsPermissionStatus::Error);
+        assert_eq!(
+            document.objects[0].diagnostic.as_ref().unwrap().win32_error,
+            Some(ERROR_INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn descriptor_access_failure_is_explicit_and_keeps_earlier_object() {
+        let mut api = FakePermissionApi::successful_open_with_descriptor(fixture(0x8000, 0, &[]));
+        api.opens.push_back(Ok(2));
+        api.metadata.push_back(Ok(WindowsPermissionMetadata {
+            attributes: 0,
+            is_directory: false,
+            is_reparse_point: false,
+            volume_serial_number: 1,
+            file_index: 5,
+            size_bytes: 6,
+            last_write_filetime: 7,
+        }));
+        api.disk_results.push_back(true);
+        api.descriptors
+            .push_back(Err(DescriptorReadError::Win32(ERROR_ACCESS_DENIED)));
+
+        let paths = [
+            PathBuf::from("observed.txt"),
+            PathBuf::from("security-denied.txt"),
+        ];
+        let document = collect_windows_permissions_with_api(&paths, &mut api);
+
+        assert_eq!(document.objects.len(), 2);
+        assert_eq!(
+            document.objects[0].status,
+            WindowsPermissionStatus::Complete
+        );
+        assert_eq!(
+            document.objects[1].status,
+            WindowsPermissionStatus::Inaccessible
+        );
+        assert!(document.objects[1].metadata.is_none());
+        assert_eq!(
+            document.objects[1].diagnostic.as_ref().unwrap().code,
+            "security_descriptor_failed"
+        );
+    }
+
+    #[test]
+    fn oversized_security_descriptor_is_reported_as_a_limit_not_parsed() {
+        let mut api =
+            FakePermissionApi::successful_open_with_descriptor(vec![0; MAX_DESCRIPTOR_BYTES + 1]);
+        let document =
+            collect_windows_permissions_with_api(&[PathBuf::from("oversized.txt")], &mut api);
+
+        assert_eq!(document.status, WindowsPermissionStatus::LimitReached);
+        assert_eq!(
+            document.objects[0].status,
+            WindowsPermissionStatus::LimitReached
+        );
+        assert!(document.objects[0].security.is_none());
+        assert_eq!(
+            document.objects[0].diagnostic.as_ref().unwrap().code,
+            "descriptor_limit"
+        );
     }
 }

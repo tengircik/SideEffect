@@ -33,7 +33,7 @@ fn windows_startup_command_reports_service_and_task_sources() {
     let bytes = fs::read(&output).unwrap();
     let document: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(document["schema"], "sideeffect.windows_startup_inventory");
-    assert_eq!(document["schema_version"], 3);
+    assert_eq!(document["schema_version"], 4);
     assert_eq!(document["platform"], "windows");
     match document["status"].as_str().unwrap() {
         "complete" => assert_eq!(first.status.code(), Some(0)),
@@ -108,6 +108,21 @@ fn windows_startup_command_reports_service_and_task_sources() {
         assert!(entry["logon_user"].is_null() || entry["logon_user"].is_string());
         assert!(entry["evidence"]["task_index"].is_number());
         assert!(entry["evidence"]["trigger_index"].is_number());
+    }
+    for action in document["scheduled_task_actions"].as_array().unwrap() {
+        assert!(action["task_path"].is_null() || action["task_path"].is_string());
+        assert!(action["action_index"].is_number());
+        assert!(action["action_type"].is_string());
+        assert!(action["action_type_code"].is_number() || action["action_type_code"].is_null());
+        assert!(matches!(
+            action["status"].as_str(),
+            Some("observed" | "unsupported" | "partial")
+        ));
+        assert!(action["executable_path"].is_null() || action["executable_path"].is_string());
+        assert!(action["arguments"].is_null() || action["arguments"].is_string());
+        assert!(action["working_directory"].is_null() || action["working_directory"].is_string());
+        assert!(action["evidence"]["task_index"].is_number());
+        assert!(action["evidence"]["action_index"].is_number());
     }
     for entry in document["registry_entries"].as_array().unwrap() {
         assert!(entry["command"].is_null() || entry["command"].is_string());

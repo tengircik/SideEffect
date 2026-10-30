@@ -40,6 +40,10 @@ fn windows_process_command_includes_current_test_process_and_refuses_overwrite()
     let document: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(document["schema"], "sideeffect.windows_process_inventory");
     assert_eq!(document["platform"], "windows");
+    assert_eq!(
+        document["scope"],
+        "toolhelp_process_snapshot_and_queryable_image_paths"
+    );
     assert!(document["processes"].as_array().is_some());
     assert!(document["processes"].as_array().unwrap().iter().any(|row| {
         row["process_id"] == std::process::id()
