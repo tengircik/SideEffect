@@ -35,6 +35,7 @@ This document records what the current repository implementation collects and wh
 ## Cross-source comparison notes
 
 - Inventory snapshots are best-effort observations over intervals and are not atomic. A complete collector status means its declared bounded work finished; it does not mean complete OS coverage.
+- The session coverage vocabulary defines `not_observed`, but current session producers do not emit it. Empty inventory rows or zero runtime events must not be translated into a claim that software or activity was absent.
 - The audit-session comparator requires matching declared platform, architecture, known OS identity/version, source scopes/statuses, collector identities/versions, settings, limits, and artifact contracts. A comparable session pair is not proof of equal coverage or event absence; see `docs/ARCHITECTURE.md` and `docs/AUDIT_SESSION_COMPATIBILITY.md`.
 - Linux and Windows schemas often represent different native facts. Similar labels such as “package”, “permission”, “process”, “startup”, or “event” do not imply equivalent semantics. See `docs/SCHEMA_COMPATIBILITY.md` for exact versions and accepted adapters.
 - Raw data, paths, names, identifiers, registry/configuration values, and traces may be sensitive. Local output is not automatically redacted or safe to publish; see `SECURITY.md` and `docs/INSTALL.md`.
