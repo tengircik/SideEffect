@@ -709,6 +709,19 @@ mod tests {
             ended_at_unix_ms: 1_002,
             interval_semantics: IntervalSemantics::BestEffortNonAtomic,
             status: SessionStatus::Partial,
+            coverage_manifest: Some(crate::audit_session::CoverageManifest::from_sources(&[
+                crate::audit_session::AuditSessionSource {
+                    role: SourceRole::Runtime,
+                    platform: "windows".to_owned(),
+                    scope: "synthetic ETW artifact contract fixture".to_owned(),
+                    started_at_unix_ms: 1_000,
+                    ended_at_unix_ms: 1_002,
+                    status: SourceStatus::Partial,
+                    applied_limits: vec![],
+                    diagnostic_codes: vec![],
+                    artifacts: vec![],
+                },
+            ])),
             sources: vec![AuditSessionSource {
                 role: SourceRole::Runtime,
                 platform: "windows".to_owned(),

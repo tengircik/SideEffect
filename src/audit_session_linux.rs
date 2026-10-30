@@ -2,9 +2,10 @@
 
 use crate::audit_session::{
     AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, AppliedLimit, ArtifactKind,
-    AuditSessionManifest, AuditSessionSource, IntervalSemantics, MAX_SESSION_ARTIFACT_BYTES,
-    MAX_SESSION_SOURCES, MAX_SESSION_TIMESTAMP_UNIX_MS, MAX_SESSION_TOTAL_ARTIFACT_BYTES,
-    SessionArtifactRef, SessionId, SessionStatus, SourceRole, SourceStatus,
+    AuditSessionManifest, AuditSessionSource, CoverageManifest, IntervalSemantics,
+    MAX_SESSION_ARTIFACT_BYTES, MAX_SESSION_SOURCES, MAX_SESSION_TIMESTAMP_UNIX_MS,
+    MAX_SESSION_TOTAL_ARTIFACT_BYTES, SessionArtifactRef, SessionId, SessionStatus, SourceRole,
+    SourceStatus,
 };
 use crate::fingerprint::sha256_hex;
 use crate::inventory::{collect_packages, collect_permissions, collect_processes, collect_startup};
@@ -314,6 +315,7 @@ pub fn collect_and_publish(
         });
     }
 
+    let coverage_manifest = Some(CoverageManifest::from_sources(&sources));
     let manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
         schema_version: AUDIT_SESSION_SCHEMA_VERSION,
@@ -329,6 +331,7 @@ pub fn collect_and_publish(
             SessionStatus::Partial
         },
         sources,
+        coverage_manifest,
     };
     manifest
         .validate()

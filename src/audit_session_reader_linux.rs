@@ -608,6 +608,13 @@ mod tests {
             ended_at_unix_ms: 101,
             interval_semantics: IntervalSemantics::BestEffortNonAtomic,
             status: SessionStatus::Complete,
+            coverage_manifest: Some(crate::audit_session::CoverageManifest {
+                version: crate::audit_session::COVERAGE_MANIFEST_VERSION,
+                sources: vec![crate::audit_session::SourceCoverage {
+                    role: SourceRole::Packages,
+                    status: crate::audit_session::CoverageStatus::Observed,
+                }],
+            }),
             sources: vec![AuditSessionSource {
                 role: SourceRole::Packages,
                 platform: "linux".to_owned(),

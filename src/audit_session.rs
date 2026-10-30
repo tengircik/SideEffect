@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 pub const AUDIT_SESSION_SCHEMA: &str = "sideeffect.audit_session";
-pub const AUDIT_SESSION_SCHEMA_VERSION: u32 = 1;
+pub const AUDIT_SESSION_SCHEMA_VERSION: u32 = 2;
+pub const AUDIT_SESSION_V1_SCHEMA_VERSION: u32 = 1;
+pub const COVERAGE_MANIFEST_VERSION: u32 = 1;
 pub const MAX_AUDIT_SESSION_MANIFEST_BYTES: usize = 512 * 1024;
 pub const MAX_SESSION_SOURCES: usize = 8;
 pub const MAX_SESSION_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
@@ -37,6 +39,73 @@ pub struct AuditSessionManifest {
     pub interval_semantics: IntervalSemantics,
     pub status: SessionStatus,
     pub sources: Vec<AuditSessionSource>,
+    /// Missing in v1 manifests; v2 producers include an explicit bounded map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_manifest: Option<CoverageManifest>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoverageManifest {
+    pub version: u32,
+    pub sources: Vec<SourceCoverage>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceCoverage {
+    pub role: SourceRole,
+    pub status: CoverageStatus,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageStatus {
+    Observed,
+    Configured,
+    NotObserved,
+    NotChecked,
+    Unsupported,
+    Inaccessible,
+    Partial,
+    Unknown,
+}
+
+impl CoverageManifest {
+    /// Summarize only the selected source's declared result. This is not an
+    /// assertion that the source or operating system was exhaustively covered.
+    pub fn from_sources(sources: &[AuditSessionSource]) -> Self {
+        let sources = sources
+            .iter()
+            .map(|source| SourceCoverage {
+                role: source.role,
+                status: coverage_status_for_source(source),
+            })
+            .collect();
+        Self {
+            version: COVERAGE_MANIFEST_VERSION,
+            sources,
+        }
+    }
+}
+
+fn coverage_status_for_source(source: &AuditSessionSource) -> CoverageStatus {
+    match source.status {
+        SourceStatus::Complete if source.role == SourceRole::Startup => CoverageStatus::Configured,
+        // “Observed” means the selected inventory snapshot was read; it does
+        // not mean runtime activity was observed.
+        SourceStatus::Complete => CoverageStatus::Observed,
+        SourceStatus::Partial => CoverageStatus::Partial,
+        SourceStatus::NotChecked => CoverageStatus::NotChecked,
+        SourceStatus::Unsupported => CoverageStatus::Unsupported,
+        SourceStatus::AccessDenied => CoverageStatus::Inaccessible,
+        SourceStatus::Unknown
+        | SourceStatus::NotApplicable
+        | SourceStatus::Unavailable
+        | SourceStatus::Failed
+        | SourceStatus::TimedOut
+        | SourceStatus::OutputLimitExceeded => CoverageStatus::Unknown,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -152,7 +221,10 @@ impl AuditSessionManifest {
     /// artifact references before serializing, consuming, or publishing it.
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.schema != AUDIT_SESSION_SCHEMA
-            || self.schema_version != AUDIT_SESSION_SCHEMA_VERSION
+            || !matches!(
+                self.schema_version,
+                AUDIT_SESSION_V1_SCHEMA_VERSION | AUDIT_SESSION_SCHEMA_VERSION
+            )
         {
             return Err(ValidationError::InvalidSchema);
         }
@@ -164,6 +236,29 @@ impl AuditSessionManifest {
         validate_interval(self.started_at_unix_ms, self.ended_at_unix_ms)?;
         if self.sources.is_empty() || self.sources.len() > MAX_SESSION_SOURCES {
             return Err(ValidationError::SourceCountOutOfBounds);
+        }
+        match (&self.coverage_manifest, self.schema_version) {
+            (None, AUDIT_SESSION_V1_SCHEMA_VERSION) => {}
+            (Some(coverage), AUDIT_SESSION_SCHEMA_VERSION) => {
+                if coverage.version != COVERAGE_MANIFEST_VERSION
+                    || coverage.sources.len() != self.sources.len()
+                    || coverage.sources.len() > MAX_SESSION_SOURCES
+                {
+                    return Err(ValidationError::InvalidCoverageManifest);
+                }
+                let mut coverage_roles = HashSet::new();
+                for entry in &coverage.sources {
+                    let Some(source) = self.sources.iter().find(|s| s.role == entry.role) else {
+                        return Err(ValidationError::InvalidCoverageManifest);
+                    };
+                    if !coverage_roles.insert(entry.role)
+                        || entry.status != coverage_status_for_source(source)
+                    {
+                        return Err(ValidationError::InvalidCoverageManifest);
+                    }
+                }
+            }
+            _ => return Err(ValidationError::InvalidCoverageManifest),
         }
 
         let mut roles = HashSet::new();
@@ -414,14 +509,16 @@ pub enum ValidationError {
     RuntimeCompletenessNotEstablished,
     ManifestTooLarge,
     InvalidManifestJson,
+    InvalidCoverageManifest,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, AppliedLimit, ArtifactKind,
-        AuditSessionManifest, AuditSessionSource, IntervalSemantics, SessionArtifactRef,
-        SessionStatus, SourceRole, SourceStatus, ValidationError, parse_manifest,
+        AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, AUDIT_SESSION_V1_SCHEMA_VERSION,
+        AppliedLimit, ArtifactKind, AuditSessionManifest, AuditSessionSource, CoverageManifest,
+        IntervalSemantics, SessionArtifactRef, SessionStatus, SourceRole, SourceStatus,
+        ValidationError, parse_manifest,
     };
 
     fn valid_manifest() -> AuditSessionManifest {
@@ -435,6 +532,17 @@ mod tests {
             ended_at_unix_ms: 1002,
             interval_semantics: IntervalSemantics::BestEffortNonAtomic,
             status: SessionStatus::Complete,
+            coverage_manifest: Some(CoverageManifest::from_sources(&[AuditSessionSource {
+                role: SourceRole::Packages,
+                platform: "linux".to_owned(),
+                scope: "available package databases".to_owned(),
+                started_at_unix_ms: 1000,
+                ended_at_unix_ms: 1001,
+                status: SourceStatus::Complete,
+                applied_limits: vec![],
+                diagnostic_codes: vec![],
+                artifacts: vec![],
+            }])),
             sources: vec![AuditSessionSource {
                 role: SourceRole::Packages,
                 platform: "linux".to_owned(),
@@ -489,9 +597,74 @@ mod tests {
     }
 
     #[test]
+    fn v1_manifests_remain_readable_without_inventing_coverage() {
+        let mut value = serde_json::to_value(valid_manifest()).unwrap();
+        value["schema_version"] = serde_json::json!(AUDIT_SESSION_V1_SCHEMA_VERSION);
+        value.as_object_mut().unwrap().remove("coverage_manifest");
+        let parsed = parse_manifest(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(parsed.schema_version, AUDIT_SESSION_V1_SCHEMA_VERSION);
+        assert_eq!(parsed.coverage_manifest, None);
+
+        let mut v2 = valid_manifest();
+        v2.coverage_manifest = None;
+        assert_eq!(v2.validate(), Err(ValidationError::InvalidCoverageManifest));
+    }
+
+    #[test]
+    fn coverage_manifest_is_bounded_versioned_and_explicit() {
+        let mut manifest = valid_manifest();
+        let entry = &manifest.coverage_manifest.as_ref().unwrap().sources[0];
+        assert_eq!(entry.status, super::CoverageStatus::Observed);
+        manifest.coverage_manifest.as_mut().unwrap().sources[0].status =
+            super::CoverageStatus::Configured;
+        assert_eq!(
+            manifest.validate(),
+            Err(ValidationError::InvalidCoverageManifest)
+        );
+        manifest.coverage_manifest.as_mut().unwrap().sources[0].status =
+            super::CoverageStatus::Observed;
+        manifest.coverage_manifest.as_mut().unwrap().version += 1;
+        assert_eq!(
+            manifest.validate(),
+            Err(ValidationError::InvalidCoverageManifest)
+        );
+        let startup = AuditSessionSource {
+            role: SourceRole::Startup,
+            platform: "linux".to_owned(),
+            scope: "curated startup paths".to_owned(),
+            started_at_unix_ms: 1000,
+            ended_at_unix_ms: 1001,
+            status: SourceStatus::Complete,
+            applied_limits: vec![],
+            diagnostic_codes: vec![],
+            artifacts: vec![],
+        };
+        assert_eq!(
+            CoverageManifest::from_sources(&[startup]).sources[0].status,
+            super::CoverageStatus::Configured
+        );
+        let inaccessible = AuditSessionSource {
+            role: SourceRole::Processes,
+            platform: "linux".to_owned(),
+            scope: "visible procfs".to_owned(),
+            started_at_unix_ms: 1000,
+            ended_at_unix_ms: 1001,
+            status: SourceStatus::AccessDenied,
+            applied_limits: vec![],
+            diagnostic_codes: vec![],
+            artifacts: vec![],
+        };
+        assert_eq!(
+            CoverageManifest::from_sources(&[inaccessible]).sources[0].status,
+            super::CoverageStatus::Inaccessible
+        );
+    }
+
+    #[test]
     fn incomplete_source_cannot_be_hidden_by_a_complete_session() {
         let mut manifest = valid_manifest();
         manifest.sources[0].status = SourceStatus::Partial;
+        manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
         assert_eq!(
             manifest.validate(),
             Err(super::ValidationError::SessionStatusHidesIncompleteSource)
@@ -515,6 +688,7 @@ mod tests {
             diagnostic_codes: vec!["procfs_unavailable".to_owned()],
             artifacts: Vec::new(),
         });
+        manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
 
         assert!(manifest.validate().is_ok());
         let bytes = serde_json::to_vec(&manifest).unwrap();
@@ -577,15 +751,18 @@ mod tests {
             }],
         });
         manifest.status = SessionStatus::Partial;
+        manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
         assert!(manifest.validate().is_ok());
 
         manifest.sources[1].status = SourceStatus::Complete;
+        manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
         manifest.status = SessionStatus::Partial;
         assert_eq!(
             manifest.validate(),
             Err(ValidationError::RuntimeCompletenessNotEstablished)
         );
         manifest.sources[1].status = SourceStatus::Partial;
+        manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
 
         manifest.sources[0].artifacts[0].schema_version = 99;
         assert_eq!(
@@ -629,6 +806,7 @@ mod tests {
         manifest.sources.push(processes);
         manifest.sources.push(unavailable);
         manifest.status = SessionStatus::Partial;
+        manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
 
         assert!(manifest.validate().is_ok());
         assert_eq!(manifest.status, SessionStatus::Partial);
@@ -717,6 +895,7 @@ mod tests {
             "permissions.json",
             "sideeffect.permission_inventory",
         ));
+        manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
         assert_eq!(
             manifest.validate(),
             Err(ValidationError::AggregateSizeOutOfBounds)

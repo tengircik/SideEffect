@@ -2,8 +2,8 @@
 
 use crate::audit_session::{
     AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, ArtifactKind, AuditSessionManifest,
-    AuditSessionSource, IntervalSemantics, SessionArtifactRef, SessionStatus, SourceRole,
-    SourceStatus,
+    AuditSessionSource, CoverageManifest, IntervalSemantics, SessionArtifactRef, SessionStatus,
+    SourceRole, SourceStatus,
 };
 use crate::fingerprint::sha256_hex;
 use crate::inventory::{
@@ -378,6 +378,7 @@ fn build_manifest(
             .collect();
     }
     let complete = sources.iter().all(|s| s.status == SourceStatus::Complete);
+    let coverage_manifest = Some(CoverageManifest::from_sources(&sources));
     let manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
         schema_version: AUDIT_SESSION_SCHEMA_VERSION,
@@ -402,6 +403,7 @@ fn build_manifest(
             SessionStatus::Partial
         },
         sources,
+        coverage_manifest,
     };
     manifest
         .validate()

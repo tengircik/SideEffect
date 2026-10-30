@@ -1,6 +1,8 @@
 # Audit session compatibility
 
-The `sideeffect.audit_session` v1 manifest is a platform-neutral envelope. Native inventory and runtime artifacts keep their own schemas. A reader accepts only the exact combinations below; it does not migrate older artifact versions, infer missing fields, or treat an unknown source as complete. Unknown platform strings and artifact contracts are rejected.
+The `sideeffect.audit_session` v2 manifest is a platform-neutral envelope. Readers also accept v1 manifests for compatibility; v1 has no `coverage_manifest`, so its coverage status is rendered as `unknown`. Native inventory and runtime artifacts keep their own schemas. A reader accepts only the exact combinations below; it does not migrate artifact versions or treat an unknown source as complete. Unknown platform strings and artifact contracts are rejected.
+
+V2 includes a bounded `coverage_manifest` with version 1 and one status per selected source role. Status is one of `observed`, `configured`, `not_observed`, `not_checked`, `unsupported`, `inaccessible`, `partial`, or `unknown`. The current producers report `configured` for a complete startup source, `observed` for a complete selected inventory snapshot, preserve partial/not-checked/unsupported/access-denied as `partial`/`not_checked`/`unsupported`/`inaccessible`, and use `unknown` for other incomplete states. Here `observed` means the selected inventory was read; it does not claim runtime activity. Runtime capture remains partial today. These values describe the selected collector result only; they do not assert exhaustive OS coverage.
 
 | Platform | Source role | Fixed artifact | Native schema | Version |
 | --- | --- | --- | --- | ---: |
@@ -22,4 +24,4 @@ Windows runtime capture is selected explicitly with `--runtime-source windows-et
 
 Each artifact reference has a fixed basename, exact native schema/version, positive bounded byte length, and lowercase SHA-256 digest. Readers reject unknown fields in the manifest, duplicate roles/artifacts, extra directory entries, unexpected artifact versions, oversized data, and mismatching hashes. The manifest digest is an integrity consistency check only; it does not authenticate who produced the manifest or artifacts. Readers render source metadata and do not claim full semantic validation of native inventory documents.
 
-The envelope version stays at 1 when a new platform contract is added because its serialized envelope fields and semantics do not change. Older binaries safely reject newly added platform/artifact combinations. A change to envelope fields or status/completeness semantics requires a manifest schema-version change; a native artifact format change requires its own artifact schema-version change and explicit reader support.
+The envelope version changes when fields or status/completeness semantics change. V2 adds the versioned coverage manifest; readers continue to accept v1 and do not invent coverage fields for it. Older binaries safely reject v2. A native artifact format change requires its own artifact schema-version change and explicit reader support.

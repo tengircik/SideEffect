@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use serde::Serialize;
 
 use crate::audit_session::{
-    AppliedLimit, AuditSessionManifest, SessionStatus, SourceRole, SourceStatus,
+    AppliedLimit, AuditSessionManifest, CoverageStatus, SessionStatus, SourceRole, SourceStatus,
 };
 
 /// Render verified session metadata without copying inventory rows into terminal output.
@@ -29,7 +29,9 @@ pub fn write_audit_session_text<W: Write>(
     )?;
     writer.write_all(b"Interval semantics: best_effort_non_atomic\n")?;
     writer.write_all(b"Intervals are best effort; no atomic system snapshot is claimed.\n")?;
-    writer.write_all(b"Coverage: complete means selected collectors produced their declared artifacts; it does not establish exhaustive system coverage.\n")?;
+    writer.write_all(
+        b"Coverage note: selected collector results do not establish exhaustive system coverage.\n",
+    )?;
     writer.write_all(b"Integrity: listed artifact lengths and SHA-256 values matched the local bytes; hashes do not authenticate the source.\n")?;
     writeln!(writer, "Sources: {}", manifest.sources.len())?;
 
@@ -37,6 +39,21 @@ pub fn write_audit_session_text<W: Write>(
         writeln!(writer, "\nSource {}", index + 1)?;
         writeln!(writer, "  Role: {}", source_role_name(source.role))?;
         writeln!(writer, "  Status: {}", source_status_name(source.status))?;
+        writeln!(
+            writer,
+            "  Coverage: {}",
+            coverage_status_name(
+                manifest
+                    .coverage_manifest
+                    .as_ref()
+                    .and_then(|coverage| coverage
+                        .sources
+                        .iter()
+                        .find(|entry| entry.role == source.role)
+                        .map(|entry| entry.status))
+                    .unwrap_or(CoverageStatus::Unknown)
+            )
+        )?;
         writeln!(writer, "  Platform: {}", source.platform)?;
         writer.write_all(b"  Scope: ")?;
         write_quoted_ascii(writer, &source.scope)?;
@@ -94,6 +111,19 @@ pub fn write_audit_session_json<W: Write>(
             role: source_role_name(source.role),
             platform: &source.platform,
             status: source_status_name(source.status),
+            coverage_status: coverage_status_name(
+                manifest
+                    .coverage_manifest
+                    .as_ref()
+                    .and_then(|coverage| {
+                        coverage
+                            .sources
+                            .iter()
+                            .find(|entry| entry.role == source.role)
+                            .map(|entry| entry.status)
+                    })
+                    .unwrap_or(CoverageStatus::Unknown),
+            ),
             scope: escape_ascii(&source.scope),
             scope_encoding: "non_ascii_and_controls_escaped_as_ascii",
             started_at_unix_ms: source.started_at_unix_ms,
@@ -117,7 +147,7 @@ pub fn write_audit_session_json<W: Write>(
         .collect();
     let review = SessionReview {
         schema: "sideeffect.audit_session_review",
-        schema_version: 1,
+        schema_version: 2,
         session_id: &manifest.session_id,
         platform: &manifest.platform,
         architecture: escape_ascii(&manifest.architecture),
@@ -155,6 +185,7 @@ struct SessionSourceReview<'a> {
     role: &'static str,
     platform: &'a str,
     status: &'static str,
+    coverage_status: &'static str,
     scope: String,
     scope_encoding: &'static str,
     started_at_unix_ms: u128,
@@ -234,6 +265,19 @@ fn source_status_name(status: SourceStatus) -> &'static str {
     }
 }
 
+fn coverage_status_name(status: CoverageStatus) -> &'static str {
+    match status {
+        CoverageStatus::Observed => "observed",
+        CoverageStatus::Configured => "configured",
+        CoverageStatus::NotObserved => "not_observed",
+        CoverageStatus::NotChecked => "not_checked",
+        CoverageStatus::Unsupported => "unsupported",
+        CoverageStatus::Inaccessible => "inaccessible",
+        CoverageStatus::Partial => "partial",
+        CoverageStatus::Unknown => "unknown",
+    }
+}
+
 fn source_role_name(role: SourceRole) -> &'static str {
     match role {
         crate::audit_session::SourceRole::Packages => "packages",
@@ -265,7 +309,8 @@ mod tests {
     use super::{write_audit_session_json, write_audit_session_text};
     use crate::audit_session::{
         AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, AuditSessionManifest,
-        AuditSessionSource, IntervalSemantics, SessionStatus, SourceRole, SourceStatus,
+        AuditSessionSource, COVERAGE_MANIFEST_VERSION, CoverageManifest, CoverageStatus,
+        IntervalSemantics, SessionStatus, SourceCoverage, SourceRole, SourceStatus,
     };
 
     fn manifest(scope: &str, status: SourceStatus) -> AuditSessionManifest {
@@ -283,6 +328,17 @@ mod tests {
             } else {
                 SessionStatus::Partial
             },
+            coverage_manifest: Some(CoverageManifest {
+                version: COVERAGE_MANIFEST_VERSION,
+                sources: vec![SourceCoverage {
+                    role: SourceRole::Packages,
+                    status: if status == SourceStatus::Complete {
+                        CoverageStatus::Observed
+                    } else {
+                        CoverageStatus::Partial
+                    },
+                }],
+            }),
             sources: vec![AuditSessionSource {
                 role: SourceRole::Packages,
                 platform: "linux".to_owned(),
@@ -324,6 +380,7 @@ mod tests {
         assert!(output.is_ascii());
         let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(value["schema"], "sideeffect.audit_session_review");
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["authenticity"], "not_established");
         assert_eq!(value["architecture"], "x86\\u{202e}_64");
         assert_eq!(
@@ -332,5 +389,17 @@ mod tests {
         );
         assert_eq!(value["sources"][0]["scope"], "safe\\n\\u{202e}path");
         assert_eq!(value["sources"][0]["status"], "partial");
+        assert_eq!(value["sources"][0]["coverage_status"], "partial");
+    }
+
+    #[test]
+    fn v1_review_keeps_missing_coverage_unknown() {
+        let mut fixture = manifest("legacy v1", SourceStatus::Complete);
+        fixture.schema_version = crate::audit_session::AUDIT_SESSION_V1_SCHEMA_VERSION;
+        fixture.coverage_manifest = None;
+        let mut output = Vec::new();
+        write_audit_session_json(&fixture, &mut output).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["sources"][0]["coverage_status"], "unknown");
     }
 }

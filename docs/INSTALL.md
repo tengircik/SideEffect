@@ -223,7 +223,7 @@ To verify and review the session metadata:
 ./target/release/sideeffect inspect --format text --session ./audit-session
 ```
 
-The reader requires a current-user-owned private directory and private regular files, rejects symlinks and unlisted entries, checks bounded JSON syntax and declared schema/version headers, and verifies every declared artifact's length and SHA-256 before writing a review. It does not fully validate each inventory artifact's domain schema or print raw inventory rows. Use `--format json` for the versioned `sideeffect.audit_session_review` v1 output. A hash match does not authenticate the session producer. Partial sessions are still reviewable and return exit status `2`.
+The reader requires a current-user-owned private directory and private regular files, rejects symlinks and unlisted entries, checks bounded JSON syntax and declared schema/version headers, and verifies every declared artifact's length and SHA-256 before writing a review. It does not fully validate each inventory artifact's domain schema or print raw inventory rows. Use `--format json` for the versioned `sideeffect.audit_session_review` v2 output. A hash match does not authenticate the session producer. Partial sessions are still reviewable and return exit status `2`.
 
 ## Record a command on Linux
 
