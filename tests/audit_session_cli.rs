@@ -142,7 +142,7 @@ fn audit_cli_publishes_private_session_with_verified_source_intervals_and_hashes
         if format == "json" {
             let review: serde_json::Value = serde_json::from_slice(&reviewed.stdout).unwrap();
             assert_eq!(review["schema"], "sideeffect.audit_session_review");
-            assert_eq!(review["schema_version"], 2);
+            assert_eq!(review["schema_version"], 3);
             assert_eq!(review["authenticity"], "not_established");
             assert_eq!(review["sources"].as_array().unwrap().len(), 4);
             assert!(review["sources"][0]["coverage_status"].is_string());
@@ -150,13 +150,19 @@ fn audit_cli_publishes_private_session_with_verified_source_intervals_and_hashes
                 review["sources"][0]["artifacts"][0]["integrity"],
                 "length_and_sha256_match_local_bytes"
             );
+            assert_eq!(
+                review["sources"][0]["artifacts"][0]["provenance"],
+                "manifest_reference_verified_against_local_bytes"
+            );
         } else {
             assert!(reviewed.stdout.is_ascii());
             let text = String::from_utf8(reviewed.stdout).unwrap();
             assert!(text.contains("SideEffect audit session review"));
             assert!(text.contains("no atomic system snapshot is claimed"));
             assert!(text.contains("hashes do not authenticate the source"));
-            assert!(text.contains("Verified artifacts:"));
+            assert!(
+                text.contains("Artifact provenance (verified local bytes; not authenticated):")
+            );
         }
     }
 
@@ -233,6 +239,15 @@ fn audit_cli_includes_bounded_runtime_bundle_and_preserves_argument_boundaries()
         .unwrap();
     assert_eq!(runtime.status, SourceStatus::Partial);
     assert!(runtime.started_at_unix_ms <= runtime.ended_at_unix_ms);
+    assert_eq!(
+        runtime.requested_settings[0].code,
+        "runtime_duration_seconds"
+    );
+    assert_eq!(runtime.requested_settings[0].value, 2);
+    assert_eq!(
+        runtime.loss.as_ref().unwrap().status,
+        sideeffect::audit_session::LossStatus::Unknown
+    );
     assert!(
         runtime
             .diagnostic_codes

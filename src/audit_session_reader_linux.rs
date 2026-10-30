@@ -623,6 +623,9 @@ mod tests {
                 ended_at_unix_ms: 101,
                 status: SourceStatus::Complete,
                 applied_limits: Vec::new(),
+                requested_settings: Vec::new(),
+                effective_settings: Vec::new(),
+                loss: None,
                 diagnostic_codes: Vec::new(),
                 artifacts: vec![SessionArtifactRef {
                     kind: ArtifactKind::Packages,

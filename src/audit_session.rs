@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 pub const AUDIT_SESSION_SCHEMA: &str = "sideeffect.audit_session";
-pub const AUDIT_SESSION_SCHEMA_VERSION: u32 = 2;
+pub const AUDIT_SESSION_SCHEMA_VERSION: u32 = 3;
 pub const AUDIT_SESSION_V1_SCHEMA_VERSION: u32 = 1;
+pub const AUDIT_SESSION_V2_SCHEMA_VERSION: u32 = 2;
 pub const COVERAGE_MANIFEST_VERSION: u32 = 1;
 pub const MAX_AUDIT_SESSION_MANIFEST_BYTES: usize = 512 * 1024;
 pub const MAX_SESSION_SOURCES: usize = 8;
@@ -19,6 +20,7 @@ pub const MAX_SESSION_TIMESTAMP_UNIX_MS: u128 = 253_402_300_799_999;
 pub const MAX_PLATFORM_BYTES: usize = 64;
 pub const MAX_SCOPE_BYTES: usize = 4 * 1024;
 pub const MAX_LIMITS_PER_SOURCE: usize = 64;
+pub const MAX_SETTINGS_PER_SOURCE: usize = 32;
 pub const MAX_DIAGNOSTIC_CODES_PER_SOURCE: usize = 256;
 pub const MAX_CODE_BYTES: usize = 128;
 
@@ -39,7 +41,7 @@ pub struct AuditSessionManifest {
     pub interval_semantics: IntervalSemantics,
     pub status: SessionStatus,
     pub sources: Vec<AuditSessionSource>,
-    /// Missing in v1 manifests; v2 producers include an explicit bounded map.
+    /// Missing in v1 manifests; v2 and v3 producers include an explicit bounded map.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_manifest: Option<CoverageManifest>,
 }
@@ -161,8 +163,58 @@ pub struct AuditSessionSource {
     pub ended_at_unix_ms: u128,
     pub status: SourceStatus,
     pub applied_limits: Vec<AppliedLimit>,
+    /// Explicitly requested settings are kept separate from collector limits
+    /// and from settings the source reports as effective.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requested_settings: Vec<Setting>,
+    /// Settings reported by the source as effective; absent means unavailable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effective_settings: Vec<Setting>,
+    /// Runtime loss facts, if this source reports them. Inventory sources omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss: Option<LossMetadata>,
     pub diagnostic_codes: Vec<String>,
     pub artifacts: Vec<SessionArtifactRef>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Setting {
+    /// Stable snake_case code naming a requested or source-reported setting.
+    pub code: String,
+    pub value: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LossStatus {
+    Reported,
+    NoneReported,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LossMetadata {
+    pub status: LossStatus,
+    pub statistics_available: bool,
+    pub final_snapshot_available: bool,
+    pub events_lost: Option<u64>,
+    pub log_buffers_lost: Option<u64>,
+    pub real_time_buffers_lost: Option<u64>,
+}
+
+impl LossMetadata {
+    pub fn unknown() -> Self {
+        Self {
+            status: LossStatus::Unknown,
+            statistics_available: false,
+            final_snapshot_available: false,
+            events_lost: None,
+            log_buffers_lost: None,
+            real_time_buffers_lost: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -223,7 +275,9 @@ impl AuditSessionManifest {
         if self.schema != AUDIT_SESSION_SCHEMA
             || !matches!(
                 self.schema_version,
-                AUDIT_SESSION_V1_SCHEMA_VERSION | AUDIT_SESSION_SCHEMA_VERSION
+                AUDIT_SESSION_V1_SCHEMA_VERSION
+                    | AUDIT_SESSION_V2_SCHEMA_VERSION
+                    | AUDIT_SESSION_SCHEMA_VERSION
             )
         {
             return Err(ValidationError::InvalidSchema);
@@ -239,7 +293,7 @@ impl AuditSessionManifest {
         }
         match (&self.coverage_manifest, self.schema_version) {
             (None, AUDIT_SESSION_V1_SCHEMA_VERSION) => {}
-            (Some(coverage), AUDIT_SESSION_SCHEMA_VERSION) => {
+            (Some(coverage), AUDIT_SESSION_V2_SCHEMA_VERSION | AUDIT_SESSION_SCHEMA_VERSION) => {
                 if coverage.version != COVERAGE_MANIFEST_VERSION
                     || coverage.sources.len() != self.sources.len()
                     || coverage.sources.len() > MAX_SESSION_SOURCES
@@ -283,12 +337,66 @@ impl AuditSessionManifest {
                 return Err(ValidationError::SourceOutsideSessionInterval);
             }
             if source.applied_limits.len() > MAX_LIMITS_PER_SOURCE
+                || source.requested_settings.len() > MAX_SETTINGS_PER_SOURCE
+                || source.effective_settings.len() > MAX_SETTINGS_PER_SOURCE
                 || source.diagnostic_codes.len() > MAX_DIAGNOSTIC_CODES_PER_SOURCE
             {
                 return Err(ValidationError::MetadataCountOutOfBounds);
             }
             for limit in &source.applied_limits {
                 validate_code(&limit.code)?;
+            }
+            for setting in source
+                .requested_settings
+                .iter()
+                .chain(&source.effective_settings)
+            {
+                validate_code(&setting.code)?;
+            }
+            if source.role == SourceRole::Runtime
+                && self.schema_version == AUDIT_SESSION_SCHEMA_VERSION
+            {
+                if source.loss.is_none() {
+                    return Err(ValidationError::InvalidLossMetadata);
+                }
+            } else if source.loss.is_some() {
+                return Err(ValidationError::InvalidLossMetadata);
+            }
+            if self.schema_version != AUDIT_SESSION_SCHEMA_VERSION
+                && (!source.requested_settings.is_empty() || !source.effective_settings.is_empty())
+            {
+                return Err(ValidationError::InvalidSourceSettings);
+            }
+            if let Some(loss) = &source.loss {
+                let counters = [
+                    loss.events_lost,
+                    loss.log_buffers_lost,
+                    loss.real_time_buffers_lost,
+                ];
+                let reported = counters.iter().any(|count| count.is_some_and(|n| n > 0));
+                let all_counters_available = counters.iter().all(Option::is_some);
+                match loss.status {
+                    LossStatus::Reported
+                        if !reported || !loss.statistics_available || !all_counters_available =>
+                    {
+                        return Err(ValidationError::InvalidLossMetadata);
+                    }
+                    LossStatus::NoneReported
+                        if reported
+                            || !all_counters_available
+                            || !loss.statistics_available
+                            || !loss.final_snapshot_available =>
+                    {
+                        return Err(ValidationError::InvalidLossMetadata);
+                    }
+                    LossStatus::Unknown
+                        if reported
+                            || (loss.statistics_available && loss.final_snapshot_available) =>
+                    {
+                        return Err(ValidationError::InvalidLossMetadata);
+                    }
+                    _ => {}
+                }
             }
             for code in &source.diagnostic_codes {
                 validate_code(code)?;
@@ -496,6 +604,8 @@ pub enum ValidationError {
     SourcePlatformMismatch,
     SourceOutsideSessionInterval,
     MetadataCountOutOfBounds,
+    InvalidLossMetadata,
+    InvalidSourceSettings,
     InvalidCode,
     UnsupportedArtifactPlatform,
     ArtifactSetMismatch,
@@ -516,9 +626,9 @@ pub enum ValidationError {
 mod tests {
     use super::{
         AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, AUDIT_SESSION_V1_SCHEMA_VERSION,
-        AppliedLimit, ArtifactKind, AuditSessionManifest, AuditSessionSource, CoverageManifest,
-        IntervalSemantics, SessionArtifactRef, SessionStatus, SourceRole, SourceStatus,
-        ValidationError, parse_manifest,
+        AUDIT_SESSION_V2_SCHEMA_VERSION, AppliedLimit, ArtifactKind, AuditSessionManifest,
+        AuditSessionSource, CoverageManifest, IntervalSemantics, SessionArtifactRef, SessionStatus,
+        SourceRole, SourceStatus, ValidationError, parse_manifest,
     };
 
     fn valid_manifest() -> AuditSessionManifest {
@@ -540,6 +650,9 @@ mod tests {
                 ended_at_unix_ms: 1001,
                 status: SourceStatus::Complete,
                 applied_limits: vec![],
+                requested_settings: vec![],
+                effective_settings: vec![],
+                loss: None,
                 diagnostic_codes: vec![],
                 artifacts: vec![],
             }])),
@@ -554,6 +667,9 @@ mod tests {
                     code: "max_inventory_rows".to_owned(),
                     value: 200_000,
                 }],
+                requested_settings: vec![],
+                effective_settings: vec![],
+                loss: None,
                 diagnostic_codes: Vec::new(),
                 artifacts: vec![SessionArtifactRef {
                     kind: ArtifactKind::Packages,
@@ -608,6 +724,18 @@ mod tests {
         let mut v2 = valid_manifest();
         v2.coverage_manifest = None;
         assert_eq!(v2.validate(), Err(ValidationError::InvalidCoverageManifest));
+        let mut v2_value = serde_json::to_value(valid_manifest()).unwrap();
+        v2_value["schema_version"] = serde_json::json!(AUDIT_SESSION_V2_SCHEMA_VERSION);
+        let parsed_v2 = parse_manifest(&serde_json::to_vec(&v2_value).unwrap()).unwrap();
+        assert_eq!(parsed_v2.schema_version, AUDIT_SESSION_V2_SCHEMA_VERSION);
+        v2_value["sources"][0]["requested_settings"] = serde_json::json!([{
+            "code": "test_setting",
+            "value": 1
+        }]);
+        assert_eq!(
+            parse_manifest(&serde_json::to_vec(&v2_value).unwrap()),
+            Err(ValidationError::InvalidSourceSettings)
+        );
     }
 
     #[test]
@@ -636,6 +764,9 @@ mod tests {
             ended_at_unix_ms: 1001,
             status: SourceStatus::Complete,
             applied_limits: vec![],
+            requested_settings: vec![],
+            effective_settings: vec![],
+            loss: None,
             diagnostic_codes: vec![],
             artifacts: vec![],
         };
@@ -651,6 +782,9 @@ mod tests {
             ended_at_unix_ms: 1001,
             status: SourceStatus::AccessDenied,
             applied_limits: vec![],
+            requested_settings: vec![],
+            effective_settings: vec![],
+            loss: None,
             diagnostic_codes: vec![],
             artifacts: vec![],
         };
@@ -685,6 +819,9 @@ mod tests {
             ended_at_unix_ms: 1002,
             status: SourceStatus::Unavailable,
             applied_limits: Vec::new(),
+            requested_settings: Vec::new(),
+            effective_settings: Vec::new(),
+            loss: None,
             diagnostic_codes: vec!["procfs_unavailable".to_owned()],
             artifacts: Vec::new(),
         });
@@ -740,6 +877,9 @@ mod tests {
                 code: "max_events".to_owned(),
                 value: 50_000,
             }],
+            requested_settings: vec![],
+            effective_settings: vec![],
+            loss: Some(super::LossMetadata::unknown()),
             diagnostic_codes: vec!["capture_completeness_unknown".to_owned()],
             artifacts: vec![SessionArtifactRef {
                 kind: ArtifactKind::WindowsRuntimeCapture,
@@ -782,6 +922,9 @@ mod tests {
             ended_at_unix_ms: 1002,
             status: SourceStatus::Partial,
             applied_limits: Vec::new(),
+            requested_settings: Vec::new(),
+            effective_settings: Vec::new(),
+            loss: None,
             diagnostic_codes: vec!["process_entry_inaccessible".to_owned()],
             artifacts: vec![SessionArtifactRef {
                 kind: ArtifactKind::Processes,
@@ -800,6 +943,9 @@ mod tests {
             ended_at_unix_ms: 1002,
             status: SourceStatus::Unavailable,
             applied_limits: Vec::new(),
+            requested_settings: Vec::new(),
+            effective_settings: Vec::new(),
+            loss: None,
             diagnostic_codes: vec!["startup_source_unavailable".to_owned()],
             artifacts: Vec::new(),
         };
@@ -844,11 +990,74 @@ mod tests {
         );
 
         let mut manifest = valid_manifest();
+        manifest.sources[0].requested_settings = vec![
+            super::Setting {
+                code: "test_setting".to_owned(),
+                value: 1
+            };
+            super::MAX_SETTINGS_PER_SOURCE + 1
+        ];
+        assert_eq!(
+            manifest.validate(),
+            Err(ValidationError::MetadataCountOutOfBounds)
+        );
+
+        let mut manifest = valid_manifest();
         manifest.sources[0].diagnostic_codes =
             vec!["test_diagnostic".to_owned(); super::MAX_DIAGNOSTIC_CODES_PER_SOURCE + 1];
         assert_eq!(
             manifest.validate(),
             Err(ValidationError::MetadataCountOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn runtime_loss_metadata_preserves_unknown_and_rejects_false_no_loss_claims() {
+        let mut manifest = valid_manifest();
+        let mut source = manifest.sources[0].clone();
+        source.role = SourceRole::Runtime;
+        source.status = SourceStatus::Partial;
+        source.artifacts = vec![
+            SessionArtifactRef {
+                kind: ArtifactKind::RuntimeManifest,
+                path: "run.json".to_owned(),
+                schema: "sideeffect.run".to_owned(),
+                schema_version: 2,
+                byte_length: 1,
+                sha256: "0".repeat(64),
+            },
+            SessionArtifactRef {
+                kind: ArtifactKind::RuntimeTrace,
+                path: "trace.strace".to_owned(),
+                schema: "strace_text".to_owned(),
+                schema_version: 1,
+                byte_length: 1,
+                sha256: "1".repeat(64),
+            },
+        ];
+        source.loss = Some(super::LossMetadata::unknown());
+        manifest.sources = vec![source];
+        manifest.status = SessionStatus::Partial;
+        manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
+        assert!(manifest.validate().is_ok());
+
+        manifest.sources[0].loss = Some(super::LossMetadata {
+            status: super::LossStatus::NoneReported,
+            statistics_available: true,
+            final_snapshot_available: true,
+            events_lost: Some(0),
+            log_buffers_lost: Some(0),
+            real_time_buffers_lost: Some(0),
+        });
+        assert!(manifest.validate().is_ok());
+        manifest.sources[0]
+            .loss
+            .as_mut()
+            .unwrap()
+            .final_snapshot_available = false;
+        assert_eq!(
+            manifest.validate(),
+            Err(ValidationError::InvalidLossMetadata)
         );
     }
 
@@ -873,6 +1082,9 @@ mod tests {
             ended_at_unix_ms: 1002,
             status: SourceStatus::Partial,
             applied_limits: Vec::new(),
+            requested_settings: Vec::new(),
+            effective_settings: Vec::new(),
+            loss: None,
             diagnostic_codes: Vec::new(),
             artifacts: vec![SessionArtifactRef {
                 kind,

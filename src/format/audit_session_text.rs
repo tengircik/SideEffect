@@ -71,6 +71,46 @@ pub fn write_audit_session_text<W: Write>(
                 writeln!(writer, "    {} = {}", limit.code, limit.value)?;
             }
         }
+        write_settings(writer, "Requested settings", &source.requested_settings)?;
+        write_settings(
+            writer,
+            "Source-reported effective settings",
+            &source.effective_settings,
+        )?;
+        if let Some(loss) = &source.loss {
+            writeln!(
+                writer,
+                "  Runtime loss status: {}",
+                loss_status_name(loss.status)
+            )?;
+            writeln!(
+                writer,
+                "  Loss statistics available: {}",
+                loss.statistics_available
+            )?;
+            writeln!(
+                writer,
+                "  Final loss snapshot available: {}",
+                loss.final_snapshot_available
+            )?;
+            writeln!(
+                writer,
+                "  Events lost: {}",
+                optional_count(loss.events_lost)
+            )?;
+            writeln!(
+                writer,
+                "  Log buffers lost: {}",
+                optional_count(loss.log_buffers_lost)
+            )?;
+            writeln!(
+                writer,
+                "  Real-time buffers lost: {}",
+                optional_count(loss.real_time_buffers_lost)
+            )?;
+        } else {
+            writer.write_all(b"  Runtime loss metadata: not applicable to this source\n")?;
+        }
         if source.diagnostic_codes.is_empty() {
             writer.write_all(b"  Diagnostic codes: none recorded\n")?;
         } else {
@@ -82,7 +122,8 @@ pub fn write_audit_session_text<W: Write>(
         if source.artifacts.is_empty() {
             writer.write_all(b"  Artifacts: none declared for this source\n")?;
         } else {
-            writer.write_all(b"  Verified artifacts:\n")?;
+            writer
+                .write_all(b"  Artifact provenance (verified local bytes; not authenticated):\n")?;
             for artifact in &source.artifacts {
                 writeln!(
                     writer,
@@ -129,6 +170,9 @@ pub fn write_audit_session_json<W: Write>(
             started_at_unix_ms: source.started_at_unix_ms,
             ended_at_unix_ms: source.ended_at_unix_ms,
             applied_limits: &source.applied_limits,
+            requested_settings: &source.requested_settings,
+            effective_settings: &source.effective_settings,
+            loss: &source.loss,
             diagnostic_codes: &source.diagnostic_codes,
             artifacts: source
                 .artifacts
@@ -140,6 +184,7 @@ pub fn write_audit_session_json<W: Write>(
                     schema_version: artifact.schema_version,
                     byte_length: artifact.byte_length,
                     sha256: &artifact.sha256,
+                    provenance: "manifest_reference_verified_against_local_bytes",
                     integrity: "length_and_sha256_match_local_bytes",
                 })
                 .collect(),
@@ -147,7 +192,7 @@ pub fn write_audit_session_json<W: Write>(
         .collect();
     let review = SessionReview {
         schema: "sideeffect.audit_session_review",
-        schema_version: 2,
+        schema_version: 3,
         session_id: &manifest.session_id,
         platform: &manifest.platform,
         architecture: escape_ascii(&manifest.architecture),
@@ -191,6 +236,9 @@ struct SessionSourceReview<'a> {
     started_at_unix_ms: u128,
     ended_at_unix_ms: u128,
     applied_limits: &'a [AppliedLimit],
+    requested_settings: &'a [crate::audit_session::Setting],
+    effective_settings: &'a [crate::audit_session::Setting],
+    loss: &'a Option<crate::audit_session::LossMetadata>,
     diagnostic_codes: &'a [String],
     artifacts: Vec<SessionArtifactReview<'a>>,
 }
@@ -203,6 +251,7 @@ struct SessionArtifactReview<'a> {
     schema_version: u32,
     byte_length: u64,
     sha256: &'a str,
+    provenance: &'static str,
     integrity: &'static str,
 }
 
@@ -240,6 +289,34 @@ fn write_quoted_ascii<W: Write>(writer: &mut W, value: &str) -> io::Result<()> {
         }
     }
     writer.write_all(b"\"")
+}
+
+fn write_settings<W: Write>(
+    writer: &mut W,
+    label: &str,
+    settings: &[crate::audit_session::Setting],
+) -> io::Result<()> {
+    if settings.is_empty() {
+        writeln!(writer, "  {label}: none reported")
+    } else {
+        writeln!(writer, "  {label}:")?;
+        for setting in settings {
+            writeln!(writer, "    {} = {}", setting.code, setting.value)?;
+        }
+        Ok(())
+    }
+}
+
+fn optional_count(value: Option<u64>) -> String {
+    value.map_or_else(|| "unknown".to_owned(), |count| count.to_string())
+}
+
+fn loss_status_name(status: crate::audit_session::LossStatus) -> &'static str {
+    match status {
+        crate::audit_session::LossStatus::Reported => "reported",
+        crate::audit_session::LossStatus::NoneReported => "none_reported",
+        crate::audit_session::LossStatus::Unknown => "unknown",
+    }
 }
 
 fn session_status_name(status: SessionStatus) -> &'static str {
@@ -347,6 +424,9 @@ mod tests {
                 ended_at_unix_ms: 2,
                 status,
                 applied_limits: Vec::new(),
+                requested_settings: Vec::new(),
+                effective_settings: Vec::new(),
+                loss: None,
                 diagnostic_codes: Vec::new(),
                 artifacts: Vec::new(),
             }],
@@ -380,7 +460,7 @@ mod tests {
         assert!(output.is_ascii());
         let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(value["schema"], "sideeffect.audit_session_review");
-        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["schema_version"], 3);
         assert_eq!(value["authenticity"], "not_established");
         assert_eq!(value["architecture"], "x86\\u{202e}_64");
         assert_eq!(

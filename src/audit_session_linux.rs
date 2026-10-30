@@ -221,8 +221,13 @@ pub fn collect_and_publish(
                     status: SourceStatus::Partial,
                     applied_limits: vec![
                         limit("max_trace_bytes", crate::limits::MAX_TRACE_BYTES as u64),
-                        limit("runtime_duration_seconds", duration.as_secs()),
                     ],
+                    requested_settings: vec![crate::audit_session::Setting {
+                        code: "runtime_duration_seconds".to_owned(),
+                        value: duration.as_secs(),
+                    }],
+                    effective_settings: Vec::new(),
+                    loss: Some(crate::audit_session::LossMetadata::unknown()),
                     diagnostic_codes,
                     artifacts: Vec::new(),
                 });
@@ -250,8 +255,13 @@ pub fn collect_and_publish(
                     },
                     applied_limits: vec![
                         limit("max_trace_bytes", crate::limits::MAX_TRACE_BYTES as u64),
-                        limit("runtime_duration_seconds", duration.as_secs()),
                     ],
+                    requested_settings: vec![crate::audit_session::Setting {
+                        code: "runtime_duration_seconds".to_owned(),
+                        value: duration.as_secs(),
+                    }],
+                    effective_settings: Vec::new(),
+                    loss: Some(crate::audit_session::LossMetadata::unknown()),
                     diagnostic_codes: if target_may_have_run {
                         vec![
                             "runtime_capture_failed".to_owned(),
@@ -386,6 +396,9 @@ fn build_source(
         ended_at_unix_ms,
         status,
         applied_limits,
+        requested_settings: Vec::new(),
+        effective_settings: Vec::new(),
+        loss: None,
         diagnostic_codes,
         artifacts: Vec::new(),
     })

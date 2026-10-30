@@ -243,6 +243,53 @@ pub fn collect_and_publish(
                 ),
             ],
         );
+        source
+            .requested_settings
+            .push(crate::audit_session::Setting {
+                code: "runtime_duration_seconds".to_owned(),
+                value: capture.requested_duration_seconds,
+            });
+        source.requested_settings.extend([
+            crate::audit_session::Setting {
+                code: "runtime_buffer_size_kb".to_owned(),
+                value: capture.session.buffer_size_kb_requested as u64,
+            },
+            crate::audit_session::Setting {
+                code: "runtime_minimum_buffers".to_owned(),
+                value: capture.session.minimum_buffers_requested as u64,
+            },
+            crate::audit_session::Setting {
+                code: "runtime_maximum_buffers".to_owned(),
+                value: capture.session.maximum_buffers_requested as u64,
+            },
+        ]);
+        source
+            .effective_settings
+            .push(crate::audit_session::Setting {
+                code: "runtime_buffer_count_reported".to_owned(),
+                value: capture.session.buffer_count_reported as u64,
+            });
+        let any_loss = capture.event_loss.events_lost > 0
+            || capture.event_loss.log_buffers_lost > 0
+            || capture.event_loss.real_time_buffers_lost > 0;
+        let statistics_available = capture.event_loss.loss_statistics_available;
+        let final_snapshot_available = capture.event_loss.final_snapshot_available;
+        source.loss = Some(crate::audit_session::LossMetadata {
+            status: if any_loss {
+                crate::audit_session::LossStatus::Reported
+            } else if statistics_available && final_snapshot_available {
+                crate::audit_session::LossStatus::NoneReported
+            } else {
+                crate::audit_session::LossStatus::Unknown
+            },
+            statistics_available,
+            final_snapshot_available,
+            events_lost: statistics_available.then_some(capture.event_loss.events_lost as u64),
+            log_buffers_lost: statistics_available
+                .then_some(capture.event_loss.log_buffers_lost as u64),
+            real_time_buffers_lost: statistics_available
+                .then_some(capture.event_loss.real_time_buffers_lost as u64),
+        });
         source.artifacts.push(SessionArtifactRef {
             kind: ArtifactKind::WindowsRuntimeCapture,
             path: "runtime.windows.json".to_owned(),
@@ -336,6 +383,9 @@ fn source(
                 value,
             })
             .collect(),
+        requested_settings: vec![],
+        effective_settings: vec![],
+        loss: (role == SourceRole::Runtime).then(crate::audit_session::LossMetadata::unknown),
         diagnostic_codes: diagnostics.into_iter().map(str::to_owned).collect(),
         artifacts: vec![],
     }
