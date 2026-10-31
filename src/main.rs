@@ -14,6 +14,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use sideeffect::audit_session::compare_sessions;
 #[cfg(target_os = "linux")]
 use sideeffect::audit_session_linux::{AuditOptions, collect_and_publish};
 #[cfg(windows)]
@@ -78,6 +79,7 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect explain <strace-trace-file>\n\
        sideeffect explain --diff <baseline-trace> <candidate-trace>\n\
        sideeffect explain --inventory-diff <before.json> <after.json>\n\
+       sideeffect compare-sessions <before-session-directory> <after-session-directory>\n\
        sideeffect model-preview --question <question> <strace-trace-file>\n\
        sideeffect model-analyze --question <question> --runtime <llama-cli> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect model-explain-preview --question <question> --backend auto|cpu|cuda <strace-trace-file>\n\
@@ -230,6 +232,9 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         }
         [command, flag, path] if command == "inspect" && flag == "--session" => {
             inspect_session_with_format(&OsString::from("json"), path)
+        }
+        [command, before, after] if command == "compare-sessions" => {
+            compare_audit_sessions(before, after)
         }
         [command, format_flag, format, session_flag, path]
             if command == "inspect" && format_flag == "--format" && session_flag == "--session" =>
@@ -1516,6 +1521,9 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         "diff-summary" => {
             "Usage: sideeffect diff-summary [--format json] LEFT RIGHT\n       sideeffect diff-summary --format html --output REPORT.html LEFT RIGHT\nWrites aggregate change counts without event strings or evidence references. Counts may still be sensitive; the output is not a safe-to-share verdict."
         }
+        "compare-sessions" => {
+            "Usage: sideeffect compare-sessions BEFORE_SESSION_DIR AFTER_SESSION_DIR\nVerifies both local audit sessions and compares only their declared collection metadata. This is a readiness/context check, not an inventory or event diff; comparable sessions do not establish equal observations, exhaustive coverage, or event absence. Incomparable results exit with status 2 and include stable reason codes."
+        }
         "explain" => {
             "Usage: sideeffect explain TRACE\n       sideeffect explain --diff LEFT RIGHT\n       sideeffect explain --inventory-diff BEFORE.json AFTER.json\nCreates bounded deterministic summaries. It does not use a language model."
         }
@@ -2104,6 +2112,55 @@ fn inspect_session_with_format(format: &OsString, path: &OsString) -> Result<Exi
         let _ = path;
         Err("audit-session inspection is not supported on this platform".to_owned())
     }
+}
+
+#[derive(Serialize)]
+struct AuditSessionComparabilityDocument {
+    schema: &'static str,
+    schema_version: u32,
+    status: &'static str,
+    comparable: bool,
+    reason_codes: Vec<&'static str>,
+    scope: &'static str,
+    limitations: [&'static str; 4],
+}
+
+fn compare_audit_sessions(
+    before_path: &OsString,
+    after_path: &OsString,
+) -> Result<ExitCode, String> {
+    let before = read_verified_audit_session(Path::new(before_path))?;
+    let after = read_verified_audit_session(Path::new(after_path))?;
+    let result = compare_sessions(before.manifest(), after.manifest());
+    let comparable = result.comparable;
+    let report = AuditSessionComparabilityDocument {
+        schema: "sideeffect.audit_session_comparability",
+        schema_version: 1,
+        status: if comparable {
+            "comparable"
+        } else {
+            "incomparable"
+        },
+        comparable,
+        reason_codes: result
+            .reasons
+            .into_iter()
+            .map(|reason| reason.code())
+            .collect(),
+        scope: "metadata_readiness_only",
+        limitations: [
+            "This compares declared collection context only; it does not compare inventory or runtime observations.",
+            "Comparable sessions do not establish equal observations, exhaustive coverage, or event absence.",
+            "This is not an item-level inventory or event diff and does not establish causation.",
+            "Verified lengths and hashes do not authenticate the session producer or source contents.",
+        ],
+    };
+    write_json(&report, "audit-session comparability report")?;
+    Ok(if comparable {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
 }
 
 fn correlate_startup(startup_path: &OsString, trace_path: &OsString) -> Result<ExitCode, String> {

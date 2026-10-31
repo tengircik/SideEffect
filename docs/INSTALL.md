@@ -343,6 +343,14 @@ To verify and review the session metadata:
 
 The reader requires a current-user-owned private directory and private regular files, rejects symlinks and unlisted entries, checks bounded JSON syntax and declared schema/version headers, and verifies every declared artifact's length and SHA-256 before writing a review. It does not fully validate each inventory artifact's domain schema or print raw inventory rows. Use `--format json` for the versioned `sideeffect.audit_session_review` v6 output, which includes recorded host OS/version and caller privilege context, source settings, runtime loss state, and artifact provenance. The display-only review escapes non-ASCII and control characters in all string values as ASCII so imported metadata cannot inject terminal formatting; this encoding does not modify stored session files. Older session versions retain absent host context; it is not reconstructed. A hash match does not authenticate the session producer. Partial sessions are still reviewable and return exit status `2`.
 
+Compare the declared collection context of two validated sessions:
+
+```sh
+./target/release/sideeffect compare-sessions ./before-session ./after-session
+```
+
+This emits `sideeffect.audit_session_comparability` v1 with a comparable status and stable reason codes. Exit status `0` means `comparable` is true, including when a matching partial source is reported with the `partial_source` review reason; status `2` means `comparable` is false. Invalid or insecure session inputs fail through the same verified readers used by `inspect --session`. The command does not compare inventory rows or runtime events. Comparable sessions do not establish equal observations, exhaustive coverage, event absence, or source authenticity.
+
 ### Sign an audit session
 
 Create a local Ed25519 keypair explicitly:
