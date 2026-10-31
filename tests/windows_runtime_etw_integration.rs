@@ -223,8 +223,11 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
     }));
     assert!(graph["edges"].as_array().unwrap().iter().any(|edge| {
         edge["kind"] == "event_process_link"
-            && edge["event_link_status"] == "context_candidate"
+            && edge["event_link_status"] == "observed"
             && edge["event_link_role"] == "windows_process_start_payload"
+            && edge["basis"]
+                .as_str()
+                .is_some_and(|basis| basis.contains("candidate_instance"))
     }));
     fs::remove_file(fixture_file).unwrap();
     fs::remove_file(output).unwrap();
