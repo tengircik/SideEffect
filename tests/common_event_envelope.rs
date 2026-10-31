@@ -49,6 +49,33 @@ fn adapts_syscall_attempt_with_failure_and_exact_source_reference() {
 }
 
 #[test]
+fn line_references_are_checked_incrementally_across_blank_lines() {
+    let bytes = b"[pid 417] 1700000000.000001 getpid() = 417\n\n[pid 417] 1700000000.000002 getpid() = 417\n[pid 417] 1700000000.000003 getpid() = 417\n";
+    let parsed = parse_trace_bytes(bytes, ParseLimits::default()).unwrap();
+    let envelope = from_linux_strace(&parsed, bytes, "synthetic-line-reference.trace");
+
+    assert_eq!(envelope.events.len(), 3);
+    assert_eq!(
+        envelope
+            .events
+            .iter()
+            .map(|event| match event.evidence {
+                EvidenceReference::RawTraceRecord { line_number, .. } => line_number,
+                EvidenceReference::WindowsEtwRecord { .. } => panic!("unexpected ETW reference"),
+            })
+            .collect::<Vec<_>>(),
+        vec![1, 3, 4]
+    );
+    assert_eq!(
+        envelope.source_state.completeness,
+        SourceCompleteness::Partial
+    );
+    assert!(envelope.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "unsupported_source_row" && diagnostic.source_local_ordinal == Some(2)
+    }));
+}
+
+#[test]
 fn process_creation_links_caller_task_to_returned_child_pid_without_parentage_claim() {
     let bytes = b"[pid 500] 1700000000.000001 fork() = 501\n";
     let parsed = parse_trace_bytes(bytes, ParseLimits::default()).unwrap();

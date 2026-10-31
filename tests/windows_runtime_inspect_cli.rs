@@ -369,12 +369,39 @@ fn events_windows_runtime_links_network_payload_and_labels_file_header_candidate
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
     let links = envelope["event_process_links"].as_array().unwrap();
     assert!(links.iter().any(|link| {
-        link["role"] == "windows_network_payload_pid" && link["status"] == "observed"
+        link["role"] == "windows_network_payload_pid" && link["status"] == "context_candidate"
     }));
     assert!(links.iter().any(|link| {
         link["role"] == "windows_file_disk_header_pid_context_candidate"
             && link["status"] == "context_candidate"
     }));
+}
+
+#[cfg(windows)]
+#[test]
+fn events_windows_runtime_labels_serialized_decoder_metadata_as_unverified() {
+    let mut value: Value = serde_json::from_slice(&fixture(CollectionStatus::Partial)).unwrap();
+    value["events"][0]["raw_payload_hex"] = json!("01");
+    value["events"][0]["payload_decoding"]["process_id"] = json!(1000);
+    let (path, output) = with_events_input(&rehashed_capture(value));
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["process_observations"][0]["identity"]["identity_status"],
+        "decoder_metadata_unverified"
+    );
+    assert_eq!(
+        envelope["event_process_links"][0]["status"],
+        "context_candidate"
+    );
+    assert!(
+        envelope["event_process_links"][0]["basis"]
+            .as_str()
+            .unwrap()
+            .contains("not re-decoded from raw payload bytes")
+    );
 }
 
 #[cfg(windows)]
@@ -524,7 +551,7 @@ fn events_windows_runtime_resolves_parent_pid_only_to_active_unique_start_instan
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         envelope["process_relationships"][0]["resolution"],
-        "observed"
+        "decoder_metadata_unverified"
     );
     assert_eq!(
         envelope["process_relationships"][0]["from_observation_id"],
@@ -565,7 +592,7 @@ fn events_windows_runtime_closes_matching_process_instance_with_end_evidence() {
             .iter()
             .any(|link| {
                 link["role"] == "windows_process_end_payload"
-                    && link["status"] == "observed"
+                    && link["status"] == "context_candidate"
                     && link["process_observation_id"] == 1
                     && link["event"]["json_pointer"] == "/events/1"
             })

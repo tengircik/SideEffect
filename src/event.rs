@@ -157,8 +157,9 @@ pub enum ProcessIdentity {
         process_id: u32,
         identity_status: ProcessIdentityStatus,
     },
-    /// A validated ETW process-start payload anchors this instance to its
-    /// source-local start record.
+    /// Supported serialized ETW decoder metadata anchors this candidate to
+    /// its source-local start record; the offline adapter does not re-decode
+    /// the raw payload bytes.
     WindowsProcessInstance {
         process_id: u32,
         start_record_ordinal: u64,
@@ -173,6 +174,9 @@ pub enum ProcessIdentityStatus {
     TaskIdOnlyGenerationUnknown,
     ReturnedChildPidOnly,
     ObservedStart,
+    /// Imported ETW decoder fields are structurally supported but are not
+    /// re-decoded from the retained raw payload by the offline adapter.
+    DecoderMetadataUnverified,
     AmbiguousPidReuse,
     LifecycleContinuityUnknown,
 }
@@ -188,6 +192,9 @@ pub enum ProcessRelationshipKind {
 #[serde(rename_all = "snake_case")]
 pub enum RelationshipResolution {
     Observed,
+    /// The relationship is derived from serialized ETW decoder metadata that
+    /// has not been independently checked against the raw payload bytes.
+    DecoderMetadataUnverified,
     ParentInstanceUnresolved,
     ParentPidAmbiguous,
     ProcessInstanceAmbiguous,
@@ -399,6 +406,8 @@ pub fn from_linux_strace(
         source_state_diagnostics.push("source_fingerprint_mismatch".to_owned());
     }
 
+    let mut line_scan_offset = 0_usize;
+    let mut expected_line_number = 1_u64;
     for (index, record) in trace.records.iter().enumerate() {
         let ordinal = index as u64 + 1;
         let evidence = EvidenceReference::RawTraceRecord {
@@ -417,9 +426,13 @@ pub fn from_linux_strace(
             .is_some_and(|slice| slice == record.raw_line.as_bytes());
         let line_number_matches = usize::try_from(record.evidence.byte_offset)
             .ok()
-            .and_then(|start| source_bytes.get(..start))
-            .and_then(|prefix| {
-                u64::try_from(prefix.iter().filter(|byte| **byte == b'\n').count() + 1).ok()
+            .and_then(|start| {
+                let skipped = source_bytes.get(line_scan_offset..start)?;
+                let skipped_lines =
+                    u64::try_from(skipped.iter().filter(|byte| **byte == b'\n').count()).ok()?;
+                expected_line_number = expected_line_number.checked_add(skipped_lines)?;
+                line_scan_offset = start;
+                Some(expected_line_number)
             })
             .is_some_and(|expected_line| expected_line == record.evidence.line_number);
         let ref_valid = source_fingerprint_valid
@@ -1292,6 +1305,7 @@ fn derive_windows_process_relationships(
     let mut active = BTreeMap::<u32, ActiveWindowsProcess>::new();
     let mut ambiguous_pids = BTreeSet::<u32>::new();
     let mut lifecycle_unknown_pids = BTreeSet::<u32>::new();
+    let mut deferred_lifecycle_invalidations = BTreeMap::<usize, u32>::new();
     let mut process_diagnostic_count = 0;
     let mut partial = false;
 
@@ -1310,8 +1324,7 @@ fn derive_windows_process_relationships(
                     &mut active,
                     &mut lifecycle_unknown_pids,
                     observations,
-                    relationships,
-                    links,
+                    &mut deferred_lifecycle_invalidations,
                 );
                 if let Some(process_id) = event
                     .process_payload
@@ -1431,7 +1444,7 @@ fn derive_windows_process_relationships(
                     reported_process_id: None,
                     role: EventProcessLinkRole::WindowsProcessStartPayload,
                     status: EventProcessLinkStatus::Observed,
-                    basis: "validated_process_start_payload_identifies_new_process_instance"
+                    basis: "supported_serialized_process_decoder_metadata_identifies_candidate_instance"
                         .to_owned(),
                 },
                 diagnostics,
@@ -1492,15 +1505,15 @@ fn derive_windows_process_relationships(
                     reported_from_process_id: Some(parent_id),
                     resolution,
                     basis: if resolution == RelationshipResolution::Observed {
-                        "validated_parent_pid_matches_one_active_process_start_instance".to_owned()
+                        "serialized_parent_pid_matches_one_active_process_decoder_metadata_candidate".to_owned()
                     } else if resolution == RelationshipResolution::ParentPidAmbiguous {
-                        "validated_parent_pid_is_ambiguous_in_capture".to_owned()
+                        "serialized_parent_pid_is_ambiguous_in_capture".to_owned()
                     } else if generation_evidence_unreliable {
                         "reported_etw_loss_or_unavailable_loss_statistics_prevents_unique_parent_instance_resolution".to_owned()
                     } else if lifecycle_unknown_pids.contains(&parent_id) {
                         "invalid_or_unsupported_lifecycle_row_prevents_unique_parent_instance_resolution".to_owned()
                     } else {
-                        "validated_parent_pid_has_no_unique_active_process_start_instance"
+                        "serialized_parent_pid_has_no_unique_active_decoder_metadata_candidate"
                             .to_owned()
                     },
                     evidence,
@@ -1515,8 +1528,7 @@ fn derive_windows_process_relationships(
                     &mut active,
                     &mut lifecycle_unknown_pids,
                     observations,
-                    relationships,
-                    links,
+                    &mut deferred_lifecycle_invalidations,
                 );
                 push_process_diagnostic(
                     diagnostics,
@@ -1698,7 +1710,53 @@ fn derive_windows_process_relationships(
             }
         }
     }
+    reconcile_deferred_lifecycle_invalidations(
+        relationships,
+        links,
+        &deferred_lifecycle_invalidations,
+    );
+    mark_windows_decoder_metadata_unverified(observations, relationships, links);
     partial
+}
+
+#[cfg(windows)]
+fn mark_windows_decoder_metadata_unverified(
+    observations: &mut [ProcessObservation],
+    relationships: &mut [ProcessRelationship],
+    links: &mut [EventProcessLink],
+) {
+    for observation in observations {
+        if let ProcessIdentity::WindowsProcessInstance {
+            identity_status, ..
+        } = &mut observation.identity
+        {
+            if *identity_status == ProcessIdentityStatus::ObservedStart {
+                *identity_status = ProcessIdentityStatus::DecoderMetadataUnverified;
+            }
+        }
+    }
+    for relationship in relationships {
+        if relationship.resolution == RelationshipResolution::Observed {
+            relationship.resolution = RelationshipResolution::DecoderMetadataUnverified;
+            relationship.basis.push_str(
+                "; derived from serialized ETW decoder metadata, not re-decoded from raw payload bytes",
+            );
+        }
+    }
+    for link in links {
+        if matches!(
+            link.role,
+            EventProcessLinkRole::WindowsProcessStartPayload
+                | EventProcessLinkRole::WindowsProcessEndPayload
+                | EventProcessLinkRole::WindowsNetworkPayloadPid
+        ) && link.status == EventProcessLinkStatus::Observed
+        {
+            link.status = EventProcessLinkStatus::ContextCandidate;
+            link.basis.push_str(
+                "; serialized ETW decoder metadata is not re-decoded from raw payload bytes",
+            );
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1706,18 +1764,71 @@ fn invalidate_active_windows_instances(
     active: &mut BTreeMap<u32, ActiveWindowsProcess>,
     lifecycle_unknown_pids: &mut BTreeSet<u32>,
     observations: &mut [ProcessObservation],
-    relationships: &mut [ProcessRelationship],
-    links: &mut [EventProcessLink],
+    deferred_invalidations: &mut BTreeMap<usize, u32>,
 ) {
     for (process_id, process) in std::mem::take(active) {
         lifecycle_unknown_pids.insert(process_id);
-        mark_windows_observation_unresolved(
-            observations,
-            process.observation_index,
-            ProcessIdentityStatus::LifecycleContinuityUnknown,
-            relationships,
-            links,
-        );
+        if let Some(ProcessObservation {
+            identity:
+                ProcessIdentity::WindowsProcessInstance {
+                    identity_status, ..
+                },
+            ..
+        }) = observations.get_mut(process.observation_index)
+        {
+            *identity_status = ProcessIdentityStatus::LifecycleContinuityUnknown;
+            deferred_invalidations.insert(process.observation_index, process_id);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn reconcile_deferred_lifecycle_invalidations(
+    relationships: &mut [ProcessRelationship],
+    links: &mut [EventProcessLink],
+    invalidated: &BTreeMap<usize, u32>,
+) {
+    if invalidated.is_empty() {
+        return;
+    }
+    for relationship in relationships {
+        if relationship
+            .to_observation_id
+            .checked_sub(1)
+            .and_then(|id| usize::try_from(id).ok())
+            .is_some_and(|index| invalidated.contains_key(&index))
+        {
+            relationship.resolution = RelationshipResolution::ProcessInstanceUnresolved;
+        }
+        if relationship
+            .from_observation_id
+            .and_then(|id| id.checked_sub(1))
+            .and_then(|id| usize::try_from(id).ok())
+            .is_some_and(|index| invalidated.contains_key(&index))
+        {
+            relationship.from_observation_id = None;
+            relationship.resolution = RelationshipResolution::ParentInstanceUnresolved;
+        }
+    }
+    for link in links {
+        if link.role == EventProcessLinkRole::WindowsProcessStartPayload {
+            continue;
+        }
+        let Some(index) = link
+            .process_observation_id
+            .and_then(|id| id.checked_sub(1))
+            .and_then(|id| usize::try_from(id).ok())
+        else {
+            continue;
+        };
+        let Some(process_id) = invalidated.get(&index) else {
+            continue;
+        };
+        link.process_observation_id = None;
+        link.reported_process_id = Some(*process_id);
+        if link.role == EventProcessLinkRole::WindowsNetworkPayloadPid {
+            link.status = EventProcessLinkStatus::Unresolved;
+        }
     }
 }
 
