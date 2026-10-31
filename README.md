@@ -130,7 +130,7 @@ sideeffect graph --trace ./capture.trace --event-kind openat
 On native Windows, adapt a validated ETW capture:
 
 ```powershell
-sideeffect.exe graph --windows-runtime .\\runtime.windows.json --event-kind file_io_observation
+sideeffect.exe graph --windows-runtime .\runtime.windows.json --event-kind file_io_observation
 ```
 
 The graph contains source-local event and process-observation nodes, process-relationship edges, and event-to-process links. `--event-kind` matches one exact kind and keeps its direct process links plus one-hop process relationships; diagnostics and source status still describe the full input. Unresolved PID context is represented by a separate node for each edge; equal PID values are never merged into one process instance. Every node and edge retains its source evidence, link status, and derivation basis. Context candidates and decoder-metadata relationships stay labeled as such. The graph does not establish ownership, causation, or a complete process tree. Partial or unknown input exits with status `2`.
@@ -148,6 +148,14 @@ sideeffect.exe timeline --windows-runtime .\runtime.windows.json --event-kind fi
 ```
 
 The JSON listing keeps each source's original order, timestamp representation, and evidence reference. Filters match an exact event kind; partial or unknown source status remains visible and exits with status `2`. Timelines are single-source views: they do not merge clocks or establish causal order. Hosted tests exercise the timeline adapter on real Linux `strace` and native Windows ETW captures for named file/loopback scenarios on Ubuntu 24.04 and Windows Server 2022/2025; they do not establish broad OS or event coverage.
+
+On native Windows, resolve one ETW timeline or graph event directly to its validated source row using the capture fingerprint, record ordinal, and raw-payload digest from that reference:
+
+```powershell
+sideeffect.exe evidence --windows-runtime .\runtime.windows.json CAPTURE_SHA256 RECORD_ORDINAL RAW_PAYLOAD_SHA256
+```
+
+The command verifies all three reference values and returns the original event row with its JSON pointer, capture loss, and diagnostics. It does not independently verify serialized decode metadata or authenticate the producer. Unknown completeness and partial status are preserved and exit with status `2`.
 
 ### Compare saved inventories
 

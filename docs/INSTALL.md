@@ -107,7 +107,7 @@ The minimums below describe declared support requirements, while the validation 
 | Linux process inventory | Visible `/proc` status fields and bounded `/proc/PID/exe` link text | Synthetic procfs fixtures and Linux CLI tests | Atomic or exhaustive process coverage; command lines or executable contents |
 | Linux startup configuration | Aggregate schema v2: curated XDG, systemd, SysV, and cron source snapshots with inert evidence | CLI tests and deterministic source/parser fixtures | Effective applicability, manager runtime state, all distribution-specific paths, or exhaustive startup coverage |
 | Diff | Exact multiset comparison of parsed syscall rows; PID/timestamp prefixes alone are ignored | Synthetic pairs plus real integration trace pair | Root cause, causal links, normalized paths/FDs, or complete OS observation |
-| Windows native x64 | Bounded inventory and experimental ETW v3 capture, inspection, event-level diff summary v3, attribution candidate view, and audit-session integration | Local Windows x64 `cargo test --locked --all-targets`, Clippy and format checks; hosted Windows Server 2022/2025 build/test and live process/file/loopback acceptance at exact commit [`797ba86`](https://github.com/tengircik/SideEffect/commit/797ba86dc41d024129da35b2fc4be7ad5eca6756) ([CI run](https://github.com/tengircik/SideEffect/actions/runs/40867530573)) | Windows 11 x64 privileged live ETW validation, ETL import, exhaustive inventory/event coverage, all provider/version combinations, and general Windows compatibility |
+| Windows native x64 | Bounded inventory and experimental ETW v3 capture, inspection, event-level diff summary v3, evidence lookup, attribution candidate view, and audit-session integration | Local Windows x64 `cargo test --locked --all-targets`, Clippy and format checks; hosted Windows Server 2022/2025 build/test and live process/file/loopback acceptance at exact commit [`797ba86`](https://github.com/tengircik/SideEffect/commit/797ba86dc41d024129da35b2fc4be7ad5eca6756) ([CI run](https://github.com/tengircik/SideEffect/actions/runs/40867530573)) | Windows 11 x64 privileged live ETW validation, ETL import, exhaustive inventory/event coverage, all provider/version combinations, and general Windows compatibility |
 
 The capture filter selects syscall families using `strace`'s own versioned definitions. SideEffect's parser is not an exhaustive syscall allowlist: it recognizes supported outer record syntax and preserves raw arguments/results, while the outcome and path-hint derivations above remain deliberately narrow. Diff category labels are syscall-name buckets, not claims about successful effects.
 
@@ -415,7 +415,7 @@ To organize the adapted facts into an evidence-linked graph, run:
 On native Windows:
 
 ```powershell
-sideeffect.exe graph --windows-runtime .\\runtime.windows.json --event-kind file_io_observation
+sideeffect.exe graph --windows-runtime .\runtime.windows.json --event-kind file_io_observation
 ```
 
 Graph nodes retain event or process-observation evidence. Edges preserve the adapter's relationship kind, status, basis, and source references. `--event-kind` performs an exact event-kind match, retaining matched events, their direct process links, and one-hop relationships around those linked processes. The filter metadata is included in JSON while source diagnostics and completeness still describe the full input. A PID without a uniquely resolved process observation gets its own context node for that edge; SideEffect does not merge equal PID values or promote event context to ownership. Partial/unknown source status and diagnostics are retained, and the graph does not imply causation or a complete process tree.
@@ -434,7 +434,7 @@ On native Windows, the same timeline view can be built from a strictly validated
 sideeffect.exe timeline --windows-runtime .\runtime.windows.json --event-kind file_io_observation
 ```
 
-ETW items retain capture-local ordinal, QPC timestamp text, payload digest, and JSON pointer back to the source event. Capture partial or unknown status remains visible and exits with status `2`. This is a source-local timeline, not a merged graph or causal sequence.
+ETW items retain capture-local ordinal, QPC timestamp text, payload digest, and JSON pointer back to the source event. Capture partial or unknown status remains visible and exits with status `2`. This is a source-local timeline, not a merged graph or causal sequence. Resolve a single event with `sideeffect.exe evidence --windows-runtime .\runtime.windows.json CAPTURE_SHA256 RECORD_ORDINAL RAW_PAYLOAD_SHA256`. The lookup validates the capture, then requires the fingerprint, ordinal, and raw-payload digest to match before returning that row and its source pointer. It includes capture status, loss, and diagnostics; serialized decode metadata and producer authenticity are not independently verified. Unknown completeness exits with status `2`.
 
 ## Use an existing WSL2 installation
 

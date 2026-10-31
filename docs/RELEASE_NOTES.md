@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added native Windows `evidence --windows-runtime` lookup for one ETW event, requiring the validated capture fingerprint, record ordinal, and raw-payload digest to match before returning the event row and source pointer. Partial status and unknown completeness remain explicit; producer authenticity and serialized decode metadata are not verified.
 - Upgraded `sideeffect.windows_runtime_diff_summary` to v3 with a field-level ledger for the two fields excluded from exact event equality (`record_ordinal` and `timestamp_qpc`). Both original values are preserved in capture-linked before/after event references. The summary also reports equality of canonical validated capture representation fingerprints, without claiming source JSON byte equality or producer authenticity. Schemas v1-v2 remain historical output formats and are not imported.
 
 Version 0.1.0 was published on 2026-10-30. This page records its release scope and compatibility evidence. Download the release archives and provenance from the [GitHub release page](https://github.com/tengircik/SideEffect/releases/tag/v0.1.0).
