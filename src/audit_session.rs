@@ -1059,7 +1059,7 @@ mod tests {
     use super::{
         AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, AUDIT_SESSION_V1_SCHEMA_VERSION,
         AUDIT_SESSION_V2_SCHEMA_VERSION, AUDIT_SESSION_V3_SCHEMA_VERSION, AppliedLimit,
-        ArtifactKind, AuditSessionManifest, AuditSessionSource, CoverageManifest,
+        ArtifactKind, AuditSessionManifest, AuditSessionSource, CoverageManifest, CoverageStatus,
         IntervalSemantics, SessionArtifactRef, SessionStatus, SourceRole, SourceStatus,
         ValidationError, compare_sessions, parse_manifest,
     };
@@ -1597,6 +1597,40 @@ mod tests {
         assert_eq!(
             CoverageManifest::from_sources(&[inaccessible]).sources[0].status,
             super::CoverageStatus::Inaccessible
+        );
+    }
+
+    #[test]
+    fn coverage_status_crosswalk_is_explicit_for_all_source_statuses() {
+        let mut source = valid_manifest().sources[0].clone();
+        let cases = [
+            (SourceStatus::Complete, CoverageStatus::Observed),
+            (SourceStatus::Partial, CoverageStatus::Partial),
+            (SourceStatus::Unknown, CoverageStatus::Unknown),
+            (SourceStatus::NotChecked, CoverageStatus::NotChecked),
+            (SourceStatus::Unsupported, CoverageStatus::Unsupported),
+            (SourceStatus::NotApplicable, CoverageStatus::Unknown),
+            (SourceStatus::Unavailable, CoverageStatus::Unknown),
+            (SourceStatus::AccessDenied, CoverageStatus::Inaccessible),
+            (SourceStatus::Failed, CoverageStatus::Unknown),
+            (SourceStatus::TimedOut, CoverageStatus::Unknown),
+            (SourceStatus::OutputLimitExceeded, CoverageStatus::Unknown),
+        ];
+
+        for (source_status, expected_coverage) in cases {
+            source.status = source_status;
+            assert_eq!(
+                super::coverage_status_for_source(&source),
+                expected_coverage,
+                "unexpected coverage mapping for {source_status:?}"
+            );
+        }
+
+        source.role = SourceRole::Startup;
+        source.status = SourceStatus::Complete;
+        assert_eq!(
+            super::coverage_status_for_source(&source),
+            CoverageStatus::Configured
         );
     }
 

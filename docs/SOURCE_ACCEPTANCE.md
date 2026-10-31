@@ -4,6 +4,21 @@ This document records what the current repository implementation collects and wh
 
 “Status/loss” distinguishes source unavailability, malformed data, limits, and runtime loss where the implementation reports them. “Identity/provenance” describes the identifiers and source references retained by the output; fingerprints establish byte consistency, not authenticity. Validation evidence below is repository-local unless a named hosted CI run is linked. Synthetic fixtures and deterministic tests do not establish live source compatibility.
 
+## Session coverage-status crosswalk
+
+`SourceStatus` preserves the selected collector's detailed result in its source record. The session `CoverageStatus` is a coarser summary and uses this explicit mapping:
+
+| Source status | Coverage status | Meaning |
+| --- | --- | --- |
+| `complete` | `configured` for startup; otherwise `observed` | The selected bounded collector completed its declared work. This does not establish exhaustive coverage; `observed` for an inventory source does not mean runtime activity. |
+| `partial` | `partial` | The collector retained a partial result or reported a relevant limitation. |
+| `not_checked` | `not_checked` | The selected source was explicitly not checked. |
+| `unsupported` | `unsupported` | The selected source or operation is not supported. |
+| `access_denied` | `inaccessible` | Access prevented the selected source from being read. |
+| `unknown`, `not_applicable`, `unavailable`, `failed`, `timed_out`, `output_limit_exceeded` | `unknown` | The collector cannot claim a complete observation for this source. The original detailed `SourceStatus` remains available in the source entry. |
+
+`not_observed` is reserved and no current session producer emits it: an empty inventory or zero captured events does not establish that software or activity was absent. Do not infer it from a complete source with zero rows.
+
 ## Linux
 
 | Source | Collected facts | Explicit exclusions | Status, loss, and truncation reporting | Identity and provenance available | Platform validation evidence in repository | Comparability caveats |
