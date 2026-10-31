@@ -115,7 +115,7 @@ pub fn compare_audit_sessions(
         comparable: context.comparable,
         reason_codes: context.reasons.iter().map(|reason| reason.code()).collect(),
         metadata_scope: "metadata_readiness_only",
-        scope: "metadata_and_item_level_inventory",
+        scope: "metadata_and_item_level_inventory_and_runtime",
         item_comparison_status,
         native_pair_input_limit_bytes: MAX_SESSION_DIFF_PAIR_BYTES,
         before_session_id: before.session_id.clone(),
@@ -131,7 +131,7 @@ pub fn compare_audit_sessions(
             "Unmatched rows are additions or removals only where the native comparator establishes complete source coverage and certain identity.",
             "Snapshots are non-atomic observations. Differences do not establish installation, execution history, causation, or safety.",
             "Caller privilege contexts are not comparability keys and may differ.",
-            "Runtime and PATH-executable artifacts are reported as not compared in this version.",
+            "PATH-executable artifacts are reported as not compared in this version.",
         ],
     }
 }
@@ -253,6 +253,27 @@ impl SessionSourceDiff {
         self.status = "incomparable";
         self.reason_code = Some(reason);
         self
+    }
+}
+
+impl AuditSessionDiff {
+    pub fn refresh_item_comparison_status(&mut self) {
+        self.item_comparison_status = if !self.source_diffs.is_empty()
+            && self
+                .source_diffs
+                .iter()
+                .all(|item| item.status == "compared")
+        {
+            "complete"
+        } else if self
+            .source_diffs
+            .iter()
+            .any(|item| item.status == "partial")
+        {
+            "partial"
+        } else {
+            "not_complete"
+        };
     }
 }
 

@@ -163,7 +163,7 @@ fn session_comparability_cli_reports_metadata_readiness_and_rejects_unverified_i
     );
     assert_eq!(
         compatible_report["scope"],
-        "metadata_and_item_level_inventory"
+        "metadata_and_item_level_inventory_and_runtime"
     );
     assert!(compatible_report["comparable"].as_bool().unwrap());
     assert_reason(&compatible, "partial_source");

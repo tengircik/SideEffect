@@ -150,7 +150,7 @@ fn windows_session_comparability_cli_preserves_metadata_only_and_reader_boundari
     );
     assert_eq!(
         compatible_report["scope"],
-        "metadata_and_item_level_inventory"
+        "metadata_and_item_level_inventory_and_runtime"
     );
     assert!(compatible_report["comparable"].as_bool().unwrap());
     assert_reason(&compatible, "partial_source");

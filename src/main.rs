@@ -2199,12 +2199,21 @@ fn compare_audit_sessions(
                 },
             )
             .collect();
-        sideeffect::audit_session_diff::compare_audit_sessions(
+        let mut report = sideeffect::audit_session_diff::compare_audit_sessions(
             before.manifest(),
             after.manifest(),
             &before_artifacts,
             &after_artifacts,
-        )
+        );
+        compare_linux_session_runtime(
+            &mut report,
+            before.manifest(),
+            after.manifest(),
+            &before_artifacts,
+            &after_artifacts,
+        );
+        report.refresh_item_comparison_status();
+        report
     };
     #[cfg(windows)]
     let report = {
@@ -2230,12 +2239,21 @@ fn compare_audit_sessions(
                 },
             )
             .collect();
-        sideeffect::audit_session_diff::compare_audit_sessions(
+        let mut report = sideeffect::audit_session_diff::compare_audit_sessions(
             before.manifest(),
             after.manifest(),
             &before_artifacts,
             &after_artifacts,
-        )
+        );
+        compare_windows_session_runtime(
+            &mut report,
+            before.manifest(),
+            after.manifest(),
+            &before_artifacts,
+            &after_artifacts,
+        );
+        report.refresh_item_comparison_status();
+        report
     };
     let comparable = report.comparable;
     write_json(&report, "audit-session diff report")?;
@@ -2244,6 +2262,327 @@ fn compare_audit_sessions(
     } else {
         ExitCode::from(2)
     })
+}
+
+fn verified_runtime_artifact<'manifest, 'bytes>(
+    manifest: &'manifest sideeffect::audit_session::AuditSessionManifest,
+    artifacts: &'bytes [sideeffect::audit_session_diff::VerifiedArtifactBytes<'bytes>],
+    kind: sideeffect::audit_session::ArtifactKind,
+    expected_path: &str,
+    expected_schema: &str,
+    expected_version: u32,
+) -> Result<
+    (
+        &'manifest sideeffect::audit_session::SessionArtifactRef,
+        &'bytes [u8],
+    ),
+    &'static str,
+> {
+    use sideeffect::audit_session::SourceRole;
+    let source = manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::Runtime)
+        .ok_or("runtime_source_missing")?;
+    let reference = source
+        .artifacts
+        .iter()
+        .find(|reference| reference.kind == kind)
+        .ok_or("runtime_artifact_missing")?;
+    if reference.path != expected_path
+        || reference.schema != expected_schema
+        || reference.schema_version != expected_version
+    {
+        return Err("runtime_artifact_contract_mismatch");
+    }
+    let artifact = artifacts
+        .iter()
+        .find(|artifact| artifact.kind == kind && artifact.path == reference.path)
+        .ok_or("runtime_artifact_reference_mismatch")?;
+    if artifact.bytes.len() as u64 != reference.byte_length
+        || format!("{:x}", Sha256::digest(artifact.bytes)) != reference.sha256
+    {
+        return Err("runtime_artifact_reference_mismatch");
+    }
+    Ok((reference, artifact.bytes))
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Serialize)]
+struct LinuxSessionRunMetadata {
+    schema_version: u32,
+    tracer_name: String,
+    tracer_major: u64,
+    tracer_minor: u64,
+    capture_profile: String,
+    strace_reported_status: String,
+    command_outcome: String,
+    capture_completeness: String,
+    time_limit_milliseconds: Option<u64>,
+    stop_reason: Option<String>,
+    trace_byte_length: u64,
+    trace_sha256: String,
+}
+
+#[cfg(target_os = "linux")]
+fn compare_linux_session_runtime(
+    report: &mut sideeffect::audit_session_diff::AuditSessionDiff,
+    before: &sideeffect::audit_session::AuditSessionManifest,
+    after: &sideeffect::audit_session::AuditSessionManifest,
+    before_artifacts: &[sideeffect::audit_session_diff::VerifiedArtifactBytes<'_>],
+    after_artifacts: &[sideeffect::audit_session_diff::VerifiedArtifactBytes<'_>],
+) {
+    let Some(entry) = report
+        .source_diffs
+        .iter_mut()
+        .find(|source| source.role == sideeffect::audit_session::SourceRole::Runtime)
+    else {
+        return;
+    };
+    if entry.reason_code != Some("role_not_supported_by_item_diff") {
+        return;
+    }
+
+    let result = compare_linux_runtime_pair(before, after, before_artifacts, after_artifacts);
+    match result {
+        Ok((metadata_before, metadata_after, trace_diff)) => {
+            entry.status = "partial";
+            entry.reason_code = Some("runtime_capture_completeness_unknown");
+            entry.comparison = Some(serde_json::json!({
+                "runtime_kind":"linux_strace",
+                "run_metadata":{"before":metadata_before,"after":metadata_after},
+                "trace_diff":trace_diff,
+                "capture_completeness":"unknown"
+            }));
+        }
+        Err(RuntimePairIssue::Partial(reason, detail)) => {
+            entry.status = "partial";
+            entry.reason_code = Some(reason);
+            entry.comparison = detail;
+        }
+        Err(RuntimePairIssue::NotCompared(reason)) => {
+            entry.status = "not_compared";
+            entry.reason_code = Some(reason);
+        }
+        Err(RuntimePairIssue::Incomparable(reason)) => {
+            entry.status = "incomparable";
+            entry.reason_code = Some(reason);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+enum RuntimePairIssue {
+    Partial(&'static str, Option<serde_json::Value>),
+    NotCompared(&'static str),
+    Incomparable(&'static str),
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_issue(reason: &'static str) -> RuntimePairIssue {
+    match reason {
+        "runtime_source_missing" | "runtime_artifact_missing" => {
+            RuntimePairIssue::NotCompared(reason)
+        }
+        "runtime_artifact_input_limit_exceeded" => RuntimePairIssue::NotCompared(reason),
+        "runtime_artifact_contract_mismatch" | "runtime_artifact_reference_mismatch" => {
+            RuntimePairIssue::Incomparable(reason)
+        }
+        _ => RuntimePairIssue::Incomparable(reason),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn compare_linux_runtime_pair(
+    before: &sideeffect::audit_session::AuditSessionManifest,
+    after: &sideeffect::audit_session::AuditSessionManifest,
+    before_artifacts: &[sideeffect::audit_session_diff::VerifiedArtifactBytes<'_>],
+    after_artifacts: &[sideeffect::audit_session_diff::VerifiedArtifactBytes<'_>],
+) -> Result<
+    (
+        LinuxSessionRunMetadata,
+        LinuxSessionRunMetadata,
+        serde_json::Value,
+    ),
+    RuntimePairIssue,
+> {
+    use sideeffect::audit_session::ArtifactKind;
+    let side =
+        |manifest: &sideeffect::audit_session::AuditSessionManifest,
+         artifacts: &[sideeffect::audit_session_diff::VerifiedArtifactBytes<'_>]| {
+            let (run_ref, run_bytes) = verified_runtime_artifact(
+                manifest,
+                artifacts,
+                ArtifactKind::RuntimeManifest,
+                "run.json",
+                "sideeffect.run",
+                2,
+            )
+            .map_err(runtime_issue)?;
+            let (trace_ref, trace_bytes) = verified_runtime_artifact(
+                manifest,
+                artifacts,
+                ArtifactKind::RuntimeTrace,
+                "trace.strace",
+                "strace_text",
+                1,
+            )
+            .map_err(runtime_issue)?;
+            if run_bytes.len() > sideeffect::limits::MAX_BUNDLE_MANIFEST_BYTES
+                || trace_bytes.len() > sideeffect::limits::MAX_TRACE_BYTES
+            {
+                return Err(RuntimePairIssue::NotCompared(
+                    "runtime_artifact_input_limit_exceeded",
+                ));
+            }
+            let manifest: RunManifest = serde_json::from_slice(run_bytes)
+                .map_err(|_| RuntimePairIssue::Incomparable("runtime_manifest_invalid"))?;
+            validate_bundle_manifest(&manifest)
+                .map_err(|_| RuntimePairIssue::Incomparable("runtime_manifest_invalid"))?;
+            if manifest.schema_version != run_ref.schema_version
+                || manifest.trace.name != trace_ref.path
+                || manifest.trace.format != trace_ref.schema
+                || manifest.trace.byte_length != trace_ref.byte_length
+                || manifest.trace.byte_length != trace_bytes.len() as u64
+                || manifest.trace.sha256 != trace_ref.sha256
+                || format!("{:x}", Sha256::digest(trace_bytes)) != manifest.trace.sha256
+            {
+                return Err(RuntimePairIssue::Incomparable(
+                    "runtime_manifest_trace_contract_mismatch",
+                ));
+            }
+            let run_metadata = LinuxSessionRunMetadata {
+                schema_version: manifest.schema_version,
+                tracer_name: manifest.capture.tracer.name.clone(),
+                tracer_major: manifest.capture.tracer.major,
+                tracer_minor: manifest.capture.tracer.minor,
+                capture_profile: manifest.capture.capture_profile.clone(),
+                strace_reported_status: match manifest.capture.strace_reported_status {
+                    BundleStatus::ExitCode { value } => format!("exit_code:{value}"),
+                    BundleStatus::Signal { value } => format!("signal:{value}"),
+                    BundleStatus::Unavailable => "unavailable".to_owned(),
+                },
+                command_outcome: manifest.capture.command_outcome.clone(),
+                capture_completeness: manifest.capture.completeness.clone(),
+                time_limit_milliseconds: manifest.capture.time_limit_milliseconds,
+                stop_reason: manifest.capture.stop_reason.clone(),
+                trace_byte_length: manifest.trace.byte_length,
+                trace_sha256: manifest.trace.sha256.clone(),
+            };
+            let trace = parse_trace_bytes(trace_bytes, ParseLimits::default()).map_err(
+                |error| match error {
+                    sideeffect::trace::strace::ParseError::InputTooLarge { .. }
+                    | sideeffect::trace::strace::ParseError::RecordTooLarge { .. }
+                    | sideeffect::trace::strace::ParseError::TooManyRecords { .. } => {
+                        RuntimePairIssue::NotCompared("runtime_trace_parse_limit_exceeded")
+                    }
+                    sideeffect::trace::strace::ParseError::InvalidUtf8 { .. } => {
+                        RuntimePairIssue::Incomparable("runtime_trace_encoding_invalid")
+                    }
+                },
+            )?;
+            Ok((run_metadata, trace))
+        };
+
+    let (metadata_before, trace_before) = side(before, before_artifacts)?;
+    let (metadata_after, trace_after) = side(after, after_artifacts)?;
+    if trace_before.parse_status != ParseCompleteness::Complete
+        || trace_after.parse_status != ParseCompleteness::Complete
+    {
+        return Err(RuntimePairIssue::Partial(
+            "runtime_trace_parse_incomplete",
+            Some(serde_json::json!({
+                "runtime_kind":"linux_strace",
+                "before_parse_status":trace_before.parse_status,
+                "before_diagnostic_count":trace_before.diagnostics.len(),
+                "after_parse_status":trace_after.parse_status,
+                "after_diagnostic_count":trace_after.diagnostics.len()
+            })),
+        ));
+    }
+    let diff =
+        sideeffect::diff::compare_traces(&trace_before, &trace_after).map_err(
+            |error| match error {
+                sideeffect::diff::DiffError::PartialParse { .. } => {
+                    RuntimePairIssue::Partial("runtime_trace_parse_incomplete", None)
+                }
+                sideeffect::diff::DiffError::InputTooLarge { .. }
+                | sideeffect::diff::DiffError::TooManyRecords { .. }
+                | sideeffect::diff::DiffError::AllocationFailed { .. } => {
+                    RuntimePairIssue::NotCompared("runtime_comparison_limit_exceeded")
+                }
+                sideeffect::diff::DiffError::InconsistentDocument { .. } => {
+                    RuntimePairIssue::Incomparable("runtime_trace_document_inconsistent")
+                }
+            },
+        )?;
+    let diff = serde_json::to_value(diff)
+        .map_err(|_| RuntimePairIssue::Incomparable("runtime_diff_serialization_failed"))?;
+    Ok((metadata_before, metadata_after, diff))
+}
+
+#[cfg(windows)]
+fn compare_windows_session_runtime(
+    report: &mut sideeffect::audit_session_diff::AuditSessionDiff,
+    before: &sideeffect::audit_session::AuditSessionManifest,
+    after: &sideeffect::audit_session::AuditSessionManifest,
+    before_artifacts: &[sideeffect::audit_session_diff::VerifiedArtifactBytes<'_>],
+    after_artifacts: &[sideeffect::audit_session_diff::VerifiedArtifactBytes<'_>],
+) {
+    use sideeffect::audit_session::{ArtifactKind, SourceRole};
+    let Some(entry) = report
+        .source_diffs
+        .iter_mut()
+        .find(|source| source.role == SourceRole::Runtime)
+    else {
+        return;
+    };
+    if entry.reason_code != Some("role_not_supported_by_item_diff") {
+        return;
+    }
+    let compare_side =
+        |manifest: &sideeffect::audit_session::AuditSessionManifest,
+         artifacts: &[sideeffect::audit_session_diff::VerifiedArtifactBytes<'_>]| {
+            let (_, bytes) = verified_runtime_artifact(
+                manifest,
+                artifacts,
+                ArtifactKind::WindowsRuntimeCapture,
+                "runtime.windows.json",
+                sideeffect::windows_runtime::WINDOWS_RUNTIME_CAPTURE_SCHEMA,
+                sideeffect::windows_runtime::WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION,
+            )?;
+            if bytes.len() > sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES {
+                return Err("runtime_artifact_input_limit_exceeded");
+            }
+            sideeffect::windows_runtime::inspect_windows_runtime_bytes(bytes)
+                .map_err(|_| "runtime_capture_invalid")
+        };
+    let result = (|| {
+        let left = compare_side(before, before_artifacts)?;
+        let right = compare_side(after, after_artifacts)?;
+        let summary =
+            sideeffect::windows_runtime_diff::compare_windows_runtime_captures(&left, &right)
+                .map_err(|_| "runtime_comparison_limit_exceeded")?;
+        serde_json::to_value(summary).map_err(|_| "runtime_diff_serialization_failed")
+    })();
+    match result {
+        Ok(comparison) => {
+            entry.status = "partial";
+            entry.reason_code = Some("runtime_capture_completeness_unknown");
+            entry.comparison = Some(comparison);
+        }
+        Err(reason) => {
+            entry.status = if reason == "runtime_artifact_input_limit_exceeded"
+                || reason == "runtime_comparison_limit_exceeded"
+            {
+                "not_compared"
+            } else {
+                "incomparable"
+            };
+            entry.reason_code = Some(reason);
+            entry.comparison = None;
+        }
+    }
 }
 
 fn correlate_startup(startup_path: &OsString, trace_path: &OsString) -> Result<ExitCode, String> {
@@ -4388,6 +4727,10 @@ mod tests {
         AnchoredOutput, ParseLimits, compare_traces, parse_trace_bytes, publish_html_report,
     };
     use super::{CappedBuffer, MAX_REPORT_BYTES, read_limited, read_trace_file};
+    #[cfg(windows)]
+    use sha2::{Digest, Sha256};
+    #[cfg(target_os = "linux")]
+    use sha2::{Digest, Sha256};
     use std::fs::{self, OpenOptions};
     use std::io::{self, Cursor, Write};
     use std::path::PathBuf;
@@ -4551,5 +4894,363 @@ mod tests {
     fn record_output_paths_escape_terminal_control_bytes() {
         let path = std::path::Path::new("safe\n\u{1b}[31m");
         assert_eq!(super::terminal_safe_path(path), "safe\\x0a\\x1b[31m");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn session_runtime_diff_uses_verified_etw_bytes_and_preserves_loss_refs() {
+        use sideeffect::audit_session::{
+            ArtifactKind, AuditSessionManifest, AuditSessionSource, IntervalSemantics,
+            LossMetadata, SessionArtifactRef, SessionStatus, SourceRole, SourceStatus,
+        };
+        use sideeffect::windows_runtime::{
+            AppliedLimits, CollectionStatus, EventLoss, NativeRuntimeEvent, SessionMetadata,
+            StopReason, TargetOutcome, WindowsRuntimeCapture,
+        };
+        let make_capture = |payload: &str, events_lost: u32| {
+            let mut capture = WindowsRuntimeCapture {
+                schema: sideeffect::windows_runtime::WINDOWS_RUNTIME_CAPTURE_SCHEMA.to_owned(),
+                schema_version: sideeffect::windows_runtime::WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION,
+                platform: "windows".to_owned(),
+                capture_profile: "synthetic_session_diff_test".to_owned(),
+                collection_status: CollectionStatus::Partial,
+                capture_completeness: "unknown".to_owned(),
+                started_at_unix_ms: 100,
+                ended_at_unix_ms: 101,
+                requested_duration_seconds: 1,
+                stop_reason: StopReason::EtwLossReported,
+                target: TargetOutcome {
+                    process_id: 10,
+                    exit_code: Some(0),
+                    status_available: true,
+                },
+                session: SessionMetadata {
+                    name: "NT Kernel Logger".to_owned(),
+                    provider: "synthetic fixture".to_owned(),
+                    scope: "system_wide_process_file_and_network_events_during_capture_window"
+                        .to_owned(),
+                    buffer_size_kb_requested: 16,
+                    minimum_buffers_requested: 8,
+                    maximum_buffers_requested: 32,
+                    buffer_count_reported: 8,
+                    provider_process_id_header_semantics: "header PID/TID is event context only"
+                        .to_owned(),
+                },
+                limits: AppliedLimits {
+                    maximum_duration_seconds: 60,
+                    maximum_events: sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_EVENTS,
+                    maximum_total_payload_bytes:
+                        sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_PAYLOAD_BYTES,
+                    maximum_payload_bytes_per_event:
+                        sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_EVENT_PAYLOAD_BYTES,
+                    maximum_document_bytes:
+                        sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
+                },
+                event_loss: EventLoss {
+                    events_lost,
+                    log_buffers_lost: 0,
+                    real_time_buffers_lost: 0,
+                    loss_statistics_available: true,
+                    observation: "synthetic_loss_fixture".to_owned(),
+                    final_snapshot_available: true,
+                },
+                document_sha256: String::new(),
+                events: vec![NativeRuntimeEvent {
+                    record_ordinal: 1,
+                    provider_guid: "synthetic-provider".to_owned(),
+                    event_id: 99,
+                    event_version: 0,
+                    opcode: 0,
+                    event_kind: "synthetic_event".to_owned(),
+                    header_process_id: 10,
+                    header_thread_id: 11,
+                    header_flags: 0,
+                    timestamp_qpc: 1,
+                    raw_payload_hex: payload.to_owned(),
+                    payload_decoding: None,
+                    observation_decoding: Some(serde_json::json!({"status":"unsupported_event"})),
+                }],
+                diagnostics: vec!["synthetic_fixture_not_a_live_capture".to_owned()],
+            };
+            capture.document_sha256 = format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&capture).unwrap())
+            );
+            serde_json::to_vec(&capture).unwrap()
+        };
+        let make_manifest = |bytes: &[u8], id: &str| {
+            let reference = SessionArtifactRef {
+                kind: ArtifactKind::WindowsRuntimeCapture,
+                path: "runtime.windows.json".to_owned(),
+                schema: sideeffect::windows_runtime::WINDOWS_RUNTIME_CAPTURE_SCHEMA.to_owned(),
+                schema_version: sideeffect::windows_runtime::WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION,
+                byte_length: bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+            };
+            AuditSessionManifest {
+                schema: sideeffect::audit_session::AUDIT_SESSION_SCHEMA.to_owned(),
+                schema_version: sideeffect::audit_session::AUDIT_SESSION_SCHEMA_VERSION,
+                session_id: id.to_owned(),
+                platform: "windows".to_owned(),
+                architecture: "x86_64".to_owned(),
+                started_at_unix_ms: 100,
+                ended_at_unix_ms: 102,
+                interval_semantics: IntervalSemantics::BestEffortNonAtomic,
+                status: SessionStatus::Partial,
+                sources: vec![AuditSessionSource {
+                    role: SourceRole::Runtime,
+                    collector: None,
+                    platform: "windows".to_owned(),
+                    scope: "synthetic bounded ETW capture".to_owned(),
+                    started_at_unix_ms: 100,
+                    ended_at_unix_ms: 101,
+                    status: SourceStatus::Partial,
+                    applied_limits: vec![],
+                    requested_settings: vec![],
+                    effective_settings: vec![],
+                    loss: Some(LossMetadata::unknown()),
+                    diagnostic_codes: vec!["synthetic_fixture_not_a_live_capture".to_owned()],
+                    artifacts: vec![reference],
+                }],
+                host_context: None,
+                coverage_manifest: None,
+            }
+        };
+        let before_bytes = make_capture("00", 1);
+        let after_bytes = make_capture("01", 2);
+        let before = make_manifest(&before_bytes, "0123456789abcdef0123456789abcdef");
+        let after = make_manifest(&after_bytes, "1123456789abcdef0123456789abcdef");
+        let before_artifacts = [sideeffect::audit_session_diff::VerifiedArtifactBytes {
+            kind: ArtifactKind::WindowsRuntimeCapture,
+            path: "runtime.windows.json",
+            bytes: &before_bytes,
+        }];
+        let after_artifacts = [sideeffect::audit_session_diff::VerifiedArtifactBytes {
+            kind: ArtifactKind::WindowsRuntimeCapture,
+            path: "runtime.windows.json",
+            bytes: &after_bytes,
+        }];
+        let mut report = sideeffect::audit_session_diff::compare_audit_sessions(
+            &before,
+            &after,
+            &before_artifacts,
+            &after_artifacts,
+        );
+        super::compare_windows_session_runtime(
+            &mut report,
+            &before,
+            &after,
+            &before_artifacts,
+            &after_artifacts,
+        );
+        report.refresh_item_comparison_status();
+        let runtime = &report.source_diffs[0];
+        assert_eq!(runtime.status, "partial");
+        assert_eq!(
+            runtime.reason_code,
+            Some("runtime_capture_completeness_unknown")
+        );
+        assert_eq!(runtime.before_artifacts[0].path, "runtime.windows.json");
+        assert_eq!(
+            runtime.before_artifacts[0].sha256,
+            format!("{:x}", Sha256::digest(&before_bytes))
+        );
+        assert_eq!(
+            runtime.comparison.as_ref().unwrap()["schema"],
+            "sideeffect.windows_runtime_diff_summary"
+        );
+        assert_eq!(
+            runtime.comparison.as_ref().unwrap()["capture_completeness"],
+            "unknown"
+        );
+        assert_eq!(
+            runtime.comparison.as_ref().unwrap()["before"]["event_loss"]["events_lost"],
+            1
+        );
+        assert_eq!(report.item_comparison_status, "partial");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_runtime_diff_checks_run_manifest_trace_binding_and_keeps_both_artifact_refs() {
+        use sideeffect::audit_session::{
+            ArtifactKind, AuditSessionManifest, AuditSessionSource, IntervalSemantics,
+            LossMetadata, SessionArtifactRef, SessionStatus, SourceRole, SourceStatus,
+        };
+        let make_run = |trace: &[u8]| {
+            serde_json::to_vec(&serde_json::json!({
+                "schema":"sideeffect.run", "schema_version":2,
+                "producer":{"sideeffect_version":env!("CARGO_PKG_VERSION"),"operating_system":"linux","architecture":"x86_64"},
+                "capture":{
+                    "tracer":{"name":"strace","major":6,"minor":1},
+                    "capture_profile":"linux_process_file_network_v1",
+                    "strace_reported_status":{"kind":"exit_code","value":0},
+                    "command_outcome":"not_independently_verified",
+                    "completeness":"unknown",
+                    "command_stdout":"inherited_not_captured",
+                    "command_stderr":"inherited_not_captured",
+                    "tracer_diagnostics":"inherited_not_captured",
+                    "time_limit_milliseconds":1000,
+                    "stop_reason":"time_limit_reached"
+                },
+                "trace":{"name":"trace.strace","format":"strace_text","byte_length":trace.len(),"sha256":format!("{:x}",Sha256::digest(trace))}
+            })).unwrap()
+        };
+        let make_manifest = |run: &[u8], trace: &[u8], id: &str| {
+            let refs = vec![
+                SessionArtifactRef {
+                    kind: ArtifactKind::RuntimeManifest,
+                    path: "run.json".to_owned(),
+                    schema: "sideeffect.run".to_owned(),
+                    schema_version: 2,
+                    byte_length: run.len() as u64,
+                    sha256: format!("{:x}", Sha256::digest(run)),
+                },
+                SessionArtifactRef {
+                    kind: ArtifactKind::RuntimeTrace,
+                    path: "trace.strace".to_owned(),
+                    schema: "strace_text".to_owned(),
+                    schema_version: 1,
+                    byte_length: trace.len() as u64,
+                    sha256: format!("{:x}", Sha256::digest(trace)),
+                },
+            ];
+            AuditSessionManifest {
+                schema: sideeffect::audit_session::AUDIT_SESSION_SCHEMA.to_owned(),
+                schema_version: sideeffect::audit_session::AUDIT_SESSION_SCHEMA_VERSION,
+                session_id: id.to_owned(),
+                platform: "linux".to_owned(),
+                architecture: "x86_64".to_owned(),
+                started_at_unix_ms: 100,
+                ended_at_unix_ms: 102,
+                interval_semantics: IntervalSemantics::BestEffortNonAtomic,
+                status: SessionStatus::Partial,
+                sources: vec![AuditSessionSource {
+                    role: SourceRole::Runtime,
+                    collector: None,
+                    platform: "linux".to_owned(),
+                    scope: "synthetic bounded strace capture".to_owned(),
+                    started_at_unix_ms: 100,
+                    ended_at_unix_ms: 101,
+                    status: SourceStatus::Partial,
+                    applied_limits: vec![],
+                    requested_settings: vec![],
+                    effective_settings: vec![],
+                    loss: Some(LossMetadata::unknown()),
+                    diagnostic_codes: vec!["synthetic_fixture_not_a_live_capture".to_owned()],
+                    artifacts: refs,
+                }],
+                host_context: None,
+                coverage_manifest: None,
+            }
+        };
+        let before_trace = b"close(1) = 0\n";
+        let after_trace = b"openat(AT_FDCWD, \"/tmp/demo\", O_RDONLY) = 3\n";
+        let before_run = make_run(before_trace);
+        let after_run = make_run(after_trace);
+        let before = make_manifest(
+            &before_run,
+            before_trace,
+            "0123456789abcdef0123456789abcdef",
+        );
+        let after = make_manifest(&after_run, after_trace, "1123456789abcdef0123456789abcdef");
+        let before_artifacts = [
+            sideeffect::audit_session_diff::VerifiedArtifactBytes {
+                kind: ArtifactKind::RuntimeManifest,
+                path: "run.json",
+                bytes: &before_run,
+            },
+            sideeffect::audit_session_diff::VerifiedArtifactBytes {
+                kind: ArtifactKind::RuntimeTrace,
+                path: "trace.strace",
+                bytes: before_trace,
+            },
+        ];
+        let after_artifacts = [
+            sideeffect::audit_session_diff::VerifiedArtifactBytes {
+                kind: ArtifactKind::RuntimeManifest,
+                path: "run.json",
+                bytes: &after_run,
+            },
+            sideeffect::audit_session_diff::VerifiedArtifactBytes {
+                kind: ArtifactKind::RuntimeTrace,
+                path: "trace.strace",
+                bytes: after_trace,
+            },
+        ];
+        let mut report = sideeffect::audit_session_diff::compare_audit_sessions(
+            &before,
+            &after,
+            &before_artifacts,
+            &after_artifacts,
+        );
+        super::compare_linux_session_runtime(
+            &mut report,
+            &before,
+            &after,
+            &before_artifacts,
+            &after_artifacts,
+        );
+        report.refresh_item_comparison_status();
+        let runtime = &report.source_diffs[0];
+        assert_eq!(runtime.status, "partial");
+        assert_eq!(
+            runtime.reason_code,
+            Some("runtime_capture_completeness_unknown")
+        );
+        assert_eq!(runtime.before_artifacts.len(), 2);
+        assert_eq!(runtime.before_artifacts[0].path, "run.json");
+        assert_eq!(runtime.before_artifacts[1].path, "trace.strace");
+        assert_eq!(
+            runtime.before_artifacts[1].sha256,
+            format!("{:x}", Sha256::digest(before_trace))
+        );
+        assert_eq!(
+            runtime.comparison.as_ref().unwrap()["runtime_kind"],
+            "linux_strace"
+        );
+        assert_eq!(
+            runtime.comparison.as_ref().unwrap()["trace_diff"]["capture_completeness"],
+            "unknown"
+        );
+        assert_eq!(report.item_comparison_status, "partial");
+
+        let mut mismatched = after.clone();
+        let mut bad_run: serde_json::Value = serde_json::from_slice(&after_run).unwrap();
+        bad_run["trace"]["sha256"] = serde_json::json!("0".repeat(64));
+        let bad_run = serde_json::to_vec(&bad_run).unwrap();
+        mismatched.sources[0].artifacts[0].byte_length = bad_run.len() as u64;
+        mismatched.sources[0].artifacts[0].sha256 = format!("{:x}", Sha256::digest(&bad_run));
+        let bad_artifacts = [
+            sideeffect::audit_session_diff::VerifiedArtifactBytes {
+                kind: ArtifactKind::RuntimeManifest,
+                path: "run.json",
+                bytes: &bad_run,
+            },
+            sideeffect::audit_session_diff::VerifiedArtifactBytes {
+                kind: ArtifactKind::RuntimeTrace,
+                path: "trace.strace",
+                bytes: after_trace,
+            },
+        ];
+        let mut invalid = sideeffect::audit_session_diff::compare_audit_sessions(
+            &before,
+            &mismatched,
+            &before_artifacts,
+            &bad_artifacts,
+        );
+        super::compare_linux_session_runtime(
+            &mut invalid,
+            &before,
+            &mismatched,
+            &before_artifacts,
+            &bad_artifacts,
+        );
+        assert_eq!(invalid.source_diffs[0].status, "incomparable");
+        assert_eq!(
+            invalid.source_diffs[0].reason_code,
+            Some("runtime_manifest_trace_contract_mismatch")
+        );
+        assert!(invalid.source_diffs[0].comparison.is_none());
     }
 }
