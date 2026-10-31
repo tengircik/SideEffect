@@ -150,6 +150,14 @@ fn windows_session_comparability_cli_preserves_metadata_only_and_reader_boundari
     assert_eq!(compatible_report["scope"], "metadata_readiness_only");
     assert!(compatible_report["comparable"].as_bool().unwrap());
     assert_reason(&compatible, "partial_source");
+    assert!(
+        compatible_report["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item
+                == "Caller privilege contexts are not comparability keys and may differ.")
+    );
     assert!(compatible_report.get("deltas").is_none());
 
     let mut changed = manifest(&after);

@@ -349,7 +349,7 @@ Compare the declared collection context of two validated sessions:
 ./target/release/sideeffect compare-sessions ./before-session ./after-session
 ```
 
-This emits `sideeffect.audit_session_comparability` v1 with a comparable status and stable reason codes. Exit status `0` means `comparable` is true, including when a matching partial source is reported with the `partial_source` review reason; status `2` means `comparable` is false. Invalid or insecure session inputs fail through the same verified readers used by `inspect --session`. The command does not compare inventory rows or runtime events. Comparable sessions do not establish equal observations, exhaustive coverage, event absence, or source authenticity.
+This emits `sideeffect.audit_session_comparability` v1 with a comparable status and stable reason codes. Exit status `0` means `comparable` is true, including when a matching partial source is reported with the `partial_source` review reason; status `2` means `comparable` is false. Invalid or insecure session inputs fail through the same verified readers used by `inspect --session`. The command does not compare inventory rows or runtime events. Comparable sessions do not establish equal observations, exhaustive coverage, event absence, equal caller privilege context, or source authenticity.
 
 ### Sign an audit session
 

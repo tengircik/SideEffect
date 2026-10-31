@@ -2152,7 +2152,7 @@ struct AuditSessionComparabilityDocument {
     comparable: bool,
     reason_codes: Vec<&'static str>,
     scope: &'static str,
-    limitations: [&'static str; 4],
+    limitations: [&'static str; 5],
 }
 
 fn compare_audit_sessions(
@@ -2183,6 +2183,7 @@ fn compare_audit_sessions(
             "Comparable sessions do not establish equal observations, exhaustive coverage, or event absence.",
             "This is not an item-level inventory or event diff and does not establish causation.",
             "Verified lengths and hashes do not authenticate the session producer or source contents.",
+            "Caller privilege contexts are not comparability keys and may differ.",
         ],
     };
     write_json(&report, "audit-session comparability report")?;

@@ -139,6 +139,14 @@ fn session_comparability_cli_reports_metadata_readiness_and_rejects_unverified_i
     assert!(compatible_report["comparable"].as_bool().unwrap());
     assert_reason(&compatible, "partial_source");
     assert!(compatible_report["limitations"].as_array().unwrap().len() >= 3);
+    assert!(
+        compatible_report["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item
+                == "Caller privilege contexts are not comparability keys and may differ.")
+    );
     assert!(compatible_report.get("deltas").is_none());
 
     let mut changed = manifest(&after);
