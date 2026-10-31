@@ -88,6 +88,8 @@ To inspect the current process's executable-name candidates, run `sideeffect inv
 
 The same inventory can be selected inside an audit session with `sideeffect audit --output ./audit-session --path-executables` (PowerShell: `sideeffect.exe audit --output .\audit-session --path-executables`). The session records its status, limits, fixed artifact provenance, and collector identity. It remains a point-in-time candidate inventory: SideEffect does not execute candidates or resolve commands through a shell.
 
+To compare two sessions that both include this source, run `sideeffect compare-sessions ./before-session ./after-session` (PowerShell: `sideeffect.exe compare-sessions .\before-session .\after-session`). The item diff uses exact platform path encodings and links candidate changes to each session's artifact. Incomplete sources and ambiguous identities suppress one-sided candidate changes; Windows `PATHEXT` changes suppress candidate classification and presence claims. A candidate label is a metadata heuristic, not proof that a shell resolves or can launch the file. Session artifacts and comparison output can contain sensitive paths and filenames.
+
 ### Capture a selected Linux command
 
 ```sh
@@ -120,6 +122,52 @@ sideeffect.exe events --windows-runtime .\runtime.windows.json
 ```
 
 The command writes versioned JSON to stdout and never runs represented commands or modifies the input. Events keep their source-local order, timestamps, outcome/status, and evidence links. Envelope v2 adds source-local process observations and event links: Linux process-creation rows link the caller task ID to the returned child PID. Windows process identities and parent relationships come from serialized ETW lifecycle decoder fields and are labeled `decoder_metadata_unverified`. For supported classic TCP/UDP rows, the adapter re-decodes retained raw payload bytes and checks the serialized observation; a mismatch is diagnosed and only the raw payload PID can support a context-candidate link. Unsupported or malformed payloads remain raw with an unresolved link and diagnostic. Windows file/disk header PIDs remain context candidates. These links do not form a merged process graph or causal view. A partial or unknown source exits with status `2`; the envelope does not infer one global clock or process ownership.
+
+### Explore an evidence-linked event graph
+
+```sh
+sideeffect graph --trace ./capture.trace --event-kind openat
+```
+
+On native Windows, adapt a validated ETW capture:
+
+```powershell
+sideeffect.exe graph --windows-runtime .\runtime.windows.json --event-kind file_io_observation
+```
+
+The graph contains source-local event and process-observation nodes, process-relationship edges, and event-to-process links. `--event-kind` matches one exact kind and keeps its direct process links plus one-hop process relationships; diagnostics and source status still describe the full input. Unresolved PID context is represented by a separate node for each edge; equal PID values are never merged into one process instance. Every node and edge retains its source evidence, link status, and derivation basis. Context candidates and decoder-metadata relationships stay labeled as such. The graph does not establish ownership, causation, or a complete process tree. Partial or unknown input exits with status `2`.
+
+### Browse a source-local event timeline
+
+```sh
+sideeffect timeline --trace ./capture.trace --event-kind openat
+```
+
+On native Windows, use a validated ETW capture:
+
+```powershell
+sideeffect.exe timeline --windows-runtime .\runtime.windows.json --event-kind file_io_observation
+```
+
+To filter by a process observation from that same source, add `--process-observation ID`:
+
+```sh
+sideeffect timeline --trace ./capture.trace --process-observation PROC_OBS_ID
+```
+
+```powershell
+sideeffect.exe timeline --windows-runtime .\runtime.windows.json --process-observation PROC_OBS_ID
+```
+
+The filters can be combined in either order; combined filters select events matching both the exact event kind and a direct link to that process observation. Process observation IDs are source-local identifiers, not PIDs, and are not portable across captures. The selected observation and its evidence remain present even when the combined filters select no events. The JSON listing keeps each source's original order, timestamp representation, and evidence reference, including every direct link for displayed events. Full-source diagnostics remain visible, and partial or unknown status exits with status `2`. An empty filtered result does not prove that the event or process activity was absent. Timelines are single-source views: they do not merge clocks or establish causal order. Hosted tests exercise the timeline adapter on real Linux `strace` and native Windows ETW captures for named file/loopback scenarios on Ubuntu 24.04 and Windows Server 2022/2025; they do not establish broad OS or event coverage.
+
+On native Windows, resolve one ETW timeline or graph event directly to its validated source row using the capture fingerprint, record ordinal, and raw-payload digest from that reference:
+
+```powershell
+sideeffect.exe evidence --windows-runtime .\runtime.windows.json CAPTURE_SHA256 RECORD_ORDINAL RAW_PAYLOAD_SHA256
+```
+
+The command verifies all three reference values and returns the original event row with its JSON pointer, capture loss, and diagnostics. It does not independently verify serialized decode metadata or authenticate the producer. Unknown completeness and partial status are preserved and exit with status `2`.
 
 ### Compare saved inventories
 
@@ -187,6 +235,7 @@ SideEffect provides a native Rust CLI for Linux x86_64 and Windows x64. The Linu
 - [Build, install, and platform compatibility](docs/INSTALL.md)
 - [Install SideEffect as an agent skill](docs/AGENT_SKILL.md)
 - [Product scope](docs/PRODUCT.md)
+- [Windows local explanation model setup](docs/LOCAL_MODEL_WINDOWS_SETUP.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Delivery plan](docs/PLAN.md)
 - [Linux real-trace benchmark methodology](docs/TRACE_BENCHMARKING.md)

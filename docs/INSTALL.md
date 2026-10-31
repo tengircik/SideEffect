@@ -107,7 +107,7 @@ The minimums below describe declared support requirements, while the validation 
 | Linux process inventory | Visible `/proc` status fields and bounded `/proc/PID/exe` link text | Synthetic procfs fixtures and Linux CLI tests | Atomic or exhaustive process coverage; command lines or executable contents |
 | Linux startup configuration | Aggregate schema v2: curated XDG, systemd, SysV, and cron source snapshots with inert evidence | CLI tests and deterministic source/parser fixtures | Effective applicability, manager runtime state, all distribution-specific paths, or exhaustive startup coverage |
 | Diff | Exact multiset comparison of parsed syscall rows; PID/timestamp prefixes alone are ignored | Synthetic pairs plus real integration trace pair | Root cause, causal links, normalized paths/FDs, or complete OS observation |
-| Windows native x64 | Bounded inventory and experimental ETW v3 capture, inspection, event-level diff v2, attribution candidate view, and audit-session integration | Local Windows x64 `cargo test --locked --all-targets`, Clippy and format checks; hosted Windows Server 2022/2025 build/test and live process/file/loopback acceptance at exact commit [`797ba86`](https://github.com/tengircik/SideEffect/commit/797ba86dc41d024129da35b2fc4be7ad5eca6756) ([CI run](https://github.com/tengircik/SideEffect/actions/runs/40867530573)) | Windows 11 x64 privileged live ETW validation, ETL import, exhaustive inventory/event coverage, all provider/version combinations, and general Windows compatibility |
+| Windows native x64 | Bounded inventory and experimental ETW v3 capture, inspection, event-level diff summary v3, evidence lookup, attribution candidate view, and audit-session integration | Local Windows x64 `cargo test --locked --all-targets`, Clippy and format checks; hosted Windows Server 2022/2025 build/test and live process/file/loopback acceptance at exact commit [`797ba86`](https://github.com/tengircik/SideEffect/commit/797ba86dc41d024129da35b2fc4be7ad5eca6756) ([CI run](https://github.com/tengircik/SideEffect/actions/runs/40867530573)) | Windows 11 x64 privileged live ETW validation, ETL import, exhaustive inventory/event coverage, all provider/version combinations, and general Windows compatibility |
 
 The capture filter selects syscall families using `strace`'s own versioned definitions. SideEffect's parser is not an exhaustive syscall allowlist: it recognizes supported outer record syntax and preserves raw arguments/results, while the outcome and path-hint derivations above remain deliberately narrow. Diff category labels are syscall-name buckets, not claims about successful effects.
 
@@ -119,9 +119,17 @@ Model management is available through `sideeffect model list`, `show ID`, `insta
 
 Catalog installation is an explicit user action and is available only for catalog entries whose analysis task is supported on the current platform. The catalog contains evidence-selection and query-plan models for Linux x86_64, plus an explanation model for Linux x86_64 and native Windows. For the shortest flow, run `sideeffect model setup ID`; it displays the immutable source, size, platform scope, license terms and evaluation note, downloads after the exact `ACCEPT <license-id>` response, verifies the file, and selects it for its declared task. `sideeffect model install ID` downloads without selecting. Acceptance for that exact catalog model/revision/license is persisted in the local registry before network access, including if the transfer later fails or is cancelled. The downloader fetches only the pinned Hugging Face file over HTTPS, allows only approved HTTPS redirects, enforces the catalog size and SHA-256, writes a private staging file, and publishes without replacing an existing destination. It sends no trace or prompt data. No model is positively recommended for quality. The inference runtime remains separately obtained and installed by the user.
 
+Before previewing evidence for an explanation, check the selected model and local runtime without running inference:
+
+```powershell
+sideeffect.exe model doctor --task explanation --runtime .\path\to\llama-completion.exe --backend auto
+```
+
+The doctor verifies the selected model file hash and performs bounded runtime version/device checks. It does not read a trace or load weights into the inference runtime. Its CUDA device result is not proof of successful GPU inference. See [the local model readiness check](LOCAL_MODEL_DOCTOR.md) for details and exit statuses.
+
 After installation, select the model for its task. An existing local GGUF can instead be registered with `sideeffect model add --name NAME --path FILE --for evidence|explanation|query[,TASK...] [--license ID]`; the user-provided license label is unverified metadata. `model select TASK ID` checks the model file and hash before saving the per-task selection. The exact model ID, hash, source/revision or user-provided marker, license/evaluation status and pinned runtime/backend metadata are included in each relevant preview digest and output. Changing the selection invalidates the old confirmation and requires a fresh preview. `model remove ID` requires typing the exact ID before deleting a verified catalog file; removing a custom model only removes its registration.
 
-The model manager and catalog can be inspected on Windows. Catalog query-plan inference and the evidence-selection command are Linux x86_64 only; the catalog explanation model and explanation command support Linux x86_64 and native Windows. Windows explanation supports `auto`, `cpu`, or `cuda`. A local custom GGUF can be registered only for a task supported on that platform. Runtime setup remains separate: SideEffect does not download or install llama.cpp or another runtime. Model/runtime compatibility does not imply model quality, and no candidate has passed its applicable semantic gate. See the task-specific setup and limitations in [evidence selection](LOCAL_MODEL_EVALUATION.md), [query plans](LOCAL_QUERY_PLAN_EVALUATION.md), and [explanations](LOCAL_MODEL_EXPLANATION_EVALUATION.md).
+The model manager and catalog can be inspected on Windows. Catalog query-plan inference and the evidence-selection command are Linux x86_64 only; the catalog explanation model and explanation command support Linux x86_64 and native Windows. Windows explanation supports `auto`, `cpu`, or `cuda`. A local custom GGUF can be registered only for a task supported on that platform. Runtime setup remains separate: SideEffect does not download or install llama.cpp or another runtime. Model/runtime compatibility does not imply model quality, and no candidate has passed its applicable semantic gate. For the Windows/NVIDIA explanation setup and its CUDA, runtime, and resource limitations, see [Windows local explanation model setup](LOCAL_MODEL_WINDOWS_SETUP.md). Also see the task-specific setup and limitations in [evidence selection](LOCAL_MODEL_EVALUATION.md), [query plans](LOCAL_QUERY_PLAN_EVALUATION.md), and [explanations](LOCAL_MODEL_EXPLANATION_EVALUATION.md).
 
 ## Build from source
 
@@ -235,7 +243,7 @@ Compare two validated Windows runtime captures with:
 .\target\release\sideeffect.exe diff --format html --output .\diff-report.html --windows-runtime .\before.json .\after.json
 ```
 
-Both inputs must pass the bounded v3 reader and representation-fingerprint check. Summary schema v2 preserves fixed category counts and ordinals, compares exact normalized event records as multisets (excluding only record ordinal and QPC timestamp), and labels unique supported operation/path or process/image matches as candidates. Each event group points to both capture fingerprints and record ordinals. Partial/loss-affected inputs do not turn one-sided observations into removals or additions; ambiguity and capture diagnostics remain visible. No count, exact representation match, or candidate identity proves cause or system-level absence. Capture completeness remains unknown; partial status yields exit `2`. The HTML variant is native Windows only and uses the protected, no-clobber publisher, CSP that blocks scripts/network sources, and the 64 MiB output cap. The result may contain sensitive local evidence.
+Both inputs must pass the bounded v3 reader and representation-fingerprint check. Summary schema v3 reports whether canonical validated capture representation fingerprints match, preserves fixed category counts and ordinals, compares exact normalized event records as multisets (excluding only record ordinal and QPC timestamp), and labels unique supported operation/path or process/image matches as candidates. Fingerprint equality does not compare JSON formatting or authenticate a producer. Its normalization ledger explains both exclusions and each event reference retains the original before/after ordinal and QPC value beside its capture fingerprint. Each event group points to both capture fingerprints and record ordinals. Partial/loss-affected inputs do not turn one-sided observations into removals or additions; ambiguity and capture diagnostics remain visible. No count, exact representation match, or candidate identity proves cause or system-level absence. Capture completeness remains unknown; partial status yields exit `2`. The HTML variant is native Windows only and uses the protected, no-clobber publisher, CSP that blocks scripts/network sources, and the 64 MiB output cap. The result may contain sensitive local evidence.
 
 To see a separate process and event attribution view for the selected runtime capture, run `sideeffect.exe attribute --windows-runtime .\capture.json`. It uses only validated process-start parent IDs, documented network payload process IDs, and file/disk header IDs as context candidates. It reports source ordinals, ambiguity, unsupported lifecycle records, and loss; it does not infer file ownership or causation.
 
@@ -258,6 +266,30 @@ This is a read-only check of explicit paths only. It records file type, UID/GID,
 ```
 
 This writes `sideeffect.windows_permission_inventory` v1 for explicit paths only. SideEffect opens each final path with `FILE_FLAG_OPEN_REPARSE_POINT`, then reads file attributes and owner/group/DACL from that same handle using read-control and file-attribute access. It records security descriptor bytes and hash, DACL state and control flags, and ACEs in original order; recognized basic allow/deny/audit ACE fields are decoded, while unknown ACEs remain raw evidence. It does not request SACLs, recurse, request elevation, follow the final reparse point, or calculate effective access. Inaccessible, malformed, unsupported, and over-limit items remain visible as partial or unknown. Bounds are 256 paths, 32,767 UTF-16 units per path, 1 Mi aggregate path units, 64 KiB per descriptor, 1,024 ACEs per descriptor, 8 MiB aggregate descriptor data, a five-second deadline checked between paths, and 64 MiB serialized output. An in-flight Windows API call cannot be canceled and may exceed that interval. Output uses the current-user-only DACL and no-clobber publisher; paths and ACL bytes are sensitive and should be reviewed before sharing.
+
+## Run a partial access check
+
+On Linux, run a non-mutating permission preflight for the current calling thread:
+
+```sh
+./target/release/sideeffect inventory access-check --operation read --output ./access-check.json /absolute/path/to/file
+```
+
+Use `read`, `write`, or `execute` and an absolute path. Linux pins the resolved final object and records the `faccessat2` result plus selected credentials and metadata. `execute` requests `X_OK`; for directories this checks search/traversal permission, and for files it does not prove that `execve` will succeed. This is only a preflight under the current thread's credentials; it does not perform the requested operation or evaluate all configured policy. The calculated conclusion remains `unknown`. The report is private, no-clobber JSON and the command exits `2` to indicate a partial result.
+
+On Windows, first collect a process snapshot and use the selected process row's PID and observed `creation_time.filetime_100ns` value:
+
+```powershell
+sideeffect.exe inventory processes --output .\processes.json
+sideeffect.exe inventory access-check `
+  --pid 1234 `
+  --creation-time-filetime 134379260545106360 `
+  --operation read `
+  --output .\access-check.json `
+  C:\path\to\file.exe
+```
+
+Replace the example PID and FILETIME with values from the same process row in your snapshot. Windows evaluates only the selected local file object's DACL against that process's primary token. After opening the selected object, SideEffect checks the handle's final NT volume path and evaluates only recognized `\Device\HarddiskVolume` paths with a numeric volume suffix; an unrecognized or remote final device path is returned unsupported. A DACL grant or denial is not a complete effective-access verdict: ancestor traversal, thread impersonation, integrity labels, remote policy, and other controls are not evaluated. Directories, reparse points, AppContainer processes, and unsupported ACE semantics return unsupported or unknown. No elevation is requested. The command writes a private, no-clobber report and exits `2` for its conditional/partial result. Treat the path, process identity, and descriptor digest as sensitive evidence.
 
 ## Inventory Linux startup configuration
 
@@ -311,6 +343,42 @@ To verify and review the session metadata:
 
 The reader requires a current-user-owned private directory and private regular files, rejects symlinks and unlisted entries, checks bounded JSON syntax and declared schema/version headers, and verifies every declared artifact's length and SHA-256 before writing a review. It does not fully validate each inventory artifact's domain schema or print raw inventory rows. Use `--format json` for the versioned `sideeffect.audit_session_review` v6 output, which includes recorded host OS/version and caller privilege context, source settings, runtime loss state, and artifact provenance. The display-only review escapes non-ASCII and control characters in all string values as ASCII so imported metadata cannot inject terminal formatting; this encoding does not modify stored session files. Older session versions retain absent host context; it is not reconstructed. A hash match does not authenticate the session producer. Partial sessions are still reviewable and return exit status `2`.
 
+Compare the declared collection context of two validated sessions:
+
+```sh
+./target/release/sideeffect compare-sessions ./before-session ./after-session
+```
+
+This emits `sideeffect.audit_session_diff` v1 with the existing metadata comparability status and stable reason codes, plus item-level package/software, process, startup, selected-path permission, and Linux strace or Windows ETW runtime comparisons when both sessions contain compatible verified artifacts. Linux runtime requires matching `run.json` metadata and raw trace fingerprints before parsing. Exit status `0` means metadata `comparable` is true, including when a matching partial source is reported with the `partial_source` review reason; status `2` means it is false. Check each `source_diffs` status and reason: partial, missing, unsupported, incompatible, invalid, and over-budget source pairs do not imply empty data. PATH-executable artifacts are not compared yet. Invalid or insecure session inputs fail through the same verified readers used by `inspect --session`. Comparable sessions do not establish equal observations, exhaustive coverage, event absence, equal caller privilege context, causation, or source authenticity.
+
+### Sign an audit session
+
+Create a local Ed25519 keypair explicitly:
+
+```sh
+./target/release/sideeffect provenance keygen ./sideeffect-signing-key.pk8 ./sideeffect-public-key.hex
+```
+
+The private key is an unencrypted PKCS#8 file. Protect it and keep a secure backup; anyone who obtains it can create signatures that verify under its public key. Key files are written with owner-only access and existing outputs are never replaced.
+
+Sign a validated session. Review the displayed session metadata and type `sign` when prompted. The signature envelope is a separate file outside the session directory:
+
+```sh
+./target/release/sideeffect provenance sign-session ./audit-session \
+  --private-key ./sideeffect-signing-key.pk8 \
+  --output ./audit-session.signature.json
+```
+
+Verify offline by supplying the matching public key:
+
+```sh
+./target/release/sideeffect provenance verify-session ./audit-session \
+  --signature ./audit-session.signature.json \
+  --public-key ./sideeffect-public-key.hex
+```
+
+Verification checks the session artifacts first, then verifies the signature over the exact `session.json` bytes. It reports cryptographic validity only. The current CLI has no local trust store or revocation handling; a valid signature does not identify a person, establish key trust, prove collector honesty, or establish capture completeness. The recorded signing time comes from the local clock and is not a trusted timestamp. Keep the detached signature file with the session when moving or archiving it.
+
 ## Record a command on Linux
 
 Install `strace` from a trusted distribution repository and confirm it reports version 6.8 or newer. On Ubuntu, these commands install system packages and change that Linux installation system-wide; they typically require administrator privileges, so run them only if you intend to make that change. `python3` is required for the Linux real-tracer integration test, not for the `record` command itself:
@@ -345,6 +413,44 @@ On native Windows, adapt a saved ETW v3 capture after the strict bounded schema 
 ```
 
 Both commands write JSON only to stdout and read the selected file without modifying it or running represented commands. The envelope preserves source-local row order, timestamps, attempt/result or observation semantics, diagnostics, and evidence references. Its status is `partial` or `unknown` when the source or adapter cannot establish a complete supported result; those outcomes exit `2`. ETW header PID is event context and is not ownership or an actor identity. Neither adapter creates global event order, parentage, or causation. The common envelope is an output format, not a persisted capture or event graph; see [schema compatibility](SCHEMA_COMPATIBILITY.md).
+
+To organize the adapted facts into an evidence-linked graph, run:
+
+```sh
+./target/release/sideeffect graph --trace ./run.trace --event-kind openat
+```
+
+On native Windows:
+
+```powershell
+sideeffect.exe graph --windows-runtime .\runtime.windows.json --event-kind file_io_observation
+```
+
+To select a source-local process observation from the graph:
+
+```sh
+./target/release/sideeffect graph --trace ./run.trace --process-observation 1
+```
+
+The same option is available with `graph --windows-runtime` on native Windows. IDs are envelope-local `ProcessObservation.source_local_id` values shown in graph output; they are neither PIDs nor identifiers that can be reused across captures. The filter retains directly linked event rows with their existing link roles, statuses, and bases, plus one-hop process relationships. It does not match unlinked events by PID. If a valid observation has no linked events, the observation node remains in the result; an empty event selection is not evidence that activity was absent. Both filters are recorded in graph schema v2. Diagnostics and completeness still describe the full input. PID-only context nodes stay separate from process observations, and the graph does not imply ownership, causation, or a complete process tree.
+
+For a source-local timeline over Linux strace evidence, use an exact event-kind filter, a source-local process observation filter, or both:
+
+```sh
+./target/release/sideeffect timeline --trace ./run.trace --event-kind openat
+./target/release/sideeffect timeline --trace ./run.trace --process-observation 1
+```
+
+Each item retains its source ordinal, original timestamp text, and raw trace line/byte reference for drilldown against the supplied trace. Parser diagnostics remain present after filtering. The command does not merge sources or infer causal order.
+
+On native Windows, the same timeline view and filters are available over a strictly validated ETW v3 capture:
+
+```powershell
+sideeffect.exe timeline --windows-runtime .\runtime.windows.json --event-kind file_io_observation
+sideeffect.exe timeline --windows-runtime .\runtime.windows.json --process-observation 1
+```
+
+Timeline schema v2 records the selected filters and includes all event-to-process links for displayed items, preserving each link role, status, and basis. A `--process-observation ID` uses only `ProcessObservation.source_local_id` emitted by that adapted capture; it is not a PID and cannot be reused across captures. When both filters are supplied, events must match both the exact event kind and a direct link to the selected observation; the options work in either order and duplicate or incomplete options fail clearly. The selected observation and its source evidence remain in output when it has no linked events or the combined selection has no events. An empty item selection or missing link is not proof that activity was absent. Linux items retain raw line/byte references; ETW items retain capture-local ordinal, QPC timestamp text, payload digest, and JSON pointer back to the source event. Full-source diagnostics and partial or unknown status remain visible; partial or unknown exits with status `2`. This is a source-local timeline, not a merged graph or causal sequence. Resolve a single event with `sideeffect.exe evidence --windows-runtime .\runtime.windows.json CAPTURE_SHA256 RECORD_ORDINAL RAW_PAYLOAD_SHA256`. The lookup validates the capture, then requires the fingerprint, ordinal, and raw-payload digest to match before returning that row and its source pointer. It includes capture status, loss, and diagnostics; serialized decode metadata and producer authenticity are not independently verified. Unknown completeness exits with status `2`.
 
 ## Use an existing WSL2 installation
 

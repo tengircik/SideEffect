@@ -3,6 +3,7 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs::{self, DirBuilder};
+use std::net::TcpListener;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -598,6 +599,87 @@ fn real_strace_capture_inspect_and_diff_observe_file_and_loopback_events() {
             .to_str()
             .expect("UTF-8 test filename"),
     );
+    let timeline_output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--trace"])
+        .arg(&baseline_path)
+        .args(["--event-kind", "openat"])
+        .output()
+        .expect("launch timeline over the real strace capture");
+    assert!(
+        matches!(timeline_output.status.code(), Some(0 | 2)),
+        "timeline real strace capture failed (status: {:?}; stderr: {})",
+        timeline_output.status.code(),
+        String::from_utf8_lossy(&timeline_output.stderr)
+    );
+    let timeline: Value =
+        serde_json::from_slice(&timeline_output.stdout).expect("parse real-capture timeline JSON");
+    assert_eq!(timeline["schema"], "sideeffect.event_timeline");
+    let expected_exit = if timeline["source_state"]["completeness"] == "complete" {
+        0
+    } else {
+        2
+    };
+    assert_eq!(timeline_output.status.code(), Some(expected_exit));
+    assert_eq!(timeline["filter"]["event_kind"], "openat");
+    let timeline_file_event = timeline["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| {
+            event["event_kind"] == "openat"
+                && event["evidence"]["line_number"] == baseline_file_open["evidence"]["line_number"]
+                && event["evidence"]["byte_offset"] == baseline_file_open["evidence"]["byte_offset"]
+                && event["evidence"]["byte_length"] == baseline_file_open["evidence"]["byte_length"]
+        })
+        .expect("timeline should link to the observed real file-open row");
+    assert_eq!(timeline_file_event["evidence"]["kind"], "raw_trace_record");
+    let raw_trace = fs::read(&baseline_path).unwrap();
+    let start = timeline_file_event["evidence"]["byte_offset"]
+        .as_u64()
+        .unwrap() as usize;
+    let length = timeline_file_event["evidence"]["byte_length"]
+        .as_u64()
+        .unwrap() as usize;
+    assert!(
+        start
+            .checked_add(length)
+            .is_some_and(|end| end <= raw_trace.len())
+    );
+    assert!(
+        String::from_utf8_lossy(&raw_trace[start..start + length])
+            .contains(baseline_file.file_name().unwrap().to_str().unwrap())
+    );
+    let graph_output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--trace"])
+        .arg(&baseline_path)
+        .output()
+        .expect("launch graph over the real strace capture");
+    assert!(
+        matches!(graph_output.status.code(), Some(0 | 2)),
+        "graph real strace capture failed (status: {:?}; stderr: {})",
+        graph_output.status.code(),
+        String::from_utf8_lossy(&graph_output.stderr)
+    );
+    let graph: Value =
+        serde_json::from_slice(&graph_output.stdout).expect("parse real-capture graph JSON");
+    assert_eq!(graph["schema"], "sideeffect.event_graph");
+    assert_eq!(graph["source_state"], timeline["source_state"]);
+    let graph_file_event = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| {
+            node["kind"] == "event"
+                && node["event"]["event_kind"] == "openat"
+                && node["evidence"]["line_number"] == baseline_file_open["evidence"]["line_number"]
+                && node["evidence"]["byte_offset"] == baseline_file_open["evidence"]["byte_offset"]
+        })
+        .expect("graph should include the observed real file-open event");
+    assert!(graph["edges"].as_array().unwrap().iter().any(|edge| {
+        edge["kind"] == "event_process_link"
+            && edge["event_link_status"] == "observed"
+            && edge["from_node_id"] == graph_file_event["id"]
+    }));
     assert_eq!(
         baseline_file_open["lexical_path_hint"]["path"],
         baseline_file.to_str().unwrap()
@@ -818,6 +900,98 @@ fn real_strace_capture_inspect_and_diff_observe_file_and_loopback_events() {
 }
 
 #[test]
+fn real_strace_capture_reports_refused_loopback_connection_as_failed_attempt() {
+    require_tool("strace", &["--version"]);
+    require_tool("python3", &["--version"]);
+
+    let directory = PrivateTempDirectory::new();
+    let trace_path = directory.path().join("refused-loopback.trace");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve loopback port");
+    let port = listener.local_addr().expect("read loopback port").port();
+    drop(listener);
+
+    const SCRIPT: &str = r#"
+import errno
+import socket
+import sys
+
+port = int(sys.argv[1])
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+    result = client.connect_ex(("127.0.0.1", port))
+if result != errno.ECONNREFUSED:
+    sys.exit(1)
+"#;
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["record", "--trace"])
+        .arg(&trace_path)
+        .args(["--", "python3", "-c", SCRIPT])
+        .arg(port.to_string())
+        .output()
+        .expect("launch SideEffect real strace capture");
+    assert_record_output_does_not_leak_capture(&output);
+    assert_success(&output, "record refused loopback connection");
+    assert!(trace_path.is_file(), "record should publish its real trace");
+
+    let document = inspect_trace(&trace_path);
+    assert_eq!(document["parse_status"], "complete");
+    let port_marker = format!("htons({port})");
+    let records = document["records"]
+        .as_array()
+        .expect("inspect records array");
+    let failed_connect = records
+        .iter()
+        .find(|record| {
+            record["kind"] == "syscall"
+                && record["syscall"] == "connect"
+                && record["raw_arguments"]
+                    .as_str()
+                    .is_some_and(|args| args.contains(&port_marker) && args.contains("127.0.0.1"))
+        })
+        .expect("real trace should retain the selected loopback connect attempt");
+    assert_eq!(failed_connect["outcome"], "failure");
+    assert!(
+        failed_connect["raw_result"]
+            .as_str()
+            .is_some_and(|result| result.starts_with("-1 ECONNREFUSED"))
+    );
+    assert!(
+        !records.iter().any(|record| {
+            record["kind"] == "syscall"
+                && record["syscall"] == "connect"
+                && record["raw_arguments"]
+                    .as_str()
+                    .is_some_and(|args| args.contains(&port_marker) && args.contains("127.0.0.1"))
+                && record["outcome"] == "success"
+        }),
+        "the refused connection must not appear as a successful network effect"
+    );
+
+    let evidence = &failed_connect["evidence"];
+    let byte_offset = evidence["byte_offset"]
+        .as_u64()
+        .expect("failed connect byte offset") as usize;
+    let byte_length = evidence["byte_length"]
+        .as_u64()
+        .expect("failed connect byte length") as usize;
+    let trace = fs::read(&trace_path).expect("read real trace bytes");
+    let evidence_end = byte_offset
+        .checked_add(byte_length)
+        .expect("evidence span must not overflow");
+    let evidence_bytes = trace
+        .get(byte_offset..evidence_end)
+        .expect("failed connect evidence span must be in the real trace");
+    assert_eq!(
+        evidence_bytes,
+        failed_connect["raw_line"].as_str().unwrap().as_bytes()
+    );
+    assert!(
+        evidence["line_number"]
+            .as_u64()
+            .is_some_and(|line| line > 0)
+    );
+}
+
+#[test]
 fn bounded_duration_capture_publishes_partial_bundle_with_explicit_limit_status() {
     let temp = PrivateTempDirectory::new();
     let bundle = temp.0.join("timed.run");
@@ -882,5 +1056,112 @@ fn bounded_duration_capture_publishes_partial_bundle_with_explicit_limit_status(
     assert!(
         !marker.exists(),
         "traced descendant continued running after the time-limited capture returned"
+    );
+}
+
+#[test]
+fn real_strace_capture_cancellation_discards_partial_trace_and_reaps_tracee() {
+    // Prerequisites: Linux x86_64, external strace >= 6.8, and python3.
+    require_tool("strace", &["--version"]);
+    require_tool("python3", &["--version"]);
+
+    let temp = PrivateTempDirectory::new();
+    let trace_path = temp.path().join("cancelled.trace");
+    let ready_path = temp.path().join("target-ready.pid");
+    let script = format!(
+        "import os,time; open({:?}, 'w').write(str(os.getpid())); time.sleep(30)",
+        ready_path
+    );
+    let mut recorder = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["record", "--trace"])
+        .arg(&trace_path)
+        .args(["--", "python3", "-c", &script])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("launch SideEffect real strace capture");
+
+    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let target_pid = loop {
+        if let Ok(contents) = fs::read_to_string(&ready_path) {
+            if let Ok(pid) = contents.parse::<libc::pid_t>() {
+                break pid;
+            }
+        }
+        if let Some(status) = recorder.try_wait().expect("check recorder startup") {
+            panic!("real capture exited before target readiness: {status}");
+        }
+        if std::time::Instant::now() >= ready_deadline {
+            let _ = recorder.kill();
+            let _ = recorder.wait();
+            panic!("real strace target did not signal readiness within 10 seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+
+    // SAFETY: send SIGTERM only to the isolated SideEffect recorder process
+    // started by this test after its traced target has written the ready file.
+    let signal_result = unsafe { libc::kill(recorder.id() as libc::pid_t, libc::SIGTERM) };
+    if signal_result != 0 {
+        let _ = recorder.kill();
+        let _ = recorder.wait();
+        panic!(
+            "could not interrupt isolated real capture: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    let stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = recorder.try_wait().expect("wait for interrupted recorder") {
+            break status;
+        }
+        if std::time::Instant::now() >= stop_deadline {
+            let _ = recorder.kill();
+            let _ = recorder.wait();
+            // SAFETY: target_pid came from the test's own isolated Python target.
+            unsafe { libc::kill(target_pid, libc::SIGKILL) };
+            panic!("recorder did not stop after SIGTERM within 5 seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let output = recorder
+        .wait_with_output()
+        .expect("collect interrupted recorder output");
+    assert_eq!(status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("capture interrupted by signal 15; the partial trace was discarded"),
+        "unexpected cancellation diagnostic: {stderr}"
+    );
+    assert!(
+        !trace_path.exists(),
+        "interrupted capture must not publish a partial trace"
+    );
+
+    // --kill-on-exit is expected to stop the real traced target when SideEffect
+    // terminates strace. Give the kernel a short bounded interval to reap it.
+    let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let target_reaped = loop {
+        // SAFETY: signal 0 only checks the recorded test target PID.
+        let result = unsafe { libc::kill(target_pid, 0) };
+        if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            break true;
+        }
+        if std::time::Instant::now() >= reap_deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    if !target_reaped {
+        // SAFETY: target_pid is the Python process created by this test.
+        unsafe { libc::kill(target_pid, libc::SIGKILL) };
+        panic!("traced Python target survived real strace cancellation");
+    }
+    assert_eq!(
+        fs::read_dir(temp.path()).unwrap().count(),
+        1,
+        "cancellation should clean the private staging output and leave only the readiness marker"
     );
 }

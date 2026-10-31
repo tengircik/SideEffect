@@ -5,9 +5,7 @@
 
 use serde::Serialize;
 use sha2::Digest;
-#[cfg(windows)]
-use std::collections::BTreeSet;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::model::{
     EvidenceReference as TraceEvidenceReference, ParseCompleteness, SyscallOutcome, TraceDocument,
@@ -16,6 +14,8 @@ use crate::model::{
 
 pub const COMMON_EVENT_SCHEMA: &str = "sideeffect.common_event_envelope";
 pub const COMMON_EVENT_SCHEMA_VERSION: u32 = 2;
+pub const EVENT_GRAPH_SCHEMA: &str = "sideeffect.event_graph";
+pub const EVENT_GRAPH_SCHEMA_VERSION: u32 = 2;
 #[cfg(windows)]
 const WINDOWS_RUNTIME_SCHEMA: &str = "sideeffect.windows_runtime_capture";
 #[cfg(windows)]
@@ -24,6 +24,8 @@ const MAX_COMMON_EVENTS: usize = 100_000;
 const MAX_COMMON_PROCESS_RELATIONS: usize = 50_000;
 const MAX_COMMON_PROCESS_DIAGNOSTICS: usize = 256;
 const MAX_COMMON_PROCESS_OBSERVATIONS: usize = MAX_COMMON_EVENTS + MAX_COMMON_PROCESS_RELATIONS;
+const MAX_EVENT_GRAPH_NODES: usize = 500_000;
+const MAX_EVENT_GRAPH_EDGES: usize = 200_000;
 #[cfg(windows)]
 const MAX_ETW_EVENTS: usize = 50_000;
 #[cfg(windows)]
@@ -264,6 +266,448 @@ pub struct CommonEventEnvelope {
     pub event_process_links: Vec<EventProcessLink>,
     /// Unsupported or invalid source rows remain visible here.
     pub diagnostics: Vec<EventDiagnostic>,
+}
+
+/// A source-local event listing with exact references back to the adapted
+/// source. `source_local_ordinal` is retained as the display order; timestamps
+/// are not parsed or used to imply a total or causal ordering.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EventTimeline {
+    pub schema: &'static str,
+    pub schema_version: u32,
+    pub source: SourceDescriptor,
+    pub source_state: SourceState,
+    pub ordering: &'static str,
+    pub semantics: &'static str,
+    pub filter: EventTimelineFilter,
+    /// The selected source-local observation, including its evidence, when a
+    /// process-observation filter was requested.
+    pub selected_process_observation: Option<ProcessObservation>,
+    pub items: Vec<CommonEvent>,
+    /// All source-native process links for displayed items, including
+    /// unresolved and context-candidate links.
+    pub event_process_links: Vec<EventProcessLink>,
+    pub diagnostics: Vec<EventDiagnostic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EventTimelineFilter {
+    pub event_kind: Option<String>,
+    /// Envelope-local source_local_id; never a PID or cross-capture ID.
+    pub process_observation_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum TimelineEvidenceKey {
+    RawTraceRecord(u64, u64, u64),
+    WindowsEtwRecord(u64, String, String),
+}
+
+fn timeline_evidence_key(evidence: &EvidenceReference) -> TimelineEvidenceKey {
+    match evidence {
+        EvidenceReference::RawTraceRecord {
+            line_number,
+            byte_offset,
+            byte_length,
+        } => TimelineEvidenceKey::RawTraceRecord(*line_number, *byte_offset, *byte_length),
+        EvidenceReference::WindowsEtwRecord {
+            record_ordinal,
+            json_pointer,
+            raw_payload_sha256,
+        } => TimelineEvidenceKey::WindowsEtwRecord(
+            *record_ordinal,
+            json_pointer.clone(),
+            raw_payload_sha256.clone(),
+        ),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EventGraphFilter {
+    pub event_kind: Option<String>,
+    /// Envelope-local process observation ID; never a PID or cross-capture ID.
+    pub process_observation_id: Option<u64>,
+}
+
+/// A source-local graph view over an adapted event envelope. PID-only context
+/// nodes are unique per edge and are never merged into process instances.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EventGraph {
+    pub schema: &'static str,
+    pub schema_version: u32,
+    pub filter: EventGraphFilter,
+    pub source: SourceDescriptor,
+    pub source_state: SourceState,
+    pub semantics: &'static str,
+    pub nodes: Vec<EventGraphNode>,
+    pub edges: Vec<EventGraphEdge>,
+    pub diagnostics: Vec<EventDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventGraphNodeKind {
+    Event,
+    ProcessObservation,
+    ProcessIdContext,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EventGraphNode {
+    pub id: String,
+    pub kind: EventGraphNodeKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_local_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<EvidenceReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<CommonEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_observation: Option<ProcessObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reported_process_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_note: Option<&'static str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EventGraphEdge {
+    pub from_node_id: String,
+    pub to_node_id: String,
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship_kind: Option<ProcessRelationshipKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship_resolution: Option<RelationshipResolution>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_link_role: Option<EventProcessLinkRole>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_link_status: Option<EventProcessLinkStatus>,
+    pub basis: String,
+    pub evidence: Vec<EvidenceReference>,
+}
+
+/// Convert already validated source adapters into an evidence-linked graph
+/// view. This function does not infer ownership, ancestry, or causation.
+pub fn graph(
+    envelope: &CommonEventEnvelope,
+    event_kind: Option<&str>,
+    process_observation_id: Option<u64>,
+) -> Result<EventGraph, String> {
+    let estimated_nodes = envelope
+        .events
+        .len()
+        .saturating_add(envelope.process_observations.len());
+    let estimated_edges = envelope
+        .process_relationships
+        .len()
+        .saturating_add(envelope.event_process_links.len());
+    if estimated_nodes > MAX_EVENT_GRAPH_NODES || estimated_edges > MAX_EVENT_GRAPH_EDGES {
+        return Err("event graph exceeds its bounded node or edge limit".to_owned());
+    }
+
+    let mut nodes = Vec::with_capacity(estimated_nodes);
+    let mut edges = Vec::with_capacity(estimated_edges);
+    let mut process_nodes = BTreeMap::new();
+    let mut event_nodes = HashMap::new();
+    let mut event_ordinals = BTreeSet::new();
+
+    for event in &envelope.events {
+        if !event_ordinals.insert(event.source_local_ordinal) {
+            return Err("event graph source contains duplicate event ordinals".to_owned());
+        }
+        let id = format!("event:{}", event.source_local_ordinal);
+        let key = serde_json::to_string(&event.evidence)
+            .map_err(|_| "could not index event graph evidence references".to_owned())?;
+        if event_nodes.insert(key, id.clone()).is_some() {
+            return Err(
+                "event graph source contains duplicate event evidence references".to_owned(),
+            );
+        }
+        nodes.push(EventGraphNode {
+            id,
+            kind: EventGraphNodeKind::Event,
+            source_local_ordinal: Some(event.source_local_ordinal),
+            evidence: Some(event.evidence.clone()),
+            event: Some(event.clone()),
+            process_observation: None,
+            reported_process_id: None,
+            context_note: None,
+        });
+    }
+
+    for observation in &envelope.process_observations {
+        let id = format!("process:{}", observation.source_local_id);
+        if process_nodes
+            .insert(observation.source_local_id, id.clone())
+            .is_some()
+        {
+            return Err("event graph source contains duplicate process observation IDs".to_owned());
+        }
+        nodes.push(EventGraphNode {
+            id,
+            kind: EventGraphNodeKind::ProcessObservation,
+            source_local_ordinal: None,
+            evidence: Some(observation.evidence.clone()),
+            event: None,
+            process_observation: Some(observation.clone()),
+            reported_process_id: None,
+            context_note: None,
+        });
+    }
+
+    let mut context_ordinal = 0_u64;
+    for relationship in &envelope.process_relationships {
+        let Some(to_node_id) = process_nodes.get(&relationship.to_observation_id).cloned() else {
+            return Err(
+                "event graph relationship references a missing target observation".to_owned(),
+            );
+        };
+        let from_node_id = if let Some(from_id) = relationship.from_observation_id {
+            process_nodes.get(&from_id).cloned().ok_or_else(|| {
+                "event graph relationship references a missing source observation".to_owned()
+            })?
+        } else {
+            context_ordinal = context_ordinal.saturating_add(1);
+            let id = format!("pid_context:{context_ordinal}");
+            nodes.push(EventGraphNode {
+                id: id.clone(),
+                kind: EventGraphNodeKind::ProcessIdContext,
+                source_local_ordinal: None,
+                evidence: relationship.evidence.first().cloned(),
+                event: None,
+                process_observation: None,
+                reported_process_id: relationship.reported_from_process_id,
+                context_note: Some("PID context is not merged into a process instance"),
+            });
+            id
+        };
+        edges.push(EventGraphEdge {
+            from_node_id,
+            to_node_id,
+            kind: "process_relationship",
+            relationship_kind: Some(relationship.kind),
+            relationship_resolution: Some(relationship.resolution),
+            event_link_role: None,
+            event_link_status: None,
+            basis: relationship.basis.clone(),
+            evidence: relationship.evidence.clone(),
+        });
+    }
+
+    for link in &envelope.event_process_links {
+        let key = serde_json::to_string(&link.event)
+            .map_err(|_| "could not index event graph evidence references".to_owned())?;
+        let Some(from_node_id) = event_nodes.get(&key).cloned() else {
+            return Err("event graph process link references a missing event".to_owned());
+        };
+        let to_node_id = if let Some(observation_id) = link.process_observation_id {
+            process_nodes.get(&observation_id).cloned().ok_or_else(|| {
+                "event graph process link references a missing observation".to_owned()
+            })?
+        } else {
+            context_ordinal = context_ordinal.saturating_add(1);
+            let id = format!("pid_context:{context_ordinal}");
+            let context_note = match link.status {
+                EventProcessLinkStatus::ContextCandidate => {
+                    "Reported event PID is context only, not verified ownership"
+                }
+                EventProcessLinkStatus::Unresolved => {
+                    "No unique process observation was resolved for this event"
+                }
+                EventProcessLinkStatus::Observed => {
+                    "Event-local process ID has no process-instance observation"
+                }
+            };
+            nodes.push(EventGraphNode {
+                id: id.clone(),
+                kind: EventGraphNodeKind::ProcessIdContext,
+                source_local_ordinal: None,
+                evidence: Some(link.event.clone()),
+                event: None,
+                process_observation: None,
+                reported_process_id: link.reported_process_id,
+                context_note: Some(context_note),
+            });
+            id
+        };
+        edges.push(EventGraphEdge {
+            from_node_id,
+            to_node_id,
+            kind: "event_process_link",
+            relationship_kind: None,
+            relationship_resolution: None,
+            event_link_role: Some(link.role),
+            event_link_status: Some(link.status),
+            basis: link.basis.clone(),
+            evidence: vec![link.event.clone()],
+        });
+    }
+
+    if nodes.len() > MAX_EVENT_GRAPH_NODES || edges.len() > MAX_EVENT_GRAPH_EDGES {
+        return Err("event graph exceeds its bounded node or edge limit".to_owned());
+    }
+
+    if let Some(observation_id) = process_observation_id {
+        if !process_nodes.contains_key(&observation_id) {
+            return Err(format!(
+                "no source-local process observation ID {observation_id} was emitted for this input"
+            ));
+        }
+    }
+
+    let mut graph = EventGraph {
+        schema: EVENT_GRAPH_SCHEMA,
+        schema_version: EVENT_GRAPH_SCHEMA_VERSION,
+        filter: EventGraphFilter {
+            event_kind: event_kind.map(str::to_owned),
+            process_observation_id,
+        },
+        source: envelope.source.clone(),
+        source_state: envelope.source_state.clone(),
+        semantics: "Evidence-linked relationships and event context only; edges do not establish ownership, causation, or a complete process tree. Filters select rows represented in this input; no matching event link is not proof of absence",
+        nodes,
+        edges,
+        diagnostics: envelope.diagnostics.clone(),
+    };
+
+    if event_kind.is_some() || process_observation_id.is_some() {
+        let selected_process_node_id =
+            process_observation_id.map(|observation_id| format!("process:{observation_id}"));
+        let process_linked_event_ids = selected_process_node_id.as_ref().map(|process_id| {
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == "event_process_link" && edge.to_node_id == *process_id)
+                .map(|edge| edge.from_node_id.clone())
+                .collect::<BTreeSet<_>>()
+        });
+        let mut selected_event_ids = BTreeSet::new();
+        for node in &graph.nodes {
+            let event_matches_kind = event_kind.is_none_or(|event_kind| {
+                node.event
+                    .as_ref()
+                    .is_some_and(|event| event.event_kind == event_kind)
+            });
+            let event_matches_process = process_linked_event_ids
+                .as_ref()
+                .is_none_or(|event_ids| event_ids.contains(&node.id));
+            if node.kind == EventGraphNodeKind::Event && event_matches_kind && event_matches_process
+            {
+                selected_event_ids.insert(node.id.clone());
+            }
+        }
+
+        let mut included_node_ids = selected_event_ids.clone();
+        let mut direct_process_node_ids = BTreeSet::new();
+        let mut filtered_edges = Vec::new();
+        if let Some(id) = selected_process_node_id.as_ref() {
+            direct_process_node_ids.insert(id.clone());
+            included_node_ids.insert(id.clone());
+        }
+        for edge in &graph.edges {
+            if edge.kind == "event_process_link" && selected_event_ids.contains(&edge.from_node_id)
+            {
+                direct_process_node_ids.insert(edge.to_node_id.clone());
+                included_node_ids.insert(edge.to_node_id.clone());
+                filtered_edges.push(edge.clone());
+            }
+        }
+
+        for edge in &graph.edges {
+            if edge.kind == "process_relationship"
+                && (direct_process_node_ids.contains(&edge.from_node_id)
+                    || direct_process_node_ids.contains(&edge.to_node_id))
+            {
+                included_node_ids.insert(edge.from_node_id.clone());
+                included_node_ids.insert(edge.to_node_id.clone());
+                filtered_edges.push(edge.clone());
+            }
+        }
+
+        graph
+            .nodes
+            .retain(|node| included_node_ids.contains(&node.id));
+        graph.edges = filtered_edges;
+    }
+
+    Ok(graph)
+}
+
+/// Build a bounded timeline view from an already adapted envelope. The
+/// envelope's source-local ordinals and evidence references remain unchanged.
+pub fn timeline(
+    envelope: &CommonEventEnvelope,
+    event_kind: Option<&str>,
+    process_observation_id: Option<u64>,
+) -> Result<EventTimeline, String> {
+    let selected_process_observation = if let Some(id) = process_observation_id {
+        if id == 0 {
+            return Err("process observation ID must be greater than zero".to_owned());
+        }
+        let mut observations = envelope
+            .process_observations
+            .iter()
+            .filter(|observation| observation.source_local_id == id);
+        let observation = observations.next().ok_or_else(|| {
+            format!("no source-local process observation ID {id} was emitted for this input")
+        })?;
+        if observations.next().is_some() {
+            return Err(format!(
+                "source-local process observation ID {id} is ambiguous in this input"
+            ));
+        }
+        Some(observation.clone())
+    } else {
+        None
+    };
+
+    let linked_evidence = process_observation_id.map(|id| {
+        envelope
+            .event_process_links
+            .iter()
+            .filter(|link| link.process_observation_id == Some(id))
+            .map(|link| timeline_evidence_key(&link.event))
+            .collect::<BTreeSet<_>>()
+    });
+    let mut items = envelope
+        .events
+        .iter()
+        .filter(|event| {
+            event_kind.is_none_or(|kind| event.event_kind == kind)
+                && linked_evidence
+                    .as_ref()
+                    .is_none_or(|linked| linked.contains(&timeline_evidence_key(&event.evidence)))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    items.sort_by_key(|event| event.source_local_ordinal);
+    let item_evidence = items
+        .iter()
+        .map(|event| timeline_evidence_key(&event.evidence))
+        .collect::<BTreeSet<_>>();
+    let event_process_links = envelope
+        .event_process_links
+        .iter()
+        .filter(|link| item_evidence.contains(&timeline_evidence_key(&link.event)))
+        .cloned()
+        .collect();
+    Ok(EventTimeline {
+        schema: "sideeffect.event_timeline",
+        schema_version: 2,
+        source: envelope.source.clone(),
+        source_state: envelope.source_state.clone(),
+        ordering: "source_local_ordinal; timestamps are source text and do not establish causal order",
+        semantics: "source-local selection only; an empty item set or missing event link does not prove activity was absent",
+        filter: EventTimelineFilter {
+            event_kind: event_kind.map(str::to_owned),
+            process_observation_id,
+        },
+        selected_process_observation,
+        items,
+        event_process_links,
+        diagnostics: envelope.diagnostics.clone(),
+    })
 }
 
 fn push_process_diagnostic(

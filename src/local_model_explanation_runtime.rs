@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::local_model_explanation::{
@@ -20,6 +21,168 @@ const MODEL_OUTPUT_TOKENS: &str = "512";
 const MODEL_PROCESS_MEMORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 #[cfg(windows)]
 const MODEL_PROCESS_MEMORY_LIMIT_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+
+/// A bounded explanation-runtime readiness report. This checks the selected
+/// executable and, unless CPU was requested, asks the runtime to enumerate
+/// devices. It never opens model weights or runs inference.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ExplanationRuntimeDoctorReport {
+    pub runtime_path: String,
+    pub expected_source_revision: &'static str,
+    pub executable_status: &'static str,
+    pub executable_diagnostic: Option<String>,
+    pub requested_backend: ExplanationBackendPreference,
+    pub cuda_device_status: &'static str,
+    pub device_diagnostic: Option<String>,
+    pub backend_readiness: &'static str,
+    /// Device enumeration is not proof that a model successfully ran on CUDA.
+    pub gpu_inference_status: &'static str,
+}
+
+pub fn doctor_explanation_runtime(
+    runtime_path: &Path,
+    backend: ExplanationBackendPreference,
+) -> ExplanationRuntimeDoctorReport {
+    let path_text = runtime_path.to_string_lossy().into_owned();
+    let mut report = ExplanationRuntimeDoctorReport {
+        runtime_path: path_text,
+        expected_source_revision: EXPLANATION_RUNTIME_REVISION,
+        executable_status: "not_checked",
+        executable_diagnostic: None,
+        requested_backend: backend,
+        cuda_device_status: if backend == ExplanationBackendPreference::Cpu {
+            "not_checked_cpu_requested"
+        } else {
+            "not_checked"
+        },
+        device_diagnostic: None,
+        backend_readiness: "blocked_runtime_not_checked",
+        gpu_inference_status: "not_run",
+    };
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let runtime = match crate::local_model::canonical_regular_file(runtime_path, "runtime") {
+        Ok(path) => path,
+        Err(error) => {
+            report.executable_status = "unavailable";
+            report.executable_diagnostic = Some(error);
+            return report;
+        }
+    };
+    #[cfg(windows)]
+    let runtime = match canonical_regular_file(runtime_path, "runtime") {
+        Ok(path) => path,
+        Err(error) => {
+            report.executable_status = "unavailable";
+            report.executable_diagnostic = Some(error);
+            return report;
+        }
+    };
+    #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), windows)))]
+    let runtime = {
+        report.executable_status = "unsupported_platform";
+        report.executable_diagnostic = Some(
+            "local explanation runtime checks support Linux x86_64 and native Windows only"
+                .to_owned(),
+        );
+        return report;
+        #[allow(unreachable_code)]
+        std::path::PathBuf::new()
+    };
+
+    report.runtime_path = runtime.to_string_lossy().into_owned();
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let version_check = verify_runtime(&runtime, |arguments| {
+        crate::local_model_runtime::run_bounded(
+            &runtime,
+            arguments,
+            None,
+            10,
+            MAX_RUNTIME_DIAGNOSTIC_BYTES,
+        )
+    });
+    #[cfg(windows)]
+    let version_check = verify_runtime(&runtime, |arguments| {
+        crate::local_model_runtime::run_bounded_windows(
+            &runtime,
+            arguments,
+            None,
+            std::time::Duration::from_secs(10),
+            MAX_RUNTIME_DIAGNOSTIC_BYTES,
+            1024 * 1024 * 1024,
+        )
+    });
+    #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), windows)))]
+    let version_check: Result<(), String> = unreachable!();
+
+    if let Err(error) = version_check {
+        report.executable_status = "revision_or_version_check_failed";
+        report.executable_diagnostic = Some(error);
+        report.backend_readiness = "blocked_runtime_check_failed";
+        return report;
+    }
+
+    report.executable_status = "verified_revision_prefix";
+    if backend == ExplanationBackendPreference::Cpu {
+        report.backend_readiness = "ready_cpu_requested";
+        return report;
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let device_check = list_cuda_devices(
+        &runtime,
+        |arguments| {
+            crate::local_model_runtime::run_bounded(
+                &runtime,
+                arguments,
+                None,
+                10,
+                MAX_RUNTIME_DIAGNOSTIC_BYTES,
+            )
+        },
+        ExplanationBackendPreference::Auto,
+    );
+    #[cfg(windows)]
+    let device_check = list_cuda_devices(
+        &runtime,
+        |arguments| {
+            crate::local_model_runtime::run_bounded_windows(
+                &runtime,
+                arguments,
+                None,
+                std::time::Duration::from_secs(10),
+                MAX_RUNTIME_DIAGNOSTIC_BYTES,
+                1024 * 1024 * 1024,
+            )
+        },
+        ExplanationBackendPreference::Auto,
+    );
+    #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), windows)))]
+    let device_check: Result<bool, String> = unreachable!();
+
+    match device_check {
+        Ok(true) => {
+            report.cuda_device_status = "reported_available";
+            report.backend_readiness = "ready_cuda_device_reported_inference_not_run";
+        }
+        Ok(false) if backend == ExplanationBackendPreference::Auto => {
+            report.cuda_device_status = "not_reported";
+            report.backend_readiness = "ready_cpu_auto_selected_without_cuda_device";
+        }
+        Ok(false) => {
+            report.cuda_device_status = "not_reported";
+            report.backend_readiness = "blocked_cuda_device_not_reported";
+        }
+        Err(error) => {
+            report.cuda_device_status = "enumeration_failed";
+            report.backend_readiness = "blocked_device_enumeration_failed";
+            report.device_diagnostic = Some(error);
+        }
+    }
+
+    report
+}
 
 pub fn analyze_model_explanation_bytes(
     trace_bytes: &[u8],
@@ -97,10 +260,16 @@ fn analyze_model_explanation_bytes_with_model(
     }
 
     if let Some(reason) = preview.deterministic_abstain_reason {
+        let interpretation = crate::local_model_explanation::derive_selected_facts(
+            Vec::new(),
+            &preview.prompt,
+            &preview.evidence_summary,
+            Some(reason),
+        )?;
         return Ok(LocalModelExplanation {
             schema: "sideeffect.local_model_explanation",
             schema_version: crate::local_model_explanation::LOCAL_MODEL_EXPLANATION_SCHEMA_VERSION,
-            interpretation_label: "deterministic_scope_guard_abstention",
+            interpretation_label: "local_model_selection_abstained",
             request_sha256: preview.request_sha256,
             backend_used: "not_run",
             backend_status: "deterministic_scope_abstention",
@@ -116,11 +285,7 @@ fn analyze_model_explanation_bytes_with_model(
             runtime_version: preview.runtime_version,
             backend: preview.backend,
             evidence_summary: preview.evidence_summary,
-            interpretation: crate::local_model_explanation::LocalModelExplanationOutput {
-                status: crate::local_model_explanation::ExplanationStatus::Abstained,
-                abstain_reason: crate::local_model_explanation::RequiredNullable(Some(reason)),
-                statements: vec![],
-            },
+            interpretation,
         });
     }
 
@@ -477,15 +642,30 @@ fn finish_inference<O: RuntimeOutputView>(
         return Err("runtime completed without verifiable CUDA layer-offload evidence; output was discarded".to_owned());
     }
     let allowed = preview_evidence_ids(&preview)?;
-    let mut interpretation = crate::local_model_explanation::validate_model_explanation_output(
+    let evidence_ids = crate::local_model_explanation::validate_model_explanation_output(
         result.stdout_bytes(),
         &allowed,
     )?;
-    downgrade_answer_for_partial_parse(&mut interpretation, &preview.evidence_summary);
+    let interpretation = crate::local_model_explanation::derive_selected_facts(
+        evidence_ids,
+        &preview.prompt,
+        &preview.evidence_summary,
+        None,
+    )?;
     Ok(LocalModelExplanation {
         schema: "sideeffect.local_model_explanation",
         schema_version: crate::local_model_explanation::LOCAL_MODEL_EXPLANATION_SCHEMA_VERSION,
-        interpretation_label: "local_model_generated_unverified_statements",
+        interpretation_label: match interpretation.selection_status {
+            crate::local_model_explanation::ExplanationSelectionStatus::Selected => {
+                "local_model_selected_preview_evidence"
+            }
+            crate::local_model_explanation::ExplanationSelectionStatus::PartialSelection => {
+                "local_model_partial_selection_from_partial_parse"
+            }
+            crate::local_model_explanation::ExplanationSelectionStatus::Abstained => {
+                "local_model_selection_abstained"
+            }
+        },
         request_sha256: preview.request_sha256,
         backend_used: if use_cuda { "cuda" } else { "cpu" },
         backend_status,
@@ -503,17 +683,6 @@ fn finish_inference<O: RuntimeOutputView>(
         evidence_summary: preview.evidence_summary,
         interpretation,
     })
-}
-
-fn downgrade_answer_for_partial_parse(
-    interpretation: &mut crate::local_model_explanation::LocalModelExplanationOutput,
-    evidence_summary: &Value,
-) {
-    if evidence_summary["parse_status"] == "partial"
-        && interpretation.status == crate::local_model_explanation::ExplanationStatus::Answered
-    {
-        interpretation.status = crate::local_model_explanation::ExplanationStatus::Partial;
-    }
 }
 
 fn runtime_diagnostic_excerpt(bytes: &[u8]) -> String {
@@ -536,7 +705,7 @@ fn preview_evidence_ids(
 ) -> Result<BTreeSet<String>, String> {
     preview
         .output_schema
-        .pointer("/properties/statements/items/properties/evidence_ids/items/enum")
+        .pointer("/properties/evidence_ids/items/enum")
         .and_then(Value::as_array)
         .map(|ids| {
             ids.iter()
@@ -627,25 +796,6 @@ fn canonical_regular_file(path: &Path, description: &str) -> Result<std::path::P
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn incomplete_parse_downgrades_model_answer_to_partial() {
-        use crate::local_model_explanation::{
-            ExplanationStatus, LocalModelExplanationOutput, RequiredNullable,
-        };
-        use serde_json::json;
-
-        let mut output = LocalModelExplanationOutput {
-            status: ExplanationStatus::Answered,
-            abstain_reason: RequiredNullable(None),
-            statements: vec![],
-        };
-        super::downgrade_answer_for_partial_parse(&mut output, &json!({"parse_status":"partial"}));
-        assert_eq!(output.status, ExplanationStatus::Partial);
-
-        super::downgrade_answer_for_partial_parse(&mut output, &json!({"parse_status":"complete"}));
-        assert_eq!(output.status, ExplanationStatus::Partial);
-    }
-
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn linux_explanation_address_space_limit_is_accepted_by_shared_runner() {

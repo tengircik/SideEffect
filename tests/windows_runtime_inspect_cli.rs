@@ -125,6 +125,28 @@ fn with_events_input(bytes: &[u8]) -> (PathBuf, Output) {
 }
 
 #[cfg(windows)]
+fn with_evidence_input(
+    bytes: &[u8],
+    capture_digest: &str,
+    ordinal: &str,
+    payload_digest: &str,
+) -> (PathBuf, Output) {
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-evidence-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, bytes).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["evidence", "--windows-runtime"])
+        .arg(&path)
+        .args([capture_digest, ordinal, payload_digest])
+        .output()
+        .unwrap();
+    (path, output)
+}
+
+#[cfg(windows)]
 fn rehashed_capture(mut value: Value) -> Vec<u8> {
     let mut capture: WindowsRuntimeCapture = serde_json::from_value(value.take()).unwrap();
     capture.document_sha256.clear();
@@ -319,6 +341,500 @@ fn events_windows_runtime_validates_capture_and_preserves_source_context() {
             .len(),
         64
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn timeline_windows_runtime_filters_kind_and_preserves_source_evidence_and_diagnostics() {
+    let input = fixture(CollectionStatus::Partial);
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-timeline-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, &input).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--windows-runtime"])
+        .arg(&path)
+        .args(["--event-kind", "process_start"])
+        .output()
+        .unwrap();
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let timeline: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(timeline["schema"], "sideeffect.event_timeline");
+    assert_eq!(timeline["schema_version"], 2);
+    assert_eq!(timeline["source"]["platform"], "windows");
+    assert_eq!(timeline["source"]["schema"], WINDOWS_RUNTIME_CAPTURE_SCHEMA);
+    assert_eq!(timeline["source_state"]["completeness"], "partial");
+    assert!(
+        timeline["source_state"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic == "synthetic_fixture_partial_source")
+    );
+    assert_eq!(timeline["filter"]["event_kind"], "process_start");
+    assert!(
+        timeline["ordering"]
+            .as_str()
+            .unwrap()
+            .contains("do not establish causal order")
+    );
+    assert_eq!(timeline["items"].as_array().unwrap().len(), 1);
+    assert_eq!(timeline["items"][0]["source_local_ordinal"], 1);
+    assert_eq!(timeline["items"][0]["source_timestamp"]["value"], "10");
+    assert_eq!(
+        timeline["items"][0]["source_timestamp"]["clock_unit"],
+        "ETW_QPC_ticks"
+    );
+    assert_eq!(
+        timeline["items"][0]["evidence"]["kind"],
+        "windows_etw_record"
+    );
+    assert_eq!(timeline["items"][0]["evidence"]["record_ordinal"], 1);
+    assert_eq!(
+        timeline["items"][0]["evidence"]["json_pointer"],
+        "/events/0"
+    );
+    assert_eq!(
+        timeline["items"][0]["evidence"]["raw_payload_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert_eq!(timeline["event_process_links"].as_array().unwrap().len(), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn timeline_windows_process_observation_preserves_candidate_link_and_partial_status() {
+    let mut value: Value = serde_json::from_slice(&fixture(CollectionStatus::Partial)).unwrap();
+    let mut unresolved_network = network_event(&value["events"][0], 2, 42);
+    unresolved_network["raw_payload_hex"] = json!("01");
+    value["events"]
+        .as_array_mut()
+        .unwrap()
+        .push(unresolved_network);
+    let input = rehashed_capture(value);
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-timeline-observation-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, &input).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--windows-runtime"])
+        .arg(&path)
+        .args(["--process-observation", "1"])
+        .output()
+        .unwrap();
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let timeline: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(timeline["schema_version"], 2);
+    assert_eq!(timeline["filter"]["process_observation_id"], 1);
+    assert_eq!(timeline["source_state"]["completeness"], "partial");
+    assert_eq!(timeline["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        timeline["items"][0]["evidence"]["json_pointer"],
+        "/events/0"
+    );
+    assert_eq!(
+        timeline["selected_process_observation"]["source_local_id"],
+        1
+    );
+    assert_eq!(
+        timeline["selected_process_observation"]["evidence"]["json_pointer"],
+        "/events/0"
+    );
+    assert_eq!(timeline["event_process_links"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        timeline["event_process_links"][0]["role"],
+        "windows_process_start_payload"
+    );
+    assert_eq!(
+        timeline["event_process_links"][0]["status"],
+        "context_candidate"
+    );
+    assert!(
+        timeline["event_process_links"][0]["basis"]
+            .as_str()
+            .unwrap()
+            .contains("not re-decoded")
+    );
+    assert!(
+        timeline["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| { diagnostic["code"] == "network_payload_malformed" })
+    );
+    assert!(
+        timeline["source_state"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d == "synthetic_fixture_partial_source")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn timeline_windows_ambiguous_observation_is_shown_without_pid_matching_events() {
+    let mut value: Value = serde_json::from_slice(&fixture(CollectionStatus::Complete)).unwrap();
+    let mut duplicate = value["events"][0].clone();
+    duplicate["record_ordinal"] = json!(2);
+    value["events"].as_array_mut().unwrap().push(duplicate);
+    let input = rehashed_capture(value);
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-timeline-ambiguous-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, input).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--windows-runtime"])
+        .arg(&path)
+        .args(["--process-observation", "2"])
+        .output()
+        .unwrap();
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let timeline: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(timeline["source_state"]["completeness"], "partial");
+    assert_eq!(
+        timeline["selected_process_observation"]["source_local_id"],
+        2
+    );
+    assert_eq!(
+        timeline["selected_process_observation"]["identity"]["identity_status"],
+        "ambiguous_pid_reuse"
+    );
+    assert!(timeline["items"].as_array().unwrap().is_empty());
+    assert!(
+        timeline["event_process_links"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        timeline["semantics"]
+            .as_str()
+            .unwrap()
+            .contains("does not prove activity was absent")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn timeline_windows_rejects_invalid_and_unemitted_observation_ids() {
+    let input = fixture(CollectionStatus::Complete);
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-timeline-invalid-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, input).unwrap();
+    for id in ["0", "invalid", "99", "18446744073709551616"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+            .args(["timeline", "--windows-runtime"])
+            .arg(&path)
+            .args(["--process-observation", id])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "ID was {id}");
+        assert!(output.stdout.is_empty(), "ID was {id}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("process observation ID"));
+    }
+    fs::remove_file(path).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn timeline_windows_combined_filters_intersect_and_preserve_observation() {
+    let input = fixture(CollectionStatus::Partial);
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-timeline-intersection-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, &input).unwrap();
+    for filters in [
+        [
+            "--event-kind",
+            "process_start",
+            "--process-observation",
+            "1",
+        ],
+        [
+            "--process-observation",
+            "1",
+            "--event-kind",
+            "process_start",
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+            .args(["timeline", "--windows-runtime"])
+            .arg(&path)
+            .args(filters)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let timeline: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(timeline["filter"]["event_kind"], "process_start");
+        assert_eq!(timeline["filter"]["process_observation_id"], 1);
+        assert_eq!(timeline["items"].as_array().unwrap().len(), 1);
+        assert_eq!(timeline["items"][0]["event_kind"], "process_start");
+        assert_eq!(timeline["event_process_links"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            timeline["selected_process_observation"]["source_local_id"],
+            1
+        );
+        assert_eq!(timeline["source_state"]["completeness"], "partial");
+        assert!(
+            timeline["source_state"]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic == "synthetic_fixture_partial_source")
+        );
+    }
+    let no_match = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--windows-runtime"])
+        .arg(&path)
+        .args([
+            "--event-kind",
+            "network_observation",
+            "--process-observation",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    fs::remove_file(path).unwrap();
+    assert_eq!(no_match.status.code(), Some(2));
+    let timeline: Value = serde_json::from_slice(&no_match.stdout).unwrap();
+    assert!(timeline["items"].as_array().unwrap().is_empty());
+    assert_eq!(
+        timeline["selected_process_observation"]["source_local_id"],
+        1
+    );
+    assert_eq!(timeline["source_state"]["completeness"], "partial");
+    assert!(
+        timeline["source_state"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic == "synthetic_fixture_partial_source")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn timeline_windows_runtime_keeps_unknown_completeness_and_exit_two() {
+    let input = fixture(CollectionStatus::Complete);
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-timeline-unknown-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, &input).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--windows-runtime"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let timeline: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(timeline["source_state"]["completeness"], "unknown");
+    assert_eq!(
+        timeline["items"][0]["evidence"]["json_pointer"],
+        "/events/0"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn graph_windows_runtime_keeps_pid_context_separate_from_process_instance() {
+    let input = fixture(CollectionStatus::Partial);
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-graph-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, &input).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--windows-runtime"])
+        .arg(&path)
+        .args(["--event-kind", "process_start"])
+        .output()
+        .unwrap();
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(graph["schema"], "sideeffect.event_graph");
+    assert_eq!(graph["schema_version"], 2);
+    assert_eq!(graph["filter"]["event_kind"], "process_start");
+    assert_eq!(graph["source_state"]["completeness"], "partial");
+    let nodes = graph["nodes"].as_array().unwrap();
+    let instance = nodes
+        .iter()
+        .find(|node| node["kind"] == "process_observation")
+        .unwrap();
+    let parent_context = nodes
+        .iter()
+        .find(|node| node["kind"] == "process_id_context")
+        .unwrap();
+    assert_eq!(
+        instance["process_observation"]["identity"]["process_id"],
+        42
+    );
+    assert_eq!(parent_context["reported_process_id"], 1);
+    assert_ne!(instance["id"], parent_context["id"]);
+    assert_eq!(graph["edges"].as_array().unwrap().len(), 2);
+    assert!(graph["edges"].as_array().unwrap().iter().any(|edge| {
+        edge["kind"] == "process_relationship"
+            && edge["relationship_resolution"] == "parent_instance_unresolved"
+            && edge["from_node_id"] == parent_context["id"]
+            && edge["to_node_id"] == instance["id"]
+    }));
+    assert!(graph["edges"].as_array().unwrap().iter().any(|edge| {
+        edge["kind"] == "event_process_link"
+            && edge["event_link_status"] == "context_candidate"
+            && edge["to_node_id"] == instance["id"]
+    }));
+}
+
+#[cfg(windows)]
+#[test]
+fn graph_process_observation_filter_preserves_candidate_context_and_relationship() {
+    let input = fixture(CollectionStatus::Partial);
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-graph-observation-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, &input).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--windows-runtime"])
+        .arg(&path)
+        .args(["--process-observation", "1"])
+        .output()
+        .unwrap();
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(graph["schema_version"], 2);
+    assert_eq!(graph["filter"]["event_kind"], Value::Null);
+    assert_eq!(graph["filter"]["process_observation_id"], 1);
+    assert_eq!(graph["source_state"]["completeness"], "partial");
+    assert!(graph["diagnostics"].as_array().is_some());
+    assert!(
+        graph["semantics"]
+            .as_str()
+            .unwrap()
+            .contains("not proof of absence")
+    );
+    let nodes = graph["nodes"].as_array().unwrap();
+    let selected_process = nodes.iter().find(|node| node["id"] == "process:1").unwrap();
+    assert_eq!(
+        selected_process["process_observation"]["identity"]["identity_status"],
+        "decoder_metadata_unverified"
+    );
+    let event = nodes.iter().find(|node| node["kind"] == "event").unwrap();
+    assert_eq!(event["event"]["event_kind"], "process_start");
+    assert_eq!(event["evidence"]["json_pointer"], "/events/0");
+    assert!(graph["edges"].as_array().unwrap().iter().any(|edge| {
+        edge["kind"] == "event_process_link"
+            && edge["event_link_status"] == "context_candidate"
+            && edge["event_link_role"] == "windows_process_start_payload"
+            && edge["to_node_id"] == "process:1"
+            && edge["basis"].as_str().unwrap().contains("not re-decoded")
+    }));
+    assert!(graph["edges"].as_array().unwrap().iter().any(|edge| {
+        edge["kind"] == "process_relationship"
+            && edge["relationship_resolution"] == "parent_instance_unresolved"
+            && edge["to_node_id"] == "process:1"
+    }));
+}
+
+#[cfg(windows)]
+#[test]
+fn graph_process_observation_filter_does_not_match_ambiguous_pid_by_number() {
+    let mut value: Value = serde_json::from_slice(&fixture(CollectionStatus::Complete)).unwrap();
+    let mut duplicate = value["events"][0].clone();
+    duplicate["record_ordinal"] = json!(2);
+    value["events"].as_array_mut().unwrap().push(duplicate);
+    let input = rehashed_capture(value);
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-graph-ambiguous-observation-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, input).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--windows-runtime"])
+        .arg(&path)
+        .args(["--process-observation", "2"])
+        .output()
+        .unwrap();
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(graph["filter"]["process_observation_id"], 2);
+    assert_eq!(graph["source_state"]["completeness"], "partial");
+    let nodes = graph["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0]["id"], "process:2");
+    assert_eq!(
+        nodes[0]["process_observation"]["identity"]["identity_status"],
+        "ambiguous_pid_reuse"
+    );
+    assert!(graph["edges"].as_array().unwrap().is_empty());
+    assert!(
+        graph["semantics"]
+            .as_str()
+            .unwrap()
+            .contains("not proof of absence")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn graph_process_observation_filter_rejects_invalid_and_unemitted_ids() {
+    let input = fixture(CollectionStatus::Complete);
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-graph-invalid-observation-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, input).unwrap();
+    for id in ["0", "invalid", "99"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+            .args(["graph", "--windows-runtime"])
+            .arg(&path)
+            .args(["--process-observation", id])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "ID was {id}");
+        assert!(output.stdout.is_empty(), "ID was {id}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("process observation ID"));
+    }
+    fs::remove_file(path).unwrap();
 }
 
 #[cfg(windows)]
@@ -813,4 +1329,109 @@ fn html_report_is_explicitly_unsupported_outside_native_windows() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("only in native Windows builds"));
     assert!(!report_path.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn evidence_lookup_resolves_validated_capture_ordinal_and_payload_digest() {
+    let bytes = fixture(CollectionStatus::Complete);
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    let capture_digest = value["document_sha256"].as_str().unwrap();
+    let payload_digest = format!("{:x}", Sha256::digest([1u8]));
+    let (path, output) = with_evidence_input(&bytes, capture_digest, "1", &payload_digest);
+
+    assert_eq!(output.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["schema"],
+        "sideeffect.windows_runtime_event_evidence"
+    );
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(
+        report["validation_status"],
+        "bounded_schema_and_capture_fingerprint_verified"
+    );
+    assert_eq!(report["authenticity"], "not_verified");
+    assert_eq!(report["capture_sha256"], capture_digest);
+    assert_eq!(report["capture_status"], "complete");
+    assert_eq!(report["capture_completeness"], "unknown");
+    assert_eq!(report["record_ordinal"], 1);
+    assert_eq!(report["json_pointer"], "/events/0");
+    assert_eq!(report["raw_payload_sha256"], payload_digest);
+    assert_eq!(
+        report["decode_metadata_status"],
+        "serialized_metadata_not_independently_verified"
+    );
+    assert_eq!(report["event"]["raw_payload_hex"], "01");
+    fs::remove_file(path).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn evidence_lookup_rejects_mismatched_capture_payload_and_missing_ordinal() {
+    let bytes = fixture(CollectionStatus::Complete);
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    let capture_digest = value["document_sha256"].as_str().unwrap();
+    let payload_digest = format!("{:x}", Sha256::digest([1u8]));
+
+    let (path, wrong_capture) = with_evidence_input(&bytes, &"0".repeat(64), "1", &payload_digest);
+    assert_eq!(wrong_capture.status.code(), Some(1));
+    assert!(wrong_capture.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&wrong_capture.stderr).contains("capture SHA-256 mismatch"));
+    fs::remove_file(path).unwrap();
+
+    let (path, wrong_payload) = with_evidence_input(&bytes, capture_digest, "1", &"0".repeat(64));
+    assert_eq!(wrong_payload.status.code(), Some(1));
+    assert!(wrong_payload.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&wrong_payload.stderr).contains("raw payload SHA-256 mismatch")
+    );
+    fs::remove_file(path).unwrap();
+
+    let (path, missing_ordinal) = with_evidence_input(&bytes, capture_digest, "2", &payload_digest);
+    assert_eq!(missing_ordinal.status.code(), Some(1));
+    assert!(missing_ordinal.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&missing_ordinal.stderr)
+            .contains("no Windows runtime event exists")
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn evidence_lookup_preserves_partial_capture_state() {
+    let bytes = fixture(CollectionStatus::Partial);
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    let capture_digest = value["document_sha256"].as_str().unwrap();
+    let payload_digest = format!("{:x}", Sha256::digest([1u8]));
+    let (path, output) = with_evidence_input(&bytes, capture_digest, "1", &payload_digest);
+
+    assert_eq!(output.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["capture_status"], "partial");
+    assert_eq!(report["capture_completeness"], "unknown");
+    assert_eq!(report["diagnostics"][0], "synthetic_fixture_partial_source");
+    fs::remove_file(path).unwrap();
+}
+
+#[cfg(not(windows))]
+#[test]
+fn windows_runtime_evidence_lookup_is_explicitly_unsupported_off_windows() {
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args([
+            "evidence",
+            "--windows-runtime",
+            "missing.json",
+            &"0".repeat(64),
+            "1",
+            &"0".repeat(64),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("available only in native Windows builds")
+    );
 }

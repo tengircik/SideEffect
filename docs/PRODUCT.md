@@ -52,6 +52,10 @@ Linux `sideeffect inventory permissions --output FILE PATH...` checks only the e
 
 The parser and recorder enforce a 32 MiB trace limit; the parser also enforces a 64 KiB physical-record limit and a 100,000-record limit. Diff results are bounded to 200,000 rows; inspect JSON/text and diff JSON/text output are capped at 64 MiB before stdout is written. Invalid UTF-8 and hard limit violations fail without producing an inspect document. Included trace fixtures and fake-tracer tests are synthetic. A limited real capture integration test exists but does not validate broad syscall output or file/network event coverage; strace remains uninstalled system-wide in the WSL environment.
 
+## Partial access-check probe
+
+`inventory access-check` is an experimental, explicitly selected-path probe on Linux and Windows. Linux checks only the calling thread's current credentials with `faccessat2` and always leaves the calculated effective-access conclusion unknown. Windows evaluates a supported local file object's DACL against a process primary token selected by PID and observed creation FILETIME; even a successful DACL grant or denial leaves the overall conclusion conditional. Both preserve what the native check observed and name important unevaluated controls. Neither executes the selected operation, requests elevation, or claims to determine everything a program can access. See [the command and limitations](INSTALL.md#run-a-partial-access-check).
+
 ## Planned capture and comparison workflow
 
 1. Record two command runs with `sideeffect record` or obtain external `strace` text files.

@@ -31,12 +31,18 @@ const FILE_OPEN_FLAGS: libc::c_int =
 #[derive(Debug)]
 pub struct VerifiedAuditSession {
     manifest: AuditSessionManifest,
+    manifest_bytes: Vec<u8>,
     artifacts: Vec<VerifiedAuditArtifact>,
 }
 
 impl VerifiedAuditSession {
     pub fn manifest(&self) -> &AuditSessionManifest {
         &self.manifest
+    }
+
+    /// Exact bounded bytes of the manifest validated by this reader.
+    pub fn manifest_bytes(&self) -> &[u8] {
+        &self.manifest_bytes
     }
 
     pub fn artifacts(&self) -> &[VerifiedAuditArtifact] {
@@ -219,6 +225,7 @@ pub fn read_verified_session(path: &Path) -> Result<VerifiedAuditSession, Sessio
 
     Ok(VerifiedAuditSession {
         manifest,
+        manifest_bytes: manifest_read.bytes,
         artifacts,
     })
 }

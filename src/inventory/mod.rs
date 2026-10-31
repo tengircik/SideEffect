@@ -1,12 +1,17 @@
 //! Read-only, on-demand system inventory sources.
 
+#[cfg(target_os = "linux")]
+mod access;
 mod debian;
+#[cfg(windows)]
+mod effective_access_windows;
 mod model;
 mod package_diff;
 #[cfg(target_os = "linux")]
 mod packages;
 #[cfg(windows)]
 mod packages_windows;
+mod path_executable_diff;
 mod path_executables;
 mod permission_diff;
 #[cfg(target_os = "linux")]
@@ -29,6 +34,18 @@ mod startup_windows;
 mod systemd_units;
 mod windows_software_diff;
 
+#[cfg(target_os = "linux")]
+pub use access::{
+    ACCESS_ANALYSIS_SCHEMA, ACCESS_ANALYSIS_SCHEMA_VERSION, AccessAnalysisDocument,
+    AccessConclusion, AccessOperation, FactStatus, KernelProbeStatus,
+    analyze_current_process_access,
+};
+#[cfg(windows)]
+pub use effective_access_windows::{
+    WindowsAccessConclusion, WindowsAccessControlEvidence, WindowsAccessControlStatus,
+    WindowsAccessOperation, WindowsAccessStatus, WindowsDaclDecision, WindowsDaclEvaluationResult,
+    evaluate_windows_dacl_for_process,
+};
 pub use model::{
     INVENTORY_SCHEMA, INVENTORY_SCHEMA_VERSION, InventoryDiagnostic, InventoryDocument,
     InventoryEvidence, InventoryPackage, InventorySource, InventorySourceStatus, InventoryStatus,
@@ -38,6 +55,10 @@ pub use package_diff::{
     PackageComparisonError, PackageComparisonStatus, PackageEvidenceReference, PackageFacts,
     PackageIdentity, PackageInventoryComparison, PackageInventoryDelta, PackageSourceComparison,
     compare_package_inventories, compare_package_inventory_json,
+};
+pub use path_executable_diff::{
+    PathEntryFacts, PathExecutableDelta, PathExecutableDiff, PathExecutableDiffCounts,
+    PathExecutableDiffError, compare_path_executable_inventory_json,
 };
 pub use path_executables::{PathExecutableInventory, collect_path_executables};
 pub use permission_diff::{

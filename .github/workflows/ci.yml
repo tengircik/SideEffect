@@ -67,6 +67,12 @@ jobs:
       - name: Run real strace capture integration test
         run: cargo test --locked --test record_observations real_strace_capture_inspect_and_diff_observe_file_and_loopback_events -- --exact
 
+      - name: Run real refused-connect capture integration test
+        run: cargo test --locked --test record_observations real_strace_capture_reports_refused_loopback_connection_as_failed_attempt -- --exact
+
+      - name: Run real strace cancellation and tracee cleanup integration test
+        run: cargo test --locked --test record_observations real_strace_capture_cancellation_discards_partial_trace_and_reaps_tracee -- --exact
+
       - name: Run startup correlation against a real strace capture
         run: cargo test --locked --test startup_correlation_real_strace real_strace_capture_can_match_a_synthetic_literal_startup_row -- --exact
 
@@ -91,6 +97,9 @@ jobs:
 
       - name: Validate portable agent skill
         run: python3 scripts/validate_agent_skill.py
+
+      - name: Validate local explanation evaluator contracts
+        run: python3 tests/test_local_model_explain_evaluator.py
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -218,6 +227,10 @@ jobs:
 
       - name: Install Rust components
         run: rustup component add rustfmt clippy
+
+      - name: Validate local explanation evaluator contracts
+        shell: pwsh
+        run: py -3 tests/test_local_model_explain_evaluator.py
 
       - name: Check formatting
         run: cargo fmt --all --check

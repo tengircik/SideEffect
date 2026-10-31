@@ -26,6 +26,14 @@ fn help_command_and_flag_show_command_list() {
 
 #[test]
 fn focused_help_covers_command_and_nested_inventory_topics() {
+    let model_explain = run(&["help", "model-explain"]);
+    assert!(model_explain.status.success());
+    let model_explain_help = String::from_utf8_lossy(&model_explain.stdout);
+    assert!(model_explain_help.contains("select up to five syscall-result evidence IDs"));
+    assert!(model_explain_help.contains("SideEffect returns only the exact matching preview rows"));
+    assert!(model_explain_help.contains("not an answer or finding"));
+    assert!(!model_explain_help.contains("generated statement"));
+
     let record = run(&["record", "--help"]);
     assert!(record.status.success());
     let record_help = String::from_utf8_lossy(&record.stdout);

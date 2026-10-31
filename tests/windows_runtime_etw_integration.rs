@@ -165,6 +165,77 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
         "capture did not include the fixture's loopback network event with payload PID; network event summaries: {}",
         serde_json::to_string(&network_event_summaries).unwrap()
     );
+    let events = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["events", "--windows-runtime"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_eq!(events.status.code(), Some(2));
+    let events: Value = serde_json::from_slice(&events.stdout).unwrap();
+    let timeline = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--windows-runtime"])
+        .arg(&output)
+        .args(["--event-kind", "file_io_observation"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        timeline.status.code(),
+        Some(2),
+        "the live ETW capture has unknown completeness; timeline should preserve that state: {}",
+        String::from_utf8_lossy(&timeline.stderr)
+    );
+    let timeline: Value = serde_json::from_slice(&timeline.stdout).unwrap();
+    assert_eq!(timeline["schema"], "sideeffect.event_timeline");
+    assert_eq!(timeline["source_state"], events["source_state"]);
+    assert!(matches!(
+        timeline["source_state"]["completeness"].as_str(),
+        Some("partial" | "unknown")
+    ));
+    assert_eq!(timeline["filter"]["event_kind"], "file_io_observation");
+    assert!(
+        timeline["items"].as_array().unwrap().iter().any(|event| {
+            event["event_kind"] == "file_io_observation"
+                && event["evidence"]["kind"] == "windows_etw_record"
+                && event["evidence"]["json_pointer"]
+                    .as_str()
+                    .is_some_and(|pointer| pointer.starts_with("/events/"))
+                && event["evidence"]["raw_payload_sha256"]
+                    .as_str()
+                    .is_some_and(|digest| digest.len() == 64)
+        }),
+        "live ETW timeline should retain a filtered file event with exact source evidence"
+    );
+    let graph = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--windows-runtime"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_eq!(graph.status.code(), Some(2));
+    let graph: Value = serde_json::from_slice(&graph.stdout).unwrap();
+    assert_eq!(graph["schema"], "sideeffect.event_graph");
+    assert_eq!(graph["source_state"], events["source_state"]);
+    assert!(graph["nodes"].as_array().unwrap().iter().any(|node| {
+        node["kind"] == "event"
+            && node["event"]["event_kind"] == "file_io_observation"
+            && node["evidence"]["json_pointer"]
+                .as_str()
+                .is_some_and(|pointer| pointer.starts_with("/events/"))
+    }));
+    let graph_edges = graph["edges"].as_array().unwrap();
+    let event_process_links = events["event_process_links"].as_array().unwrap();
+    assert!(
+        !event_process_links.is_empty(),
+        "the live process/file/network capture should yield event-process links"
+    );
+    for link in event_process_links {
+        assert!(graph_edges.iter().any(|edge| {
+            edge["kind"] == "event_process_link"
+                && edge["event_link_status"] == link["status"]
+                && edge["event_link_role"] == link["role"]
+                && edge["basis"] == link["basis"]
+                && edge["evidence"][0] == link["event"]
+        }));
+    }
     fs::remove_file(fixture_file).unwrap();
     fs::remove_file(output).unwrap();
     fs::remove_dir(directory).unwrap();
