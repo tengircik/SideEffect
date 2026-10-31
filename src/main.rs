@@ -2359,14 +2359,13 @@ fn model_explanation_file(
             &model,
             digest,
         )?;
-    let partial = analysis.evidence_summary["parse_status"] == "partial"
-        || analysis.interpretation.status
-            != sideeffect::local_model_explanation::ExplanationStatus::Answered;
-    write_json(&analysis, "local evidence-grounded model explanation")?;
-    Ok(if partial {
-        ExitCode::from(2)
-    } else {
+    let selected = analysis.interpretation.selection_status
+        == sideeffect::local_model_explanation::ExplanationSelectionStatus::Selected;
+    write_json(&analysis, "local model evidence selection")?;
+    Ok(if selected {
         ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
     })
 }
 

@@ -97,10 +97,16 @@ fn analyze_model_explanation_bytes_with_model(
     }
 
     if let Some(reason) = preview.deterministic_abstain_reason {
+        let interpretation = crate::local_model_explanation::derive_selected_facts(
+            Vec::new(),
+            &preview.prompt,
+            &preview.evidence_summary,
+            Some(reason),
+        )?;
         return Ok(LocalModelExplanation {
             schema: "sideeffect.local_model_explanation",
             schema_version: crate::local_model_explanation::LOCAL_MODEL_EXPLANATION_SCHEMA_VERSION,
-            interpretation_label: "deterministic_scope_guard_abstention",
+            interpretation_label: "local_model_selection_abstained",
             request_sha256: preview.request_sha256,
             backend_used: "not_run",
             backend_status: "deterministic_scope_abstention",
@@ -116,11 +122,7 @@ fn analyze_model_explanation_bytes_with_model(
             runtime_version: preview.runtime_version,
             backend: preview.backend,
             evidence_summary: preview.evidence_summary,
-            interpretation: crate::local_model_explanation::LocalModelExplanationOutput {
-                status: crate::local_model_explanation::ExplanationStatus::Abstained,
-                abstain_reason: crate::local_model_explanation::RequiredNullable(Some(reason)),
-                statements: vec![],
-            },
+            interpretation,
         });
     }
 
@@ -477,15 +479,30 @@ fn finish_inference<O: RuntimeOutputView>(
         return Err("runtime completed without verifiable CUDA layer-offload evidence; output was discarded".to_owned());
     }
     let allowed = preview_evidence_ids(&preview)?;
-    let mut interpretation = crate::local_model_explanation::validate_model_explanation_output(
+    let evidence_ids = crate::local_model_explanation::validate_model_explanation_output(
         result.stdout_bytes(),
         &allowed,
     )?;
-    downgrade_answer_for_partial_parse(&mut interpretation, &preview.evidence_summary);
+    let interpretation = crate::local_model_explanation::derive_selected_facts(
+        evidence_ids,
+        &preview.prompt,
+        &preview.evidence_summary,
+        None,
+    )?;
     Ok(LocalModelExplanation {
         schema: "sideeffect.local_model_explanation",
         schema_version: crate::local_model_explanation::LOCAL_MODEL_EXPLANATION_SCHEMA_VERSION,
-        interpretation_label: "local_model_generated_unverified_statements",
+        interpretation_label: match interpretation.selection_status {
+            crate::local_model_explanation::ExplanationSelectionStatus::Selected => {
+                "local_model_selected_preview_evidence"
+            }
+            crate::local_model_explanation::ExplanationSelectionStatus::PartialSelection => {
+                "local_model_partial_selection_from_partial_parse"
+            }
+            crate::local_model_explanation::ExplanationSelectionStatus::Abstained => {
+                "local_model_selection_abstained"
+            }
+        },
         request_sha256: preview.request_sha256,
         backend_used: if use_cuda { "cuda" } else { "cpu" },
         backend_status,
@@ -503,17 +520,6 @@ fn finish_inference<O: RuntimeOutputView>(
         evidence_summary: preview.evidence_summary,
         interpretation,
     })
-}
-
-fn downgrade_answer_for_partial_parse(
-    interpretation: &mut crate::local_model_explanation::LocalModelExplanationOutput,
-    evidence_summary: &Value,
-) {
-    if evidence_summary["parse_status"] == "partial"
-        && interpretation.status == crate::local_model_explanation::ExplanationStatus::Answered
-    {
-        interpretation.status = crate::local_model_explanation::ExplanationStatus::Partial;
-    }
 }
 
 fn runtime_diagnostic_excerpt(bytes: &[u8]) -> String {
@@ -536,7 +542,7 @@ fn preview_evidence_ids(
 ) -> Result<BTreeSet<String>, String> {
     preview
         .output_schema
-        .pointer("/properties/statements/items/properties/evidence_ids/items/enum")
+        .pointer("/properties/evidence_ids/items/enum")
         .and_then(Value::as_array)
         .map(|ids| {
             ids.iter()
@@ -627,25 +633,6 @@ fn canonical_regular_file(path: &Path, description: &str) -> Result<std::path::P
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn incomplete_parse_downgrades_model_answer_to_partial() {
-        use crate::local_model_explanation::{
-            ExplanationStatus, LocalModelExplanationOutput, RequiredNullable,
-        };
-        use serde_json::json;
-
-        let mut output = LocalModelExplanationOutput {
-            status: ExplanationStatus::Answered,
-            abstain_reason: RequiredNullable(None),
-            statements: vec![],
-        };
-        super::downgrade_answer_for_partial_parse(&mut output, &json!({"parse_status":"partial"}));
-        assert_eq!(output.status, ExplanationStatus::Partial);
-
-        super::downgrade_answer_for_partial_parse(&mut output, &json!({"parse_status":"complete"}));
-        assert_eq!(output.status, ExplanationStatus::Partial);
-    }
-
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn linux_explanation_address_space_limit_is_accepted_by_shared_runner() {

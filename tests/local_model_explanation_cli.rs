@@ -100,7 +100,19 @@ fn deterministic_scope_abstention_does_not_start_runtime() {
     let analysis: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(analysis["backend_used"], "not_run");
     assert_eq!(analysis["backend_status"], "deterministic_scope_abstention");
-    assert_eq!(analysis["interpretation"]["status"], "abstained");
+    assert_eq!(analysis["interpretation"]["selection_status"], "abstained");
+    assert_eq!(
+        analysis["interpretation"]["evidence_ids"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        analysis["interpretation"]["selected_facts"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        analysis["interpretation_label"],
+        "local_model_selection_abstained"
+    );
     assert_eq!(
         analysis["interpretation"]["abstain_reason"],
         "unsupported_scope"
@@ -124,7 +136,7 @@ fn preview_shows_exact_bounded_evidence_and_coverage_for_confirmation() {
         preview["schema"],
         "sideeffect.local_model_explanation_preview"
     );
-    assert_eq!(preview["schema_version"], 2);
+    assert_eq!(preview["schema_version"], 3);
     assert_eq!(
         preview["deterministic_abstain_reason"],
         serde_json::Value::Null
@@ -145,10 +157,25 @@ fn preview_shows_exact_bounded_evidence_and_coverage_for_confirmation() {
             .iter()
             .any(|fact| fact["lexical_path_hint"]["path"] == "/tmp/sideeffect-explain-config.ini")
     );
+    assert_eq!(
+        preview["output_schema"]["required"],
+        serde_json::json!(["evidence_ids"])
+    );
+    assert!(preview["output_schema"]["properties"].get("text").is_none());
     assert!(
-        preview["output_schema"]
-            .to_string()
-            .contains("evidence_ids")
+        preview["output_schema"]["properties"]
+            .get("status")
+            .is_none()
+    );
+    let result_ids = prompt["observed_syscall_results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["evidence_id"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        preview["output_schema"]["properties"]["evidence_ids"]["items"]["enum"],
+        serde_json::json!(result_ids)
     );
 }
 
