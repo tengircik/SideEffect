@@ -95,6 +95,9 @@ jobs:
       - name: Validate portable agent skill
         run: python3 scripts/validate_agent_skill.py
 
+      - name: Validate local explanation evaluator contracts
+        run: python3 tests/test_local_model_explain_evaluator.py
+
       - name: Check formatting
         run: cargo fmt --all --check
 
