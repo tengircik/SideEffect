@@ -237,7 +237,7 @@ Milestones are ordered by dependency. Work may be split into independently revie
 
 - Complete and qualify deterministic event normalization, query, evidence references, privacy controls, and coverage reporting first. Models may only consume user-selected, bounded structured evidence; they cannot create evidence IDs, run shell/commands, alter settings, capture more data, or replace source inspection.
 - Create a versioned, representative benchmark with reviewed ground truth across ordinary and unusual file/network/process/startup behavior, failures, false associations, changed software identity, baseline contamination, incomplete/lost captures, unsupported sources, misleading names, malformed evidence and prompt-injection text in paths, arguments, startup values and imported artifacts.
-- Score evidence selection precision/recall, citation validity, unsupported claim rate, uncertainty handling, query translation correctness, refusal behavior, privacy leakage, latency and resource use. Include adversarial and red-team review; report model/runtime/version, quantization, hardware and sample limits. No fabricated “500 case” threshold or accuracy claim is assumed; maintainers propose a justified benchmark size and acceptance bounds for user review when reopening.
+- Score evidence selection precision/recall, citation validity, unsupported claim rate, uncertainty handling, query translation correctness, refusal behavior, privacy leakage, latency and resource use. Include adversarial and red-team review; report model/runtime/version, quantization, hardware and sample limits. No fabricated “500 case” threshold or accuracy claim is assumed; maintainers must justify the benchmark size and acceptance bounds before a model can pass.
 - Compare against deterministic query and explanation baselines. A model must show meaningful user benefit with an acceptable error profile before packaging/integration is considered. Any failed quality gate leaves the feature experimental/deferred and does not block the core product.
 - Once R3–R7 deterministic data and privacy prerequisites are ready, implement natural-language-to-query that emits only a validated read-only query. Show the query, scope, data sources and resource limits for user review before execution; ambiguous or unsupported questions abstain. Natural-language interpretation never runs shell commands or broadens collection scope.
 - Add evidence-linked graph/diff explanations, technical report drafting and follow-up questions inside a user-selected case. Outputs may summarize evidence already in scope, cite only existing IDs, state uncertainty and open cited records; they cannot invent findings or cause.
@@ -356,7 +356,7 @@ Status describes the coverage in current repository documentation as reviewed fo
 | System Change Intelligence | Partial source inventories, no scoped cross-source install diff | R5 |
 | Effective Access Analyzer | Missing beyond selected-path facts | R6 |
 | Investigation Engine | Missing general query/case/report engine | R7 |
-| AI Investigation Assistant | Deferred; no core dependency and requires explicit reopening | R9 |
+| AI Investigation Assistant | Active evaluation; experimental, no model release-approved | R9 |
 | Top three: baseline, semantic diff, system change intelligence | Not integrated; prioritized after reliability and event/identity foundations | R1 → R3 → R4/R5 |
 
 ## Relationship to existing planning documents
