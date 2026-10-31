@@ -88,6 +88,8 @@ To inspect the current process's executable-name candidates, run `sideeffect inv
 
 The same inventory can be selected inside an audit session with `sideeffect audit --output ./audit-session --path-executables` (PowerShell: `sideeffect.exe audit --output .\audit-session --path-executables`). The session records its status, limits, fixed artifact provenance, and collector identity. It remains a point-in-time candidate inventory: SideEffect does not execute candidates or resolve commands through a shell.
 
+To compare two sessions that both include this source, run `sideeffect compare-sessions ./before-session ./after-session` (PowerShell: `sideeffect.exe compare-sessions .\before-session .\after-session`). The item diff uses exact platform path encodings and links candidate changes to each session's artifact. Incomplete sources and ambiguous identities suppress one-sided candidate changes; Windows `PATHEXT` changes suppress candidate classification and presence claims. A candidate label is a metadata heuristic, not proof that a shell resolves or can launch the file. Session artifacts and comparison output can contain sensitive paths and filenames.
+
 ### Capture a selected Linux command
 
 ```sh

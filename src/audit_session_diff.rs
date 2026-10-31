@@ -6,9 +6,9 @@ use crate::audit_session::{
 };
 use crate::fingerprint::sha256_hex;
 use crate::inventory::{
-    compare_package_inventory_json, compare_permission_inventory_json,
-    compare_process_inventory_json, compare_startup_inventory_json,
-    compare_windows_software_inventory_json,
+    compare_package_inventory_json, compare_path_executable_inventory_json,
+    compare_permission_inventory_json, compare_process_inventory_json,
+    compare_startup_inventory_json, compare_windows_software_inventory_json,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -131,7 +131,7 @@ pub fn compare_audit_sessions(
             "Unmatched rows are additions or removals only where the native comparator establishes complete source coverage and certain identity.",
             "Snapshots are non-atomic observations. Differences do not establish installation, execution history, causation, or safety.",
             "Caller privilege contexts are not comparability keys and may differ.",
-            "PATH-executable artifacts are reported as not compared in this version.",
+            "PATH-executable comparisons use exact captured directory and filename encodings; they do not resolve shell commands or prove launchability.",
         ],
     }
 }
@@ -281,7 +281,14 @@ fn suppress_session_incomplete_presence(role: SourceRole, comparison: &mut Value
                 "observed_after_only",
                 "unmatched_rows_suppressed_for_incomplete_source",
             ),
-            SourceRole::Runtime | SourceRole::PathExecutables => return,
+            SourceRole::PathExecutables => (
+                "candidate_removed",
+                "candidate_added",
+                "candidates_removed",
+                "candidates_added",
+                "unmatched_candidates_suppressed_for_incomplete_or_changed_context",
+            ),
+            SourceRole::Runtime => return,
         };
 
     let Some(deltas) = comparison.get_mut("deltas").and_then(Value::as_array_mut) else {
@@ -418,7 +425,7 @@ fn supported_role_kind(role: SourceRole, kind: ArtifactKind) -> bool {
         ) | (
             SourceRole::Startup,
             ArtifactKind::Startup | ArtifactKind::WindowsStartup
-        )
+        ) | (SourceRole::PathExecutables, ArtifactKind::PathExecutables)
     )
 }
 
@@ -438,6 +445,19 @@ fn compare_native(
     right: &[u8],
 ) -> Result<(&'static str, Value), NativeCompareError> {
     let value = match (role, kind) {
+        (SourceRole::PathExecutables, ArtifactKind::PathExecutables) => {
+            let result = compare_path_executable_inventory_json(left, right)
+                .map_err(map_path_executable_error)?;
+            let status = if result.status == "complete" {
+                "compared"
+            } else {
+                "partial"
+            };
+            (
+                status,
+                serde_json::to_value(result).map_err(|_| NativeCompareError::Malformed)?,
+            )
+        }
         (SourceRole::Packages, ArtifactKind::Packages) => {
             let result = compare_package_inventory_json(left, right).map_err(map_package_error)?;
             let status = if result.status == crate::inventory::PackageComparisonStatus::Complete {
@@ -512,6 +532,19 @@ fn compare_native(
         _ => return Err(NativeCompareError::Unsupported),
     };
     Ok(value)
+}
+
+fn map_path_executable_error(
+    error: crate::inventory::PathExecutableDiffError,
+) -> NativeCompareError {
+    use crate::inventory::PathExecutableDiffError as E;
+    match error {
+        E::MalformedInput => NativeCompareError::Malformed,
+        E::InputTooLarge => NativeCompareError::InputLimit,
+        E::UnsupportedSchema => NativeCompareError::Unsupported,
+        E::PlatformMismatch => NativeCompareError::Incompatible,
+        E::LimitExceeded => NativeCompareError::Limit,
+    }
 }
 
 fn map_process_error(error: crate::inventory::ProcessDiffError) -> NativeCompareError {
@@ -638,6 +671,7 @@ mod tests {
             kind: spec.kind,
             path: match spec.kind {
                 ArtifactKind::Permissions => "permissions.json",
+                ArtifactKind::PathExecutables => "path-executables.json",
                 _ => "packages.json",
             }
             .into(),
@@ -1056,6 +1090,130 @@ mod tests {
         assert_eq!(
             report.source_diffs[0].before_artifacts[0].path,
             "permissions.json"
+        );
+    }
+
+    #[test]
+    fn path_executable_session_diff_suppresses_unmatched_candidates_for_partial_sources() {
+        fn path_doc(candidate_status: &str, unmatched_name: &str) -> Vec<u8> {
+            fn hex(bytes: &[u8]) -> String {
+                bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+            }
+            let exact = |display: &str, bytes: &str| {
+                serde_json::json!({
+                    "display": display,
+                    "exact": true,
+                    "raw_bytes_hex": bytes
+                })
+            };
+            let directory_path = exact("/tools", "2f746f6f6c73");
+            serde_json::to_vec(&serde_json::json!({
+                "schema":"sideeffect.path_executable_inventory",
+                "schema_version":1,
+                "platform":"linux",
+                "path_source":"current_process_environment_PATH",
+                "candidate_extensions":[],
+                "candidate_extensions_status":"not_applicable",
+                "status":"complete",
+                "components":[{
+                    "ordinal":0,
+                    "path":directory_path,
+                    "empty_component_mapped_to_cwd":false,
+                    "directory_ordinal":0
+                }],
+                "directories":[{
+                    "ordinal":0,
+                    "component_ordinal":0,
+                    "path":exact("/tools", "2f746f6f6c73"),
+                    "status":"complete",
+                    "entries":[
+                        {
+                            "ordinal":0,
+                            "name":exact("tool", "746f6f6c"),
+                            "status":candidate_status,
+                            "metadata_status":"observed",
+                            "candidate_rule":if candidate_status == "candidate" { Some("regular_file_with_execute_bit") } else { None },
+                            "evidence":{"directory_ordinal":0,"entry_ordinal":0}
+                        },
+                        {
+                            "ordinal":1,
+                            "name":exact(unmatched_name, &hex(unmatched_name.as_bytes())),
+                            "status":"candidate",
+                            "metadata_status":"observed",
+                            "candidate_rule":"regular_file_with_execute_bit",
+                            "evidence":{"directory_ordinal":0,"entry_ordinal":1}
+                        }
+                    ]
+                }],
+                "diagnostics":[],
+                "limits":{
+                    "max_components":256,
+                    "max_component_path_bytes_or_units":4096,
+                    "max_entries":20000,
+                    "max_aggregate_path_and_name_bytes_or_units":16777216,
+                    "max_pathext_utf16_units":32767,
+                    "max_pathext_extensions":256,
+                    "deadline_seconds":5
+                }
+            })).unwrap()
+        }
+
+        let before_bytes = path_doc("candidate", "old");
+        let after_bytes = path_doc("not_candidate", "new");
+        let (before, _) = session_for(
+            &before_bytes,
+            "0123456789abcdef0123456789abcdef",
+            SessionSpec {
+                role: SourceRole::PathExecutables,
+                kind: ArtifactKind::PathExecutables,
+                schema: "sideeffect.path_executable_inventory",
+                schema_version: 1,
+                scope: "current process PATH metadata",
+            },
+            SourceStatus::Partial,
+        );
+        let (after, _) = session_for(
+            &after_bytes,
+            "1123456789abcdef0123456789abcdef",
+            SessionSpec {
+                role: SourceRole::PathExecutables,
+                kind: ArtifactKind::PathExecutables,
+                schema: "sideeffect.path_executable_inventory",
+                schema_version: 1,
+                scope: "current process PATH metadata",
+            },
+            SourceStatus::Partial,
+        );
+        let left = [VerifiedArtifactBytes {
+            kind: ArtifactKind::PathExecutables,
+            path: "path-executables.json",
+            bytes: &before_bytes,
+        }];
+        let right = [VerifiedArtifactBytes {
+            kind: ArtifactKind::PathExecutables,
+            path: "path-executables.json",
+            bytes: &after_bytes,
+        }];
+        let report = compare_audit_sessions(&before, &after, &left, &right);
+        let source = &report.source_diffs[0];
+        assert_eq!(source.role, SourceRole::PathExecutables);
+        assert_eq!(source.status, "partial");
+        let comparison = source.comparison.as_ref().unwrap();
+        assert_eq!(comparison["counts"]["candidates_added"], 0);
+        assert_eq!(comparison["counts"]["candidates_removed"], 0);
+        assert_eq!(
+            comparison["counts"]["unmatched_candidates_suppressed_for_incomplete_or_changed_context"],
+            2
+        );
+        assert_eq!(comparison["counts"]["candidate_status_changes"], 1);
+        assert_eq!(comparison["deltas"][0]["kind"], "candidate_status_changed");
+        assert_eq!(
+            source.before_artifacts[0].sha256,
+            format!("{:x}", Sha256::digest(&before_bytes))
+        );
+        assert_eq!(
+            source.after_artifacts[0].sha256,
+            format!("{:x}", Sha256::digest(&after_bytes))
         );
     }
 }
