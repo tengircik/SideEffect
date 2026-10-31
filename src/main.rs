@@ -290,7 +290,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         {
             timeline_trace(path, None, Some(observation_id))
         }
-        [command, flag, path, _, _, _, _] if command == "timeline" && flag == "--trace" => {
+        [command, flag, _path, _, _, _, _] if command == "timeline" && flag == "--trace" => {
             Err("--event-kind and --process-observation cannot be combined".to_owned())
         }
         [command, flag, path] if command == "timeline" && flag == "--windows-runtime" => {
@@ -310,7 +310,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         {
             timeline_windows_runtime(path, None, Some(observation_id))
         }
-        [command, flag, path, _, _, _, _]
+        [command, flag, _path, _, _, _, _]
             if command == "timeline" && flag == "--windows-runtime" =>
         {
             Err("--event-kind and --process-observation cannot be combined".to_owned())
