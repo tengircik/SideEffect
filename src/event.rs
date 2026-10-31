@@ -14,6 +14,8 @@ use crate::model::{
 
 pub const COMMON_EVENT_SCHEMA: &str = "sideeffect.common_event_envelope";
 pub const COMMON_EVENT_SCHEMA_VERSION: u32 = 2;
+pub const EVENT_GRAPH_SCHEMA: &str = "sideeffect.event_graph";
+pub const EVENT_GRAPH_SCHEMA_VERSION: u32 = 2;
 #[cfg(windows)]
 const WINDOWS_RUNTIME_SCHEMA: &str = "sideeffect.windows_runtime_capture";
 #[cfg(windows)]
@@ -289,6 +291,8 @@ pub struct EventTimelineFilter {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EventGraphFilter {
     pub event_kind: Option<String>,
+    /// Envelope-local process observation ID; never a PID or cross-capture ID.
+    pub process_observation_id: Option<u64>,
 }
 
 /// A source-local graph view over an adapted event envelope. PID-only context
@@ -354,6 +358,7 @@ pub struct EventGraphEdge {
 pub fn graph(
     envelope: &CommonEventEnvelope,
     event_kind: Option<&str>,
+    process_observation_id: Option<u64>,
 ) -> Result<EventGraph, String> {
     let estimated_nodes = envelope
         .events
@@ -509,28 +514,51 @@ pub fn graph(
         return Err("event graph exceeds its bounded node or edge limit".to_owned());
     }
 
+    if let Some(observation_id) = process_observation_id {
+        if !process_nodes.contains_key(&observation_id) {
+            return Err(format!(
+                "no source-local process observation ID {observation_id} was emitted for this input"
+            ));
+        }
+    }
+
     let mut graph = EventGraph {
-        schema: "sideeffect.event_graph",
-        schema_version: 1,
+        schema: EVENT_GRAPH_SCHEMA,
+        schema_version: EVENT_GRAPH_SCHEMA_VERSION,
         filter: EventGraphFilter {
             event_kind: event_kind.map(str::to_owned),
+            process_observation_id,
         },
         source: envelope.source.clone(),
         source_state: envelope.source_state.clone(),
-        semantics: "Evidence-linked relationships and event context only; edges do not establish ownership, causation, or a complete process tree",
+        semantics: "Evidence-linked relationships and event context only; edges do not establish ownership, causation, or a complete process tree. Filters select rows represented in this input; no matching event link is not proof of absence",
         nodes,
         edges,
         diagnostics: envelope.diagnostics.clone(),
     };
 
-    if let Some(event_kind) = event_kind {
+    if event_kind.is_some() || process_observation_id.is_some() {
+        let selected_process_node_id =
+            process_observation_id.map(|observation_id| format!("process:{observation_id}"));
+        let process_linked_event_ids = selected_process_node_id.as_ref().map(|process_id| {
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == "event_process_link" && edge.to_node_id == *process_id)
+                .map(|edge| edge.from_node_id.clone())
+                .collect::<BTreeSet<_>>()
+        });
         let mut selected_event_ids = BTreeSet::new();
         for node in &graph.nodes {
-            if node.kind == EventGraphNodeKind::Event
-                && node
-                    .event
+            let event_matches_kind = event_kind.is_none_or(|event_kind| {
+                node.event
                     .as_ref()
                     .is_some_and(|event| event.event_kind == event_kind)
+            });
+            let event_matches_process = process_linked_event_ids
+                .as_ref()
+                .is_none_or(|event_ids| event_ids.contains(&node.id));
+            if node.kind == EventGraphNodeKind::Event && event_matches_kind && event_matches_process
             {
                 selected_event_ids.insert(node.id.clone());
             }
@@ -539,6 +567,10 @@ pub fn graph(
         let mut included_node_ids = selected_event_ids.clone();
         let mut direct_process_node_ids = BTreeSet::new();
         let mut filtered_edges = Vec::new();
+        if let Some(id) = selected_process_node_id.as_ref() {
+            direct_process_node_ids.insert(id.clone());
+            included_node_ids.insert(id.clone());
+        }
         for edge in &graph.edges {
             if edge.kind == "event_process_link" && selected_event_ids.contains(&edge.from_node_id)
             {

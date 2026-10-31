@@ -1,5 +1,5 @@
 use sideeffect::event::{
-    EvidenceReference, OperationSemantics, SourceCompleteness, from_linux_strace,
+    EvidenceReference, OperationSemantics, SourceCompleteness, from_linux_strace, graph,
 };
 use sideeffect::limits::ParseLimits;
 use sideeffect::model::{SyscallOutcome, TraceRecordKind};
@@ -325,4 +325,31 @@ fn unfinished_syscalls_remain_attempts_without_inventing_a_result() {
         OperationSemantics::SyscallAttempt { result: None }
     ));
     assert_eq!(parsed.records[0].kind, TraceRecordKind::UnfinishedSyscall);
+}
+
+#[test]
+fn process_filtered_graph_keeps_selected_observation_when_it_has_no_event_link() {
+    let bytes = b"[pid 417] 1700000000.000001 getpid() = 417\n";
+    let parsed = parse_trace_bytes(bytes, ParseLimits::default()).unwrap();
+    let mut envelope = from_linux_strace(&parsed, bytes, "synthetic-no-event-link.trace");
+    envelope.event_process_links.clear();
+
+    let graph = graph(&envelope, None, Some(1)).unwrap();
+    assert_eq!(graph.schema, "sideeffect.event_graph");
+    assert_eq!(graph.schema_version, 2);
+    assert_eq!(graph.filter.process_observation_id, Some(1));
+    assert!(graph.nodes.iter().any(|node| {
+        node.kind == sideeffect::event::EventGraphNodeKind::ProcessObservation
+            && node.id == "process:1"
+    }));
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .all(|node| node.kind != sideeffect::event::EventGraphNodeKind::Event)
+    );
+    assert!(graph.edges.is_empty());
+    assert!(graph.semantics.contains("not proof of absence"));
+    assert_eq!(graph.source_state, envelope.source_state);
+    assert_eq!(graph.diagnostics, envelope.diagnostics);
 }

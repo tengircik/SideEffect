@@ -240,19 +240,35 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             inspect_windows_runtime_with_format(&OsString::from("json"), path)
         }
         [command, flag, path] if command == "events" && flag == "--trace" => events_trace(path),
-        [command, flag, path] if command == "graph" && flag == "--trace" => graph_trace(path, None),
+        [command, flag, path] if command == "graph" && flag == "--trace" => {
+            graph_trace(path, None, None)
+        }
         [command, flag, path, kind_flag, kind]
             if command == "graph" && flag == "--trace" && kind_flag == "--event-kind" =>
         {
-            graph_trace(path, Some(kind))
+            graph_trace(path, Some(kind), None)
+        }
+        [command, flag, path, observation_flag, observation_id]
+            if command == "graph"
+                && flag == "--trace"
+                && observation_flag == "--process-observation" =>
+        {
+            graph_trace(path, None, Some(observation_id))
         }
         [command, flag, path] if command == "graph" && flag == "--windows-runtime" => {
-            graph_windows_runtime(path, None)
+            graph_windows_runtime(path, None, None)
         }
         [command, flag, path, kind_flag, kind]
             if command == "graph" && flag == "--windows-runtime" && kind_flag == "--event-kind" =>
         {
-            graph_windows_runtime(path, Some(kind))
+            graph_windows_runtime(path, Some(kind), None)
+        }
+        [command, flag, path, observation_flag, observation_id]
+            if command == "graph"
+                && flag == "--windows-runtime"
+                && observation_flag == "--process-observation" =>
+        {
+            graph_windows_runtime(path, None, Some(observation_id))
         }
         [command, flag, path] if command == "timeline" && flag == "--trace" => {
             timeline_trace(path, None)
@@ -1446,7 +1462,7 @@ fn print_version() {
 
 fn print_usage() {
     println!(
-        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)\n       sideeffect graph --trace <strace-trace-file> [--event-kind <kind>]\n       sideeffect graph --windows-runtime <capture.json> [--event-kind <kind>] (native Windows)\n       sideeffect timeline --trace <strace-trace-file> [--event-kind <kind>]\n       sideeffect timeline --windows-runtime <capture.json> [--event-kind <kind>] (native Windows)\n\nProvenance:\n       sideeffect provenance keygen <private-key.pk8> <public-key.hex>\n       sideeffect provenance sign-session <session-dir> --private-key <private-key.pk8> --output <signature.json>\n       sideeffect provenance verify-session <session-dir> --signature <signature.json> --public-key <public-key.hex>"
+        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)\n       sideeffect graph --trace <strace-trace-file> [--event-kind <kind> | --process-observation <id>]\n       sideeffect graph --windows-runtime <capture.json> [--event-kind <kind> | --process-observation <id>] (native Windows)\n       sideeffect timeline --trace <strace-trace-file> [--event-kind <kind>]\n       sideeffect timeline --windows-runtime <capture.json> [--event-kind <kind>] (native Windows)\n\nProvenance:\n       sideeffect provenance keygen <private-key.pk8> <public-key.hex>\n       sideeffect provenance sign-session <session-dir> --private-key <private-key.pk8> --output <signature.json>\n       sideeffect provenance verify-session <session-dir> --signature <signature.json> --public-key <public-key.hex>"
     );
 }
 
@@ -1486,7 +1502,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect events --trace TRACE\n       sideeffect events --windows-runtime CAPTURE.json (native Windows)\nAdapts one local runtime source into a versioned common event envelope and writes JSON only. Source-local order and timestamps are preserved; no cross-platform ordering, parentage, ownership, or causation is inferred. Partial or unknown source status exits with status 2. Windows runtime input is strictly bounded and schema-validated before adaptation."
         }
         "graph" => {
-            "Usage: sideeffect graph --trace TRACE [--event-kind KIND]\n       sideeffect graph --windows-runtime CAPTURE.json [--event-kind KIND] (native Windows)\nBuilds a bounded source-local graph of event rows, process observations, reported PID context, and evidence-linked relationships. --event-kind selects exact event-kind matches and keeps their direct process links plus one-hop process relationships; diagnostics and source status remain for the full input. PID-only context nodes are kept separate and never merged into process instances. Edges preserve observed, context-candidate, unresolved, or decoder-metadata-unverified status; they do not establish ownership, causation, or a complete process tree. Partial or unknown source status exits with status 2."
+            "Usage: sideeffect graph --trace TRACE [--event-kind KIND | --process-observation ID]\n       sideeffect graph --windows-runtime CAPTURE.json [--event-kind KIND | --process-observation ID] (native Windows)\nBuilds a bounded source-local graph of event rows, process observations, reported PID context, and evidence-linked relationships. --event-kind selects exact event-kind matches. --process-observation selects a source-local ProcessObservation ID (not a PID or cross-capture ID) and retains events linked to that observation plus its direct process relationships. Retained links preserve their status and basis; diagnostics and source status remain for the full input. An empty event selection is not evidence of absence. PID-only context nodes are kept separate and never merged into process instances. Edges do not establish ownership, causation, or a complete process tree. Partial or unknown source status exits with status 2."
         }
         "timeline" => {
             "Usage: sideeffect timeline --trace TRACE [--event-kind KIND]\n       sideeffect timeline --windows-runtime CAPTURE.json [--event-kind KIND] (native Windows)\nBuilds a source-local timeline from bounded Linux strace or strictly validated Windows ETW v3 evidence. Items keep their source ordinal, original timestamp representation, and exact raw-record evidence reference; timestamps do not establish causal order. --event-kind matches an exact event kind. Unsupported rows remain in diagnostics. Partial or unknown source status exits with status 2."
@@ -1842,21 +1858,28 @@ fn events_trace(path: &OsString) -> Result<ExitCode, String> {
     })
 }
 
-fn graph_trace(path: &OsString, event_kind: Option<&OsString>) -> Result<ExitCode, String> {
+fn graph_trace(
+    path: &OsString,
+    event_kind: Option<&OsString>,
+    process_observation_id: Option<&OsString>,
+) -> Result<ExitCode, String> {
     let event_kind = parse_event_kind_filter(event_kind)?;
+    let process_observation_id = parse_process_observation_filter(process_observation_id)?;
     let bytes = read_bounded(path)?;
     let trace = parse_trace_bytes(&bytes, ParseLimits::default())
         .map_err(|error| format!("trace graph adaptation failed: {error}"))?;
     let envelope = sideeffect::event::from_linux_strace(&trace, &bytes, "trace");
-    write_event_graph(&envelope, event_kind)
+    write_event_graph(&envelope, event_kind, process_observation_id)
 }
 
 #[cfg(windows)]
 fn graph_windows_runtime(
     path: &OsString,
     event_kind: Option<&OsString>,
+    process_observation_id: Option<&OsString>,
 ) -> Result<ExitCode, String> {
     let event_kind = parse_event_kind_filter(event_kind)?;
+    let process_observation_id = parse_process_observation_filter(process_observation_id)?;
     let bytes = read_input_file(
         Path::new(path),
         sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
@@ -1865,13 +1888,14 @@ fn graph_windows_runtime(
     let capture = sideeffect::windows_runtime::inspect_windows_runtime_bytes(&bytes)
         .map_err(|error| format!("Windows runtime graph adaptation failed: {error}"))?;
     let envelope = sideeffect::event::from_windows_runtime_capture(&capture);
-    write_event_graph(&envelope, event_kind)
+    write_event_graph(&envelope, event_kind, process_observation_id)
 }
 
 #[cfg(not(windows))]
 fn graph_windows_runtime(
     _path: &OsString,
     _event_kind: Option<&OsString>,
+    _process_observation_id: Option<&OsString>,
 ) -> Result<ExitCode, String> {
     Err("graph --windows-runtime is supported only in native Windows builds".to_owned())
 }
@@ -1879,10 +1903,11 @@ fn graph_windows_runtime(
 fn write_event_graph(
     envelope: &sideeffect::event::CommonEventEnvelope,
     event_kind: Option<&str>,
+    process_observation_id: Option<u64>,
 ) -> Result<ExitCode, String> {
     let complete =
         envelope.source_state.completeness == sideeffect::event::SourceCompleteness::Complete;
-    let graph = sideeffect::event::graph(envelope, event_kind)?;
+    let graph = sideeffect::event::graph(envelope, event_kind, process_observation_id)?;
     write_json(&graph, "event graph")?;
     Ok(if complete {
         ExitCode::SUCCESS
@@ -1952,6 +1977,14 @@ fn parse_event_kind_filter(event_kind: Option<&OsString>) -> Result<Option<&str>
             }
             Ok(kind)
         })
+        .transpose()
+}
+
+fn parse_process_observation_filter(
+    process_observation_id: Option<&OsString>,
+) -> Result<Option<u64>, String> {
+    process_observation_id
+        .map(|value| parse_positive_u64(value, "process observation ID"))
         .transpose()
 }
 

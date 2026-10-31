@@ -418,7 +418,13 @@ On native Windows:
 sideeffect.exe graph --windows-runtime .\runtime.windows.json --event-kind file_io_observation
 ```
 
-Graph nodes retain event or process-observation evidence. Edges preserve the adapter's relationship kind, status, basis, and source references. `--event-kind` performs an exact event-kind match, retaining matched events, their direct process links, and one-hop relationships around those linked processes. The filter metadata is included in JSON while source diagnostics and completeness still describe the full input. A PID without a uniquely resolved process observation gets its own context node for that edge; SideEffect does not merge equal PID values or promote event context to ownership. Partial/unknown source status and diagnostics are retained, and the graph does not imply causation or a complete process tree.
+To select a source-local process observation from the graph:
+
+```sh
+./target/release/sideeffect graph --trace ./run.trace --process-observation 1
+```
+
+The same option is available with `graph --windows-runtime` on native Windows. IDs are envelope-local `ProcessObservation.source_local_id` values shown in graph output; they are neither PIDs nor identifiers that can be reused across captures. The filter retains directly linked event rows with their existing link roles, statuses, and bases, plus one-hop process relationships. It does not match unlinked events by PID. If a valid observation has no linked events, the observation node remains in the result; an empty event selection is not evidence that activity was absent. Both filters are recorded in graph schema v2. Diagnostics and completeness still describe the full input. PID-only context nodes stay separate from process observations, and the graph does not imply ownership, causation, or a complete process tree.
 
 For a source-local timeline over Linux strace evidence, with an optional exact event-kind filter:
 

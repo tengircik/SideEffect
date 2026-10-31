@@ -459,6 +459,7 @@ fn graph_windows_runtime_keeps_pid_context_separate_from_process_instance() {
     assert_eq!(output.status.code(), Some(2));
     let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(graph["schema"], "sideeffect.event_graph");
+    assert_eq!(graph["schema_version"], 2);
     assert_eq!(graph["filter"]["event_kind"], "process_start");
     assert_eq!(graph["source_state"]["completeness"], "partial");
     let nodes = graph["nodes"].as_array().unwrap();
@@ -488,6 +489,126 @@ fn graph_windows_runtime_keeps_pid_context_separate_from_process_instance() {
             && edge["event_link_status"] == "context_candidate"
             && edge["to_node_id"] == instance["id"]
     }));
+}
+
+#[cfg(windows)]
+#[test]
+fn graph_process_observation_filter_preserves_candidate_context_and_relationship() {
+    let input = fixture(CollectionStatus::Partial);
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-graph-observation-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, &input).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--windows-runtime"])
+        .arg(&path)
+        .args(["--process-observation", "1"])
+        .output()
+        .unwrap();
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(graph["schema_version"], 2);
+    assert_eq!(graph["filter"]["event_kind"], Value::Null);
+    assert_eq!(graph["filter"]["process_observation_id"], 1);
+    assert_eq!(graph["source_state"]["completeness"], "partial");
+    assert!(graph["diagnostics"].as_array().is_some());
+    assert!(
+        graph["semantics"]
+            .as_str()
+            .unwrap()
+            .contains("not proof of absence")
+    );
+    let nodes = graph["nodes"].as_array().unwrap();
+    let selected_process = nodes.iter().find(|node| node["id"] == "process:1").unwrap();
+    assert_eq!(
+        selected_process["process_observation"]["identity"]["identity_status"],
+        "decoder_metadata_unverified"
+    );
+    let event = nodes.iter().find(|node| node["kind"] == "event").unwrap();
+    assert_eq!(event["event"]["event_kind"], "process_start");
+    assert_eq!(event["evidence"]["json_pointer"], "/events/0");
+    assert!(graph["edges"].as_array().unwrap().iter().any(|edge| {
+        edge["kind"] == "event_process_link"
+            && edge["event_link_status"] == "context_candidate"
+            && edge["event_link_role"] == "windows_process_start_payload"
+            && edge["to_node_id"] == "process:1"
+            && edge["basis"].as_str().unwrap().contains("not re-decoded")
+    }));
+    assert!(graph["edges"].as_array().unwrap().iter().any(|edge| {
+        edge["kind"] == "process_relationship"
+            && edge["relationship_resolution"] == "parent_instance_unresolved"
+            && edge["to_node_id"] == "process:1"
+    }));
+}
+
+#[cfg(windows)]
+#[test]
+fn graph_process_observation_filter_does_not_match_ambiguous_pid_by_number() {
+    let mut value: Value = serde_json::from_slice(&fixture(CollectionStatus::Complete)).unwrap();
+    let mut duplicate = value["events"][0].clone();
+    duplicate["record_ordinal"] = json!(2);
+    value["events"].as_array_mut().unwrap().push(duplicate);
+    let input = rehashed_capture(value);
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-graph-ambiguous-observation-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, input).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--windows-runtime"])
+        .arg(&path)
+        .args(["--process-observation", "2"])
+        .output()
+        .unwrap();
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(graph["filter"]["process_observation_id"], 2);
+    assert_eq!(graph["source_state"]["completeness"], "partial");
+    let nodes = graph["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0]["id"], "process:2");
+    assert_eq!(
+        nodes[0]["process_observation"]["identity"]["identity_status"],
+        "ambiguous_pid_reuse"
+    );
+    assert!(graph["edges"].as_array().unwrap().is_empty());
+    assert!(
+        graph["semantics"]
+            .as_str()
+            .unwrap()
+            .contains("not proof of absence")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn graph_process_observation_filter_rejects_invalid_and_unemitted_ids() {
+    let input = fixture(CollectionStatus::Complete);
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-graph-invalid-observation-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, input).unwrap();
+    for id in ["0", "invalid", "99"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+            .args(["graph", "--windows-runtime"])
+            .arg(&path)
+            .args(["--process-observation", id])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "ID was {id}");
+        assert!(output.stdout.is_empty(), "ID was {id}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("process observation ID"));
+    }
+    fs::remove_file(path).unwrap();
 }
 
 #[cfg(windows)]

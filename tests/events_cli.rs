@@ -133,7 +133,7 @@ fn graph_trace_keeps_event_process_link_and_source_evidence() {
     assert_eq!(output.status.code(), Some(2));
     let graph: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(graph["schema"], "sideeffect.event_graph");
-    assert_eq!(graph["schema_version"], 1);
+    assert_eq!(graph["schema_version"], 2);
     assert_eq!(graph["source_state"]["completeness"], "partial");
     assert!(
         graph["semantics"]
@@ -198,6 +198,85 @@ fn graph_event_kind_filter_keeps_related_evidence_and_all_diagnostics() {
     );
     assert_eq!(graph["edges"].as_array().unwrap().len(), 1);
     assert_eq!(graph["edges"][0]["kind"], "event_process_link");
+}
+
+#[test]
+fn graph_process_observation_filter_selects_source_local_context_and_links() {
+    let trace = TempTrace::with_contents(
+        b"[pid 123] 1700000000.000001 openat(AT_FDCWD, \"/tmp/one\", O_RDONLY) = 3\n[pid 456] 1700000000.000002 close(4) = 0\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--trace"])
+        .arg(&trace.0)
+        .args(["--process-observation", "1"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let graph: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(graph["schema_version"], 2);
+    assert_eq!(graph["filter"]["event_kind"], serde_json::Value::Null);
+    assert_eq!(graph["filter"]["process_observation_id"], 1);
+    assert!(
+        graph["semantics"]
+            .as_str()
+            .unwrap()
+            .contains("not proof of absence")
+    );
+    let nodes = graph["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 2);
+    let event = nodes.iter().find(|node| node["kind"] == "event").unwrap();
+    let process = nodes
+        .iter()
+        .find(|node| node["kind"] == "process_observation")
+        .unwrap();
+    assert_eq!(event["event"]["event_kind"], "openat");
+    assert_eq!(event["evidence"]["line_number"], 1);
+    assert_eq!(process["process_observation"]["source_local_id"], 1);
+    assert_eq!(
+        process["process_observation"]["identity"]["kind"],
+        "linux_trace_task_context"
+    );
+    assert_eq!(process["process_observation"]["identity"]["task_id"], 123);
+    assert_eq!(graph["edges"].as_array().unwrap().len(), 1);
+    assert_eq!(graph["edges"][0]["event_link_status"], "observed");
+    assert_eq!(
+        graph["edges"][0]["event_link_role"],
+        "linux_trace_caller_task_context"
+    );
+}
+
+#[test]
+fn graph_process_observation_filter_rejects_invalid_or_unemitted_ids() {
+    let trace = TempTrace::with_contents(b"123 1700000000.000001 close(4) = 0\n");
+    for id in ["0", "invalid", "18446744073709551616"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+            .args(["graph", "--trace"])
+            .arg(&trace.0)
+            .args(["--process-observation", id])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "ID was {id}");
+        assert!(output.stdout.is_empty(), "ID was {id}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("process observation ID"));
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--trace"])
+        .arg(&trace.0)
+        .args(["--process-observation", "99"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("no source-local process observation ID 99 was emitted")
+    );
 }
 
 #[test]
