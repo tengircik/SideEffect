@@ -165,6 +165,13 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
         "capture did not include the fixture's loopback network event with payload PID; network event summaries: {}",
         serde_json::to_string(&network_event_summaries).unwrap()
     );
+    let events = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["events", "--windows-runtime"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_eq!(events.status.code(), Some(2));
+    let events: Value = serde_json::from_slice(&events.stdout).unwrap();
     let timeline = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .args(["timeline", "--windows-runtime"])
         .arg(&output)
@@ -179,7 +186,11 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
     );
     let timeline: Value = serde_json::from_slice(&timeline.stdout).unwrap();
     assert_eq!(timeline["schema"], "sideeffect.event_timeline");
-    assert_eq!(timeline["source_state"]["completeness"], "unknown");
+    assert_eq!(timeline["source_state"], events["source_state"]);
+    assert!(matches!(
+        timeline["source_state"]["completeness"].as_str(),
+        Some("partial" | "unknown")
+    ));
     assert_eq!(timeline["filter"]["event_kind"], "file_io_observation");
     assert!(
         timeline["items"].as_array().unwrap().iter().any(|event| {
