@@ -278,14 +278,48 @@ pub struct EventTimeline {
     pub source: SourceDescriptor,
     pub source_state: SourceState,
     pub ordering: &'static str,
+    pub semantics: &'static str,
     pub filter: EventTimelineFilter,
+    /// The selected source-local observation, including its evidence, when a
+    /// process-observation filter was requested.
+    pub selected_process_observation: Option<ProcessObservation>,
     pub items: Vec<CommonEvent>,
+    /// All source-native process links for displayed items, including
+    /// unresolved and context-candidate links.
+    pub event_process_links: Vec<EventProcessLink>,
     pub diagnostics: Vec<EventDiagnostic>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EventTimelineFilter {
     pub event_kind: Option<String>,
+    /// Envelope-local source_local_id; never a PID or cross-capture ID.
+    pub process_observation_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum TimelineEvidenceKey {
+    RawTraceRecord(u64, u64, u64),
+    WindowsEtwRecord(u64, String, String),
+}
+
+fn timeline_evidence_key(evidence: &EvidenceReference) -> TimelineEvidenceKey {
+    match evidence {
+        EvidenceReference::RawTraceRecord {
+            line_number,
+            byte_offset,
+            byte_length,
+        } => TimelineEvidenceKey::RawTraceRecord(*line_number, *byte_offset, *byte_length),
+        EvidenceReference::WindowsEtwRecord {
+            record_ordinal,
+            json_pointer,
+            raw_payload_sha256,
+        } => TimelineEvidenceKey::WindowsEtwRecord(
+            *record_ordinal,
+            json_pointer.clone(),
+            raw_payload_sha256.clone(),
+        ),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -602,26 +636,81 @@ pub fn graph(
 
 /// Build a bounded timeline view from an already adapted envelope. The
 /// envelope's source-local ordinals and evidence references remain unchanged.
-pub fn timeline(envelope: &CommonEventEnvelope, event_kind: Option<&str>) -> EventTimeline {
+pub fn timeline(
+    envelope: &CommonEventEnvelope,
+    event_kind: Option<&str>,
+    process_observation_id: Option<u64>,
+) -> Result<EventTimeline, String> {
+    if event_kind.is_some() && process_observation_id.is_some() {
+        return Err("--event-kind and --process-observation cannot be combined".to_owned());
+    }
+    let selected_process_observation = if let Some(id) = process_observation_id {
+        if id == 0 {
+            return Err("process observation ID must be greater than zero".to_owned());
+        }
+        let mut observations = envelope
+            .process_observations
+            .iter()
+            .filter(|observation| observation.source_local_id == id);
+        let observation = observations.next().ok_or_else(|| {
+            format!("no source-local process observation ID {id} was emitted for this input")
+        })?;
+        if observations.next().is_some() {
+            return Err(format!(
+                "source-local process observation ID {id} is ambiguous in this input"
+            ));
+        }
+        Some(observation.clone())
+    } else {
+        None
+    };
+
+    let linked_evidence = process_observation_id.map(|id| {
+        envelope
+            .event_process_links
+            .iter()
+            .filter(|link| link.process_observation_id == Some(id))
+            .map(|link| timeline_evidence_key(&link.event))
+            .collect::<BTreeSet<_>>()
+    });
     let mut items = envelope
         .events
         .iter()
-        .filter(|event| event_kind.is_none_or(|kind| event.event_kind == kind))
+        .filter(|event| {
+            event_kind.is_none_or(|kind| event.event_kind == kind)
+                && linked_evidence
+                    .as_ref()
+                    .is_none_or(|linked| linked.contains(&timeline_evidence_key(&event.evidence)))
+        })
         .cloned()
         .collect::<Vec<_>>();
     items.sort_by_key(|event| event.source_local_ordinal);
-    EventTimeline {
+    let item_evidence = items
+        .iter()
+        .map(|event| timeline_evidence_key(&event.evidence))
+        .collect::<BTreeSet<_>>();
+    let event_process_links = envelope
+        .event_process_links
+        .iter()
+        .filter(|link| item_evidence.contains(&timeline_evidence_key(&link.event)))
+        .cloned()
+        .collect();
+    Ok(EventTimeline {
         schema: "sideeffect.event_timeline",
-        schema_version: 1,
+        schema_version: 2,
         source: envelope.source.clone(),
         source_state: envelope.source_state.clone(),
         ordering: "source_local_ordinal; timestamps are source text and do not establish causal order",
+        semantics: "source-local selection only; an empty item set or missing event link does not prove activity was absent",
         filter: EventTimelineFilter {
             event_kind: event_kind.map(str::to_owned),
+            process_observation_id,
         },
+        selected_process_observation,
         items,
+        event_process_links,
         diagnostics: envelope.diagnostics.clone(),
-    }
+    })
 }
 
 fn push_process_diagnostic(

@@ -85,7 +85,7 @@ fn timeline_filters_exact_kind_and_retains_raw_evidence_and_diagnostics() {
     assert_eq!(output.status.code(), Some(2));
     let timeline: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(timeline["schema"], "sideeffect.event_timeline");
-    assert_eq!(timeline["schema_version"], 1);
+    assert_eq!(timeline["schema_version"], 2);
     assert_eq!(timeline["source_state"]["completeness"], "partial");
     assert_eq!(timeline["filter"]["event_kind"], "close");
     assert!(
@@ -102,8 +102,91 @@ fn timeline_filters_exact_kind_and_retains_raw_evidence_and_diagnostics() {
     );
     assert_eq!(timeline["items"][0]["evidence"]["kind"], "raw_trace_record");
     assert_eq!(timeline["items"][0]["evidence"]["line_number"], 3);
+    assert!(
+        timeline["event_process_links"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(timeline["diagnostics"][0]["code"], "unsupported_source_row");
     assert_eq!(timeline["diagnostics"][0]["source_local_ordinal"], 2);
+}
+
+#[test]
+fn timeline_process_observation_filters_by_local_link_and_preserves_evidence() {
+    let trace = TempTrace::with_contents(
+        b"[pid 123] 1700000000.000001 openat(AT_FDCWD, \"/tmp/one\", O_RDONLY) = 3\nnot a recognized trace row\n[pid 456] 1700000000.000003 close(4) = 0\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--trace"])
+        .arg(&trace.0)
+        .args(["--process-observation", "1"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let timeline: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(timeline["schema_version"], 2);
+    assert_eq!(timeline["filter"]["process_observation_id"], 1);
+    assert_eq!(timeline["source_state"]["completeness"], "partial");
+    assert_eq!(timeline["items"].as_array().unwrap().len(), 1);
+    assert_eq!(timeline["items"][0]["source_local_ordinal"], 1);
+    assert_eq!(timeline["items"][0]["evidence"]["line_number"], 1);
+    assert_eq!(
+        timeline["selected_process_observation"]["source_local_id"],
+        1
+    );
+    assert_eq!(
+        timeline["selected_process_observation"]["evidence"]["line_number"],
+        1
+    );
+    assert_eq!(timeline["event_process_links"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        timeline["event_process_links"][0]["process_observation_id"],
+        1
+    );
+    assert_eq!(
+        timeline["event_process_links"][0]["role"],
+        "linux_trace_caller_task_context"
+    );
+    assert_eq!(timeline["event_process_links"][0]["status"], "observed");
+    assert_eq!(timeline["diagnostics"][0]["code"], "unsupported_source_row");
+    assert!(
+        timeline["semantics"]
+            .as_str()
+            .unwrap()
+            .contains("does not prove activity was absent")
+    );
+}
+
+#[test]
+fn timeline_process_observation_rejects_invalid_and_unemitted_ids() {
+    let trace = TempTrace::with_contents(b"123 1700000000.000001 close(4) = 0\n");
+    for id in ["0", "invalid", "99", "18446744073709551616"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+            .args(["timeline", "--trace"])
+            .arg(&trace.0)
+            .args(["--process-observation", id])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "ID was {id}");
+        assert!(output.stdout.is_empty(), "ID was {id}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("process observation ID"));
+    }
+}
+
+#[test]
+fn timeline_rejects_combined_filters() {
+    let trace = TempTrace::with_contents(b"123 1700000000.000001 close(4) = 0\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--trace"])
+        .arg(&trace.0)
+        .args(["--process-observation", "1", "--event-kind", "close"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be combined"));
 }
 
 #[test]

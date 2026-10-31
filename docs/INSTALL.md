@@ -434,21 +434,23 @@ To select a source-local process observation from the graph:
 
 The same option is available with `graph --windows-runtime` on native Windows. IDs are envelope-local `ProcessObservation.source_local_id` values shown in graph output; they are neither PIDs nor identifiers that can be reused across captures. The filter retains directly linked event rows with their existing link roles, statuses, and bases, plus one-hop process relationships. It does not match unlinked events by PID. If a valid observation has no linked events, the observation node remains in the result; an empty event selection is not evidence that activity was absent. Both filters are recorded in graph schema v2. Diagnostics and completeness still describe the full input. PID-only context nodes stay separate from process observations, and the graph does not imply ownership, causation, or a complete process tree.
 
-For a source-local timeline over Linux strace evidence, with an optional exact event-kind filter:
+For a source-local timeline over Linux strace evidence, use either an exact event-kind filter or a source-local process observation filter:
 
 ```sh
 ./target/release/sideeffect timeline --trace ./run.trace --event-kind openat
+./target/release/sideeffect timeline --trace ./run.trace --process-observation 1
 ```
 
 Each item retains its source ordinal, original timestamp text, and raw trace line/byte reference for drilldown against the supplied trace. Parser diagnostics remain present after filtering. The command does not merge sources or infer causal order.
 
-On native Windows, the same timeline view can be built from a strictly validated ETW v3 capture:
+On native Windows, the same timeline view and filters are available over a strictly validated ETW v3 capture:
 
 ```powershell
 sideeffect.exe timeline --windows-runtime .\runtime.windows.json --event-kind file_io_observation
+sideeffect.exe timeline --windows-runtime .\runtime.windows.json --process-observation 1
 ```
 
-ETW items retain capture-local ordinal, QPC timestamp text, payload digest, and JSON pointer back to the source event. Capture partial or unknown status remains visible and exits with status `2`. This is a source-local timeline, not a merged graph or causal sequence. Resolve a single event with `sideeffect.exe evidence --windows-runtime .\runtime.windows.json CAPTURE_SHA256 RECORD_ORDINAL RAW_PAYLOAD_SHA256`. The lookup validates the capture, then requires the fingerprint, ordinal, and raw-payload digest to match before returning that row and its source pointer. It includes capture status, loss, and diagnostics; serialized decode metadata and producer authenticity are not independently verified. Unknown completeness exits with status `2`.
+Timeline schema v2 records the selected filter and includes all event-to-process links for displayed items, preserving each link role, status, and basis. A `--process-observation ID` uses only `ProcessObservation.source_local_id` emitted by that adapted capture; it is not a PID and cannot be reused across captures. Filters are mutually exclusive. The selected observation and its source evidence remain in output when it has no linked events. An empty item selection or missing link is not proof that activity was absent. Linux items retain raw line/byte references; ETW items retain capture-local ordinal, QPC timestamp text, payload digest, and JSON pointer back to the source event. Full-source diagnostics and partial or unknown status remain visible; partial or unknown exits with status `2`. This is a source-local timeline, not a merged graph or causal sequence. Resolve a single event with `sideeffect.exe evidence --windows-runtime .\runtime.windows.json CAPTURE_SHA256 RECORD_ORDINAL RAW_PAYLOAD_SHA256`. The lookup validates the capture, then requires the fingerprint, ordinal, and raw-payload digest to match before returning that row and its source pointer. It includes capture status, loss, and diagnostics; serialized decode metadata and producer authenticity are not independently verified. Unknown completeness exits with status `2`.
 
 ## Use an existing WSL2 installation
 
