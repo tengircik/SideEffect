@@ -225,6 +225,10 @@ jobs:
       - name: Install Rust components
         run: rustup component add rustfmt clippy
 
+      - name: Validate local explanation evaluator contracts
+        shell: pwsh
+        run: py -3 tests/test_local_model_explain_evaluator.py
+
       - name: Check formatting
         run: cargo fmt --all --check
 
