@@ -406,6 +406,20 @@ On native Windows, adapt a saved ETW v3 capture after the strict bounded schema 
 
 Both commands write JSON only to stdout and read the selected file without modifying it or running represented commands. The envelope preserves source-local row order, timestamps, attempt/result or observation semantics, diagnostics, and evidence references. Its status is `partial` or `unknown` when the source or adapter cannot establish a complete supported result; those outcomes exit `2`. ETW header PID is event context and is not ownership or an actor identity. Neither adapter creates global event order, parentage, or causation. The common envelope is an output format, not a persisted capture or event graph; see [schema compatibility](SCHEMA_COMPATIBILITY.md).
 
+To organize the adapted facts into an evidence-linked graph, run:
+
+```sh
+./target/release/sideeffect graph --trace ./run.trace
+```
+
+On native Windows:
+
+```powershell
+sideeffect.exe graph --windows-runtime .\\runtime.windows.json
+```
+
+Graph nodes retain event or process-observation evidence. Edges preserve the adapter's relationship kind, status, basis, and source references. A PID without a uniquely resolved process observation gets its own context node for that edge; SideEffect does not merge equal PID values or promote event context to ownership. Partial/unknown source status and diagnostics are retained, and the graph does not imply causation or a complete process tree.
+
 For a source-local timeline over Linux strace evidence, with an optional exact event-kind filter:
 
 ```sh
