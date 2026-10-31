@@ -537,7 +537,7 @@ fn timeline_windows_ambiguous_observation_is_shown_without_pid_matching_events()
 
 #[cfg(windows)]
 #[test]
-fn timeline_windows_rejects_invalid_unemitted_and_combined_filters() {
+fn timeline_windows_rejects_invalid_and_unemitted_observation_ids() {
     let input = fixture(CollectionStatus::Complete);
     let path = std::env::temp_dir().join(format!(
         "sideeffect-windows-timeline-invalid-{}-{}.json",
@@ -556,21 +556,86 @@ fn timeline_windows_rejects_invalid_unemitted_and_combined_filters() {
         assert!(output.stdout.is_empty(), "ID was {id}");
         assert!(String::from_utf8_lossy(&output.stderr).contains("process observation ID"));
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+    fs::remove_file(path).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn timeline_windows_combined_filters_intersect_and_preserve_observation() {
+    let input = fixture(CollectionStatus::Partial);
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-timeline-intersection-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, &input).unwrap();
+    for filters in [
+        [
+            "--event-kind",
+            "process_start",
+            "--process-observation",
+            "1",
+        ],
+        [
+            "--process-observation",
+            "1",
+            "--event-kind",
+            "process_start",
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+            .args(["timeline", "--windows-runtime"])
+            .arg(&path)
+            .args(filters)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let timeline: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(timeline["filter"]["event_kind"], "process_start");
+        assert_eq!(timeline["filter"]["process_observation_id"], 1);
+        assert_eq!(timeline["items"].as_array().unwrap().len(), 1);
+        assert_eq!(timeline["items"][0]["event_kind"], "process_start");
+        assert_eq!(timeline["event_process_links"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            timeline["selected_process_observation"]["source_local_id"],
+            1
+        );
+        assert_eq!(timeline["source_state"]["completeness"], "partial");
+        assert!(
+            timeline["source_state"]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic == "synthetic_fixture_partial_source")
+        );
+    }
+    let no_match = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .args(["timeline", "--windows-runtime"])
         .arg(&path)
         .args([
             "--event-kind",
-            "process_start",
+            "network_observation",
             "--process-observation",
             "1",
         ])
         .output()
         .unwrap();
     fs::remove_file(path).unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be combined"));
+    assert_eq!(no_match.status.code(), Some(2));
+    let timeline: Value = serde_json::from_slice(&no_match.stdout).unwrap();
+    assert!(timeline["items"].as_array().unwrap().is_empty());
+    assert_eq!(
+        timeline["selected_process_observation"]["source_local_id"],
+        1
+    );
+    assert_eq!(timeline["source_state"]["completeness"], "partial");
+    assert!(
+        timeline["source_state"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic == "synthetic_fixture_partial_source")
+    );
 }
 
 #[cfg(windows)]

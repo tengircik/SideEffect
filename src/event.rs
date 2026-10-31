@@ -641,9 +641,6 @@ pub fn timeline(
     event_kind: Option<&str>,
     process_observation_id: Option<u64>,
 ) -> Result<EventTimeline, String> {
-    if event_kind.is_some() && process_observation_id.is_some() {
-        return Err("--event-kind and --process-observation cannot be combined".to_owned());
-    }
     let selected_process_observation = if let Some(id) = process_observation_id {
         if id == 0 {
             return Err("process observation ID must be greater than zero".to_owned());

@@ -176,17 +176,108 @@ fn timeline_process_observation_rejects_invalid_and_unemitted_ids() {
 }
 
 #[test]
-fn timeline_rejects_combined_filters() {
-    let trace = TempTrace::with_contents(b"123 1700000000.000001 close(4) = 0\n");
-    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+fn timeline_combined_filters_intersect_in_either_argument_order() {
+    let trace = TempTrace::with_contents(
+        b"123 1700000000.000001 openat(AT_FDCWD, \"/tmp/item\", O_RDONLY) = 4\n",
+    );
+    for filters in [
+        ["--event-kind", "openat", "--process-observation", "1"],
+        ["--process-observation", "1", "--event-kind", "openat"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+            .args(["timeline", "--trace"])
+            .arg(&trace.0)
+            .args(filters)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let timeline: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(timeline["filter"]["event_kind"], "openat");
+        assert_eq!(timeline["filter"]["process_observation_id"], 1);
+        assert_eq!(timeline["items"].as_array().unwrap().len(), 1);
+        assert_eq!(timeline["items"][0]["event_kind"], "openat");
+        assert_eq!(timeline["items"][0]["evidence"]["line_number"], 1);
+        assert_eq!(
+            timeline["selected_process_observation"]["source_local_id"],
+            1
+        );
+        assert_eq!(timeline["event_process_links"].as_array().unwrap().len(), 1);
+    }
+
+    let no_match = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .args(["timeline", "--trace"])
         .arg(&trace.0)
         .args(["--process-observation", "1", "--event-kind", "close"])
         .output()
         .unwrap();
+    assert!(no_match.status.success());
+    let timeline: serde_json::Value = serde_json::from_slice(&no_match.stdout).unwrap();
+    assert!(timeline["items"].as_array().unwrap().is_empty());
+    assert_eq!(
+        timeline["selected_process_observation"]["source_local_id"],
+        1
+    );
+    assert_eq!(
+        timeline["selected_process_observation"]["evidence"]["line_number"],
+        1
+    );
+    assert!(
+        timeline["event_process_links"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn timeline_rejects_duplicate_and_malformed_filter_options() {
+    let trace = TempTrace::with_contents(b"123 1700000000.000001 close(4) = 0\n");
+    for (arguments, expected) in [
+        (
+            vec!["--event-kind", "close", "--event-kind", "openat"],
+            "duplicate timeline option --event-kind",
+        ),
+        (
+            vec!["--event-kind"],
+            "timeline option --event-kind requires a value",
+        ),
+        (
+            vec!["--unexpected", "value"],
+            "unknown timeline option --unexpected",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+            .args(["timeline", "--trace"])
+            .arg(&trace.0)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
+    }
+}
+
+#[test]
+fn timeline_unknown_option_escapes_terminal_control_characters() {
+    let trace = TempTrace::with_contents(b"123 1700000000.000001 close(4) = 0\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--trace"])
+        .arg(&trace.0)
+        .arg("--unexpected\x1b[2J")
+        .arg("value")
+        .output()
+        .unwrap();
+
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be combined"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--unexpected\\u{1b}[2J"));
+    assert!(!stderr.contains('\x1b'));
 }
 
 #[test]

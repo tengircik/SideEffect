@@ -147,7 +147,7 @@ On native Windows, use a validated ETW capture:
 sideeffect.exe timeline --windows-runtime .\runtime.windows.json --event-kind file_io_observation
 ```
 
-To filter by a process observation from that same source, use `--process-observation ID` instead of `--event-kind`:
+To filter by a process observation from that same source, add `--process-observation ID`:
 
 ```sh
 sideeffect timeline --trace ./capture.trace --process-observation PROC_OBS_ID
@@ -157,7 +157,7 @@ sideeffect timeline --trace ./capture.trace --process-observation PROC_OBS_ID
 sideeffect.exe timeline --windows-runtime .\runtime.windows.json --process-observation PROC_OBS_ID
 ```
 
-The two filters are mutually exclusive. Process observation IDs are source-local identifiers, not PIDs, and are not portable across captures. The JSON listing keeps each source's original order, timestamp representation, and evidence reference. Filters match an exact event kind or process observation; partial or unknown source status remains visible and exits with status `2`. An empty filtered result does not prove that the event or process activity was absent. Timelines are single-source views: they do not merge clocks or establish causal order. Hosted tests exercise the timeline adapter on real Linux `strace` and native Windows ETW captures for named file/loopback scenarios on Ubuntu 24.04 and Windows Server 2022/2025; they do not establish broad OS or event coverage.
+The filters can be combined in either order; combined filters select events matching both the exact event kind and a direct link to that process observation. Process observation IDs are source-local identifiers, not PIDs, and are not portable across captures. The selected observation and its evidence remain present even when the combined filters select no events. The JSON listing keeps each source's original order, timestamp representation, and evidence reference, including every direct link for displayed events. Full-source diagnostics remain visible, and partial or unknown status exits with status `2`. An empty filtered result does not prove that the event or process activity was absent. Timelines are single-source views: they do not merge clocks or establish causal order. Hosted tests exercise the timeline adapter on real Linux `strace` and native Windows ETW captures for named file/loopback scenarios on Ubuntu 24.04 and Windows Server 2022/2025; they do not establish broad OS or event coverage.
 
 On native Windows, resolve one ETW timeline or graph event directly to its validated source row using the capture fingerprint, record ordinal, and raw-payload digest from that reference:
 
