@@ -75,10 +75,7 @@ fn registration(
     publisher: &str,
     registration_index: usize,
 ) -> serde_json::Value {
-    let subkey_utf16_hex = subkey
-        .encode_utf16()
-        .map(|unit| format!("{unit:04x}"))
-        .collect::<String>();
+    let subkey_utf16_hex = utf16_units_hex(subkey);
     serde_json::json!({
         "registry_subkey": subkey,
         "registry_subkey_utf16_hex": subkey_utf16_hex,
@@ -100,11 +97,27 @@ fn registration(
     })
 }
 
+fn utf16_units_hex(text: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::new();
+    for unit in text.encode_utf16() {
+        for shift in [12, 8, 4, 0] {
+            output.push(HEX[((unit >> shift) & 0xf) as usize] as char);
+        }
+    }
+    output
+}
+
 fn utf16le_hex(text: &str) -> String {
-    text.encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::new();
+    for unit in text.encode_utf16() {
+        for byte in unit.to_le_bytes() {
+            output.push(HEX[(byte >> 4) as usize] as char);
+            output.push(HEX[(byte & 0xf) as usize] as char);
+        }
+    }
+    output
 }
 
 fn run_diff(before: &serde_json::Value, after: &serde_json::Value) -> std::process::Output {

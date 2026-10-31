@@ -218,7 +218,7 @@ impl<'de> DeserializeSeed<'de> for KeySeed {
     }
 }
 struct KeyVisitor;
-impl<'de> Visitor<'de> for KeyVisitor {
+impl Visitor<'_> for KeyVisitor {
     type Value = String;
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("bounded object key")
@@ -300,7 +300,7 @@ fn optional_counter(v: &Value, key: &str) -> Result<(), StartupDiffError> {
     Ok(())
 }
 fn validate_path_diagnostics(items: &[Value], with_raw_path: bool) -> Result<(), StartupDiffError> {
-    if items.len() > 256 {
+    if items.len() > MAX_COLLECTION {
         return Err(StartupDiffError::LimitExceeded);
     }
     for d in items {
@@ -604,9 +604,10 @@ fn validate_linux(v: &Value) -> Result<(), StartupDiffError> {
                     "line_sha256",
                 ],
             )?;
-            for f in ["key", "value", "value_hex", "line_sha256"] {
+            for f in ["key", "value", "line_sha256"] {
                 check_str(key, f, 65536)?;
             }
+            check_str(key, "value_hex", MAX_STRING)?;
             if key.get("line").and_then(Value::as_u64).is_none()
                 || key.get("byte_offset").and_then(Value::as_u64).is_none()
                 || key.get("byte_length").and_then(Value::as_u64).is_none()
@@ -672,9 +673,10 @@ fn validate_linux(v: &Value) -> Result<(), StartupDiffError> {
         }
         if let Some(t) = r.get("symlink_target").filter(|x| !x.is_null()) {
             keys(t, &["value", "value_hex", "byte_length", "sha256"])?;
-            for f in ["value", "value_hex", "sha256"] {
+            for f in ["value", "sha256"] {
                 check_str(t, f, 65536)?;
             }
+            check_str(t, "value_hex", MAX_STRING)?;
         }
         for d in arr(r, "directives")? {
             keys(
@@ -690,9 +692,10 @@ fn validate_linux(v: &Value) -> Result<(), StartupDiffError> {
                     "line_sha256",
                 ],
             )?;
-            for f in ["section", "key", "value", "value_hex", "line_sha256"] {
+            for f in ["section", "key", "value", "line_sha256"] {
                 check_str(d, f, 65536)?;
             }
+            check_str(d, "value_hex", MAX_STRING)?;
         }
     }
     let l = v
@@ -777,9 +780,10 @@ fn validate_linux(v: &Value) -> Result<(), StartupDiffError> {
                     "raw_line_hex",
                 ],
             )?;
-            for f in ["line_sha256", "raw_line", "raw_line_hex"] {
+            for f in ["line_sha256", "raw_line"] {
                 check_str(line, f, 65536)?;
             }
+            check_str(line, "raw_line_hex", MAX_STRING)?;
         }
     }
     Ok(())
@@ -1720,5 +1724,62 @@ mod tests {
             ),
             Err(StartupDiffError::InputTooLarge)
         ));
+    }
+
+    #[test]
+    fn producer_maximum_hex_encoded_line_facts_are_accepted() {
+        let long_hex = "ab".repeat(64 * 1024);
+        let mut v = linux();
+        v["xdg_autostart"]["entries"] = json!([{
+            "scope":"user","source_path":"/u/a.desktop","applicability":"not_evaluated",
+            "keys":[{"key":"Exec","value":null,"value_hex":long_hex,"line":1,
+                "byte_offset":0,"byte_length":65536,"line_sha256":"hash"}]
+        }]);
+        v["systemd_units"]["records"] = json!([{
+            "scope":"system","source_path":"/etc/systemd/system/a.service",
+            "source_path_bytes_hex":"2f657463","record_type":"unit_file","symlink_target":null,
+            "directives":[{"section":"Service","key":"ExecStart","value":null,
+                "value_hex":long_hex,"line":1,"byte_offset":0,"byte_length":65536,
+                "line_sha256":"hash"}]
+        }]);
+        v["legacy_sources"]["entries"] = json!([{
+            "source_kind":"sysv_init_scripts","entry_kind":"inert_file",
+            "path":"/etc/init.d/a","path_bytes_hex":"2f657463",
+            "lines":[{"line_number":1,"byte_offset":0,"byte_length":65536,
+                "line_sha256":"hash","raw_line":null,"raw_line_hex":long_hex}]
+        }]);
+        let encoded = bytes(&v);
+        let diff = compare_startup_inventory_json(&encoded, &encoded).unwrap();
+        assert_eq!(diff.status, StartupDiffStatus::Complete);
+        assert_eq!(diff.counts.changed, 0);
+    }
+
+    #[test]
+    fn producer_bounded_linux_directory_diagnostics_are_accepted() {
+        let diagnostics = (0..300)
+            .map(|_| {
+                json!({
+                    "code":"directory_entry_unreadable",
+                    "path":null,
+                    "line":null,
+                    "byte_offset":null
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut snapshot = linux();
+        snapshot["status"] = json!("partial");
+        snapshot["xdg_autostart"]["status"] = json!("partial");
+        snapshot["xdg_autostart"]["directories"] = json!([{
+            "scope":"user",
+            "path":"/home/user/.config/autostart",
+            "status":"partial",
+            "files_seen":0,
+            "diagnostics":diagnostics
+        }]);
+
+        let encoded = bytes(&snapshot);
+        let diff = compare_startup_inventory_json(&encoded, &encoded).unwrap();
+        assert_eq!(diff.status, StartupDiffStatus::Partial);
+        assert_eq!(diff.counts.changed, 0);
     }
 }

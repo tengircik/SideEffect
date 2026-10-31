@@ -236,7 +236,7 @@ impl<'de> DeserializeSeed<'de> for BoundedStringSeed {
     }
 }
 struct BoundedStringVisitor;
-impl<'de> Visitor<'de> for BoundedStringVisitor {
+impl Visitor<'_> for BoundedStringVisitor {
     type Value = String;
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("a bounded JSON object key")

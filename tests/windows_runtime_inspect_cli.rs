@@ -146,7 +146,18 @@ fn tcp_send_payload(process_id: u32) -> String {
     payload.extend_from_slice(&2_u32.to_le_bytes()); // end time
     payload.extend_from_slice(&99_u32.to_le_bytes());
     payload.extend_from_slice(&0x7788_u64.to_le_bytes());
-    payload.iter().map(|byte| format!("{byte:02x}")).collect()
+    lower_hex(&payload)
+}
+
+#[cfg(windows)]
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    output
 }
 
 #[cfg(windows)]

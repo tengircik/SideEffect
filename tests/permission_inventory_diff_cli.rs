@@ -65,10 +65,7 @@ fn windows_row(size: u64) -> serde_json::Value {
     descriptor[0] = 1;
     descriptor[3] = 0x80;
     let digest = Sha256::digest(descriptor);
-    let digest_hex = digest
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    let digest_hex = lower_hex(&digest);
     serde_json::json!({
         "path":"C:\\permission-fixture.txt","path_utf16_hex":"43003a005c007000650072006d0069007300730069006f006e002d0066006900780074007500720065002e00740078007400",
         "status":"complete",
@@ -76,6 +73,15 @@ fn windows_row(size: u64) -> serde_json::Value {
         "security":{"descriptor_length":20,"descriptor_sha256":digest_hex,"descriptor_raw_hex":"0100008000000000000000000000000000000000","control":32768,"owner_sid_raw_hex":null,"group_sid_raw_hex":null,"dacl_state":"absent","dacl_protected":false,"dacl_auto_inherited":false,"aces":[],"parse_diagnostic":null},
         "diagnostic":null
     })
+}
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    output
 }
 fn windows(size: u64) -> serde_json::Value {
     serde_json::json!({

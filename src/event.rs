@@ -274,22 +274,26 @@ fn push_process_diagnostic(
     source_local_ordinal: Option<u64>,
     evidence: Option<EvidenceReference>,
 ) {
-    if *process_diagnostic_count < MAX_COMMON_PROCESS_DIAGNOSTICS - 1 {
-        diagnostics.push(EventDiagnostic {
-            code: code.to_owned(),
-            message: message.to_owned(),
-            source_local_ordinal,
-            evidence,
-        });
-        *process_diagnostic_count += 1;
-    } else if *process_diagnostic_count == MAX_COMMON_PROCESS_DIAGNOSTICS - 1 {
-        diagnostics.push(EventDiagnostic {
-            code: "process_diagnostics_truncated".to_owned(),
-            message: "process relationship diagnostics exceeded the 256 entry limit".to_owned(),
-            source_local_ordinal: None,
-            evidence: None,
-        });
-        *process_diagnostic_count += 1;
+    match (*process_diagnostic_count).cmp(&(MAX_COMMON_PROCESS_DIAGNOSTICS - 1)) {
+        std::cmp::Ordering::Less => {
+            diagnostics.push(EventDiagnostic {
+                code: code.to_owned(),
+                message: message.to_owned(),
+                source_local_ordinal,
+                evidence,
+            });
+            *process_diagnostic_count += 1;
+        }
+        std::cmp::Ordering::Equal => {
+            diagnostics.push(EventDiagnostic {
+                code: "process_diagnostics_truncated".to_owned(),
+                message: "process relationship diagnostics exceeded the 256 entry limit".to_owned(),
+                source_local_ordinal: None,
+                evidence: None,
+            });
+            *process_diagnostic_count += 1;
+        }
+        std::cmp::Ordering::Greater => {}
     }
 }
 
@@ -541,8 +545,8 @@ pub fn from_linux_strace(
                     process_relationships_partial = true;
                 }
             }
-            if let Some(observation_id) = task_observations.get(&task_id).copied()
-                && !push_bounded_process_link(
+            if let Some(observation_id) = task_observations.get(&task_id).copied() {
+                if !push_bounded_process_link(
                     &mut event_process_links,
                     MAX_COMMON_EVENTS + MAX_COMMON_PROCESS_RELATIONS,
                     EventProcessLink {
@@ -557,9 +561,9 @@ pub fn from_linux_strace(
                     &mut process_diagnostic_count,
                     Some(ordinal),
                     Some(event.evidence.clone()),
-                )
-            {
-                process_relationships_partial = true;
+                ) {
+                    process_relationships_partial = true;
+                }
             }
         }
         if let EvidenceReference::RawTraceRecord {
@@ -1978,7 +1982,6 @@ fn normalized_guid(value: &str) -> Option<String> {
     .then(|| value.to_ascii_lowercase())
 }
 
-#[cfg(windows)]
 #[cfg(windows)]
 #[derive(Clone, Copy)]
 enum NetworkPayloadPidCheck {

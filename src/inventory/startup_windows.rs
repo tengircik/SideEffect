@@ -2191,68 +2191,72 @@ fn collect_task_actions(
             }
         };
         let mut row_partial = false;
-        let mut read_field = |field: ExecActionField| match read_exec_action_text(&exec, field) {
-            Ok(value) => match reserve_task_string(&value, aggregate_string_units) {
-                Ok(()) => Some(value),
-                Err(TaskStringError::AggregateLimit) => {
+        let (executable_path, arguments, working_directory) = {
+            let mut read_field = |field: ExecActionField| match read_exec_action_text(&exec, field)
+            {
+                Ok(value) => match reserve_task_string(&value, aggregate_string_units) {
+                    Ok(()) => Some(value),
+                    Err(TaskStringError::AggregateLimit) => {
+                        row_partial = true;
+                        *status = WindowsStartupStatus::Partial;
+                        push_task_diagnostic(
+                            diagnostics,
+                            diagnostic(
+                                "task_action_string_budget_exceeded",
+                                Some(task_index),
+                                "The aggregate scheduled-task action string budget was reached; this and remaining action fields are omitted.",
+                            ),
+                        );
+                        None
+                    }
+                    Err(_) => unreachable!("BSTR was validated before aggregate accounting"),
+                },
+                Err(error) => {
                     row_partial = true;
                     *status = WindowsStartupStatus::Partial;
-                    push_task_diagnostic(
-                        diagnostics,
-                        diagnostic(
-                            "task_action_string_budget_exceeded",
-                            Some(task_index),
-                            "The aggregate scheduled-task action string budget was reached; this and remaining action fields are omitted.",
+                    match error {
+                        ExecActionTextError::Com(code) => push_task_diagnostic(
+                            diagnostics,
+                            diagnostic_hresult(
+                                "task_action_field_read_failed",
+                                Some(task_index),
+                                "Windows could not read an Exec action field; that field remains unknown.",
+                                code,
+                            ),
                         ),
-                    );
+                        ExecActionTextError::Invalid(TaskStringError::OverLimit) => {
+                            push_task_diagnostic(
+                                diagnostics,
+                                diagnostic(
+                                    "task_action_field_limit_exceeded",
+                                    Some(task_index),
+                                    "An Exec action field exceeded its UTF-16 length limit and was omitted.",
+                                ),
+                            )
+                        }
+                        ExecActionTextError::Invalid(TaskStringError::MalformedUtf16) => {
+                            push_task_diagnostic(
+                                diagnostics,
+                                diagnostic(
+                                    "task_action_field_malformed_utf16",
+                                    Some(task_index),
+                                    "An Exec action field contained malformed UTF-16 and was omitted.",
+                                ),
+                            )
+                        }
+                        ExecActionTextError::Invalid(TaskStringError::AggregateLimit) => {
+                            unreachable!("aggregate limits are applied after BSTR conversion")
+                        }
+                    }
                     None
                 }
-                Err(_) => unreachable!("BSTR was validated before aggregate accounting"),
-            },
-            Err(error) => {
-                row_partial = true;
-                *status = WindowsStartupStatus::Partial;
-                match error {
-                    ExecActionTextError::Com(code) => push_task_diagnostic(
-                        diagnostics,
-                        diagnostic_hresult(
-                            "task_action_field_read_failed",
-                            Some(task_index),
-                            "Windows could not read an Exec action field; that field remains unknown.",
-                            code,
-                        ),
-                    ),
-                    ExecActionTextError::Invalid(TaskStringError::OverLimit) => {
-                        push_task_diagnostic(
-                            diagnostics,
-                            diagnostic(
-                                "task_action_field_limit_exceeded",
-                                Some(task_index),
-                                "An Exec action field exceeded its UTF-16 length limit and was omitted.",
-                            ),
-                        )
-                    }
-                    ExecActionTextError::Invalid(TaskStringError::MalformedUtf16) => {
-                        push_task_diagnostic(
-                            diagnostics,
-                            diagnostic(
-                                "task_action_field_malformed_utf16",
-                                Some(task_index),
-                                "An Exec action field contained malformed UTF-16 and was omitted.",
-                            ),
-                        )
-                    }
-                    ExecActionTextError::Invalid(TaskStringError::AggregateLimit) => {
-                        unreachable!("aggregate limits are applied after BSTR conversion")
-                    }
-                }
-                None
-            }
+            };
+            (
+                read_field(ExecActionField::Path),
+                read_field(ExecActionField::Arguments),
+                read_field(ExecActionField::WorkingDirectory),
+            )
         };
-        let executable_path = read_field(ExecActionField::Path);
-        let arguments = read_field(ExecActionField::Arguments);
-        let working_directory = read_field(ExecActionField::WorkingDirectory);
-        drop(read_field);
         actions.push(WindowsScheduledTaskAction {
             task_path: retain_action_task_path(
                 task_path,

@@ -239,7 +239,7 @@ impl<'de> DeserializeSeed<'de> for StringSeed {
     }
 }
 struct StringVisitor;
-impl<'de> Visitor<'de> for StringVisitor {
+impl Visitor<'_> for StringVisitor {
     type Value = String;
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("a bounded JSON object key")
@@ -1217,7 +1217,13 @@ fn le32(b: &[u8], o: usize) -> Option<u32> {
     Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?))
 }
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 fn validate_descriptor_sidecars(v: &Value) -> Result<(), PermissionDiffError> {
