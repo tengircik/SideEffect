@@ -13,6 +13,7 @@ If you choose to build the runtime, obtain the llama.cpp source using your usual
 ```powershell
 git clone https://github.com/ggml-org/llama.cpp.git
 Set-Location .\llama.cpp
+git config core.longpaths true
 git checkout --detach 19cce6919992fdffd92e0ac152caaf1e2b8f254e
 git rev-parse HEAD
 cmake -B build -DGGML_CUDA=ON -DLLAMA_BUILD_COMMIT=19cce6919992fdffd92e0ac152caaf1e2b8f254e
