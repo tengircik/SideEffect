@@ -519,9 +519,21 @@ fn exact_path(path: &OsStr) -> ExactPath {
     ExactPath {
         display: path.to_string_lossy().into_owned(),
         exact: true,
-        raw_bytes_hex: bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        raw_bytes_hex: hex(bytes),
     }
 }
+
+#[cfg(unix)]
+fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        output.push(char::from(HEX[(byte >> 4) as usize]));
+        output.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+    output
+}
+
 #[cfg(windows)]
 fn exact_path(path: &OsStr) -> ExactPath {
     use std::os::windows::ffi::OsStrExt;
