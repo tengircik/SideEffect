@@ -125,6 +125,28 @@ fn with_events_input(bytes: &[u8]) -> (PathBuf, Output) {
 }
 
 #[cfg(windows)]
+fn with_evidence_input(
+    bytes: &[u8],
+    capture_digest: &str,
+    ordinal: &str,
+    payload_digest: &str,
+) -> (PathBuf, Output) {
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-evidence-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, bytes).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["evidence", "--windows-runtime"])
+        .arg(&path)
+        .args([capture_digest, ordinal, payload_digest])
+        .output()
+        .unwrap();
+    (path, output)
+}
+
+#[cfg(windows)]
 fn rehashed_capture(mut value: Value) -> Vec<u8> {
     let mut capture: WindowsRuntimeCapture = serde_json::from_value(value.take()).unwrap();
     capture.document_sha256.clear();
@@ -960,4 +982,109 @@ fn html_report_is_explicitly_unsupported_outside_native_windows() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("only in native Windows builds"));
     assert!(!report_path.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn evidence_lookup_resolves_validated_capture_ordinal_and_payload_digest() {
+    let bytes = fixture(CollectionStatus::Complete);
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    let capture_digest = value["document_sha256"].as_str().unwrap();
+    let payload_digest = format!("{:x}", Sha256::digest([1u8]));
+    let (path, output) = with_evidence_input(&bytes, capture_digest, "1", &payload_digest);
+
+    assert_eq!(output.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["schema"],
+        "sideeffect.windows_runtime_event_evidence"
+    );
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(
+        report["validation_status"],
+        "bounded_schema_and_capture_fingerprint_verified"
+    );
+    assert_eq!(report["authenticity"], "not_verified");
+    assert_eq!(report["capture_sha256"], capture_digest);
+    assert_eq!(report["capture_status"], "complete");
+    assert_eq!(report["capture_completeness"], "unknown");
+    assert_eq!(report["record_ordinal"], 1);
+    assert_eq!(report["json_pointer"], "/events/0");
+    assert_eq!(report["raw_payload_sha256"], payload_digest);
+    assert_eq!(
+        report["decode_metadata_status"],
+        "serialized_metadata_not_independently_verified"
+    );
+    assert_eq!(report["event"]["raw_payload_hex"], "01");
+    fs::remove_file(path).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn evidence_lookup_rejects_mismatched_capture_payload_and_missing_ordinal() {
+    let bytes = fixture(CollectionStatus::Complete);
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    let capture_digest = value["document_sha256"].as_str().unwrap();
+    let payload_digest = format!("{:x}", Sha256::digest([1u8]));
+
+    let (path, wrong_capture) = with_evidence_input(&bytes, &"0".repeat(64), "1", &payload_digest);
+    assert_eq!(wrong_capture.status.code(), Some(1));
+    assert!(wrong_capture.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&wrong_capture.stderr).contains("capture SHA-256 mismatch"));
+    fs::remove_file(path).unwrap();
+
+    let (path, wrong_payload) = with_evidence_input(&bytes, capture_digest, "1", &"0".repeat(64));
+    assert_eq!(wrong_payload.status.code(), Some(1));
+    assert!(wrong_payload.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&wrong_payload.stderr).contains("raw payload SHA-256 mismatch")
+    );
+    fs::remove_file(path).unwrap();
+
+    let (path, missing_ordinal) = with_evidence_input(&bytes, capture_digest, "2", &payload_digest);
+    assert_eq!(missing_ordinal.status.code(), Some(1));
+    assert!(missing_ordinal.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&missing_ordinal.stderr)
+            .contains("no Windows runtime event exists")
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn evidence_lookup_preserves_partial_capture_state() {
+    let bytes = fixture(CollectionStatus::Partial);
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    let capture_digest = value["document_sha256"].as_str().unwrap();
+    let payload_digest = format!("{:x}", Sha256::digest([1u8]));
+    let (path, output) = with_evidence_input(&bytes, capture_digest, "1", &payload_digest);
+
+    assert_eq!(output.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["capture_status"], "partial");
+    assert_eq!(report["capture_completeness"], "unknown");
+    assert_eq!(report["diagnostics"][0], "synthetic_fixture_partial_source");
+    fs::remove_file(path).unwrap();
+}
+
+#[cfg(not(windows))]
+#[test]
+fn windows_runtime_evidence_lookup_is_explicitly_unsupported_off_windows() {
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args([
+            "evidence",
+            "--windows-runtime",
+            "missing.json",
+            &"0".repeat(64),
+            "1",
+            &"0".repeat(64),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("available only in native Windows builds")
+    );
 }

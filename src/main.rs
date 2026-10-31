@@ -74,7 +74,7 @@ use sideeffect::record::publish_private_windows_file;
 use sideeffect::startup_correlation::correlate_startup_bytes;
 use sideeffect::trace::strace::parse_trace_bytes;
 
-const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect inspect [--format json|text] --bundle <run-bundle-directory>\n       sideeffect inspect [--format json|text] --session <audit-session-directory>\n       sideeffect inspect [--format json|text] --windows-runtime <capture.json>\n       sideeffect inspect --format html --output <report.html> --windows-runtime <capture.json>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff --bundles [--format json|text] <baseline-bundle> <candidate-bundle>\n       sideeffect diff --bundles --format html --output <report.html> <baseline-bundle> <candidate-bundle>\n       sideeffect diff --windows-runtime [--format json|text] <before-capture.json> <after-capture.json>\n       sideeffect diff --format html --output <report.html> --windows-runtime <before-capture.json> <after-capture.json> (native Windows)\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect inventory packages --output <new-inventory.json>\n\
+const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trace-file>\n       sideeffect inspect [--format json|text] --bundle <run-bundle-directory>\n       sideeffect inspect [--format json|text] --session <audit-session-directory>\n       sideeffect inspect [--format json|text] --windows-runtime <capture.json>\n       sideeffect inspect --format html --output <report.html> --windows-runtime <capture.json>\n       sideeffect evidence <strace-trace-file> <sha256> <line> <byte-offset> <byte-length>\n       sideeffect evidence --windows-runtime <capture.json> <capture-sha256> <record-ordinal> <payload-sha256> (native Windows)\n       sideeffect diff [--format json|text] <baseline-trace> <candidate-trace>\n       sideeffect diff --format html --output <report.html> <baseline-trace> <candidate-trace>\n       sideeffect diff --bundles [--format json|text] <baseline-bundle> <candidate-bundle>\n       sideeffect diff --bundles --format html --output <report.html> <baseline-bundle> <candidate-bundle>\n       sideeffect diff --windows-runtime [--format json|text] <before-capture.json> <after-capture.json>\n       sideeffect diff --format html --output <report.html> --windows-runtime <before-capture.json> <after-capture.json> (native Windows)\n       sideeffect diff-summary [--format json] <baseline-trace> <candidate-trace>\n       sideeffect diff-summary --format html --output <summary.html> <baseline-trace> <candidate-trace>\n       sideeffect inventory packages --output <new-inventory.json>\n\
        sideeffect explain <strace-trace-file>\n\
        sideeffect explain --diff <baseline-trace> <candidate-trace>\n\
        sideeffect explain --inventory-diff <before.json> <after.json>\n\
@@ -474,6 +474,11 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             if command == "inspect" && format_flag == "--format" && bundle_flag == "--bundle" =>
         {
             inspect_bundle_with_format(format, path)
+        }
+        [command, flag, path, digest, ordinal, payload_digest]
+            if command == "evidence" && flag == "--windows-runtime" =>
+        {
+            evidence_windows_runtime(path, digest, ordinal, payload_digest)
         }
         [command, path, digest, line, byte_offset, byte_length] if command == "evidence" => {
             evidence(path, digest, line, byte_offset, byte_length)
@@ -1499,7 +1504,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect explain TRACE\n       sideeffect explain --diff LEFT RIGHT\n       sideeffect explain --inventory-diff BEFORE.json AFTER.json\nCreates bounded deterministic summaries. It does not use a language model."
         }
         "evidence" => {
-            "Usage: sideeffect evidence TRACE SHA256 LINE BYTE_OFFSET BYTE_LENGTH\nVerifies an exact parsed-row reference against the supplied fingerprint. A hash identifies bytes but does not authenticate them or prove capture completeness."
+            "Usage: sideeffect evidence TRACE SHA256 LINE BYTE_OFFSET BYTE_LENGTH\n       sideeffect evidence --windows-runtime CAPTURE.json CAPTURE_SHA256 RECORD_ORDINAL PAYLOAD_SHA256 (native Windows)\nVerifies the exact source row identified by a capture fingerprint, ordinal, and raw-payload fingerprint. Windows lookup validates the bounded capture before resolving the event; serialized decode metadata and producer authenticity are not verified. Unknown capture completeness remains visible and exits with status 2."
         }
         "record" => {
             #[cfg(windows)]
@@ -2246,6 +2251,136 @@ fn evidence(
         Ok(ExitCode::from(2))
     } else {
         Ok(ExitCode::SUCCESS)
+    }
+}
+
+#[cfg(windows)]
+#[derive(Serialize)]
+struct WindowsRuntimeEventEvidence<'a> {
+    schema: &'static str,
+    schema_version: u32,
+    validation_status: &'static str,
+    authenticity: &'static str,
+    source_file_sha256: String,
+    capture_sha256: &'a str,
+    capture_status: sideeffect::windows_runtime::CollectionStatus,
+    capture_completeness: &'a str,
+    event_loss: &'a sideeffect::windows_runtime::EventLoss,
+    record_ordinal: u64,
+    json_pointer: String,
+    raw_payload_sha256: String,
+    decode_metadata_status: &'static str,
+    event: &'a sideeffect::windows_runtime::NativeRuntimeEvent,
+    diagnostics: &'a [String],
+}
+
+#[cfg(windows)]
+fn evidence_windows_runtime(
+    path: &OsString,
+    digest: &OsString,
+    ordinal: &OsString,
+    payload_digest: &OsString,
+) -> Result<ExitCode, String> {
+    let expected_capture_digest = parse_sha256_digest(digest)?;
+    let expected_payload_digest = parse_sha256_digest(payload_digest)?;
+    let expected_ordinal = parse_reference_number(ordinal, "record ordinal")?;
+    if expected_ordinal == 0 {
+        return Err("record ordinal must be greater than zero".to_owned());
+    }
+    let bytes = read_input_file(
+        Path::new(path),
+        sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
+        "Windows runtime capture",
+    )?;
+    let capture = sideeffect::windows_runtime::inspect_windows_runtime_bytes(&bytes)
+        .map_err(|error| format!("Windows runtime evidence validation failed: {error}"))?;
+    if capture.document_sha256 != expected_capture_digest {
+        return Err(format!(
+            "capture SHA-256 mismatch: supplied {expected_capture_digest}, validated capture is {}",
+            capture.document_sha256
+        ));
+    }
+    let (index, event) = capture
+        .events
+        .iter()
+        .enumerate()
+        .find(|(_, event)| event.record_ordinal == expected_ordinal)
+        .ok_or_else(|| format!("no Windows runtime event exists at ordinal {expected_ordinal}"))?;
+    let payload = decode_validated_runtime_payload(&event.raw_payload_hex)?;
+    let actual_payload_digest = format!("{:x}", Sha256::digest(&payload));
+    if actual_payload_digest != expected_payload_digest {
+        return Err(format!(
+            "raw payload SHA-256 mismatch at ordinal {expected_ordinal}: supplied {expected_payload_digest}, event is {actual_payload_digest}"
+        ));
+    }
+
+    let partial = capture.collection_status
+        == sideeffect::windows_runtime::CollectionStatus::Partial
+        || capture.capture_completeness != "complete";
+    let report = WindowsRuntimeEventEvidence {
+        schema: "sideeffect.windows_runtime_event_evidence",
+        schema_version: 1,
+        validation_status: "bounded_schema_and_capture_fingerprint_verified",
+        authenticity: "not_verified",
+        source_file_sha256: format!("{:x}", Sha256::digest(&bytes)),
+        capture_sha256: &capture.document_sha256,
+        capture_status: capture.collection_status,
+        capture_completeness: &capture.capture_completeness,
+        event_loss: &capture.event_loss,
+        record_ordinal: event.record_ordinal,
+        json_pointer: format!("/events/{index}"),
+        raw_payload_sha256: actual_payload_digest,
+        decode_metadata_status: "serialized_metadata_not_independently_verified",
+        event,
+        diagnostics: &capture.diagnostics,
+    };
+    write_json(&report, "Windows runtime event evidence")?;
+    Ok(if partial {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+#[cfg(not(windows))]
+fn evidence_windows_runtime(
+    _path: &OsString,
+    _digest: &OsString,
+    _ordinal: &OsString,
+    _payload_digest: &OsString,
+) -> Result<ExitCode, String> {
+    Err("evidence --windows-runtime is available only in native Windows builds".to_owned())
+}
+
+#[cfg(windows)]
+fn decode_validated_runtime_payload(hex: &str) -> Result<Vec<u8>, String> {
+    let source = hex.as_bytes();
+    if source.len() % 2 != 0
+        || source.len() > sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_EVENT_PAYLOAD_BYTES * 2
+    {
+        return Err(
+            "validated Windows runtime payload has an invalid bounded hex length".to_owned(),
+        );
+    }
+    let mut decoded = Vec::with_capacity(source.len() / 2);
+    for pair in source.chunks_exact(2) {
+        let high = lower_hex_nibble(pair[0]).ok_or_else(|| {
+            "validated Windows runtime payload is not lowercase hexadecimal".to_owned()
+        })?;
+        let low = lower_hex_nibble(pair[1]).ok_or_else(|| {
+            "validated Windows runtime payload is not lowercase hexadecimal".to_owned()
+        })?;
+        decoded.push((high << 4) | low);
+    }
+    Ok(decoded)
+}
+
+#[cfg(windows)]
+fn lower_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
     }
 }
 
