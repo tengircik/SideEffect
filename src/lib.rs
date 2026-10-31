@@ -8,6 +8,7 @@ pub mod audit_session_reader_windows;
 #[cfg(windows)]
 pub mod audit_session_windows;
 pub mod diff;
+pub mod event;
 pub mod explain;
 mod fingerprint;
 pub mod format;

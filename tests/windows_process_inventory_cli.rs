@@ -39,16 +39,61 @@ fn windows_process_command_includes_current_test_process_and_refuses_overwrite()
     let bytes = fs::read(&output).unwrap();
     let document: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(document["schema"], "sideeffect.windows_process_inventory");
+    assert_eq!(document["schema_version"], 3);
     assert_eq!(document["platform"], "windows");
     assert_eq!(
         document["scope"],
-        "toolhelp_process_snapshot_and_queryable_image_paths"
+        "toolhelp_process_snapshot_image_paths_and_token_context"
     );
     assert!(document["processes"].as_array().is_some());
     assert!(document["processes"].as_array().unwrap().iter().any(|row| {
         row["process_id"] == std::process::id()
             && row["evidence"]["snapshot_source"] == "ToolHelp32Snapshot/PROCESSENTRY32W"
     }));
+    let current = document["processes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["process_id"] == std::process::id())
+        .unwrap();
+    assert!(matches!(
+        current["creation_time"]["status"].as_str(),
+        Some("observed" | "inaccessible" | "vanished" | "error")
+    ));
+    assert!(matches!(
+        current["token_context"]["identity_status"].as_str(),
+        Some("observed" | "identity_unverified" | "changed_during_read")
+    ));
+    for field in ["user_sid", "integrity_level_rid", "session_id"] {
+        assert!(matches!(
+            current["token_context"][field]["status"].as_str(),
+            Some(
+                "observed"
+                    | "inaccessible"
+                    | "vanished"
+                    | "malformed"
+                    | "over_limit"
+                    | "identity_unverified"
+                    | "changed_during_read"
+                    | "error"
+            )
+        ));
+    }
+
+    let comparison = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["explain", "--inventory-diff"])
+        .arg(&output)
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        comparison.status.success() || comparison.status.code() == Some(2),
+        "unexpected comparison result: {}",
+        String::from_utf8_lossy(&comparison.stderr)
+    );
+    let compared: Value = serde_json::from_slice(&comparison.stdout).unwrap();
+    assert_eq!(compared["schema"], "sideeffect.process_inventory_diff");
+    assert_eq!(compared["platform"], "windows");
 
     let second = run(&directory, &output);
     assert!(!second.status.success());

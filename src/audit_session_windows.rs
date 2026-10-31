@@ -2,13 +2,14 @@
 
 use crate::audit_session::{
     AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, ArtifactKind, AuditSessionManifest,
-    AuditSessionSource, IntervalSemantics, SessionArtifactRef, SessionStatus, SourceRole,
-    SourceStatus,
+    AuditSessionSource, ContextFact, ContextFactStatus, CoverageManifest, HostContext,
+    IntervalSemantics, PrivilegeContext, RuntimeCoverageDetail, SessionArtifactRef, SessionStatus,
+    SourceRole, SourceStatus, UnsupportedRuntimeCategoryCode,
 };
 use crate::fingerprint::sha256_hex;
 use crate::inventory::{
-    collect_windows_permissions, collect_windows_processes, collect_windows_software,
-    collect_windows_startup,
+    collect_path_executables, collect_windows_permissions, collect_windows_processes,
+    collect_windows_software, collect_windows_startup,
 };
 use crate::record::publish_private_windows_directory;
 use serde::Serialize;
@@ -25,6 +26,7 @@ pub struct WindowsAuditOptions {
     pub software: bool,
     pub processes: bool,
     pub startup: bool,
+    pub path_executables: bool,
     pub permission_paths: Vec<PathBuf>,
     pub include_runtime: bool,
     pub runtime_duration: Option<Duration>,
@@ -53,6 +55,7 @@ pub fn collect_and_publish(
     if !options.software
         && !options.processes
         && !options.startup
+        && !options.path_executables
         && options.permission_paths.is_empty()
         && !options.include_runtime
     {
@@ -91,6 +94,7 @@ pub fn collect_and_publish(
     let started = now_ms()?;
     let mut artifacts = Vec::new();
     let mut sources = Vec::new();
+    let mut runtime_coverage_detail = None;
 
     if options.software {
         let doc = collect_windows_software();
@@ -130,18 +134,22 @@ pub fn collect_and_publish(
             .map_err(|e| format!("could not serialize process inventory: {e}"))?;
         sources.push(source(
             SourceRole::Processes,
-            "visible Tool Help process snapshot and permitted image paths",
+            "visible Tool Help process snapshot, permitted image paths, and token context",
             doc.capture_started_at_unix_ms,
             doc.capture_ended_at_unix_ms,
             status,
             diagnostics,
-            vec![("max_processes", 8192), ("deadline_ms", 10000)],
+            vec![
+                ("max_processes", 8192),
+                ("deadline_ms", 10000),
+                ("max_token_sid_utf16_code_units", 2 * 1024 * 1024),
+            ],
         ));
         artifacts.push(artifact(
             ArtifactKind::WindowsProcesses,
             "processes.windows.json",
             "sideeffect.windows_process_inventory",
-            1,
+            3,
             value,
         ));
     }
@@ -184,6 +192,47 @@ pub fn collect_and_publish(
             value,
         ));
     }
+    if options.path_executables {
+        let source_started = now_ms()?;
+        let doc = collect_path_executables();
+        let source_ended = now_ms()?;
+        let status = match doc.status {
+            "complete" => SourceStatus::Complete,
+            "partial" => SourceStatus::Partial,
+            _ => SourceStatus::Unknown,
+        };
+        let diagnostics = doc
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        let value = serde_json::to_vec(&doc)
+            .map_err(|e| format!("could not serialize PATH executable inventory: {e}"))?;
+        sources.push(source(
+            SourceRole::PathExecutables,
+            "one-level metadata snapshot of the current process PATH; candidate heuristics only, no execution or shell resolution",
+            source_started,
+            source_ended,
+            status,
+            diagnostics,
+            vec![
+                ("max_components", doc.limits.max_components as u64),
+                ("max_component_path_bytes_or_units", doc.limits.max_component_path_bytes_or_units as u64),
+                ("max_entries", doc.limits.max_entries as u64),
+                ("max_aggregate_path_and_name_bytes_or_units", doc.limits.max_aggregate_path_and_name_bytes_or_units as u64),
+                ("max_pathext_utf16_units", doc.limits.max_pathext_utf16_units as u64),
+                ("max_pathext_extensions", doc.limits.max_pathext_extensions as u64),
+                ("deadline_seconds", doc.limits.deadline_seconds),
+            ],
+        ));
+        artifacts.push(artifact(
+            ArtifactKind::PathExecutables,
+            "path-executables.json",
+            "sideeffect.path_executable_inventory",
+            1,
+            value,
+        ));
+    }
     if options.include_runtime {
         let duration = options.runtime_duration.ok_or_else(|| {
             "Windows runtime capture requires --runtime-duration-seconds".to_owned()
@@ -198,6 +247,13 @@ pub fn collect_and_publish(
             duration,
             || ensure_runtime_destination_absent(destination),
         )?;
+        runtime_coverage_detail = runtime_coverage_detail_from_event_diagnostics(
+            capture
+                .events
+                .iter()
+                .take(crate::windows_runtime::MAX_WINDOWS_RUNTIME_EVENTS)
+                .map(|event| (event.event_kind, event.observation_decoding.as_ref())),
+        );
         let mut diagnostics = vec!["capture_completeness_unknown"];
         if capture.collection_status == crate::record::WindowsRuntimeCollectionStatus::Partial {
             diagnostics.push("etw_collection_partial");
@@ -243,6 +299,53 @@ pub fn collect_and_publish(
                 ),
             ],
         );
+        source
+            .requested_settings
+            .push(crate::audit_session::Setting {
+                code: "runtime_duration_seconds".to_owned(),
+                value: capture.requested_duration_seconds,
+            });
+        source.requested_settings.extend([
+            crate::audit_session::Setting {
+                code: "runtime_buffer_size_kb".to_owned(),
+                value: capture.session.buffer_size_kb_requested as u64,
+            },
+            crate::audit_session::Setting {
+                code: "runtime_minimum_buffers".to_owned(),
+                value: capture.session.minimum_buffers_requested as u64,
+            },
+            crate::audit_session::Setting {
+                code: "runtime_maximum_buffers".to_owned(),
+                value: capture.session.maximum_buffers_requested as u64,
+            },
+        ]);
+        source
+            .effective_settings
+            .push(crate::audit_session::Setting {
+                code: "runtime_buffer_count_reported".to_owned(),
+                value: capture.session.buffer_count_reported as u64,
+            });
+        let any_loss = capture.event_loss.events_lost > 0
+            || capture.event_loss.log_buffers_lost > 0
+            || capture.event_loss.real_time_buffers_lost > 0;
+        let statistics_available = capture.event_loss.loss_statistics_available;
+        let final_snapshot_available = capture.event_loss.final_snapshot_available;
+        source.loss = Some(crate::audit_session::LossMetadata {
+            status: if any_loss {
+                crate::audit_session::LossStatus::Reported
+            } else if statistics_available && final_snapshot_available {
+                crate::audit_session::LossStatus::NoneReported
+            } else {
+                crate::audit_session::LossStatus::Unknown
+            },
+            statistics_available,
+            final_snapshot_available,
+            events_lost: statistics_available.then_some(capture.event_loss.events_lost as u64),
+            log_buffers_lost: statistics_available
+                .then_some(capture.event_loss.log_buffers_lost as u64),
+            real_time_buffers_lost: statistics_available
+                .then_some(capture.event_loss.real_time_buffers_lost as u64),
+        });
         source.artifacts.push(SessionArtifactRef {
             kind: ArtifactKind::WindowsRuntimeCapture,
             path: "runtime.windows.json".to_owned(),
@@ -261,12 +364,20 @@ pub fn collect_and_publish(
         ));
     }
 
+    let context = host_context();
     let ended = now_ms()?;
     let mut files: Vec<(&str, &[u8])> = artifacts
         .iter()
         .map(|a| (a.file_name, a.bytes.as_slice()))
         .collect();
-    let manifest = build_manifest(started, ended, sources, &artifacts)?;
+    let manifest = build_manifest(
+        started,
+        ended,
+        context,
+        sources,
+        &artifacts,
+        runtime_coverage_detail,
+    )?;
     let manifest_bytes = serde_json::to_vec(&manifest)
         .map_err(|e| format!("could not serialize audit manifest: {e}"))?;
     files.push(("session.json", manifest_bytes.as_slice()));
@@ -324,6 +435,7 @@ fn source(
 ) -> AuditSessionSource {
     AuditSessionSource {
         role,
+        collector: Some(crate::audit_session::collector_identity("windows", role)),
         platform: "windows".to_owned(),
         scope: scope.to_owned(),
         started_at_unix_ms: start,
@@ -336,6 +448,9 @@ fn source(
                 value,
             })
             .collect(),
+        requested_settings: vec![],
+        effective_settings: vec![],
+        loss: (role == SourceRole::Runtime).then(crate::audit_session::LossMetadata::unknown),
         diagnostic_codes: diagnostics.into_iter().map(str::to_owned).collect(),
         artifacts: vec![],
     }
@@ -360,8 +475,10 @@ fn artifact(
 fn build_manifest(
     started: u128,
     ended: u128,
+    host_context: HostContext,
     mut sources: Vec<AuditSessionSource>,
     artifacts: &[Artifact],
+    runtime_coverage_detail: Option<RuntimeCoverageDetail>,
 ) -> Result<AuditSessionManifest, String> {
     for source in &mut sources {
         source.artifacts = artifacts
@@ -378,6 +495,10 @@ fn build_manifest(
             .collect();
     }
     let complete = sources.iter().all(|s| s.status == SourceStatus::Complete);
+    let coverage_manifest = Some(CoverageManifest::from_sources_with_runtime_detail(
+        &sources,
+        runtime_coverage_detail,
+    ));
     let manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
         schema_version: AUDIT_SESSION_SCHEMA_VERSION,
@@ -393,6 +514,7 @@ fn build_manifest(
             "unknown"
         }
         .to_owned(),
+        host_context: Some(host_context),
         started_at_unix_ms: started,
         ended_at_unix_ms: ended,
         interval_semantics: IntervalSemantics::BestEffortNonAtomic,
@@ -402,11 +524,158 @@ fn build_manifest(
             SessionStatus::Partial
         },
         sources,
+        coverage_manifest,
     };
     manifest
         .validate()
         .map_err(|e| format!("constructed audit session is invalid: {e:?}"))?;
     Ok(manifest)
+}
+
+fn runtime_coverage_detail_from_event_diagnostics<'a>(
+    events: impl IntoIterator<Item = (&'a str, Option<&'a serde_json::Value>)>,
+) -> Option<RuntimeCoverageDetail> {
+    let mut malformed_payloads = 0_u64;
+    let mut unsupported_events = 0_u64;
+    let mut unsupported_providers = 0_u64;
+    for (event_kind, decoding) in events {
+        let Some(decoding) = decoding else {
+            if event_kind == "unsupported_or_malformed_provider_event" {
+                return None;
+            }
+            continue;
+        };
+        match decoding.get("status").and_then(serde_json::Value::as_str) {
+            Some("decoded") => {}
+            Some("unsupported_provider") => unsupported_providers += 1,
+            Some("unsupported_event" | "unsupported_version" | "ambiguous_pointer_width") => {
+                unsupported_events += 1;
+            }
+            Some("malformed_payload") => malformed_payloads += 1,
+            _ => return None,
+        }
+    }
+    Some(RuntimeCoverageDetail::from_counts([
+        (
+            UnsupportedRuntimeCategoryCode::WindowsMalformedEtwPayloads,
+            malformed_payloads,
+        ),
+        (
+            UnsupportedRuntimeCategoryCode::WindowsUnsupportedEtwEvents,
+            unsupported_events,
+        ),
+        (
+            UnsupportedRuntimeCategoryCode::WindowsUnsupportedEtwProviders,
+            unsupported_providers,
+        ),
+    ]))
+}
+
+fn host_context() -> HostContext {
+    let version = windows_version();
+    let os_version = version.map_or(
+        ContextFact {
+            status: ContextFactStatus::Unknown,
+            value: None,
+        },
+        |value| ContextFact {
+            status: ContextFactStatus::Observed,
+            value: Some(value),
+        },
+    );
+    HostContext {
+        os_name: ContextFact {
+            status: ContextFactStatus::Observed,
+            value: Some("Windows".to_owned()),
+        },
+        os_version,
+        privilege: windows_privilege(),
+    }
+}
+
+#[repr(C)]
+struct OsVersionInfo {
+    size: u32,
+    major: u32,
+    minor: u32,
+    build: u32,
+    platform: u32,
+    service_pack: [u16; 128],
+}
+
+fn windows_version() -> Option<String> {
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn RtlGetVersion(info: *mut OsVersionInfo) -> i32;
+    }
+    let mut info = OsVersionInfo {
+        size: std::mem::size_of::<OsVersionInfo>() as u32,
+        major: 0,
+        minor: 0,
+        build: 0,
+        platform: 0,
+        service_pack: [0; 128],
+    };
+    // RtlGetVersion reports the native OS version without the compatibility
+    // version masking applied to some higher-level version APIs.
+    (unsafe { RtlGetVersion(&mut info) } == 0)
+        .then(|| format!("{}.{}.{}", info.major, info.minor, info.build))
+}
+
+fn windows_privilege() -> PrivilegeContext {
+    use std::ffi::c_void;
+    type Handle = *mut c_void;
+    #[repr(C)]
+    struct TokenElevation {
+        elevated: u32,
+    }
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenProcessToken(process: Handle, access: u32, token: *mut Handle) -> i32;
+        fn GetTokenInformation(
+            token: Handle,
+            class: u32,
+            info: *mut c_void,
+            len: u32,
+            needed: *mut u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> Handle;
+        fn CloseHandle(handle: Handle) -> i32;
+    }
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), 0x0008, &mut token) } == 0 {
+        return PrivilegeContext::Unknown;
+    }
+    struct Token(Handle);
+    impl Drop for Token {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+    let token = Token(token);
+    let mut elevation = TokenElevation { elevated: 0 };
+    let mut needed = 0;
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            20,
+            (&mut elevation as *mut TokenElevation).cast(),
+            std::mem::size_of::<TokenElevation>() as u32,
+            &mut needed,
+        )
+    } == 0
+    {
+        PrivilegeContext::Unknown
+    } else if elevation.elevated != 0 {
+        PrivilegeContext::Elevated
+    } else {
+        PrivilegeContext::NotElevated
+    }
 }
 
 fn role_kind(role: SourceRole) -> Option<ArtifactKind> {
@@ -415,6 +684,7 @@ fn role_kind(role: SourceRole) -> Option<ArtifactKind> {
         SourceRole::Processes => Some(ArtifactKind::WindowsProcesses),
         SourceRole::Permissions => Some(ArtifactKind::WindowsPermissions),
         SourceRole::Startup => Some(ArtifactKind::WindowsStartup),
+        SourceRole::PathExecutables => Some(ArtifactKind::PathExecutables),
         SourceRole::Runtime => Some(ArtifactKind::WindowsRuntimeCapture),
     }
 }
@@ -429,7 +699,52 @@ fn now_ms() -> Result<u128, String> {
 #[cfg(test)]
 mod tests {
     use super::{artifact, build_manifest, source};
-    use crate::audit_session::{ArtifactKind, SessionStatus, SourceRole, SourceStatus};
+    use crate::audit_session::{
+        ArtifactKind, ContextFact, ContextFactStatus, HostContext, PrivilegeContext, SessionStatus,
+        SourceRole, SourceStatus,
+    };
+
+    #[test]
+    fn windows_runtime_coverage_counts_only_fixed_decoder_diagnostic_categories() {
+        let provider = serde_json::json!({"status":"unsupported_provider"});
+        let unsupported = serde_json::json!({"status":"unsupported_version"});
+        let malformed = serde_json::json!({"status":"malformed_payload"});
+        let decoded = serde_json::json!({"status":"decoded"});
+        let detail = super::runtime_coverage_detail_from_event_diagnostics([
+            ("unsupported_or_malformed_provider_event", Some(&provider)),
+            (
+                "unsupported_or_malformed_provider_event",
+                Some(&unsupported),
+            ),
+            ("unsupported_or_malformed_provider_event", Some(&malformed)),
+            ("network_observation", Some(&decoded)),
+        ])
+        .unwrap();
+        assert_eq!(
+            detail.unsupported_categories,
+            vec![
+                crate::audit_session::UnsupportedRuntimeCategory {
+                    code: crate::audit_session::UnsupportedRuntimeCategoryCode::WindowsMalformedEtwPayloads,
+                    count: 1,
+                },
+                crate::audit_session::UnsupportedRuntimeCategory {
+                    code: crate::audit_session::UnsupportedRuntimeCategoryCode::WindowsUnsupportedEtwEvents,
+                    count: 1,
+                },
+                crate::audit_session::UnsupportedRuntimeCategory {
+                    code: crate::audit_session::UnsupportedRuntimeCategoryCode::WindowsUnsupportedEtwProviders,
+                    count: 1,
+                },
+            ]
+        );
+        assert!(
+            super::runtime_coverage_detail_from_event_diagnostics([(
+                "unsupported_or_malformed_provider_event",
+                None,
+            )])
+            .is_none()
+        );
+    }
 
     #[test]
     fn windows_runtime_source_manifest_binds_capture_bytes_and_stays_partial() {
@@ -451,7 +766,25 @@ mod tests {
             vec![("max_events", 50_000)],
         );
 
-        let manifest = build_manifest(1_000, 1_003, vec![runtime_source], &artifacts).unwrap();
+        let manifest = build_manifest(
+            1_000,
+            1_003,
+            HostContext {
+                os_name: ContextFact {
+                    status: ContextFactStatus::Observed,
+                    value: Some("Windows".to_owned()),
+                },
+                os_version: ContextFact {
+                    status: ContextFactStatus::Unknown,
+                    value: None,
+                },
+                privilege: PrivilegeContext::Unknown,
+            },
+            vec![runtime_source],
+            &artifacts,
+            None,
+        )
+        .unwrap();
         assert_eq!(manifest.status, SessionStatus::Partial);
         let reference = &manifest.sources[0].artifacts[0];
         assert_eq!(reference.kind, ArtifactKind::WindowsRuntimeCapture);

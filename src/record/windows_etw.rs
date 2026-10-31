@@ -25,6 +25,106 @@ use windows_sys::Win32::System::Diagnostics::Etw::{
     SystemTraceControlGuid, WNODE_FLAG_TRACED_GUID,
 };
 
+/// Result of checking a serialized TCP/UDP observation against its retained payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NetworkPayloadCrossCheck {
+    NotNetworkProvider,
+    Matched(u32),
+    Mismatch(u32),
+    Unsupported,
+    Malformed,
+    InvalidProcessId,
+}
+
+pub(crate) struct NetworkPayloadInput<'a> {
+    pub provider_guid: &'a str,
+    pub event_id: u16,
+    pub event_version: u8,
+    pub opcode: u8,
+    pub header_flags: u16,
+    pub event_kind: &'a str,
+    pub raw_payload: &'a [u8],
+    pub serialized_decoding: Option<&'a serde_json::Value>,
+}
+
+/// Re-decode supported classic TCP/UDP records and use only the raw payload's PID.
+pub(crate) fn cross_check_network_payload(
+    input: NetworkPayloadInput<'_>,
+) -> NetworkPayloadCrossCheck {
+    let Some(normalized) = normalize_provider_guid(input.provider_guid) else {
+        return NetworkPayloadCrossCheck::NotNetworkProvider;
+    };
+    let network_provider = matches!(
+        normalized.as_str(),
+        "9a280ac0-c8e0-11d1-84e2-00c04fb998a2" | "bf3a50c5-a9c9-4988-a005-2df0b7c80f80"
+    );
+    if !network_provider {
+        return NetworkPayloadCrossCheck::NotNetworkProvider;
+    }
+    let pointer_width = match input.header_flags {
+        flags
+            if flags & (EVENT_HEADER_FLAG_32_BIT_HEADER as u16) != 0
+                && flags & (EVENT_HEADER_FLAG_64_BIT_HEADER as u16) == 0 =>
+        {
+            Some(PointerWidth::Bits32)
+        }
+        flags
+            if flags & (EVENT_HEADER_FLAG_64_BIT_HEADER as u16) != 0
+                && flags & (EVENT_HEADER_FLAG_32_BIT_HEADER as u16) == 0 =>
+        {
+            Some(PointerWidth::Bits64)
+        }
+        _ => None,
+    };
+    let decoded = decode_classic_event(
+        &normalized,
+        input.event_id,
+        input.event_version,
+        input.opcode,
+        pointer_width,
+        input.raw_payload,
+    );
+    let Some(observation) = decoded.observation.as_ref() else {
+        return if decoded.status == IoDecodeStatus::MalformedPayload {
+            NetworkPayloadCrossCheck::Malformed
+        } else {
+            NetworkPayloadCrossCheck::Unsupported
+        };
+    };
+    let Activity::Network(network) = &observation.activity else {
+        return NetworkPayloadCrossCheck::Unsupported;
+    };
+    let Ok(raw_value) = serde_json::to_value(&decoded) else {
+        return NetworkPayloadCrossCheck::Malformed;
+    };
+    let matches = input.event_kind == "network_observation"
+        && input
+            .serialized_decoding
+            .is_some_and(|serialized| *serialized == raw_value);
+    if network.payload_process_id == 0 {
+        NetworkPayloadCrossCheck::InvalidProcessId
+    } else if matches {
+        NetworkPayloadCrossCheck::Matched(network.payload_process_id)
+    } else {
+        NetworkPayloadCrossCheck::Mismatch(network.payload_process_id)
+    }
+}
+
+fn normalize_provider_guid(value: &str) -> Option<String> {
+    let value = value.trim();
+    let value = if let Some(inner) = value.strip_prefix('{') {
+        inner.strip_suffix('}')?
+    } else {
+        value
+    };
+    (value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        }))
+    .then(|| value.to_ascii_lowercase())
+}
+
 #[path = "payload_decode.rs"]
 mod payload_decode;
 use super::windows_io_decode::{
@@ -868,6 +968,106 @@ fn classify_process_opcode(opcode: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::{EvidenceReference, SourceCompleteness, from_windows_etw};
+
+    fn ipv4_typegroup1_payload(process_id: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&process_id.to_le_bytes());
+        bytes.extend_from_slice(&12_u32.to_le_bytes());
+        bytes.extend_from_slice(&[127, 0, 0, 1]);
+        bytes.extend_from_slice(&[127, 0, 0, 1]);
+        bytes.extend_from_slice(&443_u16.to_be_bytes());
+        bytes.extend_from_slice(&50_000_u16.to_be_bytes());
+        bytes.extend_from_slice(&99_u32.to_le_bytes());
+        bytes.extend_from_slice(&0x7788_u64.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn network_payload_cross_check_accepts_matching_tcp_and_udp_and_rejects_forgery() {
+        for (guid, opcode) in [
+            ("9a280ac0-c8e0-11d1-84e2-00c04fb998a2", 11),
+            ("bf3a50c5-a9c9-4988-a005-2df0b7c80f80", 10),
+        ] {
+            let payload = ipv4_typegroup1_payload(4242);
+            let decoded =
+                decode_classic_event(guid, 0, 2, opcode, Some(PointerWidth::Bits64), &payload);
+            let sidecar = serde_json::to_value(decoded).unwrap();
+            assert_eq!(
+                cross_check_network_payload(NetworkPayloadInput {
+                    provider_guid: guid,
+                    event_id: 0,
+                    event_version: 2,
+                    opcode,
+                    header_flags: EVENT_HEADER_FLAG_64_BIT_HEADER as u16,
+                    event_kind: "network_observation",
+                    raw_payload: &payload,
+                    serialized_decoding: Some(&sidecar),
+                },),
+                NetworkPayloadCrossCheck::Matched(4242)
+            );
+
+            let mut forged = sidecar;
+            forged["observation"]["activity"]["observation"]["payload_process_id"] =
+                serde_json::json!(7777);
+            assert_eq!(
+                cross_check_network_payload(NetworkPayloadInput {
+                    provider_guid: guid,
+                    event_id: 0,
+                    event_version: 2,
+                    opcode,
+                    header_flags: EVENT_HEADER_FLAG_64_BIT_HEADER as u16,
+                    event_kind: "network_observation",
+                    raw_payload: &payload,
+                    serialized_decoding: Some(&forged),
+                },),
+                NetworkPayloadCrossCheck::Mismatch(4242)
+            );
+        }
+    }
+
+    #[test]
+    fn network_payload_cross_check_reports_malformed_and_unsupported_payloads() {
+        assert_eq!(
+            cross_check_network_payload(NetworkPayloadInput {
+                provider_guid: "9a280ac0-c8e0-11d1-84e2-00c04fb998a2",
+                event_id: 0,
+                event_version: 2,
+                opcode: 11,
+                header_flags: EVENT_HEADER_FLAG_64_BIT_HEADER as u16,
+                event_kind: "network_observation",
+                raw_payload: &[1],
+                serialized_decoding: None,
+            },),
+            NetworkPayloadCrossCheck::Malformed
+        );
+        assert_eq!(
+            cross_check_network_payload(NetworkPayloadInput {
+                provider_guid: "9a280ac0-c8e0-11d1-84e2-00c04fb998a2",
+                event_id: 0,
+                event_version: 2,
+                opcode: 99,
+                header_flags: EVENT_HEADER_FLAG_64_BIT_HEADER as u16,
+                event_kind: "unsupported_or_malformed_provider_event",
+                raw_payload: &[1],
+                serialized_decoding: None,
+            },),
+            NetworkPayloadCrossCheck::Unsupported
+        );
+        assert_eq!(
+            cross_check_network_payload(NetworkPayloadInput {
+                provider_guid: "{{9a280ac0-c8e0-11d1-84e2-00c04fb998a2}}",
+                event_id: 0,
+                event_version: 2,
+                opcode: 11,
+                header_flags: EVENT_HEADER_FLAG_64_BIT_HEADER as u16,
+                event_kind: "network_observation",
+                raw_payload: &ipv4_typegroup1_payload(4242),
+                serialized_decoding: None,
+            },),
+            NetworkPayloadCrossCheck::NotNetworkProvider
+        );
+    }
 
     #[test]
     fn control_trace_buffer_reserves_bounded_name_output_space() {
@@ -1050,6 +1250,218 @@ mod tests {
                 CollectionStatus::Partial
             );
         }
+    }
+
+    #[test]
+    fn common_envelope_keeps_qpc_header_context_payload_evidence_and_loss_state() {
+        let make_capture =
+            |event_loss: EventLoss,
+             collection_status: CollectionStatus,
+             stop_reason: StopReason,
+             diagnostics: Vec<String>| WindowsRuntimeCapture {
+                schema: WINDOWS_RUNTIME_CAPTURE_SCHEMA,
+                schema_version: WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION,
+                platform: "windows",
+                capture_profile: "synthetic_etw_fixture",
+                collection_status,
+                capture_completeness: "unknown",
+                started_at_unix_ms: 100,
+                ended_at_unix_ms: 200,
+                requested_duration_seconds: 1,
+                stop_reason,
+                target: TargetOutcome {
+                    process_id: 4242,
+                    exit_code: Some(0),
+                    status_available: true,
+                },
+                session: SessionMetadata {
+                    name: "synthetic-session",
+                    provider: "synthetic provider metadata",
+                    scope: "synthetic fixture only",
+                    buffer_size_kb_requested: 16,
+                    minimum_buffers_requested: 8,
+                    maximum_buffers_requested: 32,
+                    buffer_count_reported: 8,
+                    provider_process_id_header_semantics: "header context only",
+                },
+                limits: AppliedLimits {
+                    maximum_duration_seconds: 60,
+                    maximum_events: 50_000,
+                    maximum_total_payload_bytes: 8 * 1024 * 1024,
+                    maximum_payload_bytes_per_event: 64 * 1024,
+                    maximum_document_bytes: 32 * 1024 * 1024,
+                },
+                event_loss,
+                document_sha256: "00".repeat(32),
+                events: vec![NativeRuntimeEvent {
+                    record_ordinal: 1,
+                    provider_guid: "synthetic-provider-guid".to_owned(),
+                    event_id: 1,
+                    event_version: 0,
+                    opcode: 1,
+                    event_kind: "synthetic_process_start",
+                    header_process_id: 777,
+                    header_thread_id: 9,
+                    header_flags: 0,
+                    timestamp_qpc: 12345,
+                    raw_payload_hex: "010203".to_owned(),
+                    payload_decoding: None,
+                    observation_decoding: None,
+                }],
+                diagnostics,
+            };
+
+        let clean = make_capture(
+            EventLoss {
+                loss_statistics_available: true,
+                final_snapshot_available: true,
+                observation: "synthetic_fixture",
+                ..EventLoss::default()
+            },
+            CollectionStatus::Complete,
+            StopReason::TargetExited,
+            vec![],
+        );
+        let envelope = from_windows_etw(&clean);
+        assert_eq!(
+            envelope.source_state.completeness,
+            SourceCompleteness::Unknown
+        );
+        let reported_fingerprint = "00".repeat(32);
+        assert_eq!(
+            envelope.source.sha256.as_deref(),
+            Some(reported_fingerprint.as_str())
+        );
+        assert_eq!(envelope.events.len(), 1);
+        let event = &envelope.events[0];
+        assert_eq!(event.source_timestamp.as_ref().unwrap().value, "12345");
+        assert_eq!(
+            event.source_timestamp.as_ref().unwrap().clock_unit,
+            "ETW_QPC_ticks"
+        );
+        assert_eq!(event.identity_context[0].value, "777");
+        assert!(
+            event.identity_context[0]
+                .ambiguity
+                .contains("header context only")
+        );
+        let expected_payload_hash = format!("{:x}", Sha256::digest([1_u8, 2, 3]));
+        assert!(matches!(
+            &event.evidence,
+            EvidenceReference::WindowsEtwRecord {
+                record_ordinal: 1,
+                json_pointer,
+                raw_payload_sha256,
+            } if json_pointer == "/events/0" && raw_payload_sha256 == &expected_payload_hash
+        ));
+
+        let reported_loss = make_capture(
+            EventLoss {
+                events_lost: 1,
+                loss_statistics_available: true,
+                final_snapshot_available: true,
+                observation: "synthetic_fixture",
+                ..EventLoss::default()
+            },
+            CollectionStatus::Partial,
+            StopReason::EtwLossReported,
+            vec!["etw_reported_event_loss".to_owned()],
+        );
+        assert_eq!(
+            from_windows_etw(&reported_loss).source_state.completeness,
+            SourceCompleteness::Partial
+        );
+
+        let unavailable_loss = make_capture(
+            EventLoss {
+                observation: "unavailable",
+                ..EventLoss::default()
+            },
+            CollectionStatus::Partial,
+            StopReason::EtwStatisticsUnavailable,
+            vec![
+                "etw_loss_statistics_unavailable".to_owned(),
+                "etw_final_loss_statistics_unavailable".to_owned(),
+            ],
+        );
+        assert_eq!(
+            from_windows_etw(&unavailable_loss)
+                .source_state
+                .completeness,
+            SourceCompleteness::Unknown
+        );
+
+        let unrelated_diagnostic = make_capture(
+            EventLoss::default(),
+            CollectionStatus::Partial,
+            StopReason::EtwStatisticsUnavailable,
+            vec!["prefix_etw_loss_statistics_unavailable_suffix".to_owned()],
+        );
+        assert_eq!(
+            from_windows_etw(&unrelated_diagnostic)
+                .source_state
+                .completeness,
+            SourceCompleteness::Partial
+        );
+
+        let incomplete_statistics_without_partial_status = make_capture(
+            EventLoss::default(),
+            CollectionStatus::Complete,
+            StopReason::EtwStatisticsUnavailable,
+            vec![],
+        );
+        assert_eq!(
+            from_windows_etw(&incomplete_statistics_without_partial_status)
+                .source_state
+                .completeness,
+            SourceCompleteness::Unknown
+        );
+
+        let mut explicitly_complete = clean.clone();
+        explicitly_complete.capture_completeness = "complete";
+        assert_eq!(
+            from_windows_etw(&explicitly_complete)
+                .source_state
+                .completeness,
+            SourceCompleteness::Complete
+        );
+
+        let mut invalid_source_fingerprint = clean.clone();
+        invalid_source_fingerprint.document_sha256 = "not-a-sha256".to_owned();
+        let invalid_fingerprint_envelope = from_windows_etw(&invalid_source_fingerprint);
+        assert_eq!(invalid_fingerprint_envelope.source.sha256, None);
+        assert_eq!(
+            invalid_fingerprint_envelope.source_state.completeness,
+            SourceCompleteness::Partial
+        );
+
+        let mut oversized_payload = clean.clone();
+        oversized_payload.events[0].raw_payload_hex = "00".repeat(64 * 1024 + 1);
+        let oversized_envelope = from_windows_etw(&oversized_payload);
+        assert!(oversized_envelope.events.is_empty());
+        assert_eq!(
+            oversized_envelope.diagnostics[0].code,
+            "payload_size_limit_exceeded"
+        );
+        assert_eq!(
+            oversized_envelope.source_state.completeness,
+            SourceCompleteness::Partial
+        );
+
+        let mut excessive_diagnostics = clean.clone();
+        excessive_diagnostics.diagnostics = vec!["synthetic diagnostic".to_owned(); 300];
+        let bounded_diagnostics = from_windows_etw(&excessive_diagnostics);
+        assert_eq!(bounded_diagnostics.source_state.diagnostics.len(), 257);
+        assert!(
+            bounded_diagnostics
+                .source_state
+                .diagnostics
+                .contains(&"source_diagnostics_truncated".to_owned())
+        );
+        assert_eq!(
+            bounded_diagnostics.source_state.completeness,
+            SourceCompleteness::Partial
+        );
     }
 
     #[test]

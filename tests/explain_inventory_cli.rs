@@ -199,3 +199,49 @@ fn explain_inventory_diff_rejects_oversized_input_before_parsing() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("exceeds the 67108864 byte limit"));
 }
+
+#[test]
+fn explain_inventory_diff_routes_linux_process_snapshots_by_generation() {
+    let make_process = |name: &str| {
+        serde_json::json!({
+            "schema": "sideeffect.process_inventory",
+            "schema_version": 3,
+            "platform": "linux",
+            "scope": "visible_numeric_proc_status_stat_executable_and_namespace_entries",
+            "capture_started_at_unix_ms": 10,
+            "capture_ended_at_unix_ms": 11,
+            "status": "complete",
+            "source": {"id":"procfs_status","status":"complete","directories_seen":1,"status_bytes_read":64,"diagnostics":[]},
+            "processes": [{
+                "pid": 77,
+                "start_time": {"status":"observed","ticks_since_boot":900,"evidence":{"source":"/proc/77/stat","byte_length":64,"record_sha256":"private-start-hash","field_number":22}},
+                "executable_link": {"status":"observed","target_display":"/usr/bin/demo","target_bytes_hex":"2f","byte_length":1,"sha256":"private-path-hash","evidence":{"source":"/proc/77/exe","byte_length":1,"sha256":"private-path-hash"}},
+                "name": name,
+                "uid": [1000,1000,1000,1000], "gid": [1000,1000,1000,1000],
+                "namespace_pids": {"status":"not_reported"}, "namespaces": [],
+                "evidence": [{"field":"name","line":1,"byte_offset":4,"byte_length":5,"line_sha256":"private-row-hash","raw_source_line":"private raw status row"}]
+            }]
+        })
+    };
+    let before = TempJson::with_contents(make_process("before").to_string().as_bytes());
+    let after = TempJson::with_contents(make_process("after").to_string().as_bytes());
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["explain", "--inventory-diff"])
+        .arg(&before.0)
+        .arg(&after.0)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["schema"], "sideeffect.process_inventory_diff");
+    assert_eq!(json["counts"]["changes"], 1);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(!text.contains("private raw"));
+    assert!(!text.contains("private-row-hash"));
+    assert!(!text.contains("private-start-hash"));
+    assert!(!text.contains("private-path-hash"));
+}

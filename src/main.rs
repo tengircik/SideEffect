@@ -31,7 +31,15 @@ use sideeffect::format::{
 };
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{InventoryStatus, collect_packages};
-use sideeffect::inventory::{PackageComparisonStatus, compare_package_inventory_json};
+use sideeffect::inventory::{
+    PackageComparisonStatus, PermissionDiffStatus, ProcessDiffStatus, StartupDiffStatus,
+    WindowsSoftwareComparisonStatus, compare_package_inventory_json,
+    compare_permission_inventory_json, compare_process_inventory_json,
+    compare_startup_inventory_json, compare_windows_software_inventory_json,
+    is_permission_inventory_json, is_process_inventory_json, is_startup_inventory_json,
+    is_windows_software_inventory_json,
+};
+use sideeffect::inventory::{PathExecutableInventory, collect_path_executables};
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{PermissionInventoryStatus, collect_permissions};
 #[cfg(target_os = "linux")]
@@ -76,9 +84,10 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect attribute --windows-runtime <capture.json>\n\
        sideeffect inventory processes --output <new-inventory.json>\n\
        sideeffect inventory startup --output <new-inventory.json>\n\
+       sideeffect inventory path-executables --output <new-inventory.json>\n\
        sideeffect inventory permissions --output <new-inventory.json> <path>...\n\
-       sideeffect audit --output <new-session-directory> [--packages] [--processes] [--startup] [--permission <path>]... [--runtime-duration-seconds <1..3600> -- <program> [args...]]\n\
-       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect record --trace <new-trace-file> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect help [command [subcommand]]\n       sideeffect version\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. On Linux, inventory packages reads available local dpkg, RPM, pacman, and APK databases; on Windows, it reads selected current-user and machine-wide Uninstall registry entries. Both are bounded source snapshots and can miss unregistered software. Windows does not use Win32_Product or launch uninstall commands. On Linux, inventory processes reads bounded numeric /proc status entries and executable-link identities; on Windows, it reads a Tool Help snapshot and queries accessible image paths. Neither adapter reads command lines or promises atomic or exhaustive coverage. On Linux, inventory startup discovers curated sources; on Windows, it inventories selected Run/RunOnce values, Startup folders, and visible service configuration and boot/logon triggers in tasks visible to the current token. For tasks, bounded Exec-action executable paths, arguments, and working directories are recorded as inert text; other action types remain unsupported with unknown action-specific fields. Neither platform establishes that a configured entry ran. Inventory permissions inspects only explicit Linux paths and records ownership/type/mode, supported POSIX ACLs, and Linux file-capability xattrs; it never follows the final path symlink or calculates effective access. Record follows a selected command's traced descendants and may enforce a requested wall-clock limit; this is observation, not isolation or a safety check.";
+       sideeffect audit --output <new-session-directory> [--packages] [--processes] [--startup] [--path-executables] [--permission <path>]... [--runtime-duration-seconds <1..3600> -- <program> [args...]]\n\
+       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect record --trace <new-trace-file> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect help [command [subcommand]]\n       sideeffect version\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. On Linux, inventory packages reads available local dpkg, RPM, pacman, and APK databases plus optional fixed-path Flatpak installed references; on Windows, it reads selected current-user and machine-wide Uninstall registry entries. Both are bounded source snapshots and can miss unregistered software. Windows does not use Win32_Product or launch uninstall commands. On Linux, inventory processes reads bounded numeric /proc status entries and executable-link identities; on Windows, it reads a Tool Help snapshot and queries accessible image paths. Neither adapter reads command lines or promises atomic or exhaustive coverage. On Linux, inventory startup discovers curated sources; on Windows, it inventories selected Run/RunOnce values, Startup folders, and visible service configuration and boot/logon triggers in tasks visible to the current token. For tasks, bounded Exec-action executable paths, arguments, and working directories are recorded as inert text; other action types remain unsupported with unknown action-specific fields. Neither platform establishes that a configured entry ran. Inventory permissions inspects only explicit Linux paths and records ownership/type/mode, supported POSIX ACLs, and Linux file-capability xattrs; it never follows the final path symlink or calculates effective access. Record follows a selected command's traced descendants and may enforce a requested wall-clock limit; this is observation, not isolation or a safety check.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -113,7 +122,7 @@ fn read_model_confirmation() -> Result<String, String> {
 fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
     match arguments.as_slice() {
         [flag] if flag == "--help" || flag == "-h" => {
-            println!("{USAGE}");
+            print_usage();
             Ok(ExitCode::SUCCESS)
         }
         [flag] if flag == "--version" => {
@@ -160,6 +169,15 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         }
         [command, flag, path] if command == "inspect" && flag == "--windows-runtime" => {
             inspect_windows_runtime_with_format(&OsString::from("json"), path)
+        }
+        [command, flag, path] if command == "events" && flag == "--trace" => events_trace(path),
+        #[cfg(windows)]
+        [command, flag, path] if command == "events" && flag == "--windows-runtime" => {
+            events_windows_runtime(path)
+        }
+        #[cfg(not(windows))]
+        [command, flag, path] if command == "events" && flag == "--windows-runtime" => {
+            events_windows_runtime(path)
         }
         [command, flag, path] if command == "attribute" && flag == "--windows-runtime" => {
             attribute_windows_runtime(path)
@@ -291,6 +309,13 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             if command == "inventory" && subcommand == "startup" && option == "--output" =>
         {
             inventory_startup(output)
+        }
+        [command, subcommand, option, output]
+            if command == "inventory"
+                && subcommand == "path-executables"
+                && option == "--output" =>
+        {
+            inventory_path_executables(output)
         }
         [command, subcommand, option, output, paths @ ..]
             if command == "inventory"
@@ -567,6 +592,16 @@ fn audit_command(arguments: &[OsString]) -> Result<ExitCode, String> {
                 index += 1;
                 continue;
             }
+            if argument == "--path-executables" {
+                if !selected.insert("path-executables") {
+                    return Err(
+                        "audit source --path-executables was specified more than once".to_owned(),
+                    );
+                }
+                options.path_executables = true;
+                index += 1;
+                continue;
+            }
             if argument == "--permission" {
                 let Some(path) = arguments.get(index + 1) else {
                     return Err("audit --permission requires a path".to_owned());
@@ -646,6 +681,15 @@ fn audit_command(arguments: &[OsString]) -> Result<ExitCode, String> {
                 Some("--startup") if selected.insert("startup") => {
                     options.startup = true;
                     index += 1;
+                }
+                Some("--path-executables") if selected.insert("path-executables") => {
+                    options.path_executables = true;
+                    index += 1;
+                }
+                Some("--path-executables") => {
+                    return Err(
+                        "audit source --path-executables was specified more than once".to_owned(),
+                    );
                 }
                 Some("--runtime-source")
                     if selected.insert("runtime")
@@ -896,6 +940,29 @@ fn inventory_startup(output: &OsString) -> Result<ExitCode, String> {
             ExitCode::from(2)
         })
     }
+}
+
+fn inventory_path_executables(output: &OsString) -> Result<ExitCode, String> {
+    let document: PathExecutableInventory = collect_path_executables();
+    let complete = document.status == "complete";
+    let mut json = CappedBuffer::new(MAX_REPORT_BYTES);
+    serde_json::to_writer(&mut json, &document).map_err(|error| format!("could not serialize PATH executable inventory within the {MAX_REPORT_BYTES} byte limit: {error}"))?;
+    #[cfg(target_os = "linux")]
+    let published = publish_private_file(Path::new(output), &json.bytes, MAX_REPORT_BYTES)
+        .map_err(|error| format!("could not publish private PATH executable inventory: {error}"))?;
+    #[cfg(windows)]
+    let published = publish_private_windows_file(Path::new(output), &json.bytes, MAX_REPORT_BYTES)
+        .map_err(|error| format!("could not publish private PATH executable inventory: {error}"))?;
+    eprintln!(
+        "Saved a {} current-process PATH executable-candidate snapshot to {}. Candidate rows are metadata heuristics, commands were not run, and PATH coverage may be partial.",
+        if complete { "complete" } else { "partial" },
+        terminal_safe_path(&published)
+    );
+    Ok(if complete {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
 }
 
 fn inventory_permissions(output: &OsString, paths: &[OsString]) -> Result<ExitCode, String> {
@@ -1233,6 +1300,12 @@ fn print_version() {
     println!("sideeffect {}", env!("CARGO_PKG_VERSION"));
 }
 
+fn print_usage() {
+    println!(
+        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)"
+    );
+}
+
 fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
     let topic = topics
         .iter()
@@ -1243,7 +1316,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         .collect::<Result<Vec<_>, _>>()?
         .join(" ");
     if topic.is_empty() {
-        println!("{USAGE}");
+        print_usage();
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -1251,11 +1324,11 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         "audit" => {
             #[cfg(target_os = "linux")]
             {
-                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages] [--processes] [--startup] [--permission PATH]... [--runtime-duration-seconds 1..3600 -- PROGRAM [ARGS...]]\nCollects explicitly selected Linux inventory sources and an optional bounded command capture into one local, private session directory. Linux runtime uses external strace. Runtime command arguments stay separate and are passed without a shell. The session stores the native run manifest and raw trace, which may contain sensitive arguments and paths. Each source has its own interval; the session is not an atomic snapshot. Runtime completeness remains unknown, so runtime sources and sessions containing runtime are partial. Partial and unavailable selected sources are preserved and cause exit status 2."
+                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages] [--processes] [--startup] [--path-executables] [--permission PATH]... [--runtime-duration-seconds 1..3600 -- PROGRAM [ARGS...]]\nCollects explicitly selected Linux inventory sources and an optional bounded command capture into one local, private session directory. --path-executables snapshots current-process PATH metadata heuristically and never runs files or resolves commands through a shell. Linux runtime uses external strace. Runtime command arguments stay separate and are passed without a shell. The session stores the native run manifest and raw trace, which may contain sensitive arguments and paths. Each source has its own interval; the session is not an atomic snapshot. Runtime completeness remains unknown, so runtime sources and sessions containing runtime are partial. Partial and unavailable selected sources are preserved and cause exit status 2."
             }
             #[cfg(windows)]
             {
-                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages] [--processes] [--startup] [--permission PATH]... [--runtime-source windows-etw --runtime-duration-seconds 1..60 -- PROGRAM [ARGS...]]\nCollects selected bounded native Windows inventories and optional system-wide ETW observations into one current-user-private session directory. --permission inspects explicitly selected paths only. ETW requires permission to control the shared NT Kernel Logger; SideEffect never elevates. The command is passed as separate arguments and is not started unless ETW setup succeeds. Capture completeness is unknown, so runtime-containing sessions are partial."
+                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages] [--processes] [--startup] [--path-executables] [--permission PATH]... [--runtime-source windows-etw --runtime-duration-seconds 1..60 -- PROGRAM [ARGS...]]\nCollects selected bounded native Windows inventories and optional system-wide ETW observations into one current-user-private session directory. --path-executables snapshots current-process PATH metadata heuristically and never runs files or resolves commands through a shell. --permission inspects explicitly selected paths only. ETW requires permission to control the shared NT Kernel Logger; SideEffect never elevates. The command is passed as separate arguments and is not started unless ETW setup succeeds. Capture completeness is unknown, so runtime-containing sessions are partial."
             }
             #[cfg(not(any(target_os = "linux", windows)))]
             {
@@ -1264,6 +1337,9 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         }
         "inspect" => {
             "Usage: sideeffect inspect [--format json|text] TRACE\n       sideeffect inspect [--format json|text] --bundle DIR\n       sideeffect inspect [--format json|text] --session DIR\n       sideeffect inspect [--format json|text] --windows-runtime FILE\n       sideeffect inspect --format html --output NEW_REPORT.html --windows-runtime FILE (native Windows)\nReads bounded local strace evidence, a validated run bundle, a verified audit session, or a Windows ETW capture. It never runs represented commands. JSON is the default; text output escapes terminal controls and user-influenced fields. Windows runtime inspection accepts schema v3, validates its document fingerprint and bounds, and does not authenticate authorship or establish capture completeness. HTML file export uses the protected current-user publisher and is available only on native Windows. Partial input is labeled and exits with status 2."
+        }
+        "events" => {
+            "Usage: sideeffect events --trace TRACE\n       sideeffect events --windows-runtime CAPTURE.json (native Windows)\nAdapts one local runtime source into a versioned common event envelope and writes JSON only. Source-local order and timestamps are preserved; no cross-platform ordering, parentage, ownership, or causation is inferred. Partial or unknown source status exits with status 2. Windows runtime input is strictly bounded and schema-validated before adaptation."
         }
         "diff" => {
             "Usage: sideeffect diff [--format json|text] LEFT RIGHT\n       sideeffect diff --format html --output REPORT.html LEFT RIGHT\n       sideeffect diff --bundles [--format json|text] LEFT_DIR RIGHT_DIR\n       sideeffect diff --windows-runtime [--format json|text] BEFORE.json AFTER.json\n       sideeffect diff --format html --output REPORT.html --windows-runtime BEFORE.json AFTER.json (native Windows)\nCompares complete parsed strace observations or validated Windows ETW captures. Windows summary v2 preserves category counts, compares exact normalized record multisets, and labels unique supported changed identities as candidates with source references. One-sided observations are not removals or additions; capture completeness remains unknown, and no causal or system-level absence claims are made. Windows HTML uses the protected current-user publisher and a static offline report. Input and report data may be sensitive."
@@ -1288,7 +1364,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             }
         }
         "inventory" => {
-            "Usage: sideeffect inventory packages|processes|startup|permissions --output FILE [PATH...]\nCollects bounded, local snapshots from sources supported on this platform. Sources are curated and coverage can be partial; inspect output and diagnostics before drawing conclusions."
+            "Usage: sideeffect inventory packages|processes|startup|path-executables|permissions --output FILE [PATH...]\nCollects bounded, local snapshots from sources supported on this platform. Sources are curated and coverage can be partial; inspect output and diagnostics before drawing conclusions."
         }
         "inventory startup" => {
             #[cfg(target_os = "linux")]
@@ -1331,6 +1407,9 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             {
                 "Usage: sideeffect inventory processes --output FILE\nProcess inventory is not supported on this platform."
             }
+        }
+        "inventory path-executables" => {
+            "Usage: sideeffect inventory path-executables --output FILE\nSnapshots the current process PATH and checks one directory level using platform metadata heuristics. It never executes candidates; symlinks/reparse points and limits make results partial."
         }
         "inventory permissions" => {
             #[cfg(target_os = "linux")]
@@ -1399,6 +1478,46 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
 
 fn inspect(path: &OsString) -> Result<ExitCode, String> {
     inspect_with_format(&OsString::from("json"), path)
+}
+
+fn events_trace(path: &OsString) -> Result<ExitCode, String> {
+    let bytes = read_bounded(path)?;
+    let trace = parse_trace_bytes(&bytes, ParseLimits::default())
+        .map_err(|error| format!("trace event adaptation failed: {error}"))?;
+    let envelope = sideeffect::event::from_linux_strace(&trace, &bytes, "trace");
+    let complete =
+        envelope.source_state.completeness == sideeffect::event::SourceCompleteness::Complete;
+    write_json(&envelope, "common event envelope")?;
+    Ok(if complete {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
+#[cfg(windows)]
+fn events_windows_runtime(path: &OsString) -> Result<ExitCode, String> {
+    let bytes = read_input_file(
+        Path::new(path),
+        sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
+        "Windows runtime capture",
+    )?;
+    let capture = sideeffect::windows_runtime::inspect_windows_runtime_bytes(&bytes)
+        .map_err(|error| format!("Windows runtime event adaptation failed: {error}"))?;
+    let envelope = sideeffect::event::from_windows_runtime_capture(&capture);
+    let complete =
+        envelope.source_state.completeness == sideeffect::event::SourceCompleteness::Complete;
+    write_json(&envelope, "common event envelope")?;
+    Ok(if complete {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
+#[cfg(not(windows))]
+fn events_windows_runtime(_path: &OsString) -> Result<ExitCode, String> {
+    Err("events --windows-runtime is supported only in native Windows builds".to_owned())
 }
 
 fn inspect_session_with_format(format: &OsString, path: &OsString) -> Result<ExitCode, String> {
@@ -1884,21 +2003,66 @@ fn explain_inventory_diff_files(
     let before = read_input_file(
         Path::new(before_path),
         MAX_REPORT_BYTES,
-        "package inventory",
+        "inventory comparison input",
     )?;
     let after = read_input_file(
         Path::new(after_path),
         MAX_REPORT_BYTES.saturating_sub(before.len()),
-        "package inventory",
+        "inventory comparison input",
     )?;
-    let comparison = compare_package_inventory_json(&before, &after)
-        .map_err(|error| format!("package inventory comparison failed: {error:?}"))?;
-    let partial = comparison.status == PackageComparisonStatus::Partial;
-    write_json(&comparison, "JSON package inventory comparison")?;
-    if partial {
-        Ok(ExitCode::from(2))
+    if is_permission_inventory_json(&before) || is_permission_inventory_json(&after) {
+        let comparison = compare_permission_inventory_json(&before, &after)
+            .map_err(|error| format!("permission inventory comparison failed: {error:?}"))?;
+        let partial = comparison.status == PermissionDiffStatus::Partial;
+        write_json(&comparison, "JSON permission inventory comparison")?;
+        return Ok(if partial {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
+    if is_startup_inventory_json(&before) || is_startup_inventory_json(&after) {
+        let comparison = compare_startup_inventory_json(&before, &after)
+            .map_err(|error| format!("startup inventory comparison failed: {error:?}"))?;
+        let partial = comparison.status == StartupDiffStatus::Partial;
+        write_json(&comparison, "JSON startup inventory comparison")?;
+        return Ok(if partial {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
+    if is_process_inventory_json(&before) || is_process_inventory_json(&after) {
+        let comparison = compare_process_inventory_json(&before, &after)
+            .map_err(|error| format!("process inventory comparison failed: {error:?}"))?;
+        let partial = comparison.status == ProcessDiffStatus::Partial;
+        write_json(&comparison, "JSON process inventory comparison")?;
+        return Ok(if partial {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
+    if is_windows_software_inventory_json(&before) || is_windows_software_inventory_json(&after) {
+        let comparison = compare_windows_software_inventory_json(&before, &after)
+            .map_err(|error| format!("Windows software inventory comparison failed: {error:?}"))?;
+        let partial = comparison.status == WindowsSoftwareComparisonStatus::Partial;
+        write_json(&comparison, "JSON Windows software inventory comparison")?;
+        if partial {
+            Ok(ExitCode::from(2))
+        } else {
+            Ok(ExitCode::SUCCESS)
+        }
     } else {
-        Ok(ExitCode::SUCCESS)
+        let comparison = compare_package_inventory_json(&before, &after)
+            .map_err(|error| format!("package inventory comparison failed: {error:?}"))?;
+        let partial = comparison.status == PackageComparisonStatus::Partial;
+        write_json(&comparison, "JSON package inventory comparison")?;
+        if partial {
+            Ok(ExitCode::from(2))
+        } else {
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 const TOTAL_PACKAGE_SCAN_TIMEOUT: Duration = Duration::from_secs(20);
 
-const UNSUPPORTED_ADAPTERS: [(&str, &[&str]); 5] = [
+const UNSUPPORTED_ADAPTERS: [(&str, &[&str]); 4] = [
     ("xbps_query", &["/usr/bin/xbps-query", "/bin/xbps-query"]),
     (
         "nix",
@@ -36,7 +36,6 @@ const UNSUPPORTED_ADAPTERS: [(&str, &[&str]); 5] = [
         ],
     ),
     ("snap", &["/usr/bin/snap", "/bin/snap"]),
-    ("flatpak", &["/usr/bin/flatpak", "/bin/flatpak"]),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,7 +46,7 @@ struct PackageAdapter {
     kind: PackageSourceKind,
 }
 
-const ADAPTERS: [PackageAdapter; 4] = [
+const ADAPTERS: [PackageAdapter; 5] = [
     PackageAdapter {
         id: "dpkg_query",
         executable: "/usr/bin/dpkg-query",
@@ -80,6 +79,12 @@ const ADAPTERS: [PackageAdapter; 4] = [
         // One verbose level prints package-version rows; `-vv` also prints descriptions.
         args: &["--network=no", "info", "-v"],
         kind: PackageSourceKind::Apk,
+    },
+    PackageAdapter {
+        id: "flatpak",
+        executable: "/usr/bin/flatpak",
+        args: &["list", "--columns=ref"],
+        kind: PackageSourceKind::Flatpak,
     },
 ];
 
@@ -115,9 +120,9 @@ pub fn collect_packages() -> InventoryDocument {
 }
 
 fn collect_packages_with<F>(
-    availability: [bool; 4],
-    unsupported_availability: [bool; 5],
-    applicable: Option<[bool; 4]>,
+    availability: [bool; 5],
+    unsupported_availability: [bool; 4],
+    applicable: Option<[bool; 5]>,
     total_timeout: Duration,
     captured_at_unix_ms: u128,
     mut run: F,
@@ -158,7 +163,9 @@ where
         if !availability[index] {
             sources.push(InventorySource {
                 id: adapter.id,
-                status: if applicable.is_some_and(|expected| !expected[index]) {
+                status: if index == 4 {
+                    InventorySourceStatus::Unavailable
+                } else if applicable.is_some_and(|expected| !expected[index]) {
                     InventorySourceStatus::NotApplicable
                 } else {
                     InventorySourceStatus::Unavailable
@@ -166,7 +173,9 @@ where
                 exit_code: None,
                 records_seen: 0,
                 diagnostics: vec![InventoryDiagnostic {
-                    code: if applicable.is_some_and(|expected| !expected[index]) {
+                    code: if index == 4 {
+                        "package_manager_executable_unavailable"
+                    } else if applicable.is_some_and(|expected| !expected[index]) {
                         "package_manager_not_applicable_for_distribution"
                     } else {
                         "package_manager_executable_unavailable"
@@ -177,7 +186,7 @@ where
                     record_sha256: None,
                 }],
             });
-            if applicable.is_none_or(|expected| expected[index]) {
+            if package_source_required(index, applicable) {
                 available_sources_complete = false;
             }
             continue;
@@ -269,9 +278,9 @@ where
 /// Return a primary supported package ecosystem only for well-known distributions.
 /// Unknown distributions stay conservative: absent tools remain unavailable and keep the
 /// aggregate partial instead of implying that an unrecognized database was not applicable.
-fn expected_package_managers(os_release: Option<Vec<String>>) -> Option<[bool; 4]> {
+fn expected_package_managers(os_release: Option<Vec<String>>) -> Option<[bool; 5]> {
     let ids = os_release?;
-    let mut expected = [false; 4]; // dpkg, rpm, pacman, apk
+    let mut expected = [false; 5]; // dpkg, rpm, pacman, apk, optional Flatpak
     for id in ids {
         match id.as_str() {
             "debian" | "ubuntu" | "linuxmint" | "pop" | "kali" | "raspbian" => expected[0] = true,
@@ -292,6 +301,13 @@ fn expected_package_managers(os_release: Option<Vec<String>>) -> Option<[bool; 4
         .iter()
         .any(|is_expected| *is_expected)
         .then_some(expected)
+}
+
+fn package_source_required(index: usize, applicable: Option<[bool; 5]>) -> bool {
+    if index == 4 {
+        return false;
+    }
+    applicable.is_none_or(|expected| expected[index])
 }
 
 fn read_os_release() -> Option<Vec<String>> {
@@ -374,12 +390,12 @@ mod tests {
 
     #[test]
     fn only_available_sources_are_run_and_rows_keep_source_identity() {
-        let availability = [true, false, true, false];
+        let availability = [true, false, true, false, false];
         let mut invoked = Vec::new();
         let document = collect_packages_with(
             availability,
-            [false; 5],
-            Some([true, false, true, false]),
+            [false; 4],
+            Some([true, false, true, false, false]),
             TOTAL_PACKAGE_SCAN_TIMEOUT,
             44,
             |adapter, at, _, _, _, _| {
@@ -387,6 +403,9 @@ mod tests {
                 let output = match adapter.kind {
                     PackageSourceKind::Dpkg => b"one\t1\tall\tii \n".as_slice(),
                     PackageSourceKind::Pacman => b"two 2-1\n".as_slice(),
+                    PackageSourceKind::Flatpak => {
+                        b"Ref\napp/org.example.App/x86_64/stable\n".as_slice()
+                    }
                     PackageSourceKind::Rpm | PackageSourceKind::Apk => unreachable!(),
                 };
                 fixture_run(adapter, at, output, InventorySourceStatus::Complete)
@@ -395,7 +414,7 @@ mod tests {
 
         assert_eq!(invoked, ["dpkg_query", "pacman_query"]);
         assert_eq!(document.status, InventoryStatus::Complete);
-        assert_eq!(document.sources.len(), 4);
+        assert_eq!(document.sources.len(), 5);
         assert_eq!(document.sources[0].status, InventorySourceStatus::Complete);
         assert_eq!(
             document.sources[1].status,
@@ -414,8 +433,8 @@ mod tests {
     #[test]
     fn no_available_package_manager_is_partial_and_never_an_empty_complete_result() {
         let document = collect_packages_with(
-            [false; 4],
             [false; 5],
+            [false; 4],
             None,
             TOTAL_PACKAGE_SCAN_TIMEOUT,
             10,
@@ -423,7 +442,7 @@ mod tests {
         );
         assert_eq!(document.status, InventoryStatus::Partial);
         assert!(document.packages.is_empty());
-        assert_eq!(document.sources.len(), 4);
+        assert_eq!(document.sources.len(), 5);
         assert!(
             document
                 .sources
@@ -435,9 +454,9 @@ mod tests {
     #[test]
     fn failed_available_source_keeps_rows_but_marks_inventory_partial() {
         let document = collect_packages_with(
-            [false, true, false, false],
-            [false; 5],
-            Some([false, true, false, false]),
+            [false, true, false, false, false],
+            [false; 4],
+            Some([false, true, false, false, false]),
             TOTAL_PACKAGE_SCAN_TIMEOUT,
             11,
             |adapter, at, _, _, _, _| {
@@ -457,10 +476,10 @@ mod tests {
 
     #[test]
     fn detected_unsupported_manager_is_reported_even_when_no_supported_binary_exists() {
-        let mut unsupported = [false; 5];
+        let mut unsupported = [false; 4];
         unsupported[0] = true;
         let document = collect_packages_with(
-            [false; 4],
+            [false; 5],
             unsupported,
             None,
             TOTAL_PACKAGE_SCAN_TIMEOUT,
@@ -487,9 +506,9 @@ mod tests {
     #[test]
     fn known_distribution_marks_absent_alternative_managers_not_applicable() {
         let document = collect_packages_with(
-            [true, false, false, false],
-            [false; 5],
-            Some([true, false, false, false]),
+            [true, false, false, false, false],
+            [false; 4],
+            Some([true, false, false, false, false]),
             TOTAL_PACKAGE_SCAN_TIMEOUT,
             13,
             |adapter, at, _, _, _, _| {
@@ -506,16 +525,20 @@ mod tests {
             document
                 .sources
                 .iter()
-                .filter(|source| source.id != "dpkg_query")
+                .filter(|source| source.id != "dpkg_query" && source.id != "flatpak")
                 .all(|source| source.status == InventorySourceStatus::NotApplicable)
+        );
+        assert_eq!(
+            document.sources[4].status,
+            InventorySourceStatus::Unavailable
         );
     }
 
     #[test]
     fn unknown_distribution_with_missing_alternatives_remains_partial() {
         let document = collect_packages_with(
-            [true, false, false, false],
-            [false; 5],
+            [true, false, false, false, false],
+            [false; 4],
             None,
             TOTAL_PACKAGE_SCAN_TIMEOUT,
             14,
@@ -541,9 +564,9 @@ mod tests {
     #[test]
     fn aggregate_stdout_budget_exhaustion_leaves_later_manager_not_checked() {
         let document = collect_packages_with(
-            [true; 4],
-            [false; 5],
-            Some([true; 4]),
+            [true, true, true, true, false],
+            [false; 4],
+            Some([true; 5]),
             TOTAL_PACKAGE_SCAN_TIMEOUT,
             15,
             |adapter, at, stdout, _, rows, _| {
@@ -566,9 +589,9 @@ mod tests {
     fn aggregate_stderr_budget_is_shared_across_adapters() {
         let mut calls = 0usize;
         let document = collect_packages_with(
-            [true; 4],
-            [false; 5],
-            Some([true; 4]),
+            [true, true, true, true, false],
+            [false; 4],
+            Some([true; 5]),
             TOTAL_PACKAGE_SCAN_TIMEOUT,
             17,
             |adapter, at, _, stderr, _, _| {
@@ -598,11 +621,11 @@ mod tests {
     fn os_release_identifiers_map_only_known_package_families() {
         assert_eq!(
             expected_package_managers(Some(vec!["ubuntu".to_owned()])),
-            Some([true, false, false, false])
+            Some([true, false, false, false, false])
         );
         assert_eq!(
             expected_package_managers(Some(vec!["opensuse-leap".to_owned()])),
-            Some([false, true, false, false])
+            Some([false, true, false, false, false])
         );
         assert_eq!(
             expected_package_managers(Some(vec!["unknown".to_owned()])),
@@ -614,9 +637,9 @@ mod tests {
     #[test]
     fn aggregate_deadline_marks_later_sources_not_checked() {
         let document = collect_packages_with(
-            [true; 4],
-            [false; 5],
-            Some([true; 4]),
+            [true, true, true, true, false],
+            [false; 4],
+            Some([true; 5]),
             Duration::from_millis(1),
             16,
             |adapter, at, _, _, _, timeout| {
@@ -709,5 +732,168 @@ mod tests {
             );
             assert_eq!(document.packages[0].evidence.raw_record, None);
         }
+    }
+
+    #[test]
+    fn flatpak_adapter_parses_only_documented_ref_rows_as_synthetic_fixture_data() {
+        let adapter = ADAPTERS[4];
+        assert_eq!(adapter.id, "flatpak");
+        assert_eq!(adapter.executable, "/usr/bin/flatpak");
+        assert_eq!(adapter.args, ["list", "--columns=ref"]);
+        let fixture = b"Ref\napp/org.example.Editor/x86_64/stable\nruntime/org.freedesktop.Platform/x86_64/24.08\n";
+        let document = parse_package_source_output(
+            adapter.id,
+            adapter.kind,
+            fixture,
+            0,
+            MAX_INVENTORY_STDOUT_BYTES,
+            MAX_INVENTORY_ROWS,
+        );
+
+        assert_eq!(document.status, InventoryStatus::Complete);
+        assert_eq!(document.sources[0].id, "flatpak");
+        assert_eq!(document.sources[0].records_seen, 2);
+        assert_eq!(document.packages.len(), 2);
+        assert_eq!(
+            document.packages[0].name.as_deref(),
+            Some("app/org.example.Editor/x86_64/stable")
+        );
+        assert!(document.packages[0].version.is_none());
+        assert_eq!(
+            document.packages[0].evidence.raw_record.as_deref(),
+            Some("app/org.example.Editor/x86_64/stable")
+        );
+    }
+
+    #[test]
+    fn flatpak_duplicate_refs_are_retained_and_marked_ambiguous() {
+        let document = parse_package_source_output(
+            "flatpak",
+            PackageSourceKind::Flatpak,
+            b"Ref\napp/org.example.App/x86_64/stable\napp/org.example.App/x86_64/stable\n",
+            0,
+            MAX_INVENTORY_STDOUT_BYTES,
+            MAX_INVENTORY_ROWS,
+        );
+
+        assert_eq!(document.status, InventoryStatus::Partial);
+        assert_eq!(document.packages.len(), 2);
+        assert!(document.packages.iter().all(|row| {
+            row.name.as_deref() == Some("app/org.example.App/x86_64/stable")
+                && row.diagnostic_code == Some("duplicate_ref_ambiguous")
+                && row.evidence.raw_record.is_some()
+        }));
+        assert_eq!(document.sources[0].diagnostics.len(), 2);
+        assert_eq!(document.sources[0].diagnostics[0].line, Some(2));
+        assert_eq!(document.sources[0].diagnostics[1].line, Some(3));
+    }
+
+    #[test]
+    fn flatpak_malformed_rows_and_row_limits_remain_explicit() {
+        let malformed = parse_package_source_output(
+            "flatpak",
+            PackageSourceKind::Flatpak,
+            b"Ref\nnot/a/ref\napp/org.example.App/x86_64",
+            0,
+            MAX_INVENTORY_STDOUT_BYTES,
+            MAX_INVENTORY_ROWS,
+        );
+        assert_eq!(malformed.status, InventoryStatus::Partial);
+        assert_eq!(malformed.packages.len(), 2);
+        assert_eq!(
+            malformed.packages[0].diagnostic_code,
+            Some("malformed_flatpak_ref")
+        );
+        assert_eq!(
+            malformed.packages[1].diagnostic_code,
+            Some("missing_line_terminator")
+        );
+        assert!(malformed.packages[0].evidence.raw_record.is_none());
+        assert_eq!(
+            malformed.packages[0].evidence.raw_record_hex.as_deref(),
+            Some("6e6f742f612f726566")
+        );
+
+        let limited = parse_package_source_output(
+            "flatpak",
+            PackageSourceKind::Flatpak,
+            b"Ref\napp/org.example.First/x86_64/stable\napp/org.example.Second/x86_64/stable\n",
+            0,
+            MAX_INVENTORY_STDOUT_BYTES,
+            1,
+        );
+        assert_eq!(limited.status, InventoryStatus::Partial);
+        assert_eq!(limited.packages.len(), 1);
+        assert!(
+            limited.sources[0]
+                .diagnostics
+                .iter()
+                .any(|item| item.code == "row_count_limit_exceeded")
+        );
+
+        let mut oversized_row = b"Ref\n".to_vec();
+        oversized_row.extend(std::iter::repeat_n(
+            b'a',
+            crate::limits::MAX_INVENTORY_ROW_BYTES + 1,
+        ));
+        oversized_row.push(b'\n');
+        let oversized = parse_package_source_output(
+            "flatpak",
+            PackageSourceKind::Flatpak,
+            &oversized_row,
+            0,
+            MAX_INVENTORY_STDOUT_BYTES,
+            MAX_INVENTORY_ROWS,
+        );
+        assert_eq!(oversized.status, InventoryStatus::Partial);
+        assert_eq!(
+            oversized.packages[0].diagnostic_code,
+            Some("row_length_limit_exceeded")
+        );
+
+        let byte_limited = parse_package_source_output(
+            "flatpak",
+            PackageSourceKind::Flatpak,
+            b"Ref\napp/org.example.App/x86_64/stable\n",
+            0,
+            8,
+            MAX_INVENTORY_ROWS,
+        );
+        assert_eq!(
+            byte_limited.sources[0].status,
+            InventorySourceStatus::OutputLimitExceeded
+        );
+        assert_eq!(byte_limited.status, InventoryStatus::Partial);
+    }
+
+    #[test]
+    fn flatpak_cli_collector_fixture_keeps_source_status_and_evidence() {
+        let document = collect_packages_with(
+            [false, false, false, false, true],
+            [false; 4],
+            Some([false, false, false, false, false]),
+            TOTAL_PACKAGE_SCAN_TIMEOUT,
+            23,
+            |adapter, at, _, _, _, _| {
+                assert_eq!(adapter.id, "flatpak");
+                fixture_run(
+                    adapter,
+                    at,
+                    b"Ref\napp/org.example.Synthetic/x86_64/stable\n",
+                    InventorySourceStatus::Complete,
+                )
+            },
+        );
+
+        assert_eq!(document.status, InventoryStatus::Complete);
+        let flatpak = document
+            .sources
+            .iter()
+            .find(|source| source.id == "flatpak")
+            .unwrap();
+        assert_eq!(flatpak.status, InventorySourceStatus::Complete);
+        assert_eq!(document.packages.len(), 1);
+        assert_eq!(document.packages[0].source_id, "flatpak");
+        assert_eq!(document.packages[0].evidence.line, 2);
     }
 }

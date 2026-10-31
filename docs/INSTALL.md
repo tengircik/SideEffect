@@ -20,9 +20,18 @@ archive="$(find "$release_dir" -maxdepth 1 -type f -name 'sideeffect-*-linux-x86
 test -n "$archive"
 gh attestation verify "$archive" --repo tengircik/SideEffect
 tar -tzf "$archive"
+package_name="$(basename "$archive" .tar.gz)"
+install_root="$HOME/.local/opt/SideEffect"
+install_dir="$install_root/$package_name"
+test ! -e "$install_dir" || { echo "Install directory already exists: $install_dir" >&2; exit 1; }
+mkdir -p "$install_root"
+tar -xzf "$archive" -C "$install_root"
+test ! -e "$HOME/.local/bin/sideeffect" || { echo "CLI already exists at ~/.local/bin/sideeffect; check it before replacing it" >&2; exit 1; }
+mkdir -p "$HOME/.local/bin"
+install -m 0755 "$install_dir/sideeffect" "$HOME/.local/bin/sideeffect"
 ```
 
-After verification, extract the archive to a new versioned directory under `~/.local/opt/SideEffect/`. Copy its `sideeffect` executable to `~/.local/bin/sideeffect` only if that destination does not already exist. Add `~/.local/bin` to the current agent or shell `PATH`, then run `sideeffect version`. Do not overwrite an existing CLI without checking its version and location first.
+The commands above extract the archive to a new versioned directory under `~/.local/opt/SideEffect/` and copy its executable to `~/.local/bin/sideeffect` only if that destination does not already exist. Add `~/.local/bin` to the current shell with `export PATH="$HOME/.local/bin:$PATH"`, then run `sideeffect version`. To make it available in future login shells, add that `export` line to the startup file used by your shell (for example, `~/.profile` for a typical login shell) and open a new shell. Do not overwrite an existing CLI without checking its version and location first.
 
 Windows x64 PowerShell:
 
@@ -40,9 +49,31 @@ $expected = ($sumLine -split "\s+")[0]
 $actual = (Get-FileHash $archive.FullName -Algorithm SHA256).Hash
 if ($actual -ne $expected) { throw "Release archive SHA-256 mismatch" }
 gh attestation verify $archive.FullName --repo tengircik/SideEffect
+$installRoot = Join-Path $env:LOCALAPPDATA "Programs\SideEffect"
+$installDir = Join-Path $installRoot $archive.BaseName
+if (Test-Path -LiteralPath $installDir) { throw "Install directory already exists; choose a new versioned directory" }
+New-Item -ItemType Directory -Path $installDir | Out-Null
+Expand-Archive -LiteralPath $archive.FullName -DestinationPath $installDir
 ```
 
-After verification, expand the archive into a new versioned directory under `$env:LOCALAPPDATA\Programs\SideEffect`. Do not extract over an existing installation. Run `sideeffect.exe version` from that directory; add that directory to the current agent process `PATH` if you want to invoke `sideeffect` by name. A user-level PATH entry can be added separately for future sessions; administrator access is not required.
+The commands above extract to a new versioned directory without replacing an existing installation. Add it to this PowerShell session and verify the command:
+
+```powershell
+$env:Path = "$installDir;$env:Path"
+sideeffect.exe version
+```
+
+To make that version available in future user sessions, add its directory to your user PATH (no administrator access is needed). This command preserves the existing user PATH and avoids adding the same directory twice:
+
+```powershell
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+$pathEntries = @($userPath -split ';' | Where-Object { $_ })
+if (-not ($pathEntries | Where-Object { $_.TrimEnd('\') -ieq $installDir.TrimEnd('\') })) {
+    [Environment]::SetEnvironmentVariable("Path", (@($pathEntries) + $installDir) -join ';', "User")
+}
+```
+
+Close and reopen PowerShell and any terminal or agent that should use the updated PATH. Because the directory is versioned, update the PATH entry when you install a newer version. You can always run `sideeffect.exe` directly from the versioned directory.
 
 The Linux and Windows binary archives contain the CLI, README, installation and Agent Skill guides, project license, third-party notices, and the version-specific release notes. A separate `sideeffect-<version>-source.tar.gz` archive contains the corresponding tagged source tree. All published archives and notices appear in `SHA256SUMS`; the Linux and Windows binaries and source archive carry GitHub build-provenance attestations. Linux release archives target x86_64 GNU and are built on Ubuntu 22.04; Windows archives target x64 MSVC. The compatibility matrix below lists the exact validation boundaries.
 
@@ -72,7 +103,7 @@ The minimums below describe declared support requirements, while the validation 
 | Derived syscall outcomes | Strict results for `execve`, `execveat`, `openat`, `openat2`, and `connect` only | Parser fixtures and the narrow real-tracer workflow | Higher-level effects, unsupported result spellings, or outcomes for other syscalls |
 | Lexical path hints | Narrow `openat`/`openat2` argument subset only; display-only | Deterministic parser fixtures | Filesystem resolution, symlink behavior, descriptor identity, or canonical paths |
 | Linux permission inventory | Explicit paths; metadata, supported POSIX ACL xattrs, and Linux VFS file-capability revisions 1–3 | Deterministic ACL/capability byte fixtures, metadata/path handling, and xattr-backed filesystem tests when supported | Recursive or complete inventory, effective access decisions, and other ACL/permission sources |
-| Linux package inventory | dpkg, RPM, pacman, and APK adapters at fixed system paths; other detected managers are unsupported | Adapter/parser fixtures and live dpkg CLI inventory in Linux CI | Complete software inventory, custom/user manager paths, and all distributions or package formats |
+| Linux package inventory | dpkg, RPM, pacman, APK, and optional Flatpak refs at fixed system paths; XBPS, Nix, Guix, and Snap are unsupported | Adapter/parser fixtures and live dpkg CLI inventory in Linux CI; Flatpak live smoke runs only when already installed | Complete software inventory, custom/user manager paths, and all distributions or package formats |
 | Linux process inventory | Visible `/proc` status fields and bounded `/proc/PID/exe` link text | Synthetic procfs fixtures and Linux CLI tests | Atomic or exhaustive process coverage; command lines or executable contents |
 | Linux startup configuration | Aggregate schema v2: curated XDG, systemd, SysV, and cron source snapshots with inert evidence | CLI tests and deterministic source/parser fixtures | Effective applicability, manager runtime state, all distribution-specific paths, or exhaustive startup coverage |
 | Diff | Exact multiset comparison of parsed syscall rows; PID/timestamp prefixes alone are ignored | Synthetic pairs plus real integration trace pair | Root cause, causal links, normalized paths/FDs, or complete OS observation |
@@ -105,6 +136,53 @@ cargo build --locked --release --bin sideeffect
 
 The binary remains in `target/release/`; this project does not install it into a system directory. Cargo may download locked Rust dependencies from the configured registry. Review organization or network policy before allowing dependency downloads.
 
+### Windows PowerShell: `sideeffect` is not recognized
+
+When installed from this source with `cargo install --path . --locked --bin sideeffect`, Cargo normally places `sideeffect.exe` in `%USERPROFILE%\.cargo\bin`. Check that the executable exists and runs:
+
+```powershell
+$cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+$sideeffectExe = Join-Path $cargoBin "sideeffect.exe"
+Test-Path -LiteralPath $sideeffectExe
+if (Test-Path -LiteralPath $sideeffectExe) { & $sideeffectExe --version }
+```
+
+Inspect which command PowerShell resolves and whether the Cargo bin directory is on this terminal's PATH:
+
+```powershell
+Get-Command sideeffect -All -ErrorAction SilentlyContinue | Format-List CommandType, Source, Definition
+where.exe sideeffect
+$env:Path -split ';' | Where-Object { $_ -ieq $cargoBin }
+```
+
+If PATH was just changed, close and reopen PowerShell (and any terminal or agent that should use it) so it receives the updated environment. You can run the verified installed executable directly without relying on PATH:
+
+```powershell
+& (Join-Path $env:USERPROFILE ".cargo\bin\sideeffect.exe") --version
+```
+
+To use the Cargo-installed command in the current session, add Cargo's bin directory to that session's PATH:
+
+```powershell
+$env:Path = "$(Join-Path $env:USERPROFILE '.cargo\bin');$env:Path"
+sideeffect version
+```
+
+To persist it for your Windows user, add the Cargo bin directory to the user PATH without duplicating it:
+
+```powershell
+$cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+$pathEntries = @($userPath -split ';' | Where-Object { $_ })
+if (-not ($pathEntries | Where-Object { $_.TrimEnd('\') -ieq $cargoBin.TrimEnd('\') })) {
+    [Environment]::SetEnvironmentVariable("Path", (@($pathEntries) + $cargoBin) -join ';', "User")
+}
+```
+
+Restart PowerShell and the agent or terminal after changing the user PATH. If `sideeffect version` still fails, use `Get-Command sideeffect -All` and check the executable's location before changing PATH again.
+
+If you used `cargo build --release` instead of `cargo install`, the binary is in the repository's `target\release\sideeffect.exe`; from the repository root, invoke it as `& .\target\release\sideeffect.exe --version`.
+
 Try the parser with the included synthetic trace:
 
 ```sh
@@ -119,7 +197,15 @@ This does not require `strace`. The fixture is illustrative data, not a capture 
 .\target\release\sideeffect.exe inventory processes --output .\processes.json
 ```
 
-This first native Windows inventory writes `sideeffect.windows_process_inventory` v1 using one Tool Help process snapshot and queries image paths only where `PROCESS_QUERY_LIMITED_INFORMATION` is available. It does not read command lines, inspect memory, start processes, or request elevation. The snapshot and path queries happen at different times, so processes can exit or identifiers can be reused between them. Protected or inaccessible paths are reported as unknown, make the result partial, and produce exit status `2`. The scan is limited to 8,192 process entries, 10 seconds, 32,768 UTF-16 code units per path, 4 Mi aggregate path code units, and 64 MiB of JSON. The output is staged under an explicit current-user-only Windows DACL and is published without replacing an existing destination. Process names and image paths can be sensitive; review before sharing.
+This native Windows inventory writes `sideeffect.windows_process_inventory` v3 using one Tool Help process snapshot and queries image paths, creation FILETIME, and token user SID/integrity RID/session ID only where `PROCESS_QUERY_LIMITED_INFORMATION` and token query access are available. Creation FILETIME is PID-generation evidence; the token query's generation is checked against it and values are cleared when identity cannot be verified or changed. Inaccessible, vanished, malformed, or failed queries remain unknown and make the result partial. SID strings are retained as identifiers; SideEffect does not resolve account names. It does not read command lines, inspect memory, start processes, or request elevation. The snapshot and subsequent queries happen at different times, so processes can exit or identifiers can be reused between them. The scan is limited to 8,192 process entries, 10 seconds, 32,768 UTF-16 code units per path, 4 Mi aggregate path code units, 256 UTF-16 code units per SID, 2 Mi aggregate SID code units, and 64 MiB of JSON. The output is staged under an explicit current-user-only Windows DACL and is published without replacing an existing destination. Process names, image paths, and SIDs can be sensitive; review before sharing.
+
+## Find executable candidates on the current PATH
+
+```sh
+sideeffect inventory path-executables --output ./path-executables.json
+```
+
+The same command works on native Windows. It snapshots only the invoking process's current `PATH` and, on Windows, captured `PATHEXT`. It checks each directory one level deep, preserves order and duplicate components, and maps empty components to the current working directory with an explicit marker. Linux candidates are regular files with an execute bit; Windows candidates are regular files with a captured `PATHEXT` suffix; if `PATHEXT` is unavailable, regular-file rows remain unknown. These are metadata heuristics: SideEffect does not execute candidate files or recursively inspect directories. It skips symlinks/reparse points observed by metadata checks; concurrent filesystem replacements can race between a check and enumeration. It does not determine shell command resolution. Limits are 256 components, 4 KiB per Linux component or 32,767 UTF-16 units per Windows component, 20,000 directory entries, 16 MiB aggregate path/name bytes on Linux or UTF-16 code units on Windows, five seconds checked between operations, and 64 MiB serialized output. Limit, inaccessible, symlink/reparse, and unavailable-source conditions are represented as partial/unknown; partial results are written and exit with status `2`. The output is private and no-clobber. PATH values, names, and paths are sensitive; inspect the JSON before sharing.
 
 ## Experimental Windows process, file, and network capture
 
@@ -209,11 +295,11 @@ The Windows adapter writes `sideeffect.windows_associated_behavior_summary` v1. 
 
 ```sh
 ./target/release/sideeffect audit --output ./audit-session \
-  --packages --processes --startup \
+  --packages --processes --startup --path-executables \
   --permission ./some/file --permission ./some/directory
 ```
 
-Specify one or more source selectors: `--packages`, `--processes`, `--startup`, and repeated `--permission PATH` options. Permission inspection is limited to the paths you name. The command does not record runtime activity. It stores each selected inventory in its native JSON schema beside a `session.json` manifest with per-source scope, timestamps, status, selected key limits, diagnostics, artifact length, schema, and SHA-256. Collections run over a best-effort interval, not an atomic system snapshot. Partial artifacts are retained and cause exit status `2`.
+Specify one or more source selectors: `--packages`, `--processes`, `--startup`, `--path-executables`, and repeated `--permission PATH` options. Permission inspection is limited to the paths you name. The PATH source records the same one-level metadata heuristic as `inventory path-executables`; it does not execute candidates or resolve commands through a shell. The command does not record runtime activity. It stores each selected inventory in its native JSON schema beside a `session.json` manifest with per-source scope, timestamps, status, selected key limits, diagnostics, artifact length, schema, and SHA-256. Collections run over a best-effort interval, not an atomic system snapshot. Partial artifacts are retained and cause exit status `2`.
 
 The complete directory is built in a private sibling staging directory and atomically published without overwriting an existing destination. On Linux, the session directory is mode `0700` and its files are mode `0600`. Windows inventory sessions and inspection are supported using a current-user-owned directory with a protected current-user-only DACL. An explicitly selected Windows runtime source can add its bounded ETW v3 capture as a fixed `runtime.windows.json` artifact in the same audit session; runtime and containing session status remain partial because capture completeness is unknown. Artifacts can contain sensitive system and user data. There is no automatic redaction, upload, or deletion.
 
@@ -223,7 +309,7 @@ To verify and review the session metadata:
 ./target/release/sideeffect inspect --format text --session ./audit-session
 ```
 
-The reader requires a current-user-owned private directory and private regular files, rejects symlinks and unlisted entries, checks bounded JSON syntax and declared schema/version headers, and verifies every declared artifact's length and SHA-256 before writing a review. It does not fully validate each inventory artifact's domain schema or print raw inventory rows. Use `--format json` for the versioned `sideeffect.audit_session_review` v1 output. A hash match does not authenticate the session producer. Partial sessions are still reviewable and return exit status `2`.
+The reader requires a current-user-owned private directory and private regular files, rejects symlinks and unlisted entries, checks bounded JSON syntax and declared schema/version headers, and verifies every declared artifact's length and SHA-256 before writing a review. It does not fully validate each inventory artifact's domain schema or print raw inventory rows. Use `--format json` for the versioned `sideeffect.audit_session_review` v6 output, which includes recorded host OS/version and caller privilege context, source settings, runtime loss state, and artifact provenance. The display-only review escapes non-ASCII and control characters in all string values as ASCII so imported metadata cannot inject terminal formatting; this encoding does not modify stored session files. Older session versions retain absent host context; it is not reconstructed. A hash match does not authenticate the session producer. Partial sessions are still reviewable and return exit status `2`.
 
 ## Record a command on Linux
 
@@ -245,6 +331,20 @@ Then record a command by passing the program and its arguments after `--`:
 SideEffect runs the selected program with your permissions; it is not a sandbox. The program can modify files, access the network, and perform actions otherwise available to your account. Recording is bounded. If the trace exceeds its byte limit, the direct `strace` process is terminated and the partial trace is discarded. Add `--duration-seconds <seconds>` with an integer from 1 to 3600 for an optional wall-clock limit; if reached, the available nonempty partial trace is published (bundle mode publishes a partial bundle) and the command exits `2`, with target outcome and capture completeness unknown. Inspecting a timed bundle also exits `2` and warns that absence is not evidence of non-occurrence; bundle diff refuses timed bundles. After a nonempty trace is finalized and published, SideEffect propagates `strace`'s reported exit code or signal. In bundle mode, a duration-limited run records `time_limit_reached` in schema v2; schema v1 bundles remain readable. The `strace(1)` manual says it normally mirrors the wrapped command's outcome. Capture errors take precedence; a propagated status does not prove tracer success or capture completeness.
 
 Raw traces may contain command arguments, file paths, socket addresses, and other sensitive values. Keep them local unless you have reviewed them. Detailed diff reports retain event-level values. `diff-summary` omits event strings and source references but still exposes category/count patterns, which may also be sensitive; it is not a safe-to-share verdict. These commands do not upload data.
+
+## Adapt runtime evidence into a common event envelope
+
+```sh
+./target/release/sideeffect events --trace ./run.trace
+```
+
+On native Windows, adapt a saved ETW v3 capture after the strict bounded schema and fingerprint checks:
+
+```powershell
+.\target\release\sideeffect.exe events --windows-runtime .\runtime.windows.json
+```
+
+Both commands write JSON only to stdout and read the selected file without modifying it or running represented commands. The envelope preserves source-local row order, timestamps, attempt/result or observation semantics, diagnostics, and evidence references. Its status is `partial` or `unknown` when the source or adapter cannot establish a complete supported result; those outcomes exit `2`. ETW header PID is event context and is not ownership or an actor identity. Neither adapter creates global event order, parentage, or causation. The common envelope is an output format, not a persisted capture or event graph; see [schema compatibility](SCHEMA_COMPATIBILITY.md).
 
 ## Use an existing WSL2 installation
 

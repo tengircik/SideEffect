@@ -52,6 +52,13 @@ fn windows_session_publishes_and_inspects_selected_source_with_private_acl() {
     );
     let value: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
     assert_eq!(value["schema"], "sideeffect.audit_session_review");
+    assert_eq!(value["schema_version"], 6);
+    assert_eq!(
+        value["sources"][0]["collector"]["id"],
+        "windows.software_registry"
+    );
+    assert_eq!(value["host_context"]["os_name"]["value"], "Windows");
+    assert!(value["host_context"]["privilege"].is_string());
     assert_eq!(value["platform"], "windows");
     fs::remove_dir_all(root).unwrap();
 }
@@ -69,6 +76,7 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
         .arg("--packages")
         .arg("--processes")
         .arg("--startup")
+        .arg("--path-executables")
         .arg("--permission")
         .arg(&selected_path)
         .output()
@@ -83,6 +91,7 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
         "processes.windows.json",
         "permissions.windows.json",
         "startup.windows.json",
+        "path-executables.json",
         "session.json",
     ] {
         assert!(session.join(file).is_file(), "missing {file}");
@@ -106,7 +115,7 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
         ("packages", "bounded uninstall-registry registrations"),
         (
             "processes",
-            "visible Tool Help process snapshot and permitted image paths",
+            "visible Tool Help process snapshot, permitted image paths, and token context",
         ),
         (
             "permissions",
@@ -115,6 +124,10 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
         (
             "startup",
             "selected Run/RunOnce, Startup folders, services, and visible boot/logon scheduled tasks",
+        ),
+        (
+            "path_executables",
+            "one-level metadata snapshot of the current process PATH; candidate heuristics only, no execution or shell resolution",
         ),
     ] {
         let source = review["sources"]
@@ -128,7 +141,53 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
         assert!(source["ended_at_unix_ms"].as_u64().is_some());
         assert_eq!(source["artifacts"].as_array().unwrap().len(), 1);
     }
-    assert_eq!(review["sources"].as_array().unwrap().len(), 4);
+    assert_eq!(review["sources"].as_array().unwrap().len(), 5);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn windows_partial_path_source_forces_partial_session_and_has_fixed_provenance() {
+    let root = temp_dir();
+    let session = root.join("path");
+    let duplicate = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["audit", "--output"])
+        .arg(&session)
+        .args(["--path-executables", "--path-executables"])
+        .output()
+        .unwrap();
+    assert_eq!(duplicate.status.code(), Some(1));
+    assert!(!session.exists());
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["audit", "--output"])
+        .arg(&session)
+        .arg("--path-executables")
+        .env_remove("PATH")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let inspect = cli(&[
+        "inspect",
+        "--format",
+        "json",
+        "--session",
+        session.to_str().unwrap(),
+    ]);
+    assert_eq!(inspect.status.code(), Some(2));
+    let review: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(review["status"], "partial");
+    let source = review["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["role"] == "path_executables")
+        .unwrap();
+    assert_eq!(source["status"], "partial");
+    assert_eq!(source["coverage_status"], "partial");
+    assert_eq!(source["artifacts"][0]["path"], "path-executables.json");
+    assert_eq!(
+        source["artifacts"][0]["schema"],
+        "sideeffect.path_executable_inventory"
+    );
     fs::remove_dir_all(root).unwrap();
 }
 

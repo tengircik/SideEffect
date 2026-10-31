@@ -7,10 +7,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const MAX_PROCESS_DIRECTORIES: usize = 8_192;
 pub const MAX_STATUS_BYTES: usize = 64 * 1024;
+pub const MAX_PROCESS_STAT_BYTES: usize = 4 * 1024;
 pub const MAX_AGGREGATE_STATUS_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_PROCESS_SCAN_DURATION: Duration = Duration::from_secs(10);
 pub const MAX_EXECUTABLE_LINK_BYTES: usize = 4 * 1024;
 pub const MAX_AGGREGATE_EXECUTABLE_LINK_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_NAMESPACE_LINK_BYTES: usize = 128;
+pub const MAX_AGGREGATE_NAMESPACE_LINK_BYTES: usize = 2 * 1024 * 1024;
+pub const PROCESS_NAMESPACES: &[&str] = &["cgroup", "ipc", "mnt", "net", "pid", "user", "uts"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +48,7 @@ pub struct ProcessInventorySource {
 #[derive(Clone, Debug, Serialize)]
 pub struct ProcessRow {
     pub pid: u32,
+    pub start_time: ProcessStartTime,
     pub executable_link: ProcessExecutableLink,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -71,7 +76,92 @@ pub struct ProcessRow {
     pub no_new_privs: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seccomp: Option<u32>,
+    pub namespace_pids: NamespacePidEvidence,
+    pub namespaces: Vec<ProcessNamespace>,
     pub evidence: Vec<ProcessEvidence>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NamespacePidEvidence {
+    pub status: NamespacePidStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pids: Option<Vec<u32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<ProcessEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NamespacePidStatus {
+    Observed,
+    NotReported,
+    Malformed,
+    ChangedDuringRead,
+    IdentityUnverified,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProcessNamespace {
+    pub name: &'static str,
+    pub status: ProcessNamespaceStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<ProcessNamespaceEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessNamespaceStatus {
+    Observed,
+    NotReported,
+    Inaccessible,
+    Vanished,
+    Malformed,
+    OverLimit,
+    ChangedDuringRead,
+    IdentityUnverified,
+    Error,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProcessNamespaceEvidence {
+    pub source: String,
+    pub target_bytes_hex: String,
+    pub byte_length: usize,
+    pub sha256: String,
+}
+
+/// Kernel process-generation evidence. The raw clock ticks are intentionally
+/// retained; converting them to wall time would require an additional clock
+/// source and would not improve PID-reuse discrimination.
+#[derive(Clone, Debug, Serialize)]
+pub struct ProcessStartTime {
+    pub status: ProcessStartTimeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticks_since_boot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<ProcessStartTimeEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessStartTimeStatus {
+    NotChecked,
+    Observed,
+    Inaccessible,
+    Vanished,
+    Malformed,
+    PidMismatch,
+    ChangedDuringRead,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProcessStartTimeEvidence {
+    pub source: String,
+    pub byte_length: usize,
+    pub record_sha256: String,
+    pub field_number: u8,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -164,6 +254,7 @@ fn collect_with_limits(root: &Path, limits: Limits) -> ProcessInventoryDocument 
     let mut diagnostics = Vec::new();
     let mut total_bytes = 0usize;
     let mut executable_bytes = 0usize;
+    let mut namespace_bytes = 0usize;
     let mut directories_seen = 0usize;
     let mut partial = false;
     let entries = match fs::read_dir(root) {
@@ -234,6 +325,7 @@ fn collect_with_limits(root: &Path, limits: Limits) -> ProcessInventoryDocument 
             break;
         }
         directories_seen += 1;
+        let start_time_before = read_process_start_time(&directory, pid);
         let path = directory.join("status");
         let remaining = limits.aggregate.saturating_sub(total_bytes);
         if remaining == 0 {
@@ -312,6 +404,56 @@ fn collect_with_limits(root: &Path, limits: Limits) -> ProcessInventoryDocument 
                     empty_executable_link(status)
                 }
             };
+        let namespace_remaining =
+            MAX_AGGREGATE_NAMESPACE_LINK_BYTES.saturating_sub(namespace_bytes);
+        let (namespaces, bytes_used) =
+            read_process_namespaces(&directory, pid, namespace_remaining);
+        namespace_bytes = namespace_bytes.saturating_add(bytes_used);
+        if namespaces.iter().any(|item| {
+            !matches!(
+                item.status,
+                ProcessNamespaceStatus::Observed | ProcessNamespaceStatus::NotReported
+            )
+        }) {
+            partial = true;
+            for item in &namespaces {
+                if !matches!(
+                    item.status,
+                    ProcessNamespaceStatus::Observed | ProcessNamespaceStatus::NotReported
+                ) {
+                    diagnostics.push(namespace_diagnostic(pid, item.name, item.status));
+                }
+            }
+        }
+        row.namespaces = namespaces;
+        let start_time_after = read_process_start_time(&directory, pid);
+        row.start_time = match (start_time_before, start_time_after) {
+            (Ok(before), Ok(after)) if before.ticks_since_boot == after.ticks_since_boot => before,
+            (Ok(_), Ok(_)) => {
+                row.namespaces = row
+                    .namespaces
+                    .into_iter()
+                    .map(|mut item| {
+                        item.status = ProcessNamespaceStatus::ChangedDuringRead;
+                        item.namespace_id = None;
+                        item.evidence = None;
+                        item
+                    })
+                    .collect();
+                row.namespace_pids.status = NamespacePidStatus::ChangedDuringRead;
+                row.namespace_pids.pids = None;
+                row.namespace_pids.evidence = None;
+                empty_start_time(ProcessStartTimeStatus::ChangedDuringRead)
+            }
+            (Err(status), _) | (_, Err(status)) => {
+                invalidate_namespace_identity(&mut row);
+                empty_start_time(status)
+            }
+        };
+        if row.start_time.status != ProcessStartTimeStatus::Observed {
+            partial = true;
+            diagnostics.push(start_time_diagnostic(pid, row.start_time.status));
+        }
         rows.push(row);
         diagnostics.append(&mut row_diags);
     }
@@ -340,9 +482,9 @@ fn finish(
     };
     ProcessInventoryDocument {
         schema: "sideeffect.process_inventory",
-        schema_version: 1,
+        schema_version: 3,
         platform: "linux",
-        scope: "numeric_proc_status_entries",
+        scope: "visible_numeric_proc_status_stat_executable_and_namespace_entries",
         capture_started_at_unix_ms: started,
         capture_ended_at_unix_ms: now_ms(),
         status,
@@ -380,6 +522,105 @@ fn read_bounded_status(path: &Path, limit: usize) -> Result<Vec<u8>, ReadStatusE
     Ok(bytes)
 }
 
+fn read_process_start_time(
+    directory: &Path,
+    expected_pid: u32,
+) -> Result<ProcessStartTime, ProcessStartTimeStatus> {
+    let bytes =
+        read_bounded_status(&directory.join("stat"), MAX_PROCESS_STAT_BYTES).map_err(|error| {
+            match error {
+                ReadStatusError::Vanished => ProcessStartTimeStatus::Vanished,
+                ReadStatusError::TooLarge(_) => ProcessStartTimeStatus::Malformed,
+                ReadStatusError::Unreadable(_) => ProcessStartTimeStatus::Inaccessible,
+            }
+        })?;
+    parse_process_start_time(&bytes, expected_pid)
+}
+
+fn parse_process_start_time(
+    bytes: &[u8],
+    expected_pid: u32,
+) -> Result<ProcessStartTime, ProcessStartTimeStatus> {
+    let record = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let separator = record
+        .iter()
+        .rposition(|byte| *byte == b')')
+        .ok_or(ProcessStartTimeStatus::Malformed)?;
+    let pid_separator = record
+        .iter()
+        .position(|byte| byte.is_ascii_whitespace())
+        .ok_or(ProcessStartTimeStatus::Malformed)?;
+    let reported_pid = std::str::from_utf8(&record[..pid_separator])
+        .ok()
+        .and_then(|text| text.parse::<u32>().ok())
+        .ok_or(ProcessStartTimeStatus::Malformed)?;
+    if reported_pid != expected_pid {
+        return Err(ProcessStartTimeStatus::PidMismatch);
+    }
+    if separator < pid_separator || record.get(pid_separator + 1) != Some(&b'(') {
+        return Err(ProcessStartTimeStatus::Malformed);
+    }
+    // After the closing comm parenthesis, token 0 is field 3 (state), making
+    // field 22 (starttime) token 19. Using the final ')' handles ')' in comm.
+    let fields = record[separator + 1..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    let ticks_since_boot = fields
+        .get(19)
+        .and_then(|field| std::str::from_utf8(field).ok())
+        .and_then(|text| text.parse::<u64>().ok())
+        .ok_or(ProcessStartTimeStatus::Malformed)?;
+    Ok(ProcessStartTime {
+        status: ProcessStartTimeStatus::Observed,
+        ticks_since_boot: Some(ticks_since_boot),
+        evidence: Some(ProcessStartTimeEvidence {
+            source: "procfs:/proc/<pid>/stat".to_owned(),
+            byte_length: bytes.len(),
+            record_sha256: sha256_hex(record),
+            field_number: 22,
+        }),
+    })
+}
+
+fn empty_start_time(status: ProcessStartTimeStatus) -> ProcessStartTime {
+    ProcessStartTime {
+        status,
+        ticks_since_boot: None,
+        evidence: None,
+    }
+}
+
+fn start_time_diagnostic(pid: u32, status: ProcessStartTimeStatus) -> ProcessDiagnostic {
+    let (code, message) = match status {
+        ProcessStartTimeStatus::Inaccessible => (
+            "process_start_time_inaccessible",
+            "The process start-time record could not be read due to access restrictions.",
+        ),
+        ProcessStartTimeStatus::Vanished => (
+            "process_start_time_vanished",
+            "The process disappeared while its start time was being checked.",
+        ),
+        ProcessStartTimeStatus::Malformed => (
+            "process_start_time_malformed",
+            "The process start-time record was malformed or exceeded its size limit.",
+        ),
+        ProcessStartTimeStatus::PidMismatch => (
+            "process_start_time_pid_mismatch",
+            "The process start-time record PID did not match its procfs directory.",
+        ),
+        ProcessStartTimeStatus::ChangedDuringRead => (
+            "process_identity_changed_during_read",
+            "The process start-time value changed during collection; generation evidence is unknown.",
+        ),
+        ProcessStartTimeStatus::Observed | ProcessStartTimeStatus::NotChecked => (
+            "process_start_time_unavailable",
+            "The process start-time value was not observed.",
+        ),
+    };
+    diag(code, Some(pid), Some("starttime"), message)
+}
+
 fn diag(
     code: &'static str,
     pid: Option<u32>,
@@ -398,6 +639,7 @@ fn diag(
 fn parse_status(pid: u32, bytes: &[u8]) -> (ProcessRow, Vec<ProcessDiagnostic>) {
     let mut row = ProcessRow {
         pid,
+        start_time: empty_start_time(ProcessStartTimeStatus::NotChecked),
         executable_link: empty_executable_link(ProcessExecutableLinkStatus::Unsupported),
         name: None,
         tgid: None,
@@ -412,6 +654,20 @@ fn parse_status(pid: u32, bytes: &[u8]) -> (ProcessRow, Vec<ProcessDiagnostic>) 
         cap_amb: None,
         no_new_privs: None,
         seccomp: None,
+        namespace_pids: NamespacePidEvidence {
+            status: NamespacePidStatus::NotReported,
+            pids: None,
+            evidence: None,
+        },
+        namespaces: PROCESS_NAMESPACES
+            .iter()
+            .map(|name| ProcessNamespace {
+                name,
+                status: ProcessNamespaceStatus::NotReported,
+                namespace_id: None,
+                evidence: None,
+            })
+            .collect(),
         evidence: Vec::new(),
     };
     let mut diagnostics = Vec::new();
@@ -442,6 +698,7 @@ fn parse_status(pid: u32, bytes: &[u8]) -> (ProcessRow, Vec<ProcessDiagnostic>) 
                 b"CapAmb" => Some("CapAmb"),
                 b"NoNewPrivs" => Some("NoNewPrivs"),
                 b"Seccomp" => Some("Seccomp"),
+                b"NSpid" => Some("NSpid"),
                 _ => None,
             };
             if let Some(field) = field {
@@ -474,6 +731,8 @@ fn parse_status(pid: u32, bytes: &[u8]) -> (ProcessRow, Vec<ProcessDiagnostic>) 
                             message: "The status field value was malformed.",
                             evidence: Some(evidence.clone()),
                         });
+                    } else if field == "NSpid" {
+                        row.namespace_pids.evidence = Some(evidence.clone());
                     }
                     row.evidence.push(evidence);
                 }
@@ -526,6 +785,155 @@ fn empty_executable_link(status: ProcessExecutableLinkStatus) -> ProcessExecutab
         sha256: None,
         evidence: None,
     }
+}
+
+fn read_process_namespaces(
+    directory: &Path,
+    pid: u32,
+    aggregate_remaining: usize,
+) -> (Vec<ProcessNamespace>, usize) {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut remaining = aggregate_remaining;
+    let mut used = 0usize;
+    let mut namespaces = Vec::with_capacity(PROCESS_NAMESPACES.len());
+    for name in PROCESS_NAMESPACES {
+        let path = directory.join("ns").join(name);
+        let limit = MAX_NAMESPACE_LINK_BYTES.min(remaining);
+        if limit == 0 {
+            namespaces.push(ProcessNamespace {
+                name,
+                status: ProcessNamespaceStatus::OverLimit,
+                namespace_id: None,
+                evidence: None,
+            });
+            continue;
+        }
+        let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            namespaces.push(ProcessNamespace {
+                name,
+                status: ProcessNamespaceStatus::Error,
+                namespace_id: None,
+                evidence: None,
+            });
+            continue;
+        };
+        let mut target = vec![0_u8; limit.saturating_add(1)];
+        // SAFETY: c_path is NUL-terminated and target has the declared writable capacity.
+        let count =
+            unsafe { libc::readlink(c_path.as_ptr(), target.as_mut_ptr().cast(), target.len()) };
+        if count < 0 {
+            let error = io::Error::last_os_error();
+            let status = match error.kind() {
+                io::ErrorKind::PermissionDenied => ProcessNamespaceStatus::Inaccessible,
+                io::ErrorKind::NotFound if directory.exists() => {
+                    ProcessNamespaceStatus::NotReported
+                }
+                io::ErrorKind::NotFound => ProcessNamespaceStatus::Vanished,
+                _ => ProcessNamespaceStatus::Error,
+            };
+            namespaces.push(ProcessNamespace {
+                name,
+                status,
+                namespace_id: None,
+                evidence: None,
+            });
+            continue;
+        }
+        let count = count as usize;
+        if count > limit {
+            namespaces.push(ProcessNamespace {
+                name,
+                status: ProcessNamespaceStatus::OverLimit,
+                namespace_id: None,
+                evidence: None,
+            });
+            continue;
+        }
+        target.truncate(count);
+        used = used.saturating_add(count);
+        remaining = remaining.saturating_sub(count);
+        let namespace_id = parse_namespace_link(name, &target);
+        let status = if namespace_id.is_some() {
+            ProcessNamespaceStatus::Observed
+        } else {
+            ProcessNamespaceStatus::Malformed
+        };
+        let evidence = ProcessNamespaceEvidence {
+            source: format!("{pid}/ns/{name}"),
+            target_bytes_hex: hex_bytes(&target),
+            byte_length: target.len(),
+            sha256: sha256_hex(&target),
+        };
+        namespaces.push(ProcessNamespace {
+            name,
+            status,
+            namespace_id,
+            evidence: Some(evidence),
+        });
+    }
+    (namespaces, used)
+}
+
+fn parse_namespace_link(name: &str, target: &[u8]) -> Option<u64> {
+    let prefix = format!("{name}:[");
+    let text = std::str::from_utf8(target).ok()?;
+    let id = text.strip_prefix(&prefix)?.strip_suffix(']')?;
+    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let parsed = id.parse::<u64>().ok()?;
+    (parsed > 0).then_some(parsed)
+}
+
+fn namespace_diagnostic(
+    pid: u32,
+    namespace: &'static str,
+    status: ProcessNamespaceStatus,
+) -> ProcessDiagnostic {
+    let (code, message) = match status {
+        ProcessNamespaceStatus::Observed | ProcessNamespaceStatus::NotReported => unreachable!(),
+        ProcessNamespaceStatus::Inaccessible => (
+            "process_namespace_inaccessible",
+            "A process namespace link could not be read due to access restrictions.",
+        ),
+        ProcessNamespaceStatus::Vanished => (
+            "process_namespace_vanished",
+            "The process namespace link disappeared during collection.",
+        ),
+        ProcessNamespaceStatus::Malformed => (
+            "process_namespace_malformed",
+            "A process namespace link had an unsupported target form.",
+        ),
+        ProcessNamespaceStatus::OverLimit => (
+            "process_namespace_limit_exceeded",
+            "A process namespace link exceeded the configured data limit.",
+        ),
+        ProcessNamespaceStatus::ChangedDuringRead => (
+            "process_namespace_changed_during_read",
+            "The process identity changed during namespace collection.",
+        ),
+        ProcessNamespaceStatus::IdentityUnverified => (
+            "process_namespace_identity_unverified",
+            "The process generation could not be verified for namespace data.",
+        ),
+        ProcessNamespaceStatus::Error => (
+            "process_namespace_error",
+            "A process namespace link could not be read.",
+        ),
+    };
+    diag(code, Some(pid), Some(namespace), message)
+}
+
+fn invalidate_namespace_identity(row: &mut ProcessRow) {
+    for namespace in &mut row.namespaces {
+        namespace.status = ProcessNamespaceStatus::IdentityUnverified;
+        namespace.namespace_id = None;
+        namespace.evidence = None;
+    }
+    row.namespace_pids.status = NamespacePidStatus::IdentityUnverified;
+    row.namespace_pids.pids = None;
+    row.namespace_pids.evidence = None;
 }
 
 fn executable_link_diagnostic(pid: u32, status: ProcessExecutableLinkStatus) -> ProcessDiagnostic {
@@ -653,6 +1061,31 @@ fn set_field(row: &mut ProcessRow, field: &str, value: &str) -> bool {
         "CapAmb" => set_hex(value, &mut row.cap_amb),
         "NoNewPrivs" => set_num(value, &mut row.no_new_privs),
         "Seccomp" => set_num(value, &mut row.seccomp),
+        "NSpid" => {
+            let values = value
+                .split_ascii_whitespace()
+                .map(parse_num)
+                .collect::<Option<Vec<_>>>();
+            match values {
+                Some(values)
+                    if !values.is_empty()
+                        && values.len() <= 64
+                        && values.iter().all(|pid| *pid > 0) =>
+                {
+                    row.namespace_pids = NamespacePidEvidence {
+                        status: NamespacePidStatus::Observed,
+                        pids: Some(values),
+                        evidence: None,
+                    };
+                    true
+                }
+                _ => {
+                    row.namespace_pids.status = NamespacePidStatus::Malformed;
+                    row.namespace_pids.pids = None;
+                    false
+                }
+            }
+        }
         _ => false,
     }
 }
@@ -673,6 +1106,11 @@ fn clear_field(row: &mut ProcessRow, field: &str) {
         "CapAmb" => row.cap_amb = None,
         "NoNewPrivs" => row.no_new_privs = None,
         "Seccomp" => row.seccomp = None,
+        "NSpid" => {
+            row.namespace_pids.status = NamespacePidStatus::Malformed;
+            row.namespace_pids.pids = None;
+            row.namespace_pids.evidence = None;
+        }
         _ => {}
     }
 }
@@ -756,6 +1194,16 @@ mod tests {
             let d = self.0.join(pid.to_string());
             fs::create_dir(&d).unwrap();
             fs::write(d.join("status"), bytes).unwrap();
+            let ns = d.join("ns");
+            fs::create_dir(&ns).unwrap();
+            for (index, name) in PROCESS_NAMESPACES.iter().enumerate() {
+                symlink(format!("{name}:[{}]", 40_000 + index), ns.join(name)).unwrap();
+            }
+        }
+        fn stat(&self, pid: u32, bytes: &[u8]) {
+            let d = self.0.join(pid.to_string());
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("stat"), bytes).unwrap();
         }
         fn executable_link(&self, pid: u32, target: &[u8]) {
             let directory = self.0.join(pid.to_string());
@@ -768,7 +1216,7 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
-    const VALID:&[u8]=b"Name:\ttest\nUmask:\t0022\nState:\tR (running)\nTgid:\t42\nPid:\t42\nPPid:\t1\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t2\n";
+    const VALID:&[u8]=b"Name:\ttest\nUmask:\t0022\nState:\tR (running)\nTgid:\t42\nPid:\t42\nPPid:\t1\nNSpid:\t42\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t2\n";
     #[test]
     fn parses_valid_status_and_exact_line_evidence() {
         let (row, d) = parse_status(42, VALID);
@@ -776,6 +1224,11 @@ mod tests {
         assert_eq!(row.name.as_deref(), Some("test"));
         assert_eq!(row.uid, Some([1000; 4]));
         assert_eq!(row.cap_eff.as_deref(), Some("0000000000000000"));
+        assert_eq!(row.namespace_pids.status, NamespacePidStatus::Observed);
+        assert_eq!(row.namespace_pids.pids.as_deref(), Some([42].as_slice()));
+        let nspid = row.evidence.iter().find(|e| e.field == "NSpid").unwrap();
+        assert_eq!(nspid.raw_source_line, "NSpid:\t42");
+        assert_eq!(nspid.line_sha256, sha256_hex(b"NSpid:\t42"));
         let ev = row.evidence.iter().find(|e| e.field == "CapEff").unwrap();
         let line = b"CapEff:\t0000000000000000";
         assert_eq!(
@@ -784,6 +1237,99 @@ mod tests {
         );
         assert_eq!(ev.raw_source_line, "CapEff:\t0000000000000000");
         assert_eq!(ev.line_sha256, sha256_hex(line));
+    }
+
+    #[test]
+    fn namespace_links_are_bounded_parsed_and_evidence_linked() {
+        let t = Temp::new();
+        t.status(42, VALID);
+        let (namespaces, used) = read_process_namespaces(&t.0.join("42"), 42, 1024);
+        assert_eq!(namespaces.len(), PROCESS_NAMESPACES.len());
+        assert_eq!(
+            used,
+            namespaces
+                .iter()
+                .map(|item| item.evidence.as_ref().map_or(0, |e| e.byte_length))
+                .sum::<usize>()
+        );
+        for (index, item) in namespaces.iter().enumerate() {
+            assert_eq!(item.status, ProcessNamespaceStatus::Observed);
+            assert_eq!(item.namespace_id, Some(40_000 + index as u64));
+            let evidence = item.evidence.as_ref().unwrap();
+            assert_eq!(evidence.source, format!("42/ns/{}", item.name));
+            let target = format!("{}:[{}]", item.name, 40_000 + index);
+            assert_eq!(evidence.target_bytes_hex, hex_bytes(target.as_bytes()));
+            assert_eq!(evidence.sha256, sha256_hex(target.as_bytes()));
+        }
+        assert_eq!(parse_namespace_link("pid", b"pid:[12345]"), Some(12345));
+        assert_eq!(parse_namespace_link("pid", b"pid:[0]"), None);
+        assert_eq!(parse_namespace_link("pid", b"pid:[12x]"), None);
+        let (_, used) = read_process_namespaces(&t.0.join("42"), 42, 1);
+        assert_eq!(used, 0);
+    }
+
+    #[test]
+    fn parses_proc_stat_starttime_even_when_comm_contains_parentheses() {
+        // fields 3 through 21 follow comm; field 22 is starttime.
+        let stat = b"42 (worker ) pool) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987654\n";
+        let start_time = parse_process_start_time(stat, 42).unwrap();
+        assert_eq!(start_time.status, ProcessStartTimeStatus::Observed);
+        assert_eq!(start_time.ticks_since_boot, Some(987654));
+        assert_eq!(start_time.evidence.as_ref().unwrap().field_number, 22);
+        assert_eq!(
+            start_time.evidence.as_ref().unwrap().record_sha256,
+            sha256_hex(stat.strip_suffix(b"\n").unwrap())
+        );
+    }
+
+    #[test]
+    fn proc_stat_starttime_reports_pid_mismatch_and_malformed_records() {
+        let stat = b"43 (worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 100\n";
+        assert_eq!(
+            parse_process_start_time(stat, 42).unwrap_err(),
+            ProcessStartTimeStatus::PidMismatch
+        );
+        assert_eq!(
+            parse_process_start_time(b"42 (worker) S 1 2\n", 42).unwrap_err(),
+            ProcessStartTimeStatus::Malformed
+        );
+    }
+
+    #[test]
+    fn collection_keeps_malformed_and_vanished_starttime_states_explicit() {
+        let t = Temp::new();
+        t.status(42, VALID);
+        t.stat(42, b"not a proc stat record\n");
+        t.status(43, b"Name:\tworker\nPid:\t43\nTgid:\t43\nPPid:\t1\n");
+
+        let document = collect_with_limits(
+            &t.0,
+            Limits {
+                directories: 2,
+                status: MAX_STATUS_BYTES,
+                aggregate: MAX_AGGREGATE_STATUS_BYTES,
+            },
+        );
+
+        let malformed = document.processes.iter().find(|row| row.pid == 42).unwrap();
+        assert_eq!(
+            malformed.start_time.status,
+            ProcessStartTimeStatus::Malformed
+        );
+        let vanished = document.processes.iter().find(|row| row.pid == 43).unwrap();
+        assert_eq!(vanished.start_time.status, ProcessStartTimeStatus::Vanished);
+        assert!(
+            document.source.diagnostics.iter().any(|item| {
+                item.code == "process_start_time_malformed" && item.pid == Some(42)
+            })
+        );
+        assert!(
+            document
+                .source
+                .diagnostics
+                .iter()
+                .any(|item| { item.code == "process_start_time_vanished" && item.pid == Some(43) })
+        );
     }
     #[test]
     fn malformed_and_missing_fields_are_diagnostics() {
@@ -926,6 +1472,10 @@ mod tests {
     fn exact_status_limit_succeeds_and_limit_plus_one_is_partial() {
         let t = Temp::new();
         t.status(42, VALID);
+        t.stat(
+            42,
+            b"42 (worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987654\n",
+        );
         t.executable_link(42, b"/synthetic/not-opened");
         let doc = collect_with_limits(
             &t.0,

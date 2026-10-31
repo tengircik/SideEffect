@@ -34,7 +34,7 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
     let stop_server = Arc::new(AtomicBool::new(false));
     let server_stop = stop_server.clone();
     let server = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
@@ -75,7 +75,10 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
     stop_server.store(true, Ordering::Relaxed);
     assert!(
         server.join().unwrap(),
-        "loopback fixture did not accept the connection"
+        "loopback fixture did not accept the connection; recorder exit: {:?}; stderr: {}; stdout: {}",
+        command.status,
+        String::from_utf8_lossy(&command.stderr),
+        String::from_utf8_lossy(&command.stdout)
     );
     assert!(
         matches!(command.status.code(), Some(0 | 2)),

@@ -42,9 +42,12 @@ fn live_proc_inventory_writes_private_schema_without_fixed_count_assumptions() {
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     let value: serde_json::Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
     assert_eq!(value["schema"], "sideeffect.process_inventory");
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["schema_version"], 3);
     assert_eq!(value["platform"], "linux");
-    assert_eq!(value["scope"], "numeric_proc_status_entries");
+    assert_eq!(
+        value["scope"],
+        "visible_numeric_proc_status_stat_executable_and_namespace_entries"
+    );
     assert!(value["capture_started_at_unix_ms"].as_u64().is_some());
     assert!(value["capture_ended_at_unix_ms"].as_u64().is_some());
     assert!(matches!(
@@ -64,6 +67,50 @@ fn live_proc_inventory_writes_private_schema_without_fixed_count_assumptions() {
             row["executable_link"]["status"].as_str(),
             Some("observed" | "inaccessible" | "vanished" | "over_limit" | "unsupported" | "error")
         )
+    }));
+    assert!(value["processes"].as_array().unwrap().iter().all(|row| {
+        matches!(
+            row["start_time"]["status"].as_str(),
+            Some(
+                "observed"
+                    | "inaccessible"
+                    | "vanished"
+                    | "malformed"
+                    | "pid_mismatch"
+                    | "changed_during_read"
+                    | "not_checked"
+            )
+        )
+    }));
+    assert!(value["processes"].as_array().unwrap().iter().all(|row| {
+        matches!(
+            row["namespace_pids"]["status"].as_str(),
+            Some(
+                "observed"
+                    | "not_reported"
+                    | "malformed"
+                    | "identity_unverified"
+                    | "changed_during_read"
+            )
+        ) && row["namespaces"].as_array().is_some_and(|namespaces| {
+            namespaces.len() == 7
+                && namespaces.iter().all(|namespace| {
+                    matches!(
+                        namespace["status"].as_str(),
+                        Some(
+                            "observed"
+                                | "not_reported"
+                                | "inaccessible"
+                                | "vanished"
+                                | "malformed"
+                                | "over_limit"
+                                | "changed_during_read"
+                                | "identity_unverified"
+                                | "error"
+                        )
+                    )
+                })
+        })
     }));
     let collision = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .args(["inventory", "processes", "--output"])

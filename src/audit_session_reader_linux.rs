@@ -536,6 +536,7 @@ fn fixed_entry_label(name: &[u8]) -> &'static str {
         b"packages.json" => "packages.json",
         b"processes.json" => "processes.json",
         b"startup.json" => "startup.json",
+        b"path-executables.json" => "path-executables.json",
         b"software.windows.json" => "software.windows.json",
         b"processes.windows.json" => "processes.windows.json",
         b"permissions.windows.json" => "permissions.windows.json",
@@ -604,18 +605,44 @@ mod tests {
             session_id: "0123456789abcdef0123456789abcdef".to_owned(),
             platform: "linux".to_owned(),
             architecture: "x86_64".to_owned(),
+            host_context: Some(crate::audit_session::HostContext {
+                os_name: crate::audit_session::ContextFact {
+                    status: crate::audit_session::ContextFactStatus::Observed,
+                    value: Some("Linux".to_owned()),
+                },
+                os_version: crate::audit_session::ContextFact {
+                    status: crate::audit_session::ContextFactStatus::Observed,
+                    value: Some("6.1".to_owned()),
+                },
+                privilege: crate::audit_session::PrivilegeContext::NotElevated,
+            }),
             started_at_unix_ms: 100,
             ended_at_unix_ms: 101,
             interval_semantics: IntervalSemantics::BestEffortNonAtomic,
             status: SessionStatus::Complete,
+            coverage_manifest: Some(crate::audit_session::CoverageManifest {
+                version: crate::audit_session::COVERAGE_MANIFEST_VERSION,
+                sources: vec![crate::audit_session::SourceCoverage {
+                    role: SourceRole::Packages,
+                    status: crate::audit_session::CoverageStatus::Observed,
+                    runtime_detail: None,
+                }],
+            }),
             sources: vec![AuditSessionSource {
                 role: SourceRole::Packages,
+                collector: Some(crate::audit_session::collector_identity(
+                    "linux",
+                    SourceRole::Packages,
+                )),
                 platform: "linux".to_owned(),
                 scope: "fixture source".to_owned(),
                 started_at_unix_ms: 100,
                 ended_at_unix_ms: 101,
                 status: SourceStatus::Complete,
                 applied_limits: Vec::new(),
+                requested_settings: Vec::new(),
+                effective_settings: Vec::new(),
+                loss: None,
                 diagnostic_codes: Vec::new(),
                 artifacts: vec![SessionArtifactRef {
                     kind: ArtifactKind::Packages,

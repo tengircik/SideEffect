@@ -84,6 +84,10 @@ sideeffect.exe inventory startup --output .\startup.json
 
 The inventory retains source-linked configuration facts for supported startup locations, including XDG, systemd, SysV, and cron on Linux; Windows Run/RunOnce entries, Startup folders, visible services, and visible Task Scheduler boot/logon triggers. Configured commands remain inert evidence.
 
+To inspect the current process's executable-name candidates, run `sideeffect inventory path-executables --output ./path-executables.json` (PowerShell: `sideeffect.exe inventory path-executables --output .\path-executables.json`). It snapshots only the current process `PATH`, checks each listed directory one level deep, and never runs discovered files. Rows label candidates, non-candidates, and unknown entries. Linux uses regular files with an execute bit; Windows uses regular files whose suffix matches the captured `PATHEXT`. Empty components map to the current working directory and are recorded. Results are heuristic, preserve PATH order and observed directory enumeration order (which may vary between runs), and may be partial; paths and names can reveal local configuration.
+
+The same inventory can be selected inside an audit session with `sideeffect audit --output ./audit-session --path-executables` (PowerShell: `sideeffect.exe audit --output .\audit-session --path-executables`). The session records its status, limits, fixed artifact provenance, and collector identity. It remains a point-in-time candidate inventory: SideEffect does not execute candidates or resolve commands through a shell.
+
 ### Capture a selected Linux command
 
 ```sh
@@ -102,6 +106,50 @@ sideeffect.exe inspect --format text --session .\session
 ```
 
 The bounded ETW window records selected process, file, and network event families. Controlling the Windows Kernel Logger requires an already-administrative token; SideEffect never elevates automatically.
+
+### Adapt runtime evidence into a common event envelope
+
+```sh
+sideeffect events --trace ./capture.trace
+```
+
+On native Windows, a validated ETW capture can also be adapted:
+
+```powershell
+sideeffect.exe events --windows-runtime .\runtime.windows.json
+```
+
+The command writes versioned JSON to stdout and never runs represented commands or modifies the input. Events keep their source-local order, timestamps, outcome/status, and evidence links. Envelope v2 adds source-local process observations and event links: Linux process-creation rows link the caller task ID to the returned child PID. Windows process identities and parent relationships come from serialized ETW lifecycle decoder fields and are labeled `decoder_metadata_unverified`. For supported classic TCP/UDP rows, the adapter re-decodes retained raw payload bytes and checks the serialized observation; a mismatch is diagnosed and only the raw payload PID can support a context-candidate link. Unsupported or malformed payloads remain raw with an unresolved link and diagnostic. Windows file/disk header PIDs remain context candidates. These links do not form a merged process graph or causal view. A partial or unknown source exits with status `2`; the envelope does not infer one global clock or process ownership.
+
+### Compare saved inventories
+
+Capture two inventories with the same platform's command, then compare the saved files:
+
+```sh
+sideeffect inventory packages --output ./before.json
+sideeffect inventory packages --output ./after.json
+sideeffect explain --inventory-diff ./before.json ./after.json
+```
+
+For Linux startup configuration, run:
+
+```sh
+sideeffect inventory startup --output ./startup-before.json
+sideeffect inventory startup --output ./startup-after.json
+sideeffect explain --inventory-diff ./startup-before.json ./startup-after.json
+```
+
+On Windows PowerShell, run:
+
+```powershell
+sideeffect.exe inventory startup --output .\startup-before.json
+sideeffect.exe inventory startup --output .\startup-after.json
+sideeffect.exe explain --inventory-diff .\startup-before.json .\startup-after.json
+```
+
+On Windows, use `sideeffect.exe inventory packages --output .\before.json` and `sideeffect.exe explain --inventory-diff .\before.json .\after.json`. The offline comparison accepts same-platform pairs of Linux package v2, Windows software-registration v1, Linux/Windows process v3, Linux/Windows selected-path permission v1, Linux startup v2, or Windows startup v4 inventories. Permission rows match only by exact selected path bytes (Linux) or UTF-16LE path bytes (Windows); paths are not normalized. It compares bounded metadata and native ACL/capability or descriptor/ACE facts, keeps evidence references, and omits raw xattr/security descriptor bytes. Duplicate identities and incomplete inputs do not produce confident unmatched presence changes. It does not calculate effective access or establish that inode/file-index values identify a persistent object. Process rows match only by PID plus observed generation (Linux proc start ticks or Windows creation FILETIME), never PID alone. Selected process facts are compared with evidence references on both sides. Unmatched process rows become additions/removals only when both snapshots and sources are complete and identity is certain. Startup rows use native source-specific identities; task action rows are compared as an ordered sequence, and duplicate task triggers or lossy XDG display paths remain ambiguous. Startup output contains only hashed identities, changed-field labels, and before/after source references; raw commands/configuration values stay in the input files. A startup comparison does not establish that a configured entry was installed, removed, effective, or executed. These bounded outputs compare two snapshots, not start/exit or execution history, exhaustive inventory, causation, or proof of absence. PIDs, generation values, paths, and source references can be sensitive. Hashed identities are not anonymization and may be guessable for common paths or names. Incomplete sources or ambiguous identities suppress uncertain presence changes and produce exit status `2`.
+
+For process snapshots, use `sideeffect inventory processes --output ./before.json` and `sideeffect inventory processes --output ./after.json` (or `sideeffect.exe` on Windows), then run the same `explain --inventory-diff` command. Process output includes local PIDs, generation values, and selected paths; review it before sharing.
 
 ## What you can do
 
@@ -141,6 +189,7 @@ SideEffect provides a native Rust CLI for Linux x86_64 and Windows x64. The Linu
 - [Product scope](docs/PRODUCT.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Delivery plan](docs/PLAN.md)
+- [Linux real-trace benchmark methodology](docs/TRACE_BENCHMARKING.md)
 - [Security policy and private vulnerability reporting](SECURITY.md)
 - [Release notes](docs/RELEASE_NOTES.md)
 

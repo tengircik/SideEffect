@@ -7,22 +7,27 @@ mod package_diff;
 mod packages;
 #[cfg(windows)]
 mod packages_windows;
+mod path_executables;
+mod permission_diff;
 #[cfg(target_os = "linux")]
 mod permissions;
 #[cfg(windows)]
 mod permissions_windows;
+mod process_diff;
 #[cfg(target_os = "linux")]
 mod processes;
 #[cfg(windows)]
 mod processes_windows;
 #[cfg(target_os = "linux")]
 mod startup;
+mod startup_diff;
 #[cfg(target_os = "linux")]
 mod startup_legacy;
 #[cfg(windows)]
 mod startup_windows;
 #[cfg(target_os = "linux")]
 mod systemd_units;
+mod windows_software_diff;
 
 pub use model::{
     INVENTORY_SCHEMA, INVENTORY_SCHEMA_VERSION, InventoryDiagnostic, InventoryDocument,
@@ -33,6 +38,28 @@ pub use package_diff::{
     PackageComparisonError, PackageComparisonStatus, PackageEvidenceReference, PackageFacts,
     PackageIdentity, PackageInventoryComparison, PackageInventoryDelta, PackageSourceComparison,
     compare_package_inventories, compare_package_inventory_json,
+};
+pub use path_executables::{PathExecutableInventory, collect_path_executables};
+pub use permission_diff::{
+    PermissionDelta, PermissionDiff, PermissionDiffCounts, PermissionDiffError,
+    PermissionDiffStatus, PermissionEvidenceRef, PermissionSide, compare_permission_inventory_json,
+    is_permission_inventory_json,
+};
+pub use process_diff::{
+    ProcessDelta, ProcessDiff, ProcessDiffCounts, ProcessDiffError, ProcessDiffStatus,
+    ProcessEvidenceRef, ProcessSide, compare_process_inventory_json, is_process_inventory_json,
+};
+pub use startup_diff::{
+    StartupDelta, StartupDiffCounts, StartupDiffError, StartupDiffStatus, StartupEvidenceSide,
+    StartupInventoryDiff, compare_startup_inventory_json, is_startup_inventory_json,
+};
+pub use windows_software_diff::{
+    WindowsSoftwareChangeKind, WindowsSoftwareComparisonCounts,
+    WindowsSoftwareComparisonDiagnostic, WindowsSoftwareComparisonError,
+    WindowsSoftwareComparisonStatus, WindowsSoftwareDelta, WindowsSoftwareEvidenceReference,
+    WindowsSoftwareFacts, WindowsSoftwareIdentity, WindowsSoftwareInventoryComparison,
+    WindowsSoftwareSourceComparison, WindowsSoftwareSourceStatus,
+    compare_windows_software_inventory_json, is_windows_software_inventory_json,
 };
 
 #[cfg(target_os = "linux")]
@@ -61,16 +88,21 @@ pub use permissions_windows::{
 };
 #[cfg(target_os = "linux")]
 pub use processes::{
-    MAX_AGGREGATE_STATUS_BYTES, MAX_PROCESS_DIRECTORIES, ProcessDiagnostic, ProcessEvidence,
-    ProcessExecutableEvidence, ProcessExecutableLink, ProcessExecutableLinkStatus,
-    ProcessInventoryDocument, ProcessInventorySource, ProcessInventoryStatus, ProcessRow,
-    collect_processes, collect_processes_from,
+    MAX_AGGREGATE_NAMESPACE_LINK_BYTES, MAX_AGGREGATE_STATUS_BYTES, MAX_NAMESPACE_LINK_BYTES,
+    MAX_PROCESS_DIRECTORIES, MAX_PROCESS_STAT_BYTES, NamespacePidEvidence, NamespacePidStatus,
+    PROCESS_NAMESPACES, ProcessDiagnostic, ProcessEvidence, ProcessExecutableEvidence,
+    ProcessExecutableLink, ProcessExecutableLinkStatus, ProcessInventoryDocument,
+    ProcessInventorySource, ProcessInventoryStatus, ProcessNamespace, ProcessNamespaceEvidence,
+    ProcessNamespaceStatus, ProcessRow, ProcessStartTime, ProcessStartTimeEvidence,
+    ProcessStartTimeStatus, collect_processes, collect_processes_from,
 };
 #[cfg(windows)]
 pub use processes_windows::{
-    WindowsProcessDiagnostic, WindowsProcessImage, WindowsProcessImageStatus,
-    WindowsProcessInventoryDocument, WindowsProcessInventoryStatus, WindowsProcessRow,
-    collect_windows_processes,
+    MAX_AGGREGATE_TOKEN_SID_UTF16_UNITS, WindowsProcessCreationTime,
+    WindowsProcessCreationTimeStatus, WindowsProcessDiagnostic, WindowsProcessImage,
+    WindowsProcessImageStatus, WindowsProcessInventoryDocument, WindowsProcessInventoryStatus,
+    WindowsProcessRow, WindowsProcessTokenContext, WindowsProcessTokenContextStatus,
+    WindowsProcessTokenField, WindowsProcessTokenFieldStatus, collect_windows_processes,
 };
 #[cfg(target_os = "linux")]
 pub use startup::{

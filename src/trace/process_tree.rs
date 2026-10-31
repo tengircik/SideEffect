@@ -121,7 +121,7 @@ pub fn derive_process_lineage(records: &[TraceRecord]) -> ProcessLineage {
         let Some(syscall) = record.syscall.as_deref() else {
             continue;
         };
-        let is_clone = syscall == "clone" || syscall.starts_with("clone");
+        let is_clone = syscall == "clone" || syscall == "clone3";
         let is_creation = is_process_creation(syscall);
         if !is_creation {
             continue;
@@ -266,7 +266,7 @@ pub fn derive_process_lineage(records: &[TraceRecord]) -> ProcessLineage {
 }
 
 fn is_process_creation(syscall: &str) -> bool {
-    syscall == "fork" || syscall == "vfork" || syscall == "clone" || syscall.starts_with("clone3")
+    syscall == "fork" || syscall == "vfork" || syscall == "clone" || syscall == "clone3"
 }
 
 fn parse_positive_pid(value: &str) -> Option<u32> {

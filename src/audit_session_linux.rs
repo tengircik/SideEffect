@@ -2,12 +2,17 @@
 
 use crate::audit_session::{
     AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, AppliedLimit, ArtifactKind,
-    AuditSessionManifest, AuditSessionSource, IntervalSemantics, MAX_SESSION_ARTIFACT_BYTES,
-    MAX_SESSION_SOURCES, MAX_SESSION_TIMESTAMP_UNIX_MS, MAX_SESSION_TOTAL_ARTIFACT_BYTES,
-    SessionArtifactRef, SessionId, SessionStatus, SourceRole, SourceStatus,
+    AuditSessionManifest, AuditSessionSource, ContextFact, ContextFactStatus, CoverageManifest,
+    HostContext, IntervalSemantics, MAX_SESSION_ARTIFACT_BYTES, MAX_SESSION_SOURCES,
+    MAX_SESSION_TIMESTAMP_UNIX_MS, MAX_SESSION_TOTAL_ARTIFACT_BYTES, PrivilegeContext,
+    RuntimeCoverageDetail, SessionArtifactRef, SessionId, SessionStatus, SourceRole, SourceStatus,
+    UnsupportedRuntimeCategoryCode,
 };
 use crate::fingerprint::sha256_hex;
-use crate::inventory::{collect_packages, collect_permissions, collect_processes, collect_startup};
+use crate::inventory::{
+    collect_packages, collect_path_executables, collect_permissions, collect_processes,
+    collect_startup,
+};
 use crate::record::{SessionOutput, record_bundle_artifacts};
 use serde::Serialize;
 use serde_json::Value;
@@ -25,6 +30,7 @@ pub struct AuditOptions {
     pub packages: bool,
     pub processes: bool,
     pub startup: bool,
+    pub path_executables: bool,
     pub permission_paths: Vec<PathBuf>,
     pub runtime_program: Option<OsString>,
     pub runtime_arguments: Vec<OsString>,
@@ -51,6 +57,7 @@ pub fn collect_and_publish(
     if !options.packages
         && !options.processes
         && !options.startup
+        && !options.path_executables
         && options.permission_paths.is_empty()
         && options.runtime_program.is_none()
     {
@@ -87,6 +94,7 @@ pub fn collect_and_publish(
         .map_err(|error| format!("could not prepare private audit session: {error}"))?;
     let mut artifacts = Vec::new();
     let mut sources = Vec::new();
+    let mut runtime_coverage_detail = None;
     let session_start = now_unix_ms()?;
 
     if options.packages {
@@ -136,6 +144,14 @@ pub fn collect_and_publish(
                     "max_aggregate_status_bytes",
                     crate::inventory::MAX_AGGREGATE_STATUS_BYTES as u64,
                 ),
+                limit(
+                    "max_namespace_link_bytes",
+                    crate::inventory::MAX_NAMESPACE_LINK_BYTES as u64,
+                ),
+                limit(
+                    "max_aggregate_namespace_link_bytes",
+                    crate::inventory::MAX_AGGREGATE_NAMESPACE_LINK_BYTES as u64,
+                ),
             ],
         )?);
         artifacts.push(artifact("processes.json", &document)?);
@@ -166,6 +182,49 @@ pub fn collect_and_publish(
             ],
         )?);
         artifacts.push(artifact("startup.json", &document)?);
+    }
+
+    if options.path_executables {
+        let started = now_unix_ms()?;
+        let document = collect_path_executables();
+        let ended = now_unix_ms()?;
+        let value = serde_json::to_value(&document).map_err(|error| {
+            format!("could not inspect PATH executable inventory metadata: {error}")
+        })?;
+        let status = match document.status {
+            "complete" => SourceStatus::Complete,
+            "partial" => SourceStatus::Partial,
+            _ => SourceStatus::Unknown,
+        };
+        let path_platform = value
+            .get("platform")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "PATH executable artifact has no platform field".to_owned())?;
+        let path_source = AuditSessionSource {
+            role: SourceRole::PathExecutables,
+            collector: Some(crate::audit_session::collector_identity(path_platform, SourceRole::PathExecutables)),
+            platform: path_platform.to_owned(),
+            scope: "one-level metadata snapshot of the current process PATH; candidate heuristics only, no execution or shell resolution".to_owned(),
+            started_at_unix_ms: started,
+            ended_at_unix_ms: ended,
+            status,
+            applied_limits: vec![
+                limit("max_components", document.limits.max_components as u64),
+                limit("max_component_path_bytes_or_units", document.limits.max_component_path_bytes_or_units as u64),
+                limit("max_entries", document.limits.max_entries as u64),
+                limit("max_aggregate_path_and_name_bytes_or_units", document.limits.max_aggregate_path_and_name_bytes_or_units as u64),
+                limit("max_pathext_utf16_units", document.limits.max_pathext_utf16_units as u64),
+                limit("max_pathext_extensions", document.limits.max_pathext_extensions as u64),
+                limit("deadline_seconds", document.limits.deadline_seconds),
+            ],
+            requested_settings: Vec::new(),
+            effective_settings: Vec::new(),
+            loss: None,
+            diagnostic_codes: collect_codes(&value),
+            artifacts: Vec::new(),
+        };
+        sources.push(path_source);
+        artifacts.push(artifact("path-executables.json", &document)?);
     }
 
     if !options.permission_paths.is_empty() {
@@ -207,12 +266,14 @@ pub fn collect_and_publish(
         let ended = now_unix_ms()?;
         match runtime_result {
             Ok(bundle) => {
+                runtime_coverage_detail = runtime_coverage_detail_from_trace(&bundle.trace_bytes);
                 let mut diagnostic_codes = vec!["runtime_capture_completeness_unknown".to_owned()];
                 if bundle.time_limit_reached {
                     diagnostic_codes.push("runtime_time_limit_reached".to_owned());
                 }
                 sources.push(AuditSessionSource {
                     role: SourceRole::Runtime,
+                    collector: Some(crate::audit_session::collector_identity("linux", SourceRole::Runtime)),
                     platform: "linux".to_owned(),
                     scope: "selected command and traced descendants; command arguments are not copied into the session manifest".to_owned(),
                     started_at_unix_ms: started,
@@ -220,8 +281,13 @@ pub fn collect_and_publish(
                     status: SourceStatus::Partial,
                     applied_limits: vec![
                         limit("max_trace_bytes", crate::limits::MAX_TRACE_BYTES as u64),
-                        limit("runtime_duration_seconds", duration.as_secs()),
                     ],
+                    requested_settings: vec![crate::audit_session::Setting {
+                        code: "runtime_duration_seconds".to_owned(),
+                        value: duration.as_secs(),
+                    }],
+                    effective_settings: Vec::new(),
+                    loss: Some(crate::audit_session::LossMetadata::unknown()),
                     diagnostic_codes,
                     artifacts: Vec::new(),
                 });
@@ -238,6 +304,7 @@ pub fn collect_and_publish(
                 let target_may_have_run = error.target_may_have_run();
                 sources.push(AuditSessionSource {
                     role: SourceRole::Runtime,
+                    collector: Some(crate::audit_session::collector_identity("linux", SourceRole::Runtime)),
                     platform: "linux".to_owned(),
                     scope: "selected command and traced descendants; command arguments are not copied into the session manifest".to_owned(),
                     started_at_unix_ms: started,
@@ -249,8 +316,13 @@ pub fn collect_and_publish(
                     },
                     applied_limits: vec![
                         limit("max_trace_bytes", crate::limits::MAX_TRACE_BYTES as u64),
-                        limit("runtime_duration_seconds", duration.as_secs()),
                     ],
+                    requested_settings: vec![crate::audit_session::Setting {
+                        code: "runtime_duration_seconds".to_owned(),
+                        value: duration.as_secs(),
+                    }],
+                    effective_settings: Vec::new(),
+                    loss: Some(crate::audit_session::LossMetadata::unknown()),
                     diagnostic_codes: if target_may_have_run {
                         vec![
                             "runtime_capture_failed".to_owned(),
@@ -265,6 +337,7 @@ pub fn collect_and_publish(
         }
     }
 
+    let host_context = host_context();
     let session_end = now_unix_ms()?;
     if sources.is_empty() || sources.len() > MAX_SESSION_SOURCES {
         return Err("selected audit sources exceed the session source limit".to_owned());
@@ -289,6 +362,7 @@ pub fn collect_and_publish(
             ArtifactKind::Processes => SourceRole::Processes,
             ArtifactKind::Permissions => SourceRole::Permissions,
             ArtifactKind::Startup => SourceRole::Startup,
+            ArtifactKind::PathExecutables => SourceRole::PathExecutables,
             ArtifactKind::WindowsSoftware
             | ArtifactKind::WindowsProcesses
             | ArtifactKind::WindowsPermissions
@@ -314,12 +388,17 @@ pub fn collect_and_publish(
         });
     }
 
+    let coverage_manifest = Some(CoverageManifest::from_sources_with_runtime_detail(
+        &sources,
+        runtime_coverage_detail,
+    ));
     let manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
         schema_version: AUDIT_SESSION_SCHEMA_VERSION,
         session_id,
         platform: "linux".to_owned(),
         architecture: std::env::consts::ARCH.to_owned(),
+        host_context: Some(host_context),
         started_at_unix_ms: session_start,
         ended_at_unix_ms: session_end,
         interval_semantics: IntervalSemantics::BestEffortNonAtomic,
@@ -329,6 +408,7 @@ pub fn collect_and_publish(
             SessionStatus::Partial
         },
         sources,
+        coverage_manifest,
     };
     manifest
         .validate()
@@ -354,6 +434,54 @@ pub fn collect_and_publish(
     })
 }
 
+fn host_context() -> HostContext {
+    let mut uts = std::mem::MaybeUninit::<libc::utsname>::uninit();
+    let (os_name, os_version) = if unsafe { libc::uname(uts.as_mut_ptr()) } == 0 {
+        let uts = unsafe { uts.assume_init() };
+        let bounded = |field: &[libc::c_char]| {
+            let bytes: Vec<u8> = field
+                .iter()
+                .take_while(|byte| **byte != 0)
+                .map(|byte| *byte as u8)
+                .take(128)
+                .collect();
+            let decoded = String::from_utf8_lossy(&bytes);
+            let mut end = decoded.len().min(128);
+            while !decoded.is_char_boundary(end) {
+                end -= 1;
+            }
+            decoded[..end].to_owned()
+        };
+        (bounded(&uts.sysname), bounded(&uts.release))
+    } else {
+        (String::new(), String::new())
+    };
+    let fact = |value: String| {
+        if value.is_empty() {
+            ContextFact {
+                status: ContextFactStatus::Unknown,
+                value: None,
+            }
+        } else {
+            ContextFact {
+                status: ContextFactStatus::Observed,
+                value: Some(value),
+            }
+        }
+    };
+    HostContext {
+        os_name: fact(os_name),
+        os_version: fact(os_version),
+        // This reports the process effective-UID context; it is not a broad
+        // statement about capabilities or access to every system resource.
+        privilege: if unsafe { libc::geteuid() } == 0 {
+            PrivilegeContext::Elevated
+        } else {
+            PrivilegeContext::NotElevated
+        },
+    }
+}
+
 fn build_source(
     role: SourceRole,
     document: &Value,
@@ -377,15 +505,53 @@ fn build_source(
     let diagnostic_codes = collect_codes(document);
     Ok(AuditSessionSource {
         role,
+        collector: Some(crate::audit_session::collector_identity("linux", role)),
         platform: platform.to_owned(),
         scope: scope.to_owned(),
         started_at_unix_ms,
         ended_at_unix_ms,
         status,
         applied_limits,
+        requested_settings: Vec::new(),
+        effective_settings: Vec::new(),
+        loss: None,
         diagnostic_codes,
         artifacts: Vec::new(),
     })
+}
+
+fn runtime_coverage_detail_from_trace(bytes: &[u8]) -> Option<RuntimeCoverageDetail> {
+    let trace =
+        crate::trace::strace::parse_trace_bytes(bytes, crate::limits::ParseLimits::default())
+            .ok()?;
+    let mut malformed = 0_u64;
+    let mut unsupported = 0_u64;
+    let mut ambiguous_continuations = 0_u64;
+    for diagnostic in trace.diagnostics {
+        match diagnostic.code.as_str() {
+            "malformed_record" => malformed += 1,
+            "unsupported_record" => unsupported += 1,
+            "ambiguous_unfinished_syscall"
+            | "ambiguous_resumed_syscall"
+            | "orphan_resumed_syscall"
+            | "unfinished_syscall_at_eof" => ambiguous_continuations += 1,
+            _ => return None,
+        }
+    }
+    Some(RuntimeCoverageDetail::from_counts([
+        (
+            UnsupportedRuntimeCategoryCode::LinuxMalformedTraceRecords,
+            malformed,
+        ),
+        (
+            UnsupportedRuntimeCategoryCode::LinuxUnsupportedTraceRecords,
+            unsupported,
+        ),
+        (
+            UnsupportedRuntimeCategoryCode::LinuxAmbiguousTraceContinuations,
+            ambiguous_continuations,
+        ),
+    ]))
 }
 
 fn collect_codes(value: &Value) -> Vec<String> {
@@ -458,6 +624,7 @@ fn artifact_kind(file_name: &str) -> Result<ArtifactKind, String> {
         "processes.json" => Ok(ArtifactKind::Processes),
         "startup.json" => Ok(ArtifactKind::Startup),
         "permissions.json" => Ok(ArtifactKind::Permissions),
+        "path-executables.json" => Ok(ArtifactKind::PathExecutables),
         "run.json" => Ok(ArtifactKind::RuntimeManifest),
         "trace.strace" => Ok(ArtifactKind::RuntimeTrace),
         "software.windows.json" => Ok(ArtifactKind::WindowsSoftware),
@@ -527,5 +694,34 @@ impl Write for CappedWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn linux_runtime_coverage_counts_only_fixed_parser_diagnostic_categories() {
+        let detail = super::runtime_coverage_detail_from_trace(
+            b"1 execve(\nnot a syscall row\n1 clone3( <unfinished ...>\n",
+        )
+        .unwrap();
+        assert_eq!(
+            detail.unsupported_categories,
+            vec![
+                crate::audit_session::UnsupportedRuntimeCategory {
+                    code: crate::audit_session::UnsupportedRuntimeCategoryCode::LinuxMalformedTraceRecords,
+                    count: 1,
+                },
+                crate::audit_session::UnsupportedRuntimeCategory {
+                    code: crate::audit_session::UnsupportedRuntimeCategoryCode::LinuxUnsupportedTraceRecords,
+                    count: 1,
+                },
+                crate::audit_session::UnsupportedRuntimeCategory {
+                    code: crate::audit_session::UnsupportedRuntimeCategoryCode::LinuxAmbiguousTraceContinuations,
+                    count: 1,
+                },
+            ]
+        );
+        assert!(super::runtime_coverage_detail_from_trace(&[0xff]).is_none());
     }
 }

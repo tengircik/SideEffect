@@ -85,6 +85,23 @@ fn discovers_injected_xdg_roots_and_publishes_private_no_clobber_json() {
             .any(|k| k["key"] == "Exec" && k["value"] == "literal %F")
     );
     assert_eq!(run().status.code(), Some(1));
+
+    let compared = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["explain", "--inventory-diff"])
+        .arg(&output)
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_eq!(
+        compared.status.code(),
+        Some(if value["status"] == "complete" { 0 } else { 2 }),
+        "{}",
+        String::from_utf8_lossy(&compared.stderr)
+    );
+    let comparison: serde_json::Value = serde_json::from_slice(&compared.stdout).unwrap();
+    assert_eq!(comparison["schema"], "sideeffect.startup_inventory_diff");
+    assert_eq!(comparison["platform"], "linux");
+    assert_eq!(comparison["counts"]["changed"], 0);
 }
 
 #[test]
