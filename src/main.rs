@@ -248,6 +248,16 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         {
             timeline_trace(path, Some(kind))
         }
+        [command, flag, path] if command == "timeline" && flag == "--windows-runtime" => {
+            timeline_windows_runtime(path, None)
+        }
+        [command, flag, path, kind_flag, kind]
+            if command == "timeline"
+                && flag == "--windows-runtime"
+                && kind_flag == "--event-kind" =>
+        {
+            timeline_windows_runtime(path, Some(kind))
+        }
         #[cfg(windows)]
         [command, flag, path] if command == "events" && flag == "--windows-runtime" => {
             events_windows_runtime(path)
@@ -1417,7 +1427,7 @@ fn print_version() {
 
 fn print_usage() {
     println!(
-        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)\n       sideeffect timeline --trace <strace-trace-file> [--event-kind <kind>]\n\nProvenance:\n       sideeffect provenance keygen <private-key.pk8> <public-key.hex>\n       sideeffect provenance sign-session <session-dir> --private-key <private-key.pk8> --output <signature.json>\n       sideeffect provenance verify-session <session-dir> --signature <signature.json> --public-key <public-key.hex>"
+        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)\n       sideeffect timeline --trace <strace-trace-file> [--event-kind <kind>]\n       sideeffect timeline --windows-runtime <capture.json> [--event-kind <kind>] (native Windows)\n\nProvenance:\n       sideeffect provenance keygen <private-key.pk8> <public-key.hex>\n       sideeffect provenance sign-session <session-dir> --private-key <private-key.pk8> --output <signature.json>\n       sideeffect provenance verify-session <session-dir> --signature <signature.json> --public-key <public-key.hex>"
     );
 }
 
@@ -1457,7 +1467,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect events --trace TRACE\n       sideeffect events --windows-runtime CAPTURE.json (native Windows)\nAdapts one local runtime source into a versioned common event envelope and writes JSON only. Source-local order and timestamps are preserved; no cross-platform ordering, parentage, ownership, or causation is inferred. Partial or unknown source status exits with status 2. Windows runtime input is strictly bounded and schema-validated before adaptation."
         }
         "timeline" => {
-            "Usage: sideeffect timeline --trace TRACE [--event-kind KIND]\nBuilds a source-local timeline from bounded strace evidence. Items keep their source ordinal, original timestamp text, and exact raw-record evidence reference; timestamps do not establish causal order. --event-kind matches an exact event kind. Unsupported rows remain in diagnostics. Partial or unknown source status exits with status 2."
+            "Usage: sideeffect timeline --trace TRACE [--event-kind KIND]\n       sideeffect timeline --windows-runtime CAPTURE.json [--event-kind KIND] (native Windows)\nBuilds a source-local timeline from bounded Linux strace or strictly validated Windows ETW v3 evidence. Items keep their source ordinal, original timestamp representation, and exact raw-record evidence reference; timestamps do not establish causal order. --event-kind matches an exact event kind. Unsupported rows remain in diagnostics. Partial or unknown source status exits with status 2."
         }
         "provenance" => {
             "Usage: sideeffect provenance keygen PRIVATE_KEY.pk8 PUBLIC_KEY.hex\n       sideeffect provenance sign-session SESSION_DIR --private-key PRIVATE_KEY.pk8 --output SIGNATURE.json\n       sideeffect provenance verify-session SESSION_DIR --signature SIGNATURE.json --public-key PUBLIC_KEY.hex\nCreates Ed25519 keys explicitly, signs the exact validated session.json bytes into a detached envelope, or verifies cryptographic validity offline. Key files and signature output are private, no-clobber files. Verification does not evaluate key trust, signer identity, collector honesty, or capture completeness."
@@ -1811,17 +1821,7 @@ fn events_trace(path: &OsString) -> Result<ExitCode, String> {
 }
 
 fn timeline_trace(path: &OsString, event_kind: Option<&OsString>) -> Result<ExitCode, String> {
-    let kind = event_kind
-        .map(|value| {
-            let kind = value
-                .to_str()
-                .ok_or_else(|| "timeline event kind must be valid UTF-8".to_owned())?;
-            if kind.is_empty() || kind.len() > 128 || kind.chars().any(char::is_control) {
-                return Err("timeline event kind must be 1..128 printable UTF-8 bytes".to_owned());
-            }
-            Ok(kind)
-        })
-        .transpose()?;
+    let kind = parse_timeline_event_kind(event_kind)?;
     let bytes = read_bounded(path)?;
     let trace = parse_trace_bytes(&bytes, ParseLimits::default())
         .map_err(|error| format!("trace timeline adaptation failed: {error}"))?;
@@ -1835,6 +1835,53 @@ fn timeline_trace(path: &OsString, event_kind: Option<&OsString>) -> Result<Exit
     } else {
         ExitCode::from(2)
     })
+}
+
+#[cfg(windows)]
+fn timeline_windows_runtime(
+    path: &OsString,
+    event_kind: Option<&OsString>,
+) -> Result<ExitCode, String> {
+    let kind = parse_timeline_event_kind(event_kind)?;
+    let bytes = read_input_file(
+        Path::new(path),
+        sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
+        "Windows runtime capture",
+    )?;
+    let capture = sideeffect::windows_runtime::inspect_windows_runtime_bytes(&bytes)
+        .map_err(|error| format!("Windows runtime timeline adaptation failed: {error}"))?;
+    let envelope = sideeffect::event::from_windows_runtime_capture(&capture);
+    let complete =
+        envelope.source_state.completeness == sideeffect::event::SourceCompleteness::Complete;
+    let timeline = sideeffect::event::timeline(&envelope, kind);
+    write_json(&timeline, "event timeline")?;
+    Ok(if complete {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
+#[cfg(not(windows))]
+fn timeline_windows_runtime(
+    _path: &OsString,
+    _event_kind: Option<&OsString>,
+) -> Result<ExitCode, String> {
+    Err("timeline --windows-runtime is supported only in native Windows builds".to_owned())
+}
+
+fn parse_timeline_event_kind(event_kind: Option<&OsString>) -> Result<Option<&str>, String> {
+    event_kind
+        .map(|value| {
+            let kind = value
+                .to_str()
+                .ok_or_else(|| "timeline event kind must be valid UTF-8".to_owned())?;
+            if kind.is_empty() || kind.len() > 128 || kind.chars().any(char::is_control) {
+                return Err("timeline event kind must be 1..128 printable UTF-8 bytes".to_owned());
+            }
+            Ok(kind)
+        })
+        .transpose()
 }
 
 #[cfg(windows)]

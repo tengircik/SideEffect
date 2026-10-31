@@ -412,7 +412,15 @@ For a source-local timeline over Linux strace evidence, with an optional exact e
 ./target/release/sideeffect timeline --trace ./run.trace --event-kind openat
 ```
 
-Each item retains its source ordinal, original timestamp text, and raw trace line/byte reference for drilldown against the supplied trace. Parser diagnostics remain present after filtering. The command does not merge sources or infer causal order, and currently accepts Linux strace input only.
+Each item retains its source ordinal, original timestamp text, and raw trace line/byte reference for drilldown against the supplied trace. Parser diagnostics remain present after filtering. The command does not merge sources or infer causal order.
+
+On native Windows, the same timeline view can be built from a strictly validated ETW v3 capture:
+
+```powershell
+sideeffect.exe timeline --windows-runtime .\runtime.windows.json --event-kind file_io_observation
+```
+
+ETW items retain capture-local ordinal, QPC timestamp text, payload digest, and JSON pointer back to the source event. Capture partial or unknown status remains visible and exits with status `2`. This is a source-local timeline, not a merged graph or causal sequence.
 
 ## Use an existing WSL2 installation
 

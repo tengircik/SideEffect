@@ -148,3 +148,16 @@ fn windows_runtime_events_are_native_windows_only() {
         String::from_utf8_lossy(&output.stderr).contains("supported only in native Windows builds")
     );
 }
+
+#[cfg(not(windows))]
+#[test]
+fn windows_runtime_timeline_is_native_windows_only() {
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--windows-runtime", "capture.json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("supported only in native Windows builds")
+    );
+}

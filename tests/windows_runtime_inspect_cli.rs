@@ -323,6 +323,101 @@ fn events_windows_runtime_validates_capture_and_preserves_source_context() {
 
 #[cfg(windows)]
 #[test]
+fn timeline_windows_runtime_filters_kind_and_preserves_source_evidence_and_diagnostics() {
+    let input = fixture(CollectionStatus::Partial);
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-timeline-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, &input).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--windows-runtime"])
+        .arg(&path)
+        .args(["--event-kind", "process_start"])
+        .output()
+        .unwrap();
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let timeline: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(timeline["schema"], "sideeffect.event_timeline");
+    assert_eq!(timeline["schema_version"], 1);
+    assert_eq!(timeline["source"]["platform"], "windows");
+    assert_eq!(timeline["source"]["schema"], WINDOWS_RUNTIME_CAPTURE_SCHEMA);
+    assert_eq!(timeline["source_state"]["completeness"], "partial");
+    assert!(
+        timeline["source_state"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic == "synthetic_fixture_partial_source")
+    );
+    assert_eq!(timeline["filter"]["event_kind"], "process_start");
+    assert!(
+        timeline["ordering"]
+            .as_str()
+            .unwrap()
+            .contains("do not establish causal order")
+    );
+    assert_eq!(timeline["items"].as_array().unwrap().len(), 1);
+    assert_eq!(timeline["items"][0]["source_local_ordinal"], 1);
+    assert_eq!(timeline["items"][0]["source_timestamp"]["value"], "10");
+    assert_eq!(
+        timeline["items"][0]["source_timestamp"]["clock_unit"],
+        "ETW_QPC_ticks"
+    );
+    assert_eq!(
+        timeline["items"][0]["evidence"]["kind"],
+        "windows_etw_record"
+    );
+    assert_eq!(timeline["items"][0]["evidence"]["record_ordinal"], 1);
+    assert_eq!(
+        timeline["items"][0]["evidence"]["json_pointer"],
+        "/events/0"
+    );
+    assert_eq!(
+        timeline["items"][0]["evidence"]["raw_payload_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn timeline_windows_runtime_keeps_unknown_completeness_and_exit_two() {
+    let input = fixture(CollectionStatus::Complete);
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-timeline-unknown-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, &input).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--windows-runtime"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let timeline: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(timeline["source_state"]["completeness"], "unknown");
+    assert_eq!(
+        timeline["items"][0]["evidence"]["json_pointer"],
+        "/events/0"
+    );
+}
+
+#[cfg(windows)]
+#[test]
 fn events_windows_runtime_marks_reused_process_ids_ambiguous() {
     let mut value: Value = serde_json::from_slice(&fixture(CollectionStatus::Complete)).unwrap();
     let mut duplicate = value["events"][0].clone();
