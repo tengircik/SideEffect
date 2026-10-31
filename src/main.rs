@@ -32,10 +32,11 @@ use sideeffect::format::{
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{InventoryStatus, collect_packages};
 use sideeffect::inventory::{
-    PackageComparisonStatus, ProcessDiffStatus, WindowsSoftwareComparisonStatus,
-    compare_package_inventory_json, compare_process_inventory_json,
-    compare_windows_software_inventory_json, is_process_inventory_json,
-    is_windows_software_inventory_json,
+    PackageComparisonStatus, PermissionDiffStatus, ProcessDiffStatus,
+    WindowsSoftwareComparisonStatus, compare_package_inventory_json,
+    compare_permission_inventory_json, compare_process_inventory_json,
+    compare_windows_software_inventory_json, is_permission_inventory_json,
+    is_process_inventory_json, is_windows_software_inventory_json,
 };
 use sideeffect::inventory::{PathExecutableInventory, collect_path_executables};
 #[cfg(target_os = "linux")]
@@ -2008,6 +2009,17 @@ fn explain_inventory_diff_files(
         MAX_REPORT_BYTES.saturating_sub(before.len()),
         "inventory comparison input",
     )?;
+    if is_permission_inventory_json(&before) || is_permission_inventory_json(&after) {
+        let comparison = compare_permission_inventory_json(&before, &after)
+            .map_err(|error| format!("permission inventory comparison failed: {error:?}"))?;
+        let partial = comparison.status == PermissionDiffStatus::Partial;
+        write_json(&comparison, "JSON permission inventory comparison")?;
+        return Ok(if partial {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
     if is_process_inventory_json(&before) || is_process_inventory_json(&after) {
         let comparison = compare_process_inventory_json(&before, &after)
             .map_err(|error| format!("process inventory comparison failed: {error:?}"))?;
