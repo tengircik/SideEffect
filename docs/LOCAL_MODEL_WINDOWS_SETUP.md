@@ -29,7 +29,7 @@ The source revision and local hash help identify the source checkout and binary 
 
 ## NVIDIA and Windows runtime behavior
 
-The CUDA build requires a supported NVIDIA GPU, a compatible installed driver, and the CUDA build dependencies used when compiling llama.cpp. The repository does not prescribe exact driver or Toolkit versions. A successful build alone does not show that the runtime can initialize CUDA on this computer.
+Building the CUDA-enabled runtime requires the CUDA Toolkit and compatible compiler/build dependencies used by the pinned llama.cpp revision. A supported NVIDIA GPU and compatible installed driver are needed to initialize and run CUDA inference; they are not prerequisites for compiling the CUDA-enabled executable. The repository does not prescribe exact driver or Toolkit versions. A successful build alone does not show that the runtime can initialize CUDA on this computer.
 
 For inference, SideEffect clears the inherited environment and supplies a bounded DLL search path. It includes the selected runtime directory, Windows system directories, and versioned CUDA Toolkit directories discovered under the standard `%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA` location (including `bin` and `bin\x64` layouts). A Toolkit installed in a custom location may not be discovered. Required CUDA DLLs colocated with the runtime can also be found. SideEffect does not search an arbitrary user `PATH`; missing or incompatible DLLs can prevent startup. Do not copy DLLs from unrelated installations to work around a loader error. Check the selected runtime, build configuration, installed driver/Toolkit, and required libraries together.
 
@@ -86,6 +86,6 @@ sideeffect.exe model-explain `
   .\capture.strace
 ```
 
-The inference command executes the selected runtime after checking its reported revision and backend availability. A model output is an unverified aid, not a finding; citation validation confirms only that the cited evidence was in the preview. The runtime and loaded libraries are not sandboxed from the user's account. Do not use generated statements for safety, security, permission, or operational decisions. See the [explanation evaluation and quality results](LOCAL_MODEL_EXPLANATION_EVALUATION.md) for the current limitations and release gate.
+When the preview has no deterministic scope-abstention reason, an inference run executes the selected runtime after checking its reported revision and backend availability. A deterministic abstention returns without starting the runtime. A model output is an unverified aid, not a finding; citation validation confirms only that the cited evidence was in the preview. The runtime and loaded libraries are not sandboxed from the user's account. Do not use generated statements for safety, security, permission, or operational decisions. See the [explanation evaluation and quality results](LOCAL_MODEL_EXPLANATION_EVALUATION.md) for the current limitations and release gate.
 
 If CUDA setup fails, try `--backend cpu` only if you choose to run on CPU; `auto` does not fall back after detecting a CUDA device and then encountering an error. A CPU attempt still executes the selected runtime. Keep deterministic CLI workflows available independently of all local-model setup.
