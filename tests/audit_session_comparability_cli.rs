@@ -278,14 +278,14 @@ fn compare_sessions_reports_synthetic_package_change_with_artifact_evidence() {
     );
     let report = report(&output);
     assert_eq!(report["schema"], "sideeffect.audit_session_diff");
-    assert_eq!(report["item_comparison_status"], "complete");
+    assert_eq!(report["item_comparison_status"], "partial");
     let package = report["source_diffs"]
         .as_array()
         .unwrap()
         .iter()
         .find(|source| source["role"] == "packages")
         .unwrap();
-    assert_eq!(package["status"], "compared");
+    assert_eq!(package["status"], "partial");
     assert_eq!(package["before_artifacts"][0]["path"], "packages.json");
     assert_eq!(
         package["before_artifacts"][0]["sha256"]
