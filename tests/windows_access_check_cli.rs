@@ -10,18 +10,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
 };
+use windows_sys::Win32::Security::ACL;
+use windows_sys::Win32::Security::ACL_REVISION;
+use windows_sys::Win32::Security::Authorization::SetSecurityInfo;
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
 use windows_sys::Win32::Security::{
-    AccessCheck, DACL_SECURITY_INFORMATION, DuplicateTokenEx, GENERIC_MAPPING,
-    GROUP_SECURITY_INFORMATION, GetSecurityDescriptorLength, IsValidSecurityDescriptor,
-    OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, SecurityImpersonation, TOKEN_DUPLICATE, TOKEN_QUERY,
-    TokenImpersonation,
+    AccessCheck, AddAccessAllowedAceEx, AddAccessDeniedAceEx, DACL_SECURITY_INFORMATION,
+    DuplicateTokenEx, GENERIC_MAPPING, GROUP_SECURITY_INFORMATION, GetSecurityDescriptorLength,
+    GetTokenInformation, InitializeAcl, IsValidSecurityDescriptor, IsValidSid,
+    OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PROTECTED_DACL_SECURITY_INFORMATION,
+    SecurityImpersonation, TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER, TokenImpersonation, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ALL_ACCESS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_DATA, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING, READ_CONTROL,
 };
+use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, SYNCHRONIZE, WRITE_DAC};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 const MAX_ORACLE_DESCRIPTOR_BYTES: usize = 64 * 1024;
@@ -230,6 +235,41 @@ fn access_check_uses_process_snapshot_identity_and_reports_conditional_dacl_resu
         },
         "Authz and independent AccessCheck results differ: {document:#}"
     );
+
+    let allow_fixture = directory.0.join("explicit-allow.txt");
+    let deny_fixture = directory.0.join("explicit-deny.txt");
+    fs::write(&allow_fixture, b"synthetic explicit-allow fixture")
+        .expect("create explicit-allow fixture");
+    fs::write(&deny_fixture, b"synthetic explicit-deny fixture")
+        .expect("create explicit-deny fixture");
+    for (fixture, deny_read_data) in [(&allow_fixture, false), (&deny_fixture, true)] {
+        match set_current_user_fixture_dacl(fixture, deny_read_data) {
+            Ok(()) => {}
+            Err(FixtureDaclError::Unsupported(reason)) => {
+                eprintln!(
+                    "SKIP: cannot construct a private synthetic DACL oracle fixture: {reason}"
+                );
+                return;
+            }
+            Err(FixtureDaclError::Failure(reason)) => {
+                panic!("failed to construct a private synthetic DACL oracle fixture: {reason}");
+            }
+        }
+    }
+    for (fixture, output_name, expected) in [
+        (&allow_fixture, "explicit-allow.json", "granted_by_dacl"),
+        (&deny_fixture, "explicit-deny.json", "denied_by_dacl"),
+    ] {
+        if !assert_cli_matches_access_check_oracle(
+            fixture,
+            &directory.0.join(output_name),
+            current_pid,
+            creation_time,
+            expected,
+        ) {
+            return;
+        }
+    }
 
     let after_metadata = fs::metadata(&selected).expect("read fixture metadata after check");
     assert_eq!(
@@ -488,4 +528,269 @@ fn access_check_with_bounded_privilege_buffer(
 fn privilege_buffer(minimum_bytes: usize) -> Vec<usize> {
     let word_bytes = std::mem::size_of::<usize>();
     vec![0; minimum_bytes.div_ceil(word_bytes)]
+}
+
+enum FixtureDaclError {
+    Unsupported(String),
+    Failure(String),
+}
+
+fn set_current_user_fixture_dacl(
+    path: &std::path::Path,
+    deny_read_data: bool,
+) -> Result<(), FixtureDaclError> {
+    let mut wide_path: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide_path.contains(&0) {
+        return Err(FixtureDaclError::Failure(
+            "synthetic fixture path unexpectedly contains a NUL".to_owned(),
+        ));
+    }
+    wide_path.push(0);
+    let file = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            READ_CONTROL | WRITE_DAC,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if file == INVALID_HANDLE_VALUE {
+        let error = unsafe { GetLastError() };
+        if error == 5 || error == 50 {
+            return Err(FixtureDaclError::Unsupported(format!(
+                "fixture cannot be opened with WRITE_DAC (Win32 {error})"
+            )));
+        }
+        return Err(FixtureDaclError::Failure(format!(
+            "could not open fixture with WRITE_DAC (Win32 {error})"
+        )));
+    }
+    let file = OwnedHandle(file);
+
+    let mut token = null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        let error = unsafe { GetLastError() };
+        if error == 5 || error == 50 {
+            return Err(FixtureDaclError::Unsupported(format!(
+                "test process token cannot be queried (Win32 {error})"
+            )));
+        }
+        return Err(FixtureDaclError::Failure(format!(
+            "could not query test process token (Win32 {error})"
+        )));
+    }
+    if token.is_null() {
+        return Err(FixtureDaclError::Failure(
+            "OpenProcessToken returned a null token handle".to_owned(),
+        ));
+    }
+    let token = OwnedHandle(token);
+    let mut required = 0u32;
+    let sized = unsafe { GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut required) };
+    if sized != 0 || unsafe { GetLastError() } != 122 {
+        let error = unsafe { GetLastError() };
+        return Err(FixtureDaclError::Failure(format!(
+            "could not size TokenUser information (Win32 {error})"
+        )));
+    }
+    let required = required as usize;
+    if required < std::mem::size_of::<TOKEN_USER>() || required > 4096 {
+        return Err(FixtureDaclError::Unsupported(format!(
+            "TokenUser size {required} is outside the bounded fixture limit"
+        )));
+    }
+    let word_bytes = std::mem::size_of::<usize>();
+    let mut token_user_buffer = vec![0usize; required.div_ceil(word_bytes)];
+    let buffer_bytes = token_user_buffer.len() * word_bytes;
+    let mut returned = 0u32;
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            token_user_buffer.as_mut_ptr().cast(),
+            u32::try_from(buffer_bytes).map_err(|_| {
+                FixtureDaclError::Failure("TokenUser buffer length overflowed u32".to_owned())
+            })?,
+            &mut returned,
+        )
+    } == 0
+    {
+        let error = unsafe { GetLastError() };
+        if error == 5 || error == 50 {
+            return Err(FixtureDaclError::Unsupported(format!(
+                "TokenUser information is unavailable (Win32 {error})"
+            )));
+        }
+        return Err(FixtureDaclError::Failure(format!(
+            "could not read TokenUser information (Win32 {error})"
+        )));
+    }
+    let returned = returned as usize;
+    if returned < std::mem::size_of::<TOKEN_USER>() || returned > buffer_bytes {
+        return Err(FixtureDaclError::Failure(
+            "TokenUser returned a length outside its allocated buffer".to_owned(),
+        ));
+    }
+    let token_user = unsafe { &*token_user_buffer.as_ptr().cast::<TOKEN_USER>() };
+    let sid = token_user.User.Sid;
+    if sid.is_null() {
+        return Err(FixtureDaclError::Failure(
+            "TokenUser returned a null SID".to_owned(),
+        ));
+    }
+    let buffer_start = token_user_buffer.as_ptr() as usize;
+    let buffer_end = buffer_start
+        .checked_add(returned)
+        .ok_or_else(|| FixtureDaclError::Failure("TokenUser address overflow".to_owned()))?;
+    let sid_start = sid as usize;
+    let sid_header_end = sid_start
+        .checked_add(8)
+        .ok_or_else(|| FixtureDaclError::Failure("SID address overflow".to_owned()))?;
+    if sid_start < buffer_start || sid_header_end > buffer_end {
+        return Err(FixtureDaclError::Failure(
+            "TokenUser SID header lies outside its returned buffer".to_owned(),
+        ));
+    }
+    let sid_bytes = unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), 8) };
+    let subauthority_count = usize::from(sid_bytes[1]);
+    if subauthority_count > 15 {
+        return Err(FixtureDaclError::Failure(
+            "TokenUser SID has an invalid subauthority count".to_owned(),
+        ));
+    }
+    let sid_length = 8 + subauthority_count * 4;
+    let sid_end = sid_start
+        .checked_add(sid_length)
+        .ok_or_else(|| FixtureDaclError::Failure("SID address overflow".to_owned()))?;
+    if sid_end > buffer_end || unsafe { IsValidSid(sid) } == 0 {
+        return Err(FixtureDaclError::Failure(
+            "TokenUser SID is invalid or exceeds its returned buffer".to_owned(),
+        ));
+    }
+
+    const ACL_BUFFER_BYTES: usize = 1024;
+    let mut acl_buffer = vec![0usize; ACL_BUFFER_BYTES.div_ceil(word_bytes)];
+    let acl_length = u32::try_from(acl_buffer.len() * word_bytes)
+        .map_err(|_| FixtureDaclError::Failure("ACL buffer length overflow".to_owned()))?;
+    let acl = acl_buffer.as_mut_ptr().cast::<ACL>();
+    if unsafe { InitializeAcl(acl, acl_length, ACL_REVISION) } == 0 {
+        return Err(FixtureDaclError::Failure(format!(
+            "InitializeAcl failed (Win32 {})",
+            unsafe { GetLastError() }
+        )));
+    }
+    if deny_read_data
+        && unsafe { AddAccessDeniedAceEx(acl, ACL_REVISION, 0, FILE_READ_DATA, sid) } == 0
+    {
+        return Err(FixtureDaclError::Failure(format!(
+            "AddAccessDeniedAceEx failed (Win32 {})",
+            unsafe { GetLastError() }
+        )));
+    }
+    let allow_mask = FILE_READ_ATTRIBUTES
+        | READ_CONTROL
+        | SYNCHRONIZE
+        | if deny_read_data { 0 } else { FILE_READ_DATA };
+    if unsafe { AddAccessAllowedAceEx(acl, ACL_REVISION, 0, allow_mask, sid) } == 0 {
+        return Err(FixtureDaclError::Failure(format!(
+            "AddAccessAllowedAceEx failed (Win32 {})",
+            unsafe { GetLastError() }
+        )));
+    }
+    let status = unsafe {
+        SetSecurityInfo(
+            file.0,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            acl,
+            null_mut(),
+        )
+    };
+    if status != 0 {
+        if status == 5 || status == 50 {
+            return Err(FixtureDaclError::Unsupported(format!(
+                "DACL cannot be set on the private fixture (Win32 {status})"
+            )));
+        }
+        return Err(FixtureDaclError::Failure(format!(
+            "SetSecurityInfo failed (Win32 {status})"
+        )));
+    }
+    Ok(())
+}
+
+fn assert_cli_matches_access_check_oracle(
+    path: &std::path::Path,
+    output: &std::path::Path,
+    process_id: u32,
+    creation_time: u64,
+    expected_decision: &str,
+) -> bool {
+    let result = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["inventory", "access-check", "--pid"])
+        .arg(process_id.to_string())
+        .args(["--creation-time-filetime"])
+        .arg(creation_time.to_string())
+        .args(["--operation", "read", "--output"])
+        .arg(output)
+        .arg(path)
+        .output()
+        .expect("start Windows access-check CLI for explicit DACL fixture");
+    assert_eq!(
+        result.status.code(),
+        Some(2),
+        "expected conditional result for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(result.stdout.is_empty());
+    let document: Value = serde_json::from_slice(
+        &fs::read(output).expect("explicit DACL access-check output exists"),
+    )
+    .expect("explicit DACL access-check output is JSON");
+    assert_eq!(document["schema"], "sideeffect.windows_dacl_evaluation");
+    assert_eq!(document["status"], "conditional", "result: {document:#}");
+    assert_eq!(
+        document["dacl_decision"], expected_decision,
+        "result: {document:#}"
+    );
+    assert_eq!(
+        document["diagnostic_code"],
+        "dacl_only_result_is_conditional"
+    );
+
+    let oracle = match access_check_oracle(path, FILE_READ_DATA) {
+        Ok(value) => value,
+        Err(error) if error.starts_with("UNSUPPORTED:") => {
+            eprintln!("SKIP: independent AccessCheck oracle prerequisite unsupported: {error}");
+            return false;
+        }
+        Err(error) => panic!("AccessCheck oracle failed: {error}"),
+    };
+    assert_eq!(
+        document["object_volume_serial_number"].as_u64(),
+        Some(u64::from(oracle.volume_serial_number))
+    );
+    assert_eq!(
+        document["object_file_index"].as_u64(),
+        Some(oracle.file_index)
+    );
+    if oracle.privileges_used != 0 {
+        eprintln!(
+            "SKIP: AccessCheck used {} token privilege(s); this run cannot serve as a DACL-only oracle.",
+            oracle.privileges_used
+        );
+        return false;
+    }
+    assert_eq!(
+        oracle.granted,
+        expected_decision == "granted_by_dacl",
+        "native AccessCheck disagrees with the explicit fixture ACL: {document:#}"
+    );
+    true
 }
