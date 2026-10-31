@@ -167,6 +167,40 @@ fn graph_trace_keeps_event_process_link_and_source_evidence() {
 }
 
 #[test]
+fn graph_event_kind_filter_keeps_related_evidence_and_all_diagnostics() {
+    let trace = TempTrace::with_contents(
+        b"123 1700000000.000001 openat(AT_FDCWD, \"/tmp/item\", O_RDONLY) = 4\n456 1700000000.000002 close(4) = 0\nnot a recognized trace row\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--trace"])
+        .arg(&trace.0)
+        .args(["--event-kind", "openat"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let graph: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(graph["filter"]["event_kind"], "openat");
+    assert_eq!(graph["source_state"]["completeness"], "partial");
+    assert_eq!(graph["diagnostics"].as_array().unwrap().len(), 1);
+    assert_eq!(graph["nodes"].as_array().unwrap().len(), 2);
+    assert!(graph["nodes"].as_array().unwrap().iter().any(|node| {
+        node["kind"] == "event"
+            && node["event"]["event_kind"] == "openat"
+            && node["evidence"]["line_number"] == 1
+    }));
+    assert!(
+        !graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["event"]["event_kind"] == "close")
+    );
+    assert_eq!(graph["edges"].as_array().unwrap().len(), 1);
+    assert_eq!(graph["edges"][0]["kind"], "event_process_link");
+}
+
+#[test]
 fn events_trace_preserves_partial_diagnostics_and_uses_exit_two() {
     let trace = TempTrace::with_contents(b"not a recognized trace row\n");
     let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))

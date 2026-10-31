@@ -429,6 +429,7 @@ fn graph_windows_runtime_keeps_pid_context_separate_from_process_instance() {
     let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .args(["graph", "--windows-runtime"])
         .arg(&path)
+        .args(["--event-kind", "process_start"])
         .output()
         .unwrap();
     fs::remove_file(path).unwrap();
@@ -436,6 +437,7 @@ fn graph_windows_runtime_keeps_pid_context_separate_from_process_instance() {
     assert_eq!(output.status.code(), Some(2));
     let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(graph["schema"], "sideeffect.event_graph");
+    assert_eq!(graph["filter"]["event_kind"], "process_start");
     assert_eq!(graph["source_state"]["completeness"], "partial");
     let nodes = graph["nodes"].as_array().unwrap();
     let instance = nodes

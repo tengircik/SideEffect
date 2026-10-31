@@ -286,12 +286,18 @@ pub struct EventTimelineFilter {
     pub event_kind: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EventGraphFilter {
+    pub event_kind: Option<String>,
+}
+
 /// A source-local graph view over an adapted event envelope. PID-only context
 /// nodes are unique per edge and are never merged into process instances.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EventGraph {
     pub schema: &'static str,
     pub schema_version: u32,
+    pub filter: EventGraphFilter,
     pub source: SourceDescriptor,
     pub source_state: SourceState,
     pub semantics: &'static str,
@@ -345,7 +351,10 @@ pub struct EventGraphEdge {
 
 /// Convert already validated source adapters into an evidence-linked graph
 /// view. This function does not infer ownership, ancestry, or causation.
-pub fn graph(envelope: &CommonEventEnvelope) -> Result<EventGraph, String> {
+pub fn graph(
+    envelope: &CommonEventEnvelope,
+    event_kind: Option<&str>,
+) -> Result<EventGraph, String> {
     let estimated_nodes = envelope
         .events
         .len()
@@ -500,16 +509,63 @@ pub fn graph(envelope: &CommonEventEnvelope) -> Result<EventGraph, String> {
         return Err("event graph exceeds its bounded node or edge limit".to_owned());
     }
 
-    Ok(EventGraph {
+    let mut graph = EventGraph {
         schema: "sideeffect.event_graph",
         schema_version: 1,
+        filter: EventGraphFilter {
+            event_kind: event_kind.map(str::to_owned),
+        },
         source: envelope.source.clone(),
         source_state: envelope.source_state.clone(),
         semantics: "Evidence-linked relationships and event context only; edges do not establish ownership, causation, or a complete process tree",
         nodes,
         edges,
         diagnostics: envelope.diagnostics.clone(),
-    })
+    };
+
+    if let Some(event_kind) = event_kind {
+        let mut selected_event_ids = BTreeSet::new();
+        for node in &graph.nodes {
+            if node.kind == EventGraphNodeKind::Event
+                && node
+                    .event
+                    .as_ref()
+                    .is_some_and(|event| event.event_kind == event_kind)
+            {
+                selected_event_ids.insert(node.id.clone());
+            }
+        }
+
+        let mut included_node_ids = selected_event_ids.clone();
+        let mut direct_process_node_ids = BTreeSet::new();
+        let mut filtered_edges = Vec::new();
+        for edge in &graph.edges {
+            if edge.kind == "event_process_link" && selected_event_ids.contains(&edge.from_node_id)
+            {
+                direct_process_node_ids.insert(edge.to_node_id.clone());
+                included_node_ids.insert(edge.to_node_id.clone());
+                filtered_edges.push(edge.clone());
+            }
+        }
+
+        for edge in &graph.edges {
+            if edge.kind == "process_relationship"
+                && (direct_process_node_ids.contains(&edge.from_node_id)
+                    || direct_process_node_ids.contains(&edge.to_node_id))
+            {
+                included_node_ids.insert(edge.from_node_id.clone());
+                included_node_ids.insert(edge.to_node_id.clone());
+                filtered_edges.push(edge.clone());
+            }
+        }
+
+        graph
+            .nodes
+            .retain(|node| included_node_ids.contains(&node.id));
+        graph.edges = filtered_edges;
+    }
+
+    Ok(graph)
 }
 
 /// Build a bounded timeline view from an already adapted envelope. The
