@@ -229,7 +229,7 @@ Milestones 6–12 define product scope; each release claims only its documented 
 
 **Current status:** the canonical skill, platform references, third-party installer instructions, OMP copy steps, README visuals, and static validator are implemented. CI validates skill metadata, references, safety requirements, README links, and SVG assets; the hosted `npx skills add` installation was verified in [run 41104218442](https://github.com/tengircik/SideEffect/actions/runs/41104218442). No local agent configuration was changed. M13 implementation and its installer smoke criteria are met. The v0.1.0 release publishes Linux x86_64 and Windows x64 binaries, tagged source, checksums, third-party notices, and build-provenance attestations.
 
-## Deferred work
+## Broader future work
 
 ### Future product roadmap
 

@@ -227,7 +227,7 @@ Milestones are ordered by dependency. Work may be split into independently revie
 
 **Failure gate:** key custody or canonicalization is ambiguous, signed scope omits important diagnostics, or UI overstates trust; retain hashes only until resolved.
 
-### R9 — Optional AI investigation evaluation and reopening decision
+### R9 — Optional AI investigation evaluation and implementation
 
 **Status:** active under the current project objective; experimental and not release-approved. No model is approved, and core product workflows do not depend on one. Continue implementation only behind the deterministic evidence, privacy, security, resource, and quality gates below.
 
@@ -302,11 +302,11 @@ Status describes the coverage in current repository documentation as reviewed fo
 | 6 | Hash checks byte identity, not source authenticity | Explicit limitation; current hashes are not signatures/authentication | R8 |
 | 6 provenance manifest | Evidence ID, source, collector/OS, interval, privilege, settings, hashes, diagnostics, parent session | Partial; bundles and audit sessions carry bounded metadata, not the proposed signed provenance package/key lifecycle | R0, R8 |
 | 6 signatures | Ed25519/signing key ID/time/hash links; limits of signature claims | Missing; signatures are not established as implemented | R8 |
-| 7 | AI can help but cannot be evidence or security authority | Partial; optional local model is experimental and unqualified; core deterministic path exists | R9 (deferred) |
+| 7 | AI can help but cannot be evidence or security authority | Partial; optional local model is experimental and unqualified; core deterministic path exists | R9 (active evaluation) |
 | 7.1 | Prompt injection in paths, args, process names and reports; provider privacy | Partial; untrusted input and Agent Skill boundaries are documented; investigation workflow needs benchmarked adversarial controls | R7, R9 |
 | 7.1 layered design | collectors → deterministic analysis → structured findings → AI interpretation → human review | Partial; components exist separately but full bounded investigation interface does not | R3–R7, R9 |
 | 7.1 evidence IDs | Model restricted to supplied evidence IDs and user remains decision maker | Partial; existing model tasks validate selected IDs within bounded requests; no approved quality claim | R9 |
-| 7.2 | Local model currently experimental; usefulness benchmark before expansion | Explicit limitation/deferred work; no model release-approved | R9; requires explicit reopening |
+| 7.2 | Local model currently experimental; usefulness benchmark before expansion | Explicit limitation; implementation/evaluation active, no model release-approved | R9 |
 | 7.2 benchmark scenarios | Normal/suspicious, failed operation, misleading names, incomplete capture, similar traces, injection | Missing as a broad reviewed benchmark | R9 |
 | 8 | Self-security architecture: local, no auto-elevation, safe output, bounded input | Partial/existing for documented commands; broader future collectors/UI need equivalent review | R1, R7, cross-phase gates |
 | 8.1 | Long lines, invalid UTF-8, controls, numbers, continuations, contradictions, HTML injection, fuzzing | Partial; bounds and selected tests exist; broad fuzzing and hostile-schema coverage remain future work | R1, R7 |
@@ -331,7 +331,7 @@ Status describes the coverage in current repository documentation as reviewed fo
 | 10.6 query engine | Read-only structured/SQL-like search over events and relationships | Missing as a general investigation query engine | R7 |
 | 10.6 cases | Saved scope, evidence, findings and investigation status | Missing | R7 |
 | 10.6 reports | Technical, security/analyst and executive views from evidence-linked facts | Partial static HTML and deterministic summaries exist; role-specific report set missing | R7 |
-| 10.7 AI assistant | Natural language query, explanation and report only after deterministic engine | Experimental task-specific plumbing exists; no general approved assistant | R9 deferred |
+| 10.7 AI assistant | Natural language query, explanation and report only after deterministic engine | Experimental task-specific plumbing exists; no general approved assistant | R9 active, gated by R3–R7 |
 | 11 | Priority order and acceptance before expanding analysis | Partial; existing milestones are gated, comprehensive future gates are now proposed | R0–R9 |
 | 12 | Local evidence-based software behavior product, not AV/EDR/SIEM/sandbox | Existing product boundary; future broader platform is bounded and not complete coverage | Product boundaries; R0–R9 |
 | 12 questions 1–10 | Origin, files, children, endpoints, access, startup, changes, diffs, deviations, evidence | Partial across separate bounded commands; integrated answers vary by current source scope | R2–R7; unknowns stay explicit |
