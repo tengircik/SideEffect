@@ -5,7 +5,8 @@ use crate::audit_session::{
     AuditSessionManifest, AuditSessionSource, ContextFact, ContextFactStatus, CoverageManifest,
     HostContext, IntervalSemantics, MAX_SESSION_ARTIFACT_BYTES, MAX_SESSION_SOURCES,
     MAX_SESSION_TIMESTAMP_UNIX_MS, MAX_SESSION_TOTAL_ARTIFACT_BYTES, PrivilegeContext,
-    SessionArtifactRef, SessionId, SessionStatus, SourceRole, SourceStatus,
+    RuntimeCoverageDetail, SessionArtifactRef, SessionId, SessionStatus, SourceRole, SourceStatus,
+    UnsupportedRuntimeCategoryCode,
 };
 use crate::fingerprint::sha256_hex;
 use crate::inventory::{
@@ -93,6 +94,7 @@ pub fn collect_and_publish(
         .map_err(|error| format!("could not prepare private audit session: {error}"))?;
     let mut artifacts = Vec::new();
     let mut sources = Vec::new();
+    let mut runtime_coverage_detail = None;
     let session_start = now_unix_ms()?;
 
     if options.packages {
@@ -264,6 +266,7 @@ pub fn collect_and_publish(
         let ended = now_unix_ms()?;
         match runtime_result {
             Ok(bundle) => {
+                runtime_coverage_detail = runtime_coverage_detail_from_trace(&bundle.trace_bytes);
                 let mut diagnostic_codes = vec!["runtime_capture_completeness_unknown".to_owned()];
                 if bundle.time_limit_reached {
                     diagnostic_codes.push("runtime_time_limit_reached".to_owned());
@@ -385,7 +388,10 @@ pub fn collect_and_publish(
         });
     }
 
-    let coverage_manifest = Some(CoverageManifest::from_sources(&sources));
+    let coverage_manifest = Some(CoverageManifest::from_sources_with_runtime_detail(
+        &sources,
+        runtime_coverage_detail,
+    ));
     let manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
         schema_version: AUDIT_SESSION_SCHEMA_VERSION,
@@ -512,6 +518,40 @@ fn build_source(
         diagnostic_codes,
         artifacts: Vec::new(),
     })
+}
+
+fn runtime_coverage_detail_from_trace(bytes: &[u8]) -> Option<RuntimeCoverageDetail> {
+    let trace =
+        crate::trace::strace::parse_trace_bytes(bytes, crate::limits::ParseLimits::default())
+            .ok()?;
+    let mut malformed = 0_u64;
+    let mut unsupported = 0_u64;
+    let mut ambiguous_continuations = 0_u64;
+    for diagnostic in trace.diagnostics {
+        match diagnostic.code.as_str() {
+            "malformed_record" => malformed += 1,
+            "unsupported_record" => unsupported += 1,
+            "ambiguous_unfinished_syscall"
+            | "ambiguous_resumed_syscall"
+            | "orphan_resumed_syscall"
+            | "unfinished_syscall_at_eof" => ambiguous_continuations += 1,
+            _ => return None,
+        }
+    }
+    Some(RuntimeCoverageDetail::from_counts([
+        (
+            UnsupportedRuntimeCategoryCode::LinuxMalformedTraceRecords,
+            malformed,
+        ),
+        (
+            UnsupportedRuntimeCategoryCode::LinuxUnsupportedTraceRecords,
+            unsupported,
+        ),
+        (
+            UnsupportedRuntimeCategoryCode::LinuxAmbiguousTraceContinuations,
+            ambiguous_continuations,
+        ),
+    ]))
 }
 
 fn collect_codes(value: &Value) -> Vec<String> {
@@ -654,5 +694,34 @@ impl Write for CappedWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn linux_runtime_coverage_counts_only_fixed_parser_diagnostic_categories() {
+        let detail = super::runtime_coverage_detail_from_trace(
+            b"1 execve(\nnot a syscall row\n1 clone3( <unfinished ...>\n",
+        )
+        .unwrap();
+        assert_eq!(
+            detail.unsupported_categories,
+            vec![
+                crate::audit_session::UnsupportedRuntimeCategory {
+                    code: crate::audit_session::UnsupportedRuntimeCategoryCode::LinuxMalformedTraceRecords,
+                    count: 1,
+                },
+                crate::audit_session::UnsupportedRuntimeCategory {
+                    code: crate::audit_session::UnsupportedRuntimeCategoryCode::LinuxUnsupportedTraceRecords,
+                    count: 1,
+                },
+                crate::audit_session::UnsupportedRuntimeCategory {
+                    code: crate::audit_session::UnsupportedRuntimeCategoryCode::LinuxAmbiguousTraceContinuations,
+                    count: 1,
+                },
+            ]
+        );
+        assert!(super::runtime_coverage_detail_from_trace(&[0xff]).is_none());
     }
 }

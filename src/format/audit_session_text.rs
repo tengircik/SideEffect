@@ -56,6 +56,30 @@ pub fn write_audit_session_text<W: Write>(
                     .unwrap_or(CoverageStatus::Unknown)
             )
         )?;
+        if source.role == SourceRole::Runtime {
+            match manifest
+                .coverage_manifest
+                .as_ref()
+                .and_then(|coverage| {
+                    coverage
+                        .sources
+                        .iter()
+                        .find(|entry| entry.role == source.role)
+                })
+                .and_then(|entry| entry.runtime_detail.as_ref())
+            {
+                Some(detail) if detail.unsupported_categories.is_empty() => writer.write_all(
+                    b"  Unsupported runtime categories: none found in retained evidence\n",
+                )?,
+                Some(detail) => {
+                    writer.write_all(b"  Unsupported runtime categories:\n")?;
+                    for category in &detail.unsupported_categories {
+                        writeln!(writer, "    {} = {}", category.code.code(), category.count)?;
+                    }
+                }
+                None => writer.write_all(b"  Unsupported runtime categories: unknown\n")?,
+            }
+        }
         writeln!(writer, "  Platform: {}", source.platform)?;
         if let Some(collector) = &source.collector {
             writeln!(
@@ -217,6 +241,16 @@ pub fn write_audit_session_json<W: Write>(
                     })
                     .unwrap_or(CoverageStatus::Unknown),
             ),
+            runtime_coverage_detail: manifest
+                .coverage_manifest
+                .as_ref()
+                .and_then(|coverage| {
+                    coverage
+                        .sources
+                        .iter()
+                        .find(|entry| entry.role == source.role)
+                })
+                .and_then(|entry| entry.runtime_detail.as_ref()),
             scope: source.scope.clone(),
             scope_encoding: "non_ascii_and_controls_escaped_as_ascii",
             started_at_unix_ms: source.started_at_unix_ms,
@@ -307,6 +341,7 @@ struct SessionSourceReview<'a> {
     status: &'static str,
     collector: &'a Option<crate::audit_session::CollectorIdentity>,
     coverage_status: &'static str,
+    runtime_coverage_detail: Option<&'a crate::audit_session::RuntimeCoverageDetail>,
     scope: String,
     scope_encoding: &'static str,
     started_at_unix_ms: u128,
@@ -503,6 +538,7 @@ mod tests {
                     } else {
                         CoverageStatus::Partial
                     },
+                    runtime_detail: None,
                 }],
             }),
             sources: vec![AuditSessionSource {
@@ -580,6 +616,42 @@ mod tests {
         assert_eq!(value["sources"][0]["scope"], "safe\\n\\u{202e}path");
         assert_eq!(value["sources"][0]["status"], "partial");
         assert_eq!(value["sources"][0]["coverage_status"], "partial");
+    }
+
+    #[test]
+    fn runtime_coverage_detail_is_visible_in_text_and_json_review() {
+        let mut fixture = manifest("synthetic runtime coverage fixture", SourceStatus::Partial);
+        fixture.sources[0].role = SourceRole::Runtime;
+        fixture.sources[0].loss = Some(crate::audit_session::LossMetadata::unknown());
+        let detail = crate::audit_session::RuntimeCoverageDetail::from_counts([(
+            crate::audit_session::UnsupportedRuntimeCategoryCode::LinuxUnsupportedTraceRecords,
+            2,
+        )]);
+        fixture.coverage_manifest = Some(CoverageManifest {
+            version: COVERAGE_MANIFEST_VERSION,
+            sources: vec![SourceCoverage {
+                role: SourceRole::Runtime,
+                status: CoverageStatus::Partial,
+                runtime_detail: Some(detail),
+            }],
+        });
+
+        let mut text = Vec::new();
+        write_audit_session_text(&fixture, &mut text).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("linux_unsupported_trace_records = 2"));
+
+        let mut json = Vec::new();
+        write_audit_session_json(&fixture, &mut json).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(
+            value["sources"][0]["runtime_coverage_detail"]["unsupported_categories"][0]["code"],
+            "linux_unsupported_trace_records"
+        );
+        assert_eq!(
+            value["sources"][0]["runtime_coverage_detail"]["unsupported_categories"][0]["count"],
+            2
+        );
     }
 
     #[test]

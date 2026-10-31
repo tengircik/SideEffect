@@ -5,7 +5,7 @@
 //! does not claim that the sources were captured atomically.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 pub const AUDIT_SESSION_SCHEMA: &str = "sideeffect.audit_session";
 pub const AUDIT_SESSION_SCHEMA_VERSION: u32 = 6;
@@ -14,7 +14,8 @@ pub const AUDIT_SESSION_V2_SCHEMA_VERSION: u32 = 2;
 pub const AUDIT_SESSION_V3_SCHEMA_VERSION: u32 = 3;
 pub const AUDIT_SESSION_V4_SCHEMA_VERSION: u32 = 4;
 pub const AUDIT_SESSION_V5_SCHEMA_VERSION: u32 = 5;
-pub const COVERAGE_MANIFEST_VERSION: u32 = 1;
+pub const COVERAGE_MANIFEST_V1_VERSION: u32 = 1;
+pub const COVERAGE_MANIFEST_VERSION: u32 = 2;
 pub const MAX_AUDIT_SESSION_MANIFEST_BYTES: usize = 512 * 1024;
 pub const MAX_SESSION_SOURCES: usize = 8;
 pub const MAX_SESSION_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
@@ -26,6 +27,8 @@ pub const MAX_LIMITS_PER_SOURCE: usize = 64;
 pub const MAX_SETTINGS_PER_SOURCE: usize = 32;
 pub const MAX_DIAGNOSTIC_CODES_PER_SOURCE: usize = 256;
 pub const MAX_CODE_BYTES: usize = 128;
+pub const MAX_UNSUPPORTED_RUNTIME_CATEGORIES: usize = 8;
+pub const MAX_UNSUPPORTED_RUNTIME_CATEGORY_COUNT: u64 = 100_000;
 
 /// The session ID is an opaque stable identifier, not a secret or credential.
 /// Producers should create it once and preserve it when the manifest is read.
@@ -97,6 +100,69 @@ pub struct CoverageManifest {
 pub struct SourceCoverage {
     pub role: SourceRole,
     pub status: CoverageStatus,
+    /// Absent in coverage v1 and when runtime detail was not available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_detail: Option<RuntimeCoverageDetail>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeCoverageDetail {
+    /// Stable counts of unsupported or malformed categories found in retained
+    /// runtime evidence. Empty means none were found in that evidence, not that
+    /// the capture covered all activity.
+    pub unsupported_categories: Vec<UnsupportedRuntimeCategory>,
+}
+
+impl RuntimeCoverageDetail {
+    pub fn from_counts(
+        counts: impl IntoIterator<Item = (UnsupportedRuntimeCategoryCode, u64)>,
+    ) -> Self {
+        let mut merged = BTreeMap::<UnsupportedRuntimeCategoryCode, u64>::new();
+        for (code, count) in counts {
+            if count > 0 {
+                let value = merged.entry(code).or_default();
+                *value = value.saturating_add(count);
+            }
+        }
+        Self {
+            unsupported_categories: merged
+                .into_iter()
+                .map(|(code, count)| UnsupportedRuntimeCategory { code, count })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnsupportedRuntimeCategory {
+    pub code: UnsupportedRuntimeCategoryCode,
+    pub count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnsupportedRuntimeCategoryCode {
+    LinuxMalformedTraceRecords,
+    LinuxUnsupportedTraceRecords,
+    LinuxAmbiguousTraceContinuations,
+    WindowsMalformedEtwPayloads,
+    WindowsUnsupportedEtwEvents,
+    WindowsUnsupportedEtwProviders,
+}
+
+impl UnsupportedRuntimeCategoryCode {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::LinuxMalformedTraceRecords => "linux_malformed_trace_records",
+            Self::LinuxUnsupportedTraceRecords => "linux_unsupported_trace_records",
+            Self::LinuxAmbiguousTraceContinuations => "linux_ambiguous_trace_continuations",
+            Self::WindowsMalformedEtwPayloads => "windows_malformed_etw_payloads",
+            Self::WindowsUnsupportedEtwEvents => "windows_unsupported_etw_events",
+            Self::WindowsUnsupportedEtwProviders => "windows_unsupported_etw_providers",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -116,11 +182,23 @@ impl CoverageManifest {
     /// Summarize only the selected source's declared result. This is not an
     /// assertion that the source or operating system was exhaustively covered.
     pub fn from_sources(sources: &[AuditSessionSource]) -> Self {
+        Self::from_sources_with_runtime_detail(sources, None)
+    }
+
+    /// Attach bounded details derived from a retained runtime artifact.
+    /// `None` preserves unknown detail and is never treated as equal evidence.
+    pub fn from_sources_with_runtime_detail(
+        sources: &[AuditSessionSource],
+        runtime_detail: Option<RuntimeCoverageDetail>,
+    ) -> Self {
         let sources = sources
             .iter()
             .map(|source| SourceCoverage {
                 role: source.role,
                 status: coverage_status_for_source(source),
+                runtime_detail: (source.role == SourceRole::Runtime)
+                    .then(|| runtime_detail.clone())
+                    .flatten(),
             })
             .collect();
         Self {
@@ -375,8 +453,10 @@ impl AuditSessionManifest {
                 | AUDIT_SESSION_V5_SCHEMA_VERSION
                 | AUDIT_SESSION_SCHEMA_VERSION,
             ) => {
-                if coverage.version != COVERAGE_MANIFEST_VERSION
-                    || coverage.sources.len() != self.sources.len()
+                if !matches!(
+                    coverage.version,
+                    COVERAGE_MANIFEST_V1_VERSION | COVERAGE_MANIFEST_VERSION
+                ) || coverage.sources.len() != self.sources.len()
                     || coverage.sources.len() > MAX_SESSION_SOURCES
                 {
                     return Err(ValidationError::InvalidCoverageManifest);
@@ -390,6 +470,21 @@ impl AuditSessionManifest {
                         || entry.status != coverage_status_for_source(source)
                     {
                         return Err(ValidationError::InvalidCoverageManifest);
+                    }
+                    match (coverage.version, entry.role, &entry.runtime_detail) {
+                        (COVERAGE_MANIFEST_V1_VERSION, _, Some(_)) => {
+                            return Err(ValidationError::InvalidCoverageManifest);
+                        }
+                        (_, role, Some(_)) if role != SourceRole::Runtime => {
+                            return Err(ValidationError::InvalidCoverageManifest);
+                        }
+                        (_, SourceRole::Runtime, Some(detail)) => {
+                            validate_runtime_coverage_detail(detail, &source.platform)?;
+                            if !runtime_source_has_selected_artifacts(source) {
+                                return Err(ValidationError::InvalidCoverageManifest);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -699,8 +794,21 @@ pub fn compare_sessions(
         let mut b_coverage: Vec<_> = b.sources.iter().map(|s| (s.role, s.status)).collect();
         a_coverage.sort_unstable_by_key(|(role, _)| *role as u8);
         b_coverage.sort_unstable_by_key(|(role, _)| *role as u8);
-        if a.version != b.version || a_coverage != b_coverage {
+        let runtime_selected = left_sources
+            .iter()
+            .any(|source| source.role == SourceRole::Runtime)
+            || right_sources
+                .iter()
+                .any(|source| source.role == SourceRole::Runtime);
+        if a_coverage != b_coverage || (runtime_selected && a.version != b.version) {
             add(R::CoverageMismatch, true);
+        }
+        if runtime_selected {
+            match (runtime_coverage_detail(a), runtime_coverage_detail(b)) {
+                (Some(left_detail), Some(right_detail)) if left_detail == right_detail => {}
+                (Some(_), Some(_)) => add(R::CoverageMismatch, true),
+                _ => add(R::CoverageUnknown, true),
+            }
         }
     }
 
@@ -821,6 +929,14 @@ pub fn compare_sessions(
         comparable,
         reasons,
     }
+}
+
+fn runtime_coverage_detail(manifest: &CoverageManifest) -> Option<&RuntimeCoverageDetail> {
+    manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::Runtime)
+        .and_then(|source| source.runtime_detail.as_ref())
 }
 
 fn artifact_version_supported(kind: ArtifactKind, observed: u32, current: u32) -> bool {
@@ -1002,6 +1118,56 @@ fn validate_code(code: &str) -> Result<(), ValidationError> {
         return Err(ValidationError::InvalidCode);
     }
     Ok(())
+}
+
+fn validate_runtime_coverage_detail(
+    detail: &RuntimeCoverageDetail,
+    platform: &str,
+) -> Result<(), ValidationError> {
+    if detail.unsupported_categories.len() > MAX_UNSUPPORTED_RUNTIME_CATEGORIES
+        || detail.unsupported_categories.iter().any(|category| {
+            category.count == 0 || category.count > MAX_UNSUPPORTED_RUNTIME_CATEGORY_COUNT
+        })
+        || detail
+            .unsupported_categories
+            .windows(2)
+            .any(|pair| pair[0].code >= pair[1].code)
+    {
+        return Err(ValidationError::InvalidCoverageManifest);
+    }
+    if detail.unsupported_categories.iter().any(|category| {
+        !matches!(
+            (platform, category.code),
+            (
+                "linux",
+                UnsupportedRuntimeCategoryCode::LinuxMalformedTraceRecords
+                    | UnsupportedRuntimeCategoryCode::LinuxUnsupportedTraceRecords
+                    | UnsupportedRuntimeCategoryCode::LinuxAmbiguousTraceContinuations
+            ) | (
+                "windows",
+                UnsupportedRuntimeCategoryCode::WindowsMalformedEtwPayloads
+                    | UnsupportedRuntimeCategoryCode::WindowsUnsupportedEtwEvents
+                    | UnsupportedRuntimeCategoryCode::WindowsUnsupportedEtwProviders
+            )
+        )
+    }) {
+        return Err(ValidationError::InvalidCoverageManifest);
+    }
+    Ok(())
+}
+
+fn runtime_source_has_selected_artifacts(source: &AuditSessionSource) -> bool {
+    let has = |kind| {
+        source
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == kind)
+    };
+    match source.platform.as_str() {
+        "linux" => has(ArtifactKind::RuntimeManifest) && has(ArtifactKind::RuntimeTrace),
+        "windows" => has(ArtifactKind::WindowsRuntimeCapture),
+        _ => false,
+    }
 }
 
 fn validate_interval(start: u128, end: u128) -> Result<(), ValidationError> {
@@ -1598,6 +1764,222 @@ mod tests {
             CoverageManifest::from_sources(&[inaccessible]).sources[0].status,
             super::CoverageStatus::Inaccessible
         );
+    }
+
+    #[test]
+    fn coverage_v2_serializes_runtime_categories_and_reads_legacy_v1() {
+        let legacy: CoverageManifest = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "sources": [{"role": "packages", "status": "observed"}]
+        }))
+        .unwrap();
+        assert_eq!(legacy.version, super::COVERAGE_MANIFEST_V1_VERSION);
+        assert_eq!(legacy.sources[0].runtime_detail, None);
+
+        let mut runtime = valid_manifest();
+        runtime.sources[0].role = SourceRole::Runtime;
+        runtime.sources[0].collector =
+            Some(super::collector_identity("linux", SourceRole::Runtime));
+        runtime.sources[0].status = SourceStatus::Partial;
+        runtime.sources[0].loss = Some(super::LossMetadata::unknown());
+        runtime.sources[0].artifacts = vec![
+            SessionArtifactRef {
+                kind: ArtifactKind::RuntimeManifest,
+                path: "run.json".to_owned(),
+                schema: "sideeffect.run".to_owned(),
+                schema_version: 2,
+                byte_length: 1,
+                sha256: "0".repeat(64),
+            },
+            SessionArtifactRef {
+                kind: ArtifactKind::RuntimeTrace,
+                path: "trace.strace".to_owned(),
+                schema: "strace_text".to_owned(),
+                schema_version: 1,
+                byte_length: 1,
+                sha256: "0".repeat(64),
+            },
+        ];
+        runtime.status = SessionStatus::Partial;
+        runtime.coverage_manifest = Some(CoverageManifest::from_sources_with_runtime_detail(
+            &runtime.sources,
+            Some(super::RuntimeCoverageDetail::from_counts([(
+                super::UnsupportedRuntimeCategoryCode::LinuxUnsupportedTraceRecords,
+                2,
+            )])),
+        ));
+        let coverage = runtime.coverage_manifest.as_ref().unwrap();
+        assert_eq!(coverage.version, super::COVERAGE_MANIFEST_VERSION);
+        assert_eq!(
+            serde_json::to_value(coverage).unwrap()["sources"][0]["runtime_detail"]["unsupported_categories"]
+                [0],
+            serde_json::json!({"code":"linux_unsupported_trace_records", "count":2})
+        );
+        assert!(runtime.validate().is_ok());
+
+        let v1 = serde_json::json!({
+            "version": 1,
+            "sources": [{"role":"packages", "status":"observed"}]
+        });
+        let mut legacy_session = valid_manifest();
+        legacy_session.coverage_manifest = Some(serde_json::from_value(v1).unwrap());
+        assert!(legacy_session.validate().is_ok());
+    }
+
+    #[test]
+    fn runtime_coverage_detail_is_bounded_canonical_and_platform_specific() {
+        let duplicate_code = super::RuntimeCoverageDetail {
+            unsupported_categories: vec![
+                super::UnsupportedRuntimeCategory {
+                    code: super::UnsupportedRuntimeCategoryCode::LinuxMalformedTraceRecords,
+                    count: 1,
+                },
+                super::UnsupportedRuntimeCategory {
+                    code: super::UnsupportedRuntimeCategoryCode::LinuxMalformedTraceRecords,
+                    count: 2,
+                },
+            ],
+        };
+        assert_eq!(
+            super::validate_runtime_coverage_detail(&duplicate_code, "linux"),
+            Err(ValidationError::InvalidCoverageManifest)
+        );
+
+        let mut manifest = valid_manifest();
+        manifest.sources[0].role = SourceRole::Runtime;
+        manifest.sources[0].collector =
+            Some(super::collector_identity("linux", SourceRole::Runtime));
+        manifest.sources[0].status = SourceStatus::Partial;
+        manifest.sources[0].loss = Some(super::LossMetadata::unknown());
+        manifest.status = SessionStatus::Partial;
+        let detail = super::RuntimeCoverageDetail {
+            unsupported_categories: vec![super::UnsupportedRuntimeCategory {
+                code: super::UnsupportedRuntimeCategoryCode::LinuxMalformedTraceRecords,
+                count: super::MAX_UNSUPPORTED_RUNTIME_CATEGORY_COUNT + 1,
+            }],
+        };
+        manifest.coverage_manifest = Some(CoverageManifest::from_sources_with_runtime_detail(
+            &manifest.sources,
+            Some(detail),
+        ));
+        assert_eq!(
+            manifest.validate(),
+            Err(ValidationError::InvalidCoverageManifest)
+        );
+
+        let mut wrong_platform = valid_manifest();
+        wrong_platform.sources[0].role = SourceRole::Runtime;
+        wrong_platform.sources[0].collector =
+            Some(super::collector_identity("linux", SourceRole::Runtime));
+        wrong_platform.sources[0].status = SourceStatus::Partial;
+        wrong_platform.sources[0].loss = Some(super::LossMetadata::unknown());
+        wrong_platform.status = SessionStatus::Partial;
+        wrong_platform.coverage_manifest =
+            Some(CoverageManifest::from_sources_with_runtime_detail(
+                &wrong_platform.sources,
+                Some(super::RuntimeCoverageDetail::from_counts([(
+                    super::UnsupportedRuntimeCategoryCode::WindowsUnsupportedEtwEvents,
+                    1,
+                )])),
+            ));
+        assert_eq!(
+            wrong_platform.validate(),
+            Err(ValidationError::InvalidCoverageManifest)
+        );
+    }
+
+    #[test]
+    fn runtime_coverage_details_must_match_and_missing_detail_is_incomparable() {
+        fn runtime(detail: Option<super::RuntimeCoverageDetail>) -> AuditSessionManifest {
+            let mut manifest = valid_manifest();
+            manifest.sources[0].role = SourceRole::Runtime;
+            manifest.sources[0].collector =
+                Some(super::collector_identity("linux", SourceRole::Runtime));
+            manifest.sources[0].scope = "selected command and traced descendants".to_owned();
+            manifest.sources[0].status = SourceStatus::Partial;
+            manifest.sources[0].loss = Some(super::LossMetadata {
+                status: super::LossStatus::NoneReported,
+                statistics_available: true,
+                final_snapshot_available: true,
+                events_lost: Some(0),
+                log_buffers_lost: Some(0),
+                real_time_buffers_lost: Some(0),
+            });
+            manifest.sources[0].artifacts = vec![
+                SessionArtifactRef {
+                    kind: ArtifactKind::RuntimeManifest,
+                    path: "run.json".to_owned(),
+                    schema: "sideeffect.run".to_owned(),
+                    schema_version: 2,
+                    byte_length: 1,
+                    sha256: "0".repeat(64),
+                },
+                SessionArtifactRef {
+                    kind: ArtifactKind::RuntimeTrace,
+                    path: "trace.strace".to_owned(),
+                    schema: "strace_text".to_owned(),
+                    schema_version: 1,
+                    byte_length: 1,
+                    sha256: "0".repeat(64),
+                },
+            ];
+            manifest.status = SessionStatus::Partial;
+            manifest.coverage_manifest = Some(CoverageManifest::from_sources_with_runtime_detail(
+                &manifest.sources,
+                detail,
+            ));
+            manifest
+        }
+
+        let known = super::RuntimeCoverageDetail::from_counts([(
+            super::UnsupportedRuntimeCategoryCode::LinuxUnsupportedTraceRecords,
+            1,
+        )]);
+        let left = runtime(Some(known.clone()));
+        let matching = runtime(Some(known));
+        assert!(left.validate().is_ok());
+        assert!(compare_sessions(&left, &matching).comparable);
+
+        let different = runtime(Some(super::RuntimeCoverageDetail::from_counts([(
+            super::UnsupportedRuntimeCategoryCode::LinuxMalformedTraceRecords,
+            1,
+        )])));
+        let result = compare_sessions(&left, &different);
+        assert!(!result.comparable);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.code() == "coverage_mismatch")
+        );
+
+        let missing = runtime(None);
+        let result = compare_sessions(&left, &missing);
+        assert!(!result.comparable);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.code() == "coverage_unknown")
+        );
+
+        let mut legacy_left = runtime(None);
+        let mut legacy_right = runtime(None);
+        legacy_left.coverage_manifest.as_mut().unwrap().version =
+            super::COVERAGE_MANIFEST_V1_VERSION;
+        legacy_right.coverage_manifest.as_mut().unwrap().version =
+            super::COVERAGE_MANIFEST_V1_VERSION;
+        assert!(!compare_sessions(&legacy_left, &legacy_right).comparable);
+    }
+
+    #[test]
+    fn coverage_version_difference_without_runtime_does_not_block_comparability() {
+        let mut legacy = valid_manifest();
+        legacy.coverage_manifest.as_mut().unwrap().version = super::COVERAGE_MANIFEST_V1_VERSION;
+        let current = valid_manifest();
+        assert!(legacy.validate().is_ok());
+        assert!(current.validate().is_ok());
+        assert!(compare_sessions(&legacy, &current).comparable);
     }
 
     #[test]

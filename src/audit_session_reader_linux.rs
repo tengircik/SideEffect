@@ -625,6 +625,7 @@ mod tests {
                 sources: vec![crate::audit_session::SourceCoverage {
                     role: SourceRole::Packages,
                     status: crate::audit_session::CoverageStatus::Observed,
+                    runtime_detail: None,
                 }],
             }),
             sources: vec![AuditSessionSource {

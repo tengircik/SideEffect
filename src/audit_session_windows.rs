@@ -3,8 +3,8 @@
 use crate::audit_session::{
     AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, ArtifactKind, AuditSessionManifest,
     AuditSessionSource, ContextFact, ContextFactStatus, CoverageManifest, HostContext,
-    IntervalSemantics, PrivilegeContext, SessionArtifactRef, SessionStatus, SourceRole,
-    SourceStatus,
+    IntervalSemantics, PrivilegeContext, RuntimeCoverageDetail, SessionArtifactRef, SessionStatus,
+    SourceRole, SourceStatus, UnsupportedRuntimeCategoryCode,
 };
 use crate::fingerprint::sha256_hex;
 use crate::inventory::{
@@ -94,6 +94,7 @@ pub fn collect_and_publish(
     let started = now_ms()?;
     let mut artifacts = Vec::new();
     let mut sources = Vec::new();
+    let mut runtime_coverage_detail = None;
 
     if options.software {
         let doc = collect_windows_software();
@@ -246,6 +247,13 @@ pub fn collect_and_publish(
             duration,
             || ensure_runtime_destination_absent(destination),
         )?;
+        runtime_coverage_detail = runtime_coverage_detail_from_event_diagnostics(
+            capture
+                .events
+                .iter()
+                .take(crate::windows_runtime::MAX_WINDOWS_RUNTIME_EVENTS)
+                .map(|event| (event.event_kind, event.observation_decoding.as_ref())),
+        );
         let mut diagnostics = vec!["capture_completeness_unknown"];
         if capture.collection_status == crate::record::WindowsRuntimeCollectionStatus::Partial {
             diagnostics.push("etw_collection_partial");
@@ -362,7 +370,14 @@ pub fn collect_and_publish(
         .iter()
         .map(|a| (a.file_name, a.bytes.as_slice()))
         .collect();
-    let manifest = build_manifest(started, ended, context, sources, &artifacts)?;
+    let manifest = build_manifest(
+        started,
+        ended,
+        context,
+        sources,
+        &artifacts,
+        runtime_coverage_detail,
+    )?;
     let manifest_bytes = serde_json::to_vec(&manifest)
         .map_err(|e| format!("could not serialize audit manifest: {e}"))?;
     files.push(("session.json", manifest_bytes.as_slice()));
@@ -463,6 +478,7 @@ fn build_manifest(
     host_context: HostContext,
     mut sources: Vec<AuditSessionSource>,
     artifacts: &[Artifact],
+    runtime_coverage_detail: Option<RuntimeCoverageDetail>,
 ) -> Result<AuditSessionManifest, String> {
     for source in &mut sources {
         source.artifacts = artifacts
@@ -479,7 +495,10 @@ fn build_manifest(
             .collect();
     }
     let complete = sources.iter().all(|s| s.status == SourceStatus::Complete);
-    let coverage_manifest = Some(CoverageManifest::from_sources(&sources));
+    let coverage_manifest = Some(CoverageManifest::from_sources_with_runtime_detail(
+        &sources,
+        runtime_coverage_detail,
+    ));
     let manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
         schema_version: AUDIT_SESSION_SCHEMA_VERSION,
@@ -511,6 +530,45 @@ fn build_manifest(
         .validate()
         .map_err(|e| format!("constructed audit session is invalid: {e:?}"))?;
     Ok(manifest)
+}
+
+fn runtime_coverage_detail_from_event_diagnostics<'a>(
+    events: impl IntoIterator<Item = (&'a str, Option<&'a serde_json::Value>)>,
+) -> Option<RuntimeCoverageDetail> {
+    let mut malformed_payloads = 0_u64;
+    let mut unsupported_events = 0_u64;
+    let mut unsupported_providers = 0_u64;
+    for (event_kind, decoding) in events {
+        let Some(decoding) = decoding else {
+            if event_kind == "unsupported_or_malformed_provider_event" {
+                return None;
+            }
+            continue;
+        };
+        match decoding.get("status").and_then(serde_json::Value::as_str) {
+            Some("decoded") => {}
+            Some("unsupported_provider") => unsupported_providers += 1,
+            Some("unsupported_event" | "unsupported_version" | "ambiguous_pointer_width") => {
+                unsupported_events += 1;
+            }
+            Some("malformed_payload") => malformed_payloads += 1,
+            _ => return None,
+        }
+    }
+    Some(RuntimeCoverageDetail::from_counts([
+        (
+            UnsupportedRuntimeCategoryCode::WindowsMalformedEtwPayloads,
+            malformed_payloads,
+        ),
+        (
+            UnsupportedRuntimeCategoryCode::WindowsUnsupportedEtwEvents,
+            unsupported_events,
+        ),
+        (
+            UnsupportedRuntimeCategoryCode::WindowsUnsupportedEtwProviders,
+            unsupported_providers,
+        ),
+    ]))
 }
 
 fn host_context() -> HostContext {
@@ -647,6 +705,48 @@ mod tests {
     };
 
     #[test]
+    fn windows_runtime_coverage_counts_only_fixed_decoder_diagnostic_categories() {
+        let provider = serde_json::json!({"status":"unsupported_provider"});
+        let unsupported = serde_json::json!({"status":"unsupported_version"});
+        let malformed = serde_json::json!({"status":"malformed_payload"});
+        let decoded = serde_json::json!({"status":"decoded"});
+        let detail = super::runtime_coverage_detail_from_event_diagnostics([
+            ("unsupported_or_malformed_provider_event", Some(&provider)),
+            (
+                "unsupported_or_malformed_provider_event",
+                Some(&unsupported),
+            ),
+            ("unsupported_or_malformed_provider_event", Some(&malformed)),
+            ("network_observation", Some(&decoded)),
+        ])
+        .unwrap();
+        assert_eq!(
+            detail.unsupported_categories,
+            vec![
+                crate::audit_session::UnsupportedRuntimeCategory {
+                    code: crate::audit_session::UnsupportedRuntimeCategoryCode::WindowsMalformedEtwPayloads,
+                    count: 1,
+                },
+                crate::audit_session::UnsupportedRuntimeCategory {
+                    code: crate::audit_session::UnsupportedRuntimeCategoryCode::WindowsUnsupportedEtwEvents,
+                    count: 1,
+                },
+                crate::audit_session::UnsupportedRuntimeCategory {
+                    code: crate::audit_session::UnsupportedRuntimeCategoryCode::WindowsUnsupportedEtwProviders,
+                    count: 1,
+                },
+            ]
+        );
+        assert!(
+            super::runtime_coverage_detail_from_event_diagnostics([(
+                "unsupported_or_malformed_provider_event",
+                None,
+            )])
+            .is_none()
+        );
+    }
+
+    #[test]
     fn windows_runtime_source_manifest_binds_capture_bytes_and_stays_partial() {
         let bytes = br#"{"schema":"sideeffect.windows_runtime_capture","schema_version":3,"synthetic_fixture":true}"#.to_vec();
         let artifacts = [artifact(
@@ -682,6 +782,7 @@ mod tests {
             },
             vec![runtime_source],
             &artifacts,
+            None,
         )
         .unwrap();
         assert_eq!(manifest.status, SessionStatus::Partial);
