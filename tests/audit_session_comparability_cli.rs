@@ -70,6 +70,28 @@ fn write_manifest(path: &Path, value: &Value) {
     fs::set_permissions(path.join("session.json"), fs::Permissions::from_mode(0o600)).unwrap();
 }
 
+fn write_package_artifact(path: &Path, version: &str) {
+    let bytes = serde_json::to_vec(&json!({
+        "schema":"sideeffect.inventory", "schema_version":2, "platform":"linux",
+        "scope":"available_package_manager_databases", "captured_at_unix_ms":1001,
+        "status":"complete",
+        "sources":[{"id":"dpkg_query","status":"complete","exit_code":0,"records_seen":1,"diagnostics":[]}],
+        "packages":[{"source_id":"dpkg_query","name":"synthetic-demo","version":version,"architecture":"amd64","status_abbrev":"ii ","evidence":{"line":1,"byte_offset":0,"byte_length":8,"record_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","raw_record":null,"raw_record_hex":null},"diagnostic_code":null}]
+    }))
+    .unwrap();
+    fs::write(path.join("packages.json"), &bytes).unwrap();
+    fs::set_permissions(
+        path.join("packages.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let mut value = manifest(path);
+    let reference = &mut value["sources"][0]["artifacts"][0];
+    reference["byte_length"] = json!(bytes.len());
+    reference["sha256"] = json!(format!("{:x}", sha2::Sha256::digest(&bytes)));
+    write_manifest(path, &value);
+}
+
 fn report(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
@@ -77,7 +99,7 @@ fn report(output: &Output) -> Value {
 fn assert_code(output: &Output, expected: &str) {
     assert_eq!(output.status.code(), Some(2));
     let value = report(output);
-    assert_eq!(value["schema"], "sideeffect.audit_session_comparability");
+    assert_eq!(value["schema"], "sideeffect.audit_session_diff");
     assert_eq!(value["schema_version"], 1);
     assert_eq!(value["status"], "incomparable");
     assert!(
@@ -135,7 +157,14 @@ fn session_comparability_cli_reports_metadata_readiness_and_rejects_unverified_i
     assert_eq!(compatible.status.code(), Some(0));
     let compatible_report = report(&compatible);
     assert_eq!(compatible_report["status"], "comparable");
-    assert_eq!(compatible_report["scope"], "metadata_readiness_only");
+    assert_eq!(
+        compatible_report["metadata_scope"],
+        "metadata_readiness_only"
+    );
+    assert_eq!(
+        compatible_report["scope"],
+        "metadata_and_item_level_inventory"
+    );
     assert!(compatible_report["comparable"].as_bool().unwrap());
     assert_reason(&compatible, "partial_source");
     assert!(compatible_report["limitations"].as_array().unwrap().len() >= 3);
@@ -147,7 +176,8 @@ fn session_comparability_cli_reports_metadata_readiness_and_rejects_unverified_i
             .any(|item| item
                 == "Caller privilege contexts are not comparability keys and may differ.")
     );
-    assert!(compatible_report.get("deltas").is_none());
+    assert!(compatible_report["source_diffs"].is_array());
+    assert_eq!(compatible_report["item_comparison_status"], "partial");
 
     let mut changed = manifest(&after);
     changed["sources"][0]["scope"] = json!("changed bounded scope");
@@ -229,4 +259,55 @@ fn session_comparability_cli_reports_metadata_readiness_and_rejects_unverified_i
     let rejected = compare(&insecure, &insecure);
     assert_eq!(rejected.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("private"));
+}
+
+#[test]
+fn compare_sessions_reports_synthetic_package_change_with_artifact_evidence() {
+    let root = TestDirectory::new();
+    let before = audit(&root.0, "before-delta");
+    let after = audit(&root.0, "after-delta");
+    write_package_artifact(&before, "1.0");
+    write_package_artifact(&after, "2.0");
+
+    let output = compare(&before, &after);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = report(&output);
+    assert_eq!(report["schema"], "sideeffect.audit_session_diff");
+    assert_eq!(report["item_comparison_status"], "compared");
+    let package = report["source_diffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["role"] == "packages")
+        .unwrap();
+    assert_eq!(package["status"], "compared");
+    assert_eq!(package["before_artifacts"][0]["path"], "packages.json");
+    assert_eq!(
+        package["before_artifacts"][0]["sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert_eq!(
+        package["after_artifacts"][0]["sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert_eq!(package["comparison"]["deltas"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        package["comparison"]["deltas"][0]["changed_fields"][0],
+        "version"
+    );
+    assert_eq!(
+        package["comparison"]["deltas"][0]["before"]["evidence"]["line"],
+        1
+    );
 }

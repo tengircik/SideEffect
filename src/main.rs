@@ -14,7 +14,6 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sideeffect::audit_session::compare_sessions;
 #[cfg(target_os = "linux")]
 use sideeffect::audit_session_linux::{AuditOptions, collect_and_publish};
 #[cfg(windows)]
@@ -2170,49 +2169,76 @@ fn inspect_session_with_format(format: &OsString, path: &OsString) -> Result<Exi
     }
 }
 
-#[derive(Serialize)]
-struct AuditSessionComparabilityDocument {
-    schema: &'static str,
-    schema_version: u32,
-    status: &'static str,
-    comparable: bool,
-    reason_codes: Vec<&'static str>,
-    scope: &'static str,
-    limitations: [&'static str; 5],
-}
-
 fn compare_audit_sessions(
     before_path: &OsString,
     after_path: &OsString,
 ) -> Result<ExitCode, String> {
     let before = read_verified_audit_session(Path::new(before_path))?;
     let after = read_verified_audit_session(Path::new(after_path))?;
-    let result = compare_sessions(before.manifest(), after.manifest());
-    let comparable = result.comparable;
-    let report = AuditSessionComparabilityDocument {
-        schema: "sideeffect.audit_session_comparability",
-        schema_version: 1,
-        status: if comparable {
-            "comparable"
-        } else {
-            "incomparable"
-        },
-        comparable,
-        reason_codes: result
-            .reasons
-            .into_iter()
-            .map(|reason| reason.code())
-            .collect(),
-        scope: "metadata_readiness_only",
-        limitations: [
-            "This compares declared collection context only; it does not compare inventory or runtime observations.",
-            "Comparable sessions do not establish equal observations, exhaustive coverage, or event absence.",
-            "This is not an item-level inventory or event diff and does not establish causation.",
-            "Verified lengths and hashes do not authenticate the session producer or source contents.",
-            "Caller privilege contexts are not comparability keys and may differ.",
-        ],
+    #[cfg(target_os = "linux")]
+    let report = {
+        let before_artifacts: Vec<_> = before
+            .artifacts()
+            .iter()
+            .map(
+                |artifact| sideeffect::audit_session_diff::VerifiedArtifactBytes {
+                    kind: artifact.kind(),
+                    path: artifact.path(),
+                    bytes: artifact.bytes(),
+                },
+            )
+            .collect();
+        let after_artifacts: Vec<_> = after
+            .artifacts()
+            .iter()
+            .map(
+                |artifact| sideeffect::audit_session_diff::VerifiedArtifactBytes {
+                    kind: artifact.kind(),
+                    path: artifact.path(),
+                    bytes: artifact.bytes(),
+                },
+            )
+            .collect();
+        sideeffect::audit_session_diff::compare_audit_sessions(
+            before.manifest(),
+            after.manifest(),
+            &before_artifacts,
+            &after_artifacts,
+        )
     };
-    write_json(&report, "audit-session comparability report")?;
+    #[cfg(windows)]
+    let report = {
+        let before_artifacts: Vec<_> = before
+            .artifacts()
+            .iter()
+            .map(
+                |artifact| sideeffect::audit_session_diff::VerifiedArtifactBytes {
+                    kind: artifact.kind(),
+                    path: artifact.path(),
+                    bytes: artifact.bytes(),
+                },
+            )
+            .collect();
+        let after_artifacts: Vec<_> = after
+            .artifacts()
+            .iter()
+            .map(
+                |artifact| sideeffect::audit_session_diff::VerifiedArtifactBytes {
+                    kind: artifact.kind(),
+                    path: artifact.path(),
+                    bytes: artifact.bytes(),
+                },
+            )
+            .collect();
+        sideeffect::audit_session_diff::compare_audit_sessions(
+            before.manifest(),
+            after.manifest(),
+            &before_artifacts,
+            &after_artifacts,
+        )
+    };
+    let comparable = report.comparable;
+    write_json(&report, "audit-session diff report")?;
     Ok(if comparable {
         ExitCode::SUCCESS
     } else {

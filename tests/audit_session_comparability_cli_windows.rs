@@ -80,7 +80,7 @@ fn assert_code(output: &Output, expected: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
     let value = report(output);
-    assert_eq!(value["schema"], "sideeffect.audit_session_comparability");
+    assert_eq!(value["schema"], "sideeffect.audit_session_diff");
     assert_eq!(value["schema_version"], 1);
     assert_eq!(value["status"], "incomparable");
     assert!(
@@ -142,12 +142,16 @@ fn windows_session_comparability_cli_preserves_metadata_only_and_reader_boundari
     let compatible = compare(&before, &after);
     assert_eq!(compatible.status.code(), Some(0));
     let compatible_report = report(&compatible);
-    assert_eq!(
-        compatible_report["schema"],
-        "sideeffect.audit_session_comparability"
-    );
+    assert_eq!(compatible_report["schema"], "sideeffect.audit_session_diff");
     assert_eq!(compatible_report["status"], "comparable");
-    assert_eq!(compatible_report["scope"], "metadata_readiness_only");
+    assert_eq!(
+        compatible_report["metadata_scope"],
+        "metadata_readiness_only"
+    );
+    assert_eq!(
+        compatible_report["scope"],
+        "metadata_and_item_level_inventory"
+    );
     assert!(compatible_report["comparable"].as_bool().unwrap());
     assert_reason(&compatible, "partial_source");
     assert!(
@@ -158,7 +162,8 @@ fn windows_session_comparability_cli_preserves_metadata_only_and_reader_boundari
             .any(|item| item
                 == "Caller privilege contexts are not comparability keys and may differ.")
     );
-    assert!(compatible_report.get("deltas").is_none());
+    assert!(compatible_report["source_diffs"].is_array());
+    assert_eq!(compatible_report["item_comparison_status"], "partial");
 
     let mut changed = manifest(&after);
     changed["sources"][0]["scope"] = json!("changed bounded scope");
