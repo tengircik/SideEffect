@@ -156,6 +156,39 @@ fn access_check_runs_real_faccessat2_and_preserves_unknown_conclusion() {
     );
     assert_eq!(document["controls"][1]["status"], "observed");
 
+    let execute_output = directory.0.join("execute-access-check.json");
+    let execute_result = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args([
+            "inventory",
+            "access-check",
+            "--operation",
+            "execute",
+            "--output",
+        ])
+        .arg(&execute_output)
+        .arg(&selected)
+        .output()
+        .expect("start SideEffect execute permission probe");
+    assert_eq!(execute_result.status.code(), Some(2));
+    let execute_document: Value = serde_json::from_slice(
+        &fs::read(&execute_output).expect("execute access-check output exists"),
+    )
+    .expect("execute access-check output is JSON");
+    assert_eq!(execute_document["status"], "partial");
+    assert_eq!(
+        execute_document["operation"], "execute",
+        "result: {execute_document:#}"
+    );
+    assert_eq!(
+        execute_document["observed_kernel_check"]["status"], "rejected_by_kernel_probe",
+        "a regular file without execute bits must fail X_OK, including when tests run as root: {execute_document:#}"
+    );
+    assert!(matches!(
+        execute_document["observed_kernel_check"]["raw_errno"].as_i64(),
+        Some(1 | 13)
+    ));
+    assert_eq!(execute_document["calculated_conclusion"], "unknown");
+
     let after_metadata = fs::metadata(&selected).expect("read fixture metadata after probe");
     assert_eq!(
         fs::read(&selected).expect("probe leaves file contents unchanged"),

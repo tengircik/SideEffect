@@ -121,7 +121,9 @@ fn access_check_uses_process_snapshot_identity_and_reports_conditional_dacl_resu
         );
         return;
     }
-    if document["diagnostic_code"] == "unsupported_dacl_ace" {
+    if document["diagnostic_code"] == "unsupported_dacl_ace"
+        || document["diagnostic_code"] == "owner_rights_ace_not_supported"
+    {
         eprintln!(
             "SKIP: host temporary-file DACL contains ACE semantics outside the supported basic allow/deny test prerequisite."
         );

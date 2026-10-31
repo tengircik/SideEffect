@@ -236,10 +236,7 @@ pub fn analyze_current_process_access(
     }
     // SAFETY: open returned a new descriptor owned by this function.
     let file = unsafe { File::from_raw_fd(descriptor) };
-    let metadata = match file.metadata() {
-        Ok(value) => Some(value),
-        Err(_) => None,
-    };
+    let metadata = file.metadata().ok();
     let selected_path = selected_path_resolved(path_bytes, metadata.as_ref());
     let credentials = calling_thread_identity();
     let empty_path = c"";
@@ -385,15 +382,17 @@ fn calling_thread_identity() -> CallingThreadIdentity {
             unknown_with_status(status),
         ),
     };
-    let effective_filesystem_ids_match = Some(
-        effective_uid.value == filesystem_uid.value && effective_gid.value == filesystem_gid.value,
-    )
-    .filter(|_| {
-        effective_uid.value.is_some()
-            && effective_gid.value.is_some()
-            && filesystem_uid.value.is_some()
-            && filesystem_gid.value.is_some()
-    });
+    let effective_filesystem_ids_match = match (
+        effective_uid.value,
+        effective_gid.value,
+        filesystem_uid.value,
+        filesystem_gid.value,
+    ) {
+        (Some(effective_uid), Some(effective_gid), Some(filesystem_uid), Some(filesystem_gid)) => {
+            Some(effective_uid == filesystem_uid && effective_gid == filesystem_gid)
+        }
+        _ => None,
+    };
     CallingThreadIdentity {
         identity_scope: "calling_thread_at_query_time; effective and filesystem IDs reported separately",
         effective_uid,

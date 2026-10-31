@@ -29,7 +29,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GetFileInformationByHandle, OPEN_EXISTING,
+    GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_EXISTING, VOLUME_NAME_NT,
 };
 use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -272,6 +272,23 @@ pub fn evaluate_windows_dacl_for_process(
         Ok(value) => value,
         Err(error) => return fail(result, "selected_object_open_failed", error),
     };
+    match opened_handle_is_supported_local_volume(file.0) {
+        Ok(true) => {}
+        Ok(false) => {
+            result.status = WindowsAccessStatus::Unsupported;
+            result.diagnostic_code = Some("final_volume_not_supported");
+            set_control(
+                &mut result,
+                control(
+                    "remote_share_and_server_policy",
+                    WindowsAccessControlStatus::Unsupported,
+                    "The opened handle does not resolve to a supported local HarddiskVolume device path; its DACL is not evaluated.",
+                ),
+            );
+            return result;
+        }
+        Err(error) => return fail(result, "final_volume_identity_unavailable", error),
+    }
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     if unsafe { GetFileInformationByHandle(file.0, &mut info) } == 0 {
         return fail(result, "selected_object_metadata_failed", unsafe {
@@ -726,6 +743,45 @@ fn volume_is_remote(path: &[u16]) -> Result<bool, u32> {
     }
 }
 
+fn opened_handle_is_supported_local_volume(handle: HANDLE) -> Result<bool, u32> {
+    let mut final_path = vec![0u16; MAX_PATH_UTF16_UNITS + 1];
+    let length = unsafe {
+        GetFinalPathNameByHandleW(
+            handle,
+            final_path.as_mut_ptr(),
+            final_path.len() as u32,
+            VOLUME_NAME_NT,
+        )
+    } as usize;
+    if length == 0 {
+        return Err(unsafe { GetLastError() });
+    }
+    if length >= final_path.len() {
+        return Ok(false);
+    }
+    Ok(is_supported_local_nt_volume_path(&final_path[..length]))
+}
+
+fn is_supported_local_nt_volume_path(path: &[u16]) -> bool {
+    const PREFIX: &str = r"\Device\HarddiskVolume";
+    let prefix: Vec<u16> = PREFIX.encode_utf16().collect();
+    path.len() > prefix.len()
+        && path
+            .iter()
+            .zip(prefix.iter())
+            .all(|(actual, expected)| ascii_uppercase(*actual) == ascii_uppercase(*expected))
+        && path[prefix.len()] >= u16::from(b'0')
+        && path[prefix.len()] <= u16::from(b'9')
+}
+
+fn ascii_uppercase(value: u16) -> u16 {
+    if (u16::from(b'a')..=u16::from(b'z')).contains(&value) {
+        value - u16::from(b'a') + u16::from(b'A')
+    } else {
+        value
+    }
+}
+
 fn bounded_path(path: &Path) -> Result<Vec<u16>, &'static str> {
     if !path.is_absolute() {
         return Err("path_must_be_absolute");
@@ -1010,6 +1066,28 @@ mod tests {
                 .encode_utf16()
                 .collect::<Vec<_>>()
         ));
+    }
+
+    #[test]
+    fn only_handle_paths_on_known_local_harddisk_volumes_are_supported() {
+        let local = r"\Device\HarddiskVolume4\Users\example\file.txt";
+        assert!(is_supported_local_nt_volume_path(
+            &local.encode_utf16().collect::<Vec<_>>()
+        ));
+        let local_case_variant = r"\device\harddiskvolume12\file.txt";
+        assert!(is_supported_local_nt_volume_path(
+            &local_case_variant.encode_utf16().collect::<Vec<_>>()
+        ));
+        for unsupported in [
+            r"\Device\Mup\server\share\file.txt",
+            r"\Device\LanmanRedirector\server\share\file.txt",
+            r"\Device\HarddiskVolumeShadowCopy1\file.txt",
+            r"\Device\HarddiskVolume\file.txt",
+        ] {
+            assert!(!is_supported_local_nt_volume_path(
+                &unsupported.encode_utf16().collect::<Vec<_>>()
+            ));
+        }
     }
 
     #[test]

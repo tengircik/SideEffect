@@ -1474,11 +1474,11 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         "inventory access-check" => {
             #[cfg(target_os = "linux")]
             {
-                "Usage: sideeffect inventory access-check --operation read|write|execute --output FILE ABSOLUTE_PATH\nRuns a non-mutating faccessat2 permission preflight under the current calling thread's credentials and records the observed kernel result. It does not evaluate another process identity or prove that a later file operation succeeds; the calculated effective-access conclusion remains unknown. A partial result is written with exit status 2."
+                "Usage: sideeffect inventory access-check --operation read|write|execute --output FILE ABSOLUTE_PATH\nRuns a non-mutating faccessat2 permission preflight under the current calling thread's credentials and records the observed kernel result. `execute` requests X_OK; on a directory, that checks search/traversal permission, and it does not prove execve will succeed. The probe does not evaluate another process identity or prove that a later file operation succeeds; the calculated effective-access conclusion remains unknown. A partial result is written with exit status 2."
             }
             #[cfg(windows)]
             {
-                "Usage: sideeffect inventory access-check --pid PID --creation-time-filetime FILETIME_100NS --operation read|write|execute --output FILE ABSOLUTE_PATH\nUses the selected process's primary token (PID plus creation time from a process snapshot) to evaluate only a local file object's DACL with Authz. The collector opens the path under its own token; ancestor traversal under the selected token, reparse targets, integrity labels, thread impersonation, and other policy are not evaluated. Overall access is conditional, never a definitive allow/deny. No elevation is requested."
+                "Usage: sideeffect inventory access-check --pid PID --creation-time-filetime FILETIME_100NS --operation read|write|execute --output FILE ABSOLUTE_PATH\nUses the selected process's primary token (PID plus creation time from a process snapshot) to evaluate only a local file object's DACL with Authz. After opening the selected path, it validates the final handle path is on a recognized local HarddiskVolume before DACL evaluation. Ancestor traversal under the selected token, reparse targets, integrity labels, thread impersonation, and other policy are not evaluated. Overall access is conditional, never a definitive allow/deny. No elevation is requested."
             }
             #[cfg(not(any(target_os = "linux", windows)))]
             {

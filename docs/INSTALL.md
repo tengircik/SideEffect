@@ -267,7 +267,7 @@ On Linux, run a non-mutating permission preflight for the current calling thread
 ./target/release/sideeffect inventory access-check --operation read --output ./access-check.json /absolute/path/to/file
 ```
 
-Use `read`, `write`, or `execute` and an absolute path. Linux pins the resolved final object and records the `faccessat2` result plus selected credentials and metadata. This is only a preflight under the current thread's credentials; it does not perform the requested operation or evaluate all configured policy. The calculated conclusion remains `unknown`. The report is private, no-clobber JSON and the command exits `2` to indicate a partial result.
+Use `read`, `write`, or `execute` and an absolute path. Linux pins the resolved final object and records the `faccessat2` result plus selected credentials and metadata. `execute` requests `X_OK`; for directories this checks search/traversal permission, and for files it does not prove that `execve` will succeed. This is only a preflight under the current thread's credentials; it does not perform the requested operation or evaluate all configured policy. The calculated conclusion remains `unknown`. The report is private, no-clobber JSON and the command exits `2` to indicate a partial result.
 
 On Windows, first collect a process snapshot and use the selected process row's PID and observed `creation_time.filetime_100ns` value:
 
@@ -281,7 +281,7 @@ sideeffect.exe inventory access-check `
   C:\path\to\file.exe
 ```
 
-Replace the example PID and FILETIME with values from the same process row in your snapshot. Windows evaluates only the selected local file object's DACL against that process's primary token. A DACL grant or denial is not a complete effective-access verdict: ancestor traversal, thread impersonation, integrity labels, remote policy, and other controls are not evaluated. Directories, reparse points, AppContainer processes, and unsupported ACE semantics return unsupported or unknown. No elevation is requested. The command writes a private, no-clobber report and exits `2` for its conditional/partial result. Treat the path, process identity, and descriptor digest as sensitive evidence.
+Replace the example PID and FILETIME with values from the same process row in your snapshot. Windows evaluates only the selected local file object's DACL against that process's primary token. After opening the selected object, SideEffect checks the handle's final NT volume path and evaluates only recognized `\Device\HarddiskVolume` paths with a numeric volume suffix; an unrecognized or remote final device path is returned unsupported. A DACL grant or denial is not a complete effective-access verdict: ancestor traversal, thread impersonation, integrity labels, remote policy, and other controls are not evaluated. Directories, reparse points, AppContainer processes, and unsupported ACE semantics return unsupported or unknown. No elevation is requested. The command writes a private, no-clobber report and exits `2` for its conditional/partial result. Treat the path, process identity, and descriptor digest as sensitive evidence.
 
 ## Inventory Linux startup configuration
 
