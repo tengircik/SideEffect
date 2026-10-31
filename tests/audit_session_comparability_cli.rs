@@ -278,7 +278,7 @@ fn compare_sessions_reports_synthetic_package_change_with_artifact_evidence() {
     );
     let report = report(&output);
     assert_eq!(report["schema"], "sideeffect.audit_session_diff");
-    assert_eq!(report["item_comparison_status"], "compared");
+    assert_eq!(report["item_comparison_status"], "complete");
     let package = report["source_diffs"]
         .as_array()
         .unwrap()
@@ -302,9 +302,14 @@ fn compare_sessions_reports_synthetic_package_change_with_artifact_evidence() {
         64
     );
     assert_eq!(package["comparison"]["deltas"].as_array().unwrap().len(), 1);
+    assert_eq!(package["comparison"]["deltas"][0]["kind"], "changed");
     assert_eq!(
-        package["comparison"]["deltas"][0]["changed_fields"][0],
-        "version"
+        package["comparison"]["deltas"][0]["before"]["version"],
+        "1.0"
+    );
+    assert_eq!(
+        package["comparison"]["deltas"][0]["after"]["version"],
+        "2.0"
     );
     assert_eq!(
         package["comparison"]["deltas"][0]["before"]["evidence"]["line"],
