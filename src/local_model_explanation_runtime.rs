@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::local_model_explanation::{
@@ -20,6 +21,168 @@ const MODEL_OUTPUT_TOKENS: &str = "512";
 const MODEL_PROCESS_MEMORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 #[cfg(windows)]
 const MODEL_PROCESS_MEMORY_LIMIT_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+
+/// A bounded explanation-runtime readiness report. This checks the selected
+/// executable and, unless CPU was requested, asks the runtime to enumerate
+/// devices. It never opens model weights or runs inference.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ExplanationRuntimeDoctorReport {
+    pub runtime_path: String,
+    pub expected_source_revision: &'static str,
+    pub executable_status: &'static str,
+    pub executable_diagnostic: Option<String>,
+    pub requested_backend: ExplanationBackendPreference,
+    pub cuda_device_status: &'static str,
+    pub device_diagnostic: Option<String>,
+    pub backend_readiness: &'static str,
+    /// Device enumeration is not proof that a model successfully ran on CUDA.
+    pub gpu_inference_status: &'static str,
+}
+
+pub fn doctor_explanation_runtime(
+    runtime_path: &Path,
+    backend: ExplanationBackendPreference,
+) -> ExplanationRuntimeDoctorReport {
+    let path_text = runtime_path.to_string_lossy().into_owned();
+    let mut report = ExplanationRuntimeDoctorReport {
+        runtime_path: path_text,
+        expected_source_revision: EXPLANATION_RUNTIME_REVISION,
+        executable_status: "not_checked",
+        executable_diagnostic: None,
+        requested_backend: backend,
+        cuda_device_status: if backend == ExplanationBackendPreference::Cpu {
+            "not_checked_cpu_requested"
+        } else {
+            "not_checked"
+        },
+        device_diagnostic: None,
+        backend_readiness: "blocked_runtime_not_checked",
+        gpu_inference_status: "not_run",
+    };
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let runtime = match crate::local_model::canonical_regular_file(runtime_path, "runtime") {
+        Ok(path) => path,
+        Err(error) => {
+            report.executable_status = "unavailable";
+            report.executable_diagnostic = Some(error);
+            return report;
+        }
+    };
+    #[cfg(windows)]
+    let runtime = match canonical_regular_file(runtime_path, "runtime") {
+        Ok(path) => path,
+        Err(error) => {
+            report.executable_status = "unavailable";
+            report.executable_diagnostic = Some(error);
+            return report;
+        }
+    };
+    #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), windows)))]
+    let runtime = {
+        report.executable_status = "unsupported_platform";
+        report.executable_diagnostic = Some(
+            "local explanation runtime checks support Linux x86_64 and native Windows only"
+                .to_owned(),
+        );
+        return report;
+        #[allow(unreachable_code)]
+        std::path::PathBuf::new()
+    };
+
+    report.runtime_path = runtime.to_string_lossy().into_owned();
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let version_check = verify_runtime(&runtime, |arguments| {
+        crate::local_model_runtime::run_bounded(
+            &runtime,
+            arguments,
+            None,
+            10,
+            MAX_RUNTIME_DIAGNOSTIC_BYTES,
+        )
+    });
+    #[cfg(windows)]
+    let version_check = verify_runtime(&runtime, |arguments| {
+        crate::local_model_runtime::run_bounded_windows(
+            &runtime,
+            arguments,
+            None,
+            std::time::Duration::from_secs(10),
+            MAX_RUNTIME_DIAGNOSTIC_BYTES,
+            1024 * 1024 * 1024,
+        )
+    });
+    #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), windows)))]
+    let version_check: Result<(), String> = unreachable!();
+
+    if let Err(error) = version_check {
+        report.executable_status = "revision_or_version_check_failed";
+        report.executable_diagnostic = Some(error);
+        report.backend_readiness = "blocked_runtime_check_failed";
+        return report;
+    }
+
+    report.executable_status = "verified_revision_prefix";
+    if backend == ExplanationBackendPreference::Cpu {
+        report.backend_readiness = "ready_cpu_requested";
+        return report;
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let device_check = list_cuda_devices(
+        &runtime,
+        |arguments| {
+            crate::local_model_runtime::run_bounded(
+                &runtime,
+                arguments,
+                None,
+                10,
+                MAX_RUNTIME_DIAGNOSTIC_BYTES,
+            )
+        },
+        ExplanationBackendPreference::Auto,
+    );
+    #[cfg(windows)]
+    let device_check = list_cuda_devices(
+        &runtime,
+        |arguments| {
+            crate::local_model_runtime::run_bounded_windows(
+                &runtime,
+                arguments,
+                None,
+                std::time::Duration::from_secs(10),
+                MAX_RUNTIME_DIAGNOSTIC_BYTES,
+                1024 * 1024 * 1024,
+            )
+        },
+        ExplanationBackendPreference::Auto,
+    );
+    #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), windows)))]
+    let device_check: Result<bool, String> = unreachable!();
+
+    match device_check {
+        Ok(true) => {
+            report.cuda_device_status = "reported_available";
+            report.backend_readiness = "ready_cuda_device_reported_inference_not_run";
+        }
+        Ok(false) if backend == ExplanationBackendPreference::Auto => {
+            report.cuda_device_status = "not_reported";
+            report.backend_readiness = "ready_cpu_auto_selected_without_cuda_device";
+        }
+        Ok(false) => {
+            report.cuda_device_status = "not_reported";
+            report.backend_readiness = "blocked_cuda_device_not_reported";
+        }
+        Err(error) => {
+            report.cuda_device_status = "enumeration_failed";
+            report.backend_readiness = "blocked_device_enumeration_failed";
+            report.device_diagnostic = Some(error);
+        }
+    }
+
+    report
+}
 
 pub fn analyze_model_explanation_bytes(
     trace_bytes: &[u8],

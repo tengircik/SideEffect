@@ -85,6 +85,7 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect model-query-preview --question <question> <strace-trace-file>\n\
        sideeffect model-query --question <question> --runtime <llama-completion> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect model list | show <id> | install <id> | setup <id> | add | select <task> <id> | remove <id>\n\
+       sideeffect model doctor --task explanation --runtime <llama-completion> [--backend auto|cpu|cuda]\n\
        sideeffect correlate-startup <startup-inventory.json> <strace-trace-file>\n\
        sideeffect associated-behavior <startup-inventory.json> <runtime-evidence-file>\n\
        sideeffect attribute --windows-runtime <capture.json>\n\
@@ -197,6 +198,31 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         }
         [command, operation, task, id] if command == "model" && operation == "select" => {
             model_select(task, id)
+        }
+        [command, operation, task_flag, task, runtime_flag, runtime]
+            if command == "model"
+                && operation == "doctor"
+                && task_flag == "--task"
+                && runtime_flag == "--runtime" =>
+        {
+            model_doctor(task, runtime, None)
+        }
+        [
+            command,
+            operation,
+            task_flag,
+            task,
+            runtime_flag,
+            runtime,
+            backend_flag,
+            backend,
+        ] if command == "model"
+            && operation == "doctor"
+            && task_flag == "--task"
+            && runtime_flag == "--runtime"
+            && backend_flag == "--backend" =>
+        {
+            model_doctor(task, runtime, Some(backend))
         }
         [command, operation, id] if command == "model" && operation == "remove" => model_remove(id),
         [command, operation, arguments @ ..] if command == "model" && operation == "add" => {
@@ -1544,7 +1570,10 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect attribute --windows-runtime CAPTURE.json\nWrites a separate evidence-linked candidate view over a validated Windows ETW v3 capture. Descendant process links require supported process-start payloads and observed active parent IDs. Network association uses the decoded payload process ID. File and disk header PIDs remain context candidates, not ownership. Capture bytes are unchanged. Missing lifecycle data, ambiguity, unsupported records, or reported/unavailable loss is surfaced as partial or unassigned evidence; no causal or absence claims are made."
         }
         "model" => {
-            "Usage: sideeffect model list\n       sideeffect model show ID\n       sideeffect model install ID\n       sideeffect model setup ID\n       sideeffect model add --name NAME --path FILE --for evidence|explanation|query [--license ID]\n       sideeffect model select evidence|explanation|query ID\n       sideeffect model remove ID\n\nLists pinned catalog candidates and user-provided models. Catalog evaluation status is shown separately from runtime compatibility. Installing a catalog model requires explicit license acceptance; analysis never downloads weights implicitly. The setup command installs and selects the catalog model for its declared task. Registering a local model records its size and SHA-256, but does not verify task compatibility, licensing, or quality. Removing a custom registration leaves the model file untouched. Select a model for its task before running a model preview."
+            "Usage: sideeffect model list\n       sideeffect model show ID\n       sideeffect model install ID\n       sideeffect model setup ID\n       sideeffect model add --name NAME --path FILE --for evidence|explanation|query [--license ID]\n       sideeffect model select evidence|explanation|query ID\n       sideeffect model remove ID\n       sideeffect model doctor --task explanation --runtime LLAMA_COMPLETION [--backend auto|cpu|cuda]\n\nLists pinned catalog candidates and user-provided models. Catalog evaluation status is shown separately from runtime compatibility. Installing a catalog model requires explicit license acceptance; analysis never downloads weights implicitly. The setup command installs and selects the catalog model for its declared task. Registering a local model records its size and SHA-256, but does not verify task compatibility, licensing, or quality. Removing a custom registration leaves the model file untouched. Select a model for its task before running a model preview."
+        }
+        "model doctor" => {
+            "Usage: sideeffect model doctor --task explanation --runtime LLAMA_COMPLETION [--backend auto|cpu|cuda]\nChecks the selected explanation model registration and SHA-256, then runs only bounded runtime version and (unless CPU is selected) device-enumeration checks. It does not read a trace, load model weights for inference, or run inference. A reported CUDA device is not proof of successful GPU inference. The selected runtime is executable code and must be trusted separately."
         }
         "model setup" => {
             "Usage: sideeffect model setup MODEL_ID\nShows the catalog license and model evaluation status, downloads the exact pinned file after explicit typed acceptance, verifies its size and SHA-256, then selects it for its declared task. The local inference runtime is installed or built separately and its path is still supplied to analysis commands."
@@ -2588,6 +2617,79 @@ fn selected_model(task: ModelTask) -> Result<ResolvedModel, String> {
         ));
     }
     sideeffect::model_manager::load_registry()?.selected(task)
+}
+
+fn model_doctor(
+    task: &OsString,
+    runtime_path: &OsString,
+    backend: Option<&OsString>,
+) -> Result<ExitCode, String> {
+    if task.to_str() != Some("explanation") {
+        return Err("model doctor currently supports only --task explanation".to_owned());
+    }
+    if runtime_path.is_empty()
+        || runtime_path.to_string_lossy().len() > sideeffect::model_manager::MAX_MODEL_PATH_BYTES
+    {
+        return Err("runtime path is empty or exceeds the path length limit".to_owned());
+    }
+    let backend_name = match backend {
+        None => Some("auto"),
+        Some(value) => value.to_str(),
+    }
+    .ok_or_else(|| "backend must be valid UTF-8".to_owned())?;
+    let backend = match backend_name {
+        "auto" => sideeffect::local_model_explanation::ExplanationBackendPreference::Auto,
+        "cpu" => sideeffect::local_model_explanation::ExplanationBackendPreference::Cpu,
+        "cuda" => sideeffect::local_model_explanation::ExplanationBackendPreference::Cuda,
+        _ => return Err("backend must be auto, cpu, or cuda".to_owned()),
+    };
+
+    let model = match selected_model(ModelTask::Explanation) {
+        Ok(model) => serde_json::json!({
+            "status": "verified",
+            "id": model.id,
+            "name": model.name,
+            "size_bytes": model.size_bytes,
+            "sha256": model.sha256,
+            "source": model.source,
+            "license_id": model.license_id,
+            "evaluation_status": model.evaluation,
+            "recommended": model.recommended,
+            "note": "File identity and registration match; compatibility and answer quality are not established."
+        }),
+        Err(error) => serde_json::json!({
+            "status": "not_ready",
+            "diagnostic": error
+        }),
+    };
+    let runtime = sideeffect::local_model_explanation_runtime::doctor_explanation_runtime(
+        Path::new(runtime_path),
+        backend,
+    );
+    let ready = model["status"] == "verified"
+        && runtime.backend_readiness.starts_with("ready_")
+        && runtime.executable_status == "verified_revision_prefix";
+    let report = serde_json::json!({
+        "schema": "sideeffect.local_model_doctor",
+        "schema_version": 1,
+        "task": "explanation",
+        "readiness": if ready { "ready_for_an_explicit_inference_run" } else { "blocked_or_incomplete" },
+        "selected_model": model,
+        "runtime": runtime,
+        "inference": "not_run",
+        "model_weights_loaded_for_inference": false,
+        "limitations": [
+            "A runtime revision check identifies only a reported version prefix; it does not authenticate the executable or its loaded libraries.",
+            "CUDA device enumeration does not prove that GPU inference succeeds or measure GPU memory.",
+            "Model registration and hash checks do not establish runtime compatibility or answer quality."
+        ]
+    });
+    write_json(&report, "local model doctor report")?;
+    Ok(if ready {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
 }
 
 fn model_list() -> Result<ExitCode, String> {
