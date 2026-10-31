@@ -370,6 +370,14 @@ On native Windows, adapt a saved ETW v3 capture after the strict bounded schema 
 
 Both commands write JSON only to stdout and read the selected file without modifying it or running represented commands. The envelope preserves source-local row order, timestamps, attempt/result or observation semantics, diagnostics, and evidence references. Its status is `partial` or `unknown` when the source or adapter cannot establish a complete supported result; those outcomes exit `2`. ETW header PID is event context and is not ownership or an actor identity. Neither adapter creates global event order, parentage, or causation. The common envelope is an output format, not a persisted capture or event graph; see [schema compatibility](SCHEMA_COMPATIBILITY.md).
 
+For a source-local timeline over Linux strace evidence, with an optional exact event-kind filter:
+
+```sh
+./target/release/sideeffect timeline --trace ./run.trace --event-kind openat
+```
+
+Each item retains its source ordinal, original timestamp text, and raw trace line/byte reference for drilldown against the supplied trace. Parser diagnostics remain present after filtering. The command does not merge sources or infer causal order, and currently accepts Linux strace input only.
+
 ## Use an existing WSL2 installation
 
 If you already have a WSL2 Linux distribution, open its shell and follow the Linux build steps there. Rust, Cargo, `strace`, the repository checkout, and generated Linux traces belong to that environment. WSL runs do not validate native Windows ETW capture. If WSL is not installed, consult [Microsoft's WSL installation guide](https://learn.microsoft.com/windows/wsl/install); installing WSL and a Linux distribution changes Windows system configuration and is outside this project setup.

@@ -179,6 +179,14 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             inspect_windows_runtime_with_format(&OsString::from("json"), path)
         }
         [command, flag, path] if command == "events" && flag == "--trace" => events_trace(path),
+        [command, flag, path] if command == "timeline" && flag == "--trace" => {
+            timeline_trace(path, None)
+        }
+        [command, flag, path, kind_flag, kind]
+            if command == "timeline" && flag == "--trace" && kind_flag == "--event-kind" =>
+        {
+            timeline_trace(path, Some(kind))
+        }
         #[cfg(windows)]
         [command, flag, path] if command == "events" && flag == "--windows-runtime" => {
             events_windows_runtime(path)
@@ -1627,6 +1635,33 @@ fn events_trace(path: &OsString) -> Result<ExitCode, String> {
     let complete =
         envelope.source_state.completeness == sideeffect::event::SourceCompleteness::Complete;
     write_json(&envelope, "common event envelope")?;
+    Ok(if complete {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
+fn timeline_trace(path: &OsString, event_kind: Option<&OsString>) -> Result<ExitCode, String> {
+    let kind = event_kind
+        .map(|value| {
+            let kind = value
+                .to_str()
+                .ok_or_else(|| "timeline event kind must be valid UTF-8".to_owned())?;
+            if kind.is_empty() || kind.len() > 128 || kind.chars().any(char::is_control) {
+                return Err("timeline event kind must be 1..128 printable UTF-8 bytes".to_owned());
+            }
+            Ok(kind)
+        })
+        .transpose()?;
+    let bytes = read_bounded(path)?;
+    let trace = parse_trace_bytes(&bytes, ParseLimits::default())
+        .map_err(|error| format!("trace timeline adaptation failed: {error}"))?;
+    let envelope = sideeffect::event::from_linux_strace(&trace, &bytes, "trace");
+    let complete =
+        envelope.source_state.completeness == sideeffect::event::SourceCompleteness::Complete;
+    let timeline = sideeffect::event::timeline(&envelope, kind);
+    write_json(&timeline, "event timeline")?;
     Ok(if complete {
         ExitCode::SUCCESS
     } else {

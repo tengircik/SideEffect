@@ -266,6 +266,50 @@ pub struct CommonEventEnvelope {
     pub diagnostics: Vec<EventDiagnostic>,
 }
 
+/// A source-local event listing with exact references back to the adapted
+/// source. `source_local_ordinal` is retained as the display order; timestamps
+/// are not parsed or used to imply a total or causal ordering.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EventTimeline {
+    pub schema: &'static str,
+    pub schema_version: u32,
+    pub source: SourceDescriptor,
+    pub source_state: SourceState,
+    pub ordering: &'static str,
+    pub filter: EventTimelineFilter,
+    pub items: Vec<CommonEvent>,
+    pub diagnostics: Vec<EventDiagnostic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EventTimelineFilter {
+    pub event_kind: Option<String>,
+}
+
+/// Build a bounded timeline view from an already adapted envelope. The
+/// envelope's source-local ordinals and evidence references remain unchanged.
+pub fn timeline(envelope: &CommonEventEnvelope, event_kind: Option<&str>) -> EventTimeline {
+    let mut items = envelope
+        .events
+        .iter()
+        .filter(|event| event_kind.is_none_or(|kind| event.event_kind == kind))
+        .cloned()
+        .collect::<Vec<_>>();
+    items.sort_by_key(|event| event.source_local_ordinal);
+    EventTimeline {
+        schema: "sideeffect.event_timeline",
+        schema_version: 1,
+        source: envelope.source.clone(),
+        source_state: envelope.source_state.clone(),
+        ordering: "source_local_ordinal; timestamps are source text and do not establish causal order",
+        filter: EventTimelineFilter {
+            event_kind: event_kind.map(str::to_owned),
+        },
+        items,
+        diagnostics: envelope.diagnostics.clone(),
+    }
+}
+
 fn push_process_diagnostic(
     diagnostics: &mut Vec<EventDiagnostic>,
     process_diagnostic_count: &mut usize,
