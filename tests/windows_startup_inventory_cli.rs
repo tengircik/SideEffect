@@ -129,6 +129,27 @@ fn windows_startup_command_reports_service_and_task_sources() {
         assert!(entry["command_utf16_hex"].is_null() || entry["command_utf16_hex"].is_string());
     }
 
+    let compared = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["explain", "--inventory-diff"])
+        .arg(&output)
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_eq!(
+        compared.status.code(),
+        Some(if document["status"] == "complete" {
+            0
+        } else {
+            2
+        }),
+        "{}",
+        String::from_utf8_lossy(&compared.stderr)
+    );
+    let comparison: Value = serde_json::from_slice(&compared.stdout).unwrap();
+    assert_eq!(comparison["schema"], "sideeffect.startup_inventory_diff");
+    assert_eq!(comparison["platform"], "windows");
+    assert_eq!(comparison["counts"]["changed"], 0);
+
     let second = run();
     assert!(!second.status.success());
     assert_eq!(fs::read(&output).unwrap(), bytes);

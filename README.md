@@ -131,7 +131,23 @@ sideeffect inventory packages --output ./after.json
 sideeffect explain --inventory-diff ./before.json ./after.json
 ```
 
-On Windows, use `sideeffect.exe inventory packages --output .\before.json` and `sideeffect.exe explain --inventory-diff .\before.json .\after.json`. The offline comparison accepts same-platform pairs of Linux package v2, Windows software-registration v1, Linux/Windows process v3, or Linux/Windows selected-path permission v1 inventories. Permission rows match only by exact selected path bytes (Linux) or UTF-16LE path bytes (Windows); paths are not normalized. It compares bounded metadata and native ACL/capability or descriptor/ACE facts, keeps both row indices and evidence references, and omits raw xattr/security descriptor bytes. Duplicate identities and incomplete inputs do not produce confident unmatched presence changes. It does not calculate effective access or establish that inode/file-index values identify a persistent object. Process rows match only by PID plus observed generation (Linux proc start ticks or Windows creation FILETIME), never PID alone. Selected process facts are compared with evidence references on both sides. Unmatched process rows become additions/removals only when both snapshots and sources are complete and identity is certain. The output is a bounded pair of snapshots, not process start/exit history, exhaustive inventory, causation, or proof of absence. PIDs, generation values, and paths can be sensitive. Windows registration comparison retains its exact registry identity policy and omits uninstall commands and raw registry values. Incomplete sources or ambiguous identities suppress uncertain presence changes and produce exit status `2`.
+For Linux startup configuration, run:
+
+```sh
+sideeffect inventory startup --output ./startup-before.json
+sideeffect inventory startup --output ./startup-after.json
+sideeffect explain --inventory-diff ./startup-before.json ./startup-after.json
+```
+
+On Windows PowerShell, run:
+
+```powershell
+sideeffect.exe inventory startup --output .\startup-before.json
+sideeffect.exe inventory startup --output .\startup-after.json
+sideeffect.exe explain --inventory-diff .\startup-before.json .\startup-after.json
+```
+
+On Windows, use `sideeffect.exe inventory packages --output .\before.json` and `sideeffect.exe explain --inventory-diff .\before.json .\after.json`. The offline comparison accepts same-platform pairs of Linux package v2, Windows software-registration v1, Linux/Windows process v3, Linux/Windows selected-path permission v1, Linux startup v2, or Windows startup v4 inventories. Permission rows match only by exact selected path bytes (Linux) or UTF-16LE path bytes (Windows); paths are not normalized. It compares bounded metadata and native ACL/capability or descriptor/ACE facts, keeps evidence references, and omits raw xattr/security descriptor bytes. Duplicate identities and incomplete inputs do not produce confident unmatched presence changes. It does not calculate effective access or establish that inode/file-index values identify a persistent object. Process rows match only by PID plus observed generation (Linux proc start ticks or Windows creation FILETIME), never PID alone. Selected process facts are compared with evidence references on both sides. Unmatched process rows become additions/removals only when both snapshots and sources are complete and identity is certain. Startup rows use native source-specific identities; task action rows are compared as an ordered sequence, and duplicate task triggers or lossy XDG display paths remain ambiguous. Startup output contains only hashed identities, changed-field labels, and before/after source references; raw commands/configuration values stay in the input files. A startup comparison does not establish that a configured entry was installed, removed, effective, or executed. These bounded outputs compare two snapshots, not start/exit or execution history, exhaustive inventory, causation, or proof of absence. PIDs, generation values, paths, and source references can be sensitive. Hashed identities are not anonymization and may be guessable for common paths or names. Incomplete sources or ambiguous identities suppress uncertain presence changes and produce exit status `2`.
 
 For process snapshots, use `sideeffect inventory processes --output ./before.json` and `sideeffect inventory processes --output ./after.json` (or `sideeffect.exe` on Windows), then run the same `explain --inventory-diff` command. Process output includes local PIDs, generation values, and selected paths; review it before sharing.
 

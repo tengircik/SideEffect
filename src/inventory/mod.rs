@@ -20,6 +20,7 @@ mod processes;
 mod processes_windows;
 #[cfg(target_os = "linux")]
 mod startup;
+mod startup_diff;
 #[cfg(target_os = "linux")]
 mod startup_legacy;
 #[cfg(windows)]
@@ -47,6 +48,10 @@ pub use permission_diff::{
 pub use process_diff::{
     ProcessDelta, ProcessDiff, ProcessDiffCounts, ProcessDiffError, ProcessDiffStatus,
     ProcessEvidenceRef, ProcessSide, compare_process_inventory_json, is_process_inventory_json,
+};
+pub use startup_diff::{
+    StartupDelta, StartupDiffCounts, StartupDiffError, StartupDiffStatus, StartupEvidenceSide,
+    StartupInventoryDiff, compare_startup_inventory_json, is_startup_inventory_json,
 };
 pub use windows_software_diff::{
     WindowsSoftwareChangeKind, WindowsSoftwareComparisonCounts,
