@@ -61,7 +61,8 @@ pub fn write_audit_session_text<W: Write>(
             writeln!(
                 writer,
                 "  Collector: {} v{}",
-                collector.id, collector.version
+                escape_ascii(&collector.id),
+                escape_ascii(&collector.version)
             )?;
             writeln!(
                 writer,
@@ -508,11 +509,13 @@ mod tests {
     fn escapes_non_ascii_controls_and_bidi_scope_as_terminal_safe_ascii() {
         let mut fixture = manifest("safe\n\u{202e}path", SourceStatus::Partial);
         fixture.architecture = "x86\u{202e}_64".to_owned();
+        fixture.sources[0].collector.as_mut().unwrap().version = "1.0\u{202e}txt.exe".to_owned();
         let mut output = Vec::new();
         write_audit_session_text(&fixture, &mut output).unwrap();
         assert!(output.is_ascii());
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("Platform: linux (x86\\u{202e}_64)"));
+        assert!(output.contains("v1.0\\u{202e}txt.exe"));
         assert!(output.contains("Scope: \"safe\\n\\u{202e}path\""));
         assert!(output.contains("Status: partial"));
         assert!(output.contains("Session interval (Unix milliseconds): 1..=2"));
