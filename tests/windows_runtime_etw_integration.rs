@@ -165,6 +165,35 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
         "capture did not include the fixture's loopback network event with payload PID; network event summaries: {}",
         serde_json::to_string(&network_event_summaries).unwrap()
     );
+    let timeline = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--windows-runtime"])
+        .arg(&output)
+        .args(["--event-kind", "file_io_observation"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        timeline.status.code(),
+        Some(2),
+        "the live ETW capture has unknown completeness; timeline should preserve that state: {}",
+        String::from_utf8_lossy(&timeline.stderr)
+    );
+    let timeline: Value = serde_json::from_slice(&timeline.stdout).unwrap();
+    assert_eq!(timeline["schema"], "sideeffect.event_timeline");
+    assert_eq!(timeline["source_state"]["completeness"], "unknown");
+    assert_eq!(timeline["filter"]["event_kind"], "file_io_observation");
+    assert!(
+        timeline["items"].as_array().unwrap().iter().any(|event| {
+            event["event_kind"] == "file_io_observation"
+                && event["evidence"]["kind"] == "windows_etw_record"
+                && event["evidence"]["json_pointer"]
+                    .as_str()
+                    .is_some_and(|pointer| pointer.starts_with("/events/"))
+                && event["evidence"]["raw_payload_sha256"]
+                    .as_str()
+                    .is_some_and(|digest| digest.len() == 64)
+        }),
+        "live ETW timeline should retain a filtered file event with exact source evidence"
+    );
     fs::remove_file(fixture_file).unwrap();
     fs::remove_file(output).unwrap();
     fs::remove_dir(directory).unwrap();

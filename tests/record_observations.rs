@@ -599,6 +599,56 @@ fn real_strace_capture_inspect_and_diff_observe_file_and_loopback_events() {
             .to_str()
             .expect("UTF-8 test filename"),
     );
+    let timeline_output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--trace"])
+        .arg(&baseline_path)
+        .args(["--event-kind", "openat"])
+        .output()
+        .expect("launch timeline over the real strace capture");
+    assert!(
+        matches!(timeline_output.status.code(), Some(0 | 2)),
+        "timeline real strace capture failed (status: {:?}; stderr: {})",
+        timeline_output.status.code(),
+        String::from_utf8_lossy(&timeline_output.stderr)
+    );
+    let timeline: Value =
+        serde_json::from_slice(&timeline_output.stdout).expect("parse real-capture timeline JSON");
+    assert_eq!(timeline["schema"], "sideeffect.event_timeline");
+    let expected_exit = if timeline["source_state"]["completeness"] == "complete" {
+        0
+    } else {
+        2
+    };
+    assert_eq!(timeline_output.status.code(), Some(expected_exit));
+    assert_eq!(timeline["filter"]["event_kind"], "openat");
+    let timeline_file_event = timeline["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| {
+            event["event_kind"] == "openat"
+                && event["evidence"]["line_number"] == baseline_file_open["evidence"]["line_number"]
+                && event["evidence"]["byte_offset"] == baseline_file_open["evidence"]["byte_offset"]
+                && event["evidence"]["byte_length"] == baseline_file_open["evidence"]["byte_length"]
+        })
+        .expect("timeline should link to the observed real file-open row");
+    assert_eq!(timeline_file_event["evidence"]["kind"], "raw_trace_record");
+    let raw_trace = fs::read(&baseline_path).unwrap();
+    let start = timeline_file_event["evidence"]["byte_offset"]
+        .as_u64()
+        .unwrap() as usize;
+    let length = timeline_file_event["evidence"]["byte_length"]
+        .as_u64()
+        .unwrap() as usize;
+    assert!(
+        start
+            .checked_add(length)
+            .is_some_and(|end| end <= raw_trace.len())
+    );
+    assert!(
+        String::from_utf8_lossy(&raw_trace[start..start + length])
+            .contains(baseline_file.file_name().unwrap().to_str().unwrap())
+    );
     assert_eq!(
         baseline_file_open["lexical_path_hint"]["path"],
         baseline_file.to_str().unwrap()
