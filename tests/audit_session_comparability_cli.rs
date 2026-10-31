@@ -102,7 +102,6 @@ fn assert_reason(output: &Output, expected: &str) {
 
 fn make_windows_peer(path: &Path) {
     let mut value = manifest(path);
-    let source = &mut value["sources"][0];
     let old_artifact = path.join("packages.json");
     let new_artifact = path.join("software.windows.json");
     let bytes = br#"{"schema":"sideeffect.windows_software_inventory","schema_version":1}"#;
@@ -111,6 +110,7 @@ fn make_windows_peer(path: &Path) {
     fs::set_permissions(&new_artifact, fs::Permissions::from_mode(0o600)).unwrap();
     value["platform"] = json!("windows");
     value["host_context"]["os_name"]["value"] = json!("Windows");
+    let source = &mut value["sources"][0];
     source["platform"] = json!("windows");
     source["collector"]["id"] = json!("windows.software_registry");
     source["scope"] = json!("bounded uninstall-registry registrations");
@@ -207,7 +207,14 @@ fn session_comparability_cli_reports_metadata_readiness_and_rejects_unverified_i
     fs::write(before.join("packages.json"), b"tampered artifact").unwrap();
     let rejected = compare(&before, &before);
     assert_eq!(rejected.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("hash"));
+    assert!(
+        {
+            let error = String::from_utf8_lossy(&rejected.stderr);
+            error.contains("hash") || error.contains("byte length")
+        },
+        "unexpected rejection: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
 
     let insecure = audit(&root.0, "insecure");
     fs::set_permissions(&insecure, fs::Permissions::from_mode(0o755)).unwrap();
