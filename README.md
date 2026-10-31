@@ -133,7 +133,7 @@ On native Windows, use a validated ETW capture:
 sideeffect.exe timeline --windows-runtime .\runtime.windows.json --event-kind file_io_observation
 ```
 
-The JSON listing keeps each source's original order, timestamp representation, and evidence reference. Filters match an exact event kind; partial or unknown source status remains visible and exits with status `2`. Timelines are single-source views: they do not merge clocks, build a process graph, or establish causal order. Synthetic CLI tests cover both platform adapters; this does not claim a live capture-through-timeline acceptance test.
+The JSON listing keeps each source's original order, timestamp representation, and evidence reference. Filters match an exact event kind; partial or unknown source status remains visible and exits with status `2`. Timelines are single-source views: they do not merge clocks, build a process graph, or establish causal order. Hosted tests exercise the adapter on real Linux `strace` and native Windows ETW captures for the named file/loopback scenarios on Ubuntu 24.04 and Windows Server 2022/2025; they do not establish broad OS or event coverage.
 
 ### Compare saved inventories
 
