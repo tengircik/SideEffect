@@ -22,6 +22,7 @@ pub mod local_query_plan;
 pub mod model;
 pub mod model_installer;
 pub mod model_manager;
+pub mod provenance;
 pub mod record;
 pub mod startup_correlation;
 pub mod trace;

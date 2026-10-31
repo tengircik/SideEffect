@@ -21,11 +21,16 @@ const MAX_ENTRIES: usize = 9;
 #[derive(Debug)]
 pub struct VerifiedAuditSession {
     manifest: AuditSessionManifest,
+    manifest_bytes: Vec<u8>,
     artifacts: Vec<VerifiedAuditArtifact>,
 }
 impl VerifiedAuditSession {
     pub fn manifest(&self) -> &AuditSessionManifest {
         &self.manifest
+    }
+    /// Exact bounded bytes of the manifest validated by this reader.
+    pub fn manifest_bytes(&self) -> &[u8] {
+        &self.manifest_bytes
     }
     pub fn artifacts(&self) -> &[VerifiedAuditArtifact] {
         &self.artifacts
@@ -203,6 +208,7 @@ pub fn read_verified_session(path: &Path) -> Result<VerifiedAuditSession, Sessio
     drop(directory_lock);
     Ok(VerifiedAuditSession {
         manifest,
+        manifest_bytes: manifest_file,
         artifacts,
     })
 }
@@ -365,7 +371,7 @@ fn label(path: &str) -> &'static str {
 
 // Windows publication creates a protected DACL. The reader accepts only an explicit
 // non-inheriting DACL with a single allow ACE for the current user SID.
-fn owner_only_acl(path: &Path) -> io::Result<bool> {
+pub(crate) fn owner_only_acl(path: &Path) -> io::Result<bool> {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
     type Handle = *mut c_void;

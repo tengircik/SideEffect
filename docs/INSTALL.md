@@ -335,6 +335,34 @@ To verify and review the session metadata:
 
 The reader requires a current-user-owned private directory and private regular files, rejects symlinks and unlisted entries, checks bounded JSON syntax and declared schema/version headers, and verifies every declared artifact's length and SHA-256 before writing a review. It does not fully validate each inventory artifact's domain schema or print raw inventory rows. Use `--format json` for the versioned `sideeffect.audit_session_review` v6 output, which includes recorded host OS/version and caller privilege context, source settings, runtime loss state, and artifact provenance. The display-only review escapes non-ASCII and control characters in all string values as ASCII so imported metadata cannot inject terminal formatting; this encoding does not modify stored session files. Older session versions retain absent host context; it is not reconstructed. A hash match does not authenticate the session producer. Partial sessions are still reviewable and return exit status `2`.
 
+### Sign an audit session
+
+Create a local Ed25519 keypair explicitly:
+
+```sh
+./target/release/sideeffect provenance keygen ./sideeffect-signing-key.pk8 ./sideeffect-public-key.hex
+```
+
+The private key is an unencrypted PKCS#8 file. Protect it and keep a secure backup; anyone who obtains it can create signatures that verify under its public key. Key files are written with owner-only access and existing outputs are never replaced.
+
+Sign a validated session. Review the displayed session metadata and type `sign` when prompted. The signature envelope is a separate file outside the session directory:
+
+```sh
+./target/release/sideeffect provenance sign-session ./audit-session \
+  --private-key ./sideeffect-signing-key.pk8 \
+  --output ./audit-session.signature.json
+```
+
+Verify offline by supplying the matching public key:
+
+```sh
+./target/release/sideeffect provenance verify-session ./audit-session \
+  --signature ./audit-session.signature.json \
+  --public-key ./sideeffect-public-key.hex
+```
+
+Verification checks the session artifacts first, then verifies the signature over the exact `session.json` bytes. It reports cryptographic validity only. The current CLI has no local trust store or revocation handling; a valid signature does not identify a person, establish key trust, prove collector honesty, or establish capture completeness. The recorded signing time comes from the local clock and is not a trusted timestamp. Keep the detached signature file with the session when moving or archiving it.
+
 ## Record a command on Linux
 
 Install `strace` from a trusted distribution repository and confirm it reports version 6.8 or newer. On Ubuntu, these commands install system packages and change that Linux installation system-wide; they typically require administrator privileges, so run them only if you intend to make that change. `python3` is required for the Linux real-tracer integration test, not for the `record` command itself:

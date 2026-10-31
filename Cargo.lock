@@ -823,6 +823,7 @@ dependencies = [
  "fs2",
  "libc",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

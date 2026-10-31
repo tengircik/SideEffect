@@ -141,6 +141,41 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             print_version();
             Ok(ExitCode::SUCCESS)
         }
+        [command, operation, private_path, public_path]
+            if command == "provenance" && operation == "keygen" =>
+        {
+            provenance_keygen(private_path, public_path)
+        }
+        [
+            command,
+            operation,
+            session,
+            key_flag,
+            key_path,
+            output_flag,
+            output_path,
+        ] if command == "provenance"
+            && operation == "sign-session"
+            && key_flag == "--private-key"
+            && output_flag == "--output" =>
+        {
+            provenance_sign_session(session, key_path, output_path)
+        }
+        [
+            command,
+            operation,
+            session,
+            signature_flag,
+            signature_path,
+            key_flag,
+            key_path,
+        ] if command == "provenance"
+            && operation == "verify-session"
+            && signature_flag == "--signature"
+            && key_flag == "--public-key" =>
+        {
+            provenance_verify_session(session, signature_path, key_path)
+        }
         [command] if command == "help" => command_help(&[]),
         [command, topic] if command == "help" => command_help(std::slice::from_ref(topic)),
         [command, topic, subtopic] if command == "help" => {
@@ -1356,7 +1391,7 @@ fn print_version() {
 
 fn print_usage() {
     println!(
-        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)"
+        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)\n       sideeffect timeline --trace <strace-trace-file> [--event-kind <kind>]\n\nProvenance:\n       sideeffect provenance keygen <private-key.pk8> <public-key.hex>\n       sideeffect provenance sign-session <session-dir> --private-key <private-key.pk8> --output <signature.json>\n       sideeffect provenance verify-session <session-dir> --signature <signature.json> --public-key <public-key.hex>"
     );
 }
 
@@ -1394,6 +1429,12 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         }
         "events" => {
             "Usage: sideeffect events --trace TRACE\n       sideeffect events --windows-runtime CAPTURE.json (native Windows)\nAdapts one local runtime source into a versioned common event envelope and writes JSON only. Source-local order and timestamps are preserved; no cross-platform ordering, parentage, ownership, or causation is inferred. Partial or unknown source status exits with status 2. Windows runtime input is strictly bounded and schema-validated before adaptation."
+        }
+        "timeline" => {
+            "Usage: sideeffect timeline --trace TRACE [--event-kind KIND]\nBuilds a source-local timeline from bounded strace evidence. Items keep their source ordinal, original timestamp text, and exact raw-record evidence reference; timestamps do not establish causal order. --event-kind matches an exact event kind. Unsupported rows remain in diagnostics. Partial or unknown source status exits with status 2."
+        }
+        "provenance" => {
+            "Usage: sideeffect provenance keygen PRIVATE_KEY.pk8 PUBLIC_KEY.hex\n       sideeffect provenance sign-session SESSION_DIR --private-key PRIVATE_KEY.pk8 --output SIGNATURE.json\n       sideeffect provenance verify-session SESSION_DIR --signature SIGNATURE.json --public-key PUBLIC_KEY.hex\nCreates Ed25519 keys explicitly, signs the exact validated session.json bytes into a detached envelope, or verifies cryptographic validity offline. Key files and signature output are private, no-clobber files. Verification does not evaluate key trust, signer identity, collector honesty, or capture completeness."
         }
         "diff" => {
             "Usage: sideeffect diff [--format json|text] LEFT RIGHT\n       sideeffect diff --format html --output REPORT.html LEFT RIGHT\n       sideeffect diff --bundles [--format json|text] LEFT_DIR RIGHT_DIR\n       sideeffect diff --windows-runtime [--format json|text] BEFORE.json AFTER.json\n       sideeffect diff --format html --output REPORT.html --windows-runtime BEFORE.json AFTER.json (native Windows)\nCompares complete parsed strace observations or validated Windows ETW captures. Windows summary v2 preserves category counts, compares exact normalized record multisets, and labels unique supported changed identities as candidates with source references. One-sided observations are not removals or additions; capture completeness remains unknown, and no causal or system-level absence claims are made. Windows HTML uses the protected current-user publisher and a static offline report. Input and report data may be sensitive."
@@ -1625,6 +1666,104 @@ fn inventory_access_check(
         let _ = (operation, output, path, process_identity);
         Err("inventory access-check is not supported on this platform".to_owned())
     }
+}
+
+fn provenance_keygen(private_path: &OsString, public_path: &OsString) -> Result<ExitCode, String> {
+    sideeffect::provenance::generate_keypair(Path::new(private_path), Path::new(public_path))
+        .map_err(|error| format!("could not create provenance keypair: {error}"))?;
+    println!("Created private signing key and public verification key.");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn provenance_sign_session(
+    session_path: &OsString,
+    key_path: &OsString,
+    output_path: &OsString,
+) -> Result<ExitCode, String> {
+    let session = read_verified_audit_session(Path::new(session_path))?;
+    let manifest = session.manifest();
+    println!("Session: {}", manifest.session_id);
+    println!(
+        "Platform: {} / {}",
+        manifest.platform, manifest.architecture
+    );
+    println!("Sources: {}", manifest.sources.len());
+    println!(
+        "Artifacts: {}",
+        manifest
+            .sources
+            .iter()
+            .map(|source| source.artifacts.len())
+            .sum::<usize>()
+    );
+    println!(
+        "Signing binds the exact session.json bytes and its declared artifact hashes. The signature does not establish signer identity or capture completeness."
+    );
+    print!("Type 'sign' to continue: ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("could not write signing confirmation: {error}"))?;
+    let mut confirmation = String::new();
+    io::stdin()
+        .read_line(&mut confirmation)
+        .map_err(|error| format!("could not read signing confirmation: {error}"))?;
+    if confirmation.trim() != "sign" {
+        return Err("session signing cancelled".to_owned());
+    }
+    let private = sideeffect::provenance::load_private_key(Path::new(key_path))
+        .map_err(|error| format!("could not read private key: {error}"))?;
+    let signed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch".to_owned())?
+        .as_millis();
+    let signed_at =
+        u64::try_from(signed_at).map_err(|_| "signing timestamp is out of range".to_owned())?;
+    let envelope =
+        sideeffect::provenance::sign_manifest(session.manifest_bytes(), &private, signed_at)
+            .map_err(|error| format!("could not sign session manifest: {error}"))?;
+    sideeffect::provenance::publish_envelope(Path::new(output_path), &envelope)
+        .map_err(|error| format!("could not publish signature envelope: {error}"))?;
+    println!("Signature created. The recorded local clock time is not a trusted timestamp.");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn provenance_verify_session(
+    session_path: &OsString,
+    signature_path: &OsString,
+    key_path: &OsString,
+) -> Result<ExitCode, String> {
+    let session = read_verified_audit_session(Path::new(session_path))?;
+    let envelope = sideeffect::provenance::read_envelope(Path::new(signature_path))
+        .map_err(|error| format!("could not read signature envelope: {error}"))?;
+    let public = sideeffect::provenance::load_public_key(Path::new(key_path))
+        .map_err(|error| format!("could not read public key: {error}"))?;
+    match sideeffect::provenance::verify_manifest(session.manifest_bytes(), &envelope, &public)
+        .map_err(|error| format!("signature verification failed: {error}"))?
+    {
+        sideeffect::provenance::Verification::Valid { key_id } => {
+            println!("Cryptographic signature valid for key {key_id}.");
+            println!(
+                "Key trust was not evaluated. This does not establish signer identity, collector honesty, or capture completeness."
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_verified_audit_session(
+    path: &Path,
+) -> Result<sideeffect::audit_session_reader_linux::VerifiedAuditSession, String> {
+    sideeffect::audit_session_reader_linux::read_verified_session(path)
+        .map_err(|error| format!("could not verify audit session: {error}"))
+}
+
+#[cfg(windows)]
+fn read_verified_audit_session(
+    path: &Path,
+) -> Result<sideeffect::audit_session_reader_windows::VerifiedAuditSession, String> {
+    sideeffect::audit_session_reader_windows::read_verified_session(path)
+        .map_err(|error| format!("could not verify audit session: {error}"))
 }
 
 fn events_trace(path: &OsString) -> Result<ExitCode, String> {
