@@ -31,7 +31,10 @@ use sideeffect::format::{
 };
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{InventoryStatus, collect_packages};
-use sideeffect::inventory::{PackageComparisonStatus, compare_package_inventory_json};
+use sideeffect::inventory::{
+    PackageComparisonStatus, WindowsSoftwareComparisonStatus, compare_package_inventory_json,
+    compare_windows_software_inventory_json, is_windows_software_inventory_json,
+};
 use sideeffect::inventory::{PathExecutableInventory, collect_path_executables};
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{PermissionInventoryStatus, collect_permissions};
@@ -1996,21 +1999,33 @@ fn explain_inventory_diff_files(
     let before = read_input_file(
         Path::new(before_path),
         MAX_REPORT_BYTES,
-        "package inventory",
+        "inventory comparison input",
     )?;
     let after = read_input_file(
         Path::new(after_path),
         MAX_REPORT_BYTES.saturating_sub(before.len()),
-        "package inventory",
+        "inventory comparison input",
     )?;
-    let comparison = compare_package_inventory_json(&before, &after)
-        .map_err(|error| format!("package inventory comparison failed: {error:?}"))?;
-    let partial = comparison.status == PackageComparisonStatus::Partial;
-    write_json(&comparison, "JSON package inventory comparison")?;
-    if partial {
-        Ok(ExitCode::from(2))
+    if is_windows_software_inventory_json(&before) || is_windows_software_inventory_json(&after) {
+        let comparison = compare_windows_software_inventory_json(&before, &after)
+            .map_err(|error| format!("Windows software inventory comparison failed: {error:?}"))?;
+        let partial = comparison.status == WindowsSoftwareComparisonStatus::Partial;
+        write_json(&comparison, "JSON Windows software inventory comparison")?;
+        if partial {
+            Ok(ExitCode::from(2))
+        } else {
+            Ok(ExitCode::SUCCESS)
+        }
     } else {
-        Ok(ExitCode::SUCCESS)
+        let comparison = compare_package_inventory_json(&before, &after)
+            .map_err(|error| format!("package inventory comparison failed: {error:?}"))?;
+        let partial = comparison.status == PackageComparisonStatus::Partial;
+        write_json(&comparison, "JSON package inventory comparison")?;
+        if partial {
+            Ok(ExitCode::from(2))
+        } else {
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 

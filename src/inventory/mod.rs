@@ -24,6 +24,7 @@ mod startup_legacy;
 mod startup_windows;
 #[cfg(target_os = "linux")]
 mod systemd_units;
+mod windows_software_diff;
 
 pub use model::{
     INVENTORY_SCHEMA, INVENTORY_SCHEMA_VERSION, InventoryDiagnostic, InventoryDocument,
@@ -36,6 +37,14 @@ pub use package_diff::{
     compare_package_inventories, compare_package_inventory_json,
 };
 pub use path_executables::{PathExecutableInventory, collect_path_executables};
+pub use windows_software_diff::{
+    WindowsSoftwareChangeKind, WindowsSoftwareComparisonCounts,
+    WindowsSoftwareComparisonDiagnostic, WindowsSoftwareComparisonError,
+    WindowsSoftwareComparisonStatus, WindowsSoftwareDelta, WindowsSoftwareEvidenceReference,
+    WindowsSoftwareFacts, WindowsSoftwareIdentity, WindowsSoftwareInventoryComparison,
+    WindowsSoftwareSourceComparison, WindowsSoftwareSourceStatus,
+    compare_windows_software_inventory_json, is_windows_software_inventory_json,
+};
 
 #[cfg(target_os = "linux")]
 pub use debian::collect_debian_packages;

@@ -121,6 +121,18 @@ sideeffect.exe events --windows-runtime .\runtime.windows.json
 
 The command writes versioned JSON to stdout and never runs represented commands or modifies the input. Events keep their source-local order, timestamps, outcome/status, and evidence links. Envelope v2 adds source-local process observations and event links: Linux process-creation rows link the caller task ID to the returned child PID. Windows process identities and parent relationships come from serialized ETW lifecycle decoder fields and are labeled `decoder_metadata_unverified`. For supported classic TCP/UDP rows, the adapter re-decodes retained raw payload bytes and checks the serialized observation; a mismatch is diagnosed and only the raw payload PID can support a context-candidate link. Unsupported or malformed payloads remain raw with an unresolved link and diagnostic. Windows file/disk header PIDs remain context candidates. These links do not form a merged process graph or causal view. A partial or unknown source exits with status `2`; the envelope does not infer one global clock or process ownership.
 
+### Compare saved software inventories
+
+Capture two inventories with the same platform's command, then compare the saved files:
+
+```sh
+sideeffect inventory packages --output ./before.json
+sideeffect inventory packages --output ./after.json
+sideeffect explain --inventory-diff ./before.json ./after.json
+```
+
+On Windows, use `sideeffect.exe inventory packages --output .\before.json` and `sideeffect.exe explain --inventory-diff .\before.json .\after.json`. The offline comparison accepts Linux package inventory v2 or Windows software-registration inventory v1, but both inputs must use the same schema. Windows rows are matched by their exact registry source, view, and subkey evidence. The report compares display name, version, and publisher; it omits uninstall commands and raw registry values. If either source is incomplete or a registration identity is ambiguous, unmatched rows are not reported as confirmed additions or removals and the command exits with status `2`.
+
 ## What you can do
 
 | Workflow | Evidence and output |
