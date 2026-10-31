@@ -28,6 +28,21 @@ pub fn write_windows_runtime_diff_text<W: Write>(
     writer.write_all(b"\nCapture completeness: unknown\n")?;
     write_side(writer, "Before", &summary.before, before.collection_status)?;
     write_side(writer, "After", &summary.after, after.collection_status)?;
+    writer.write_all(b"\nExact-match normalization ledger:\n")?;
+    if summary.normalization_ledger.is_empty() {
+        writer.write_all(b"  No fields are excluded from exact event equality.\n")?;
+    }
+    for entry in &summary.normalization_ledger {
+        writer.write_all(b"  field=")?;
+        write_quoted(writer, entry.field)?;
+        writer.write_all(b" treatment=")?;
+        write_quoted(writer, entry.treatment)?;
+        writer.write_all(b" reason=")?;
+        write_quoted(writer, entry.reason)?;
+        writer.write_all(b" retained_as=")?;
+        write_quoted(writer, entry.source_values_retained_as)?;
+        writer.write_all(b"\n")?;
+    }
     writer.write_all(b"\nObserved category count deltas:\n")?;
     if summary.categories.is_empty() {
         writer.write_all(b"  No supported categories were observed in either capture.\n")?;
@@ -128,7 +143,11 @@ fn write_event_references<W: Write>(
     for reference in references {
         writer.write_all(b"      capture=")?;
         write_quoted(writer, &reference.capture_sha256)?;
-        write!(writer, " ordinal={} provider=", reference.record_ordinal)?;
+        write!(
+            writer,
+            " ordinal={} timestamp_qpc={} provider=",
+            reference.record_ordinal, reference.timestamp_qpc
+        )?;
         write_quoted(writer, &reference.provider_guid)?;
         writeln!(
             writer,
@@ -203,7 +222,7 @@ mod tests {
     fn text_is_terminal_safe_and_states_comparison_limits() {
         let mut summary = WindowsRuntimeDiffSummary {
             schema: "sideeffect.windows_runtime_diff_summary",
-            schema_version: 2,
+            schema_version: 3,
             algorithm: crate::windows_runtime_diff::ComparisonAlgorithm {
                 id: "test\u{1b}[31m",
                 version: 2,
@@ -248,6 +267,12 @@ mod tests {
                 observed_count_delta: -1,
                 before_event_ordinals: vec![1],
                 after_event_ordinals: vec![],
+            }],
+            normalization_ledger: vec![crate::windows_runtime_diff::NormalizationLedgerEntry {
+                field: "timestamp_qpc",
+                treatment: "excluded_from_exact_event_equality",
+                reason: "capture-local QPC timestamp",
+                source_values_retained_as: "before/after event references timestamp_qpc",
             }],
             event_changes: vec![],
             diagnostics: vec!["partial"],
@@ -314,5 +339,7 @@ mod tests {
         assert!(!output.contains('\u{1b}'));
         assert!(output.contains("Before event ordinals: 1"));
         assert!(output.contains("After event ordinals: none"));
+        assert!(output.contains("Exact-match normalization ledger"));
+        assert!(output.contains("field=\"timestamp_qpc\""));
     }
 }

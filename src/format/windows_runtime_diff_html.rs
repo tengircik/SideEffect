@@ -69,7 +69,21 @@ pub fn write_windows_runtime_diff_html<W: Write>(
         summary.after.diagnostics_count,
     )?;
     write_value(writer, &summary.after.event_loss.observation)?;
-    writer.write_all(b"</dd>\n</dl></section>\n<p>Category counts and one-sided observations do not establish event absence, operation success, causation, or target attribution. Event ordinals refer to positions in one capture document; they are not byte offsets. Candidate matches do not prove the same underlying execution.</p>\n<section><h2>Category count deltas (")?;
+    writer.write_all(b"</dd>\n</dl></section>\n<p>Category counts and one-sided observations do not establish event absence, operation success, causation, or target attribution. Event ordinals refer to positions in one capture document; they are not byte offsets. Candidate matches do not prove the same underlying execution.</p>\n<section><h2>Exact-match normalization ledger (")?;
+    write!(writer, "{}", summary.normalization_ledger.len())?;
+    writer.write_all(b")</h2><p>Fields excluded from exact equality retain their source values in the ledger and event references.</p><ul>")?;
+    for entry in &summary.normalization_ledger {
+        writer.write_all(b"<li><dl><dt>Field</dt><dd>")?;
+        write_value(writer, entry.field)?;
+        writer.write_all(b"</dd><dt>Treatment</dt><dd>")?;
+        write_value(writer, entry.treatment)?;
+        writer.write_all(b"</dd><dt>Reason</dt><dd>")?;
+        write_value(writer, entry.reason)?;
+        writer.write_all(b"</dd><dt>Source values retained as</dt><dd>")?;
+        write_value(writer, entry.source_values_retained_as)?;
+        writer.write_all(b"</dd></dl></li>")?;
+    }
+    writer.write_all(b"</ul></section>\n<section><h2>Category count deltas (")?;
     write!(writer, "{}", summary.categories.len())?;
     writer.write_all(b")</h2>")?;
     if summary.categories.is_empty() {
@@ -147,8 +161,8 @@ fn write_evidence<W: Write>(
         write_value(writer, &reference.capture_sha256)?;
         write!(
             writer,
-            "; record ordinal {} ; provider ",
-            reference.record_ordinal
+            "; record ordinal {} ; QPC timestamp {} ; provider ",
+            reference.record_ordinal, reference.timestamp_qpc
         )?;
         write_value(writer, &reference.provider_guid)?;
         write!(
@@ -270,7 +284,7 @@ mod tests {
     fn summary(before_hash: &str, after_hash: &str) -> WindowsRuntimeDiffSummary {
         WindowsRuntimeDiffSummary {
             schema: "sideeffect.windows_runtime_diff_summary",
-            schema_version: 2,
+            schema_version: 3,
             algorithm: ComparisonAlgorithm {
                 id: "windows_etw_exact_multiset_and_unique_candidate_diff",
                 version: 2,
@@ -315,6 +329,12 @@ mod tests {
                 observed_count_delta: -1,
                 before_event_ordinals: vec![1],
                 after_event_ordinals: vec![],
+            }],
+            normalization_ledger: vec![crate::windows_runtime_diff::NormalizationLedgerEntry {
+                field: "timestamp_qpc",
+                treatment: "excluded_from_exact_event_equality",
+                reason: "capture-local QPC timestamp",
+                source_values_retained_as: "before/after event references timestamp_qpc",
             }],
             event_changes: vec![],
             diagnostics: vec!["one_or_both_captures_report_partial_collection"],
@@ -363,6 +383,8 @@ mod tests {
         assert!(html.contains(">1</dd>"));
         assert!(html.contains(">none</dd>"));
         assert!(html.contains("candidate matching does not establish event identity"));
+        assert!(html.contains("Exact-match normalization ledger"));
+        assert!(html.contains("timestamp_qpc"));
         assert!(
             html.contains("event absence, operation success, causation, or target attribution")
         );

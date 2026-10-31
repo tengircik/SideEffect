@@ -266,7 +266,7 @@ fn json_compares_observed_category_counts_and_preserves_ordinals() {
     assert_eq!(output.status.code(), Some(0));
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["schema"], "sideeffect.windows_runtime_diff_summary");
-    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["schema_version"], 3);
     assert_eq!(
         report["algorithm"]["id"],
         "windows_etw_exact_multiset_and_unique_candidate_diff"
@@ -290,6 +290,8 @@ fn json_compares_observed_category_counts_and_preserves_ordinals() {
     assert_eq!(report["after"]["producer_collection_status"], "complete");
     assert_eq!(report["before"]["observed_event_count"], 3);
     assert_eq!(report["after"]["observed_event_count"], 3);
+    assert_eq!(report["normalization_ledger"].as_array().unwrap().len(), 2);
+    assert_eq!(report["normalization_ledger"][1]["field"], "timestamp_qpc");
     assert_eq!(category(&report, "process.start")["before_count"], 1);
     assert_eq!(category(&report, "process.start")["after_count"], 1);
     assert_eq!(
@@ -355,6 +357,37 @@ fn json_compares_observed_category_counts_and_preserves_ordinals() {
                     .unwrap()
                     .contains("exact normalized event records")
             })
+    );
+}
+
+#[test]
+fn exact_event_match_excludes_qpc_but_keeps_both_source_values() {
+    let before = capture(CollectionStatus::Complete, &["process.start"]);
+    let mut after_value: Value = serde_json::from_slice(&before).unwrap();
+    after_value["events"][0]["timestamp_qpc"] = json!(99);
+    let after = refingerprint_capture(
+        &serde_json::to_vec(&after_value).unwrap(),
+        WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION,
+    );
+    let (_temp, output) = run_diff(&before, &after, &[]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let unchanged = report["event_changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|delta| delta["status"] == "unchanged")
+        .unwrap();
+    assert_eq!(unchanged["before"][0]["timestamp_qpc"], 1);
+    assert_eq!(unchanged["after"][0]["timestamp_qpc"], 99);
+    assert_eq!(
+        report["normalization_ledger"][1]["treatment"],
+        "excluded_from_exact_event_equality"
+    );
+    assert_eq!(
+        report["normalization_ledger"][1]["source_values_retained_as"],
+        "before/after event references timestamp_qpc"
     );
 }
 
@@ -430,6 +463,8 @@ fn text_is_terminal_safe_and_partial_collection_exits_two() {
     assert!(text.contains("One-sided observations are not removals or additions"));
     assert!(text.contains("Capture completeness remains unknown"));
     assert!(text.contains("event absence, operation success, causation, or target attribution"));
+    assert!(text.contains("Exact-match normalization ledger"));
+    assert!(text.contains("field=\"timestamp_qpc\""));
 }
 
 #[test]
@@ -502,6 +537,9 @@ fn html_uses_static_csp_and_refuses_to_replace_existing_report() {
         assert!(html.contains("default-src 'none'"));
         assert!(html.contains("connect-src 'none'"));
         assert!(html.contains("script-src 'none'"));
+        assert!(html.contains("Exact-match normalization ledger"));
+        assert!(html.contains("timestamp_qpc"));
+        assert!(html.contains("QPC timestamp 1"));
         assert!(
             html.contains(
                 "Category counts and one-sided observations do not establish event absence"

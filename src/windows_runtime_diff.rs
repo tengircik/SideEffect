@@ -12,7 +12,7 @@ use std::io::{self, Write};
 use crate::windows_runtime::{CollectionStatus, MAX_WINDOWS_RUNTIME_EVENTS, WindowsRuntimeCapture};
 
 pub const WINDOWS_RUNTIME_DIFF_SUMMARY_SCHEMA: &str = "sideeffect.windows_runtime_diff_summary";
-pub const WINDOWS_RUNTIME_DIFF_SUMMARY_SCHEMA_VERSION: u32 = 2;
+pub const WINDOWS_RUNTIME_DIFF_SUMMARY_SCHEMA_VERSION: u32 = 3;
 const MAX_EVENT_DIFF_KEY_BYTES: usize = 128 * 1024 * 1024;
 const MAX_EVENT_DIFF_ROWS: usize = MAX_WINDOWS_RUNTIME_EVENTS * 2;
 const PROCESS_PROVIDER_GUID: &str = "3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c";
@@ -40,6 +40,8 @@ pub struct WindowsRuntimeDiffSummary {
     pub before: CaptureSide,
     pub after: CaptureSide,
     pub categories: Vec<CategoryCountDelta>,
+    /// Declares every source field omitted from exact event equality.
+    pub normalization_ledger: Vec<NormalizationLedgerEntry>,
     /// Event-level differences. Exact records are multiset-compared; uncertain
     /// cross-capture identity is explicitly left unpaired or marked candidate.
     pub event_changes: Vec<EventDelta>,
@@ -72,12 +74,21 @@ pub struct EventDelta {
 pub struct EventEvidenceReference {
     pub capture_sha256: String,
     pub record_ordinal: u64,
+    pub timestamp_qpc: i64,
     pub provider_guid: String,
     pub event_id: u16,
     pub event_version: u8,
     pub opcode: u8,
     pub event_kind: String,
     pub category: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NormalizationLedgerEntry {
+    pub field: &'static str,
+    pub treatment: &'static str,
+    pub reason: &'static str,
+    pub source_values_retained_as: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -227,6 +238,20 @@ pub fn compare_windows_runtime_captures(
         before: capture_side(before),
         after: capture_side(after),
         categories,
+        normalization_ledger: vec![
+            NormalizationLedgerEntry {
+                field: "record_ordinal",
+                treatment: "excluded_from_exact_event_equality",
+                reason: "record ordinals are source-local evidence locators and can differ between captures",
+                source_values_retained_as: "before/after event references record_ordinal",
+            },
+            NormalizationLedgerEntry {
+                field: "timestamp_qpc",
+                treatment: "excluded_from_exact_event_equality",
+                reason: "QPC ticks are capture-local timestamps and are not comparable across captures",
+                source_values_retained_as: "before/after event references timestamp_qpc",
+            },
+        ],
         event_changes,
         diagnostics,
         limitations: vec![
@@ -696,6 +721,7 @@ fn event_references(
             EventEvidenceReference {
                 capture_sha256: capture.document_sha256.clone(),
                 record_ordinal: event.record_ordinal,
+                timestamp_qpc: event.timestamp_qpc,
                 provider_guid: event.provider_guid.clone(),
                 event_id: event.event_id,
                 event_version: event.event_version,
@@ -1416,7 +1442,7 @@ mod tests {
         let json = serde_json::to_value(&summary).unwrap();
 
         assert_eq!(summary.schema, WINDOWS_RUNTIME_DIFF_SUMMARY_SCHEMA);
-        assert_eq!(summary.schema_version, 2);
+        assert_eq!(summary.schema_version, 3);
         assert_eq!(summary.comparison_status, ComparisonStatus::Complete);
         assert_eq!(summary.capture_completeness, "unknown");
         assert_eq!(summary.before.document_sha256, "a".repeat(64));
