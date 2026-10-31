@@ -20,9 +20,18 @@ archive="$(find "$release_dir" -maxdepth 1 -type f -name 'sideeffect-*-linux-x86
 test -n "$archive"
 gh attestation verify "$archive" --repo tengircik/SideEffect
 tar -tzf "$archive"
+package_name="$(basename "$archive" .tar.gz)"
+install_root="$HOME/.local/opt/SideEffect"
+install_dir="$install_root/$package_name"
+test ! -e "$install_dir" || { echo "Install directory already exists: $install_dir" >&2; exit 1; }
+mkdir -p "$install_root"
+tar -xzf "$archive" -C "$install_root"
+test ! -e "$HOME/.local/bin/sideeffect" || { echo "CLI already exists at ~/.local/bin/sideeffect; check it before replacing it" >&2; exit 1; }
+mkdir -p "$HOME/.local/bin"
+install -m 0755 "$install_dir/sideeffect" "$HOME/.local/bin/sideeffect"
 ```
 
-After verification, extract the archive to a new versioned directory under `~/.local/opt/SideEffect/`. Copy its `sideeffect` executable to `~/.local/bin/sideeffect` only if that destination does not already exist. Add `~/.local/bin` to the current agent or shell `PATH`, then run `sideeffect version`. Do not overwrite an existing CLI without checking its version and location first.
+The commands above extract the archive to a new versioned directory under `~/.local/opt/SideEffect/` and copy its executable to `~/.local/bin/sideeffect` only if that destination does not already exist. Add `~/.local/bin` to the current shell with `export PATH="$HOME/.local/bin:$PATH"`, then run `sideeffect version`. To make it available in future login shells, add that `export` line to the startup file used by your shell (for example, `~/.profile` for a typical login shell) and open a new shell. Do not overwrite an existing CLI without checking its version and location first.
 
 Windows x64 PowerShell:
 
@@ -40,9 +49,31 @@ $expected = ($sumLine -split "\s+")[0]
 $actual = (Get-FileHash $archive.FullName -Algorithm SHA256).Hash
 if ($actual -ne $expected) { throw "Release archive SHA-256 mismatch" }
 gh attestation verify $archive.FullName --repo tengircik/SideEffect
+$installRoot = Join-Path $env:LOCALAPPDATA "Programs\SideEffect"
+$installDir = Join-Path $installRoot $archive.BaseName
+if (Test-Path -LiteralPath $installDir) { throw "Install directory already exists; choose a new versioned directory" }
+New-Item -ItemType Directory -Path $installDir | Out-Null
+Expand-Archive -LiteralPath $archive.FullName -DestinationPath $installDir
 ```
 
-After verification, expand the archive into a new versioned directory under `$env:LOCALAPPDATA\Programs\SideEffect`. Do not extract over an existing installation. Run `sideeffect.exe version` from that directory; add that directory to the current agent process `PATH` if you want to invoke `sideeffect` by name. A user-level PATH entry can be added separately for future sessions; administrator access is not required.
+The commands above extract to a new versioned directory without replacing an existing installation. Add it to this PowerShell session and verify the command:
+
+```powershell
+$env:Path = "$installDir;$env:Path"
+sideeffect.exe version
+```
+
+To make that version available in future user sessions, add its directory to your user PATH (no administrator access is needed). This command preserves the existing user PATH and avoids adding the same directory twice:
+
+```powershell
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+$pathEntries = @($userPath -split ';' | Where-Object { $_ })
+if (-not ($pathEntries | Where-Object { $_.TrimEnd('\') -ieq $installDir.TrimEnd('\') })) {
+    [Environment]::SetEnvironmentVariable("Path", (@($pathEntries) + $installDir) -join ';', "User")
+}
+```
+
+Close and reopen PowerShell and any terminal or agent that should use the updated PATH. Because the directory is versioned, update the PATH entry when you install a newer version. You can always run `sideeffect.exe` directly from the versioned directory.
 
 The Linux and Windows binary archives contain the CLI, README, installation and Agent Skill guides, project license, third-party notices, and the version-specific release notes. A separate `sideeffect-<version>-source.tar.gz` archive contains the corresponding tagged source tree. All published archives and notices appear in `SHA256SUMS`; the Linux and Windows binaries and source archive carry GitHub build-provenance attestations. Linux release archives target x86_64 GNU and are built on Ubuntu 22.04; Windows archives target x64 MSVC. The compatibility matrix below lists the exact validation boundaries.
 
@@ -129,6 +160,26 @@ If PATH was just changed, close and reopen PowerShell (and any terminal or agent
 ```powershell
 & (Join-Path $env:USERPROFILE ".cargo\bin\sideeffect.exe") --version
 ```
+
+To use the Cargo-installed command in the current session, add Cargo's bin directory to that session's PATH:
+
+```powershell
+$env:Path = "$(Join-Path $env:USERPROFILE '.cargo\bin');$env:Path"
+sideeffect version
+```
+
+To persist it for your Windows user, add the Cargo bin directory to the user PATH without duplicating it:
+
+```powershell
+$cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+$pathEntries = @($userPath -split ';' | Where-Object { $_ })
+if (-not ($pathEntries | Where-Object { $_.TrimEnd('\') -ieq $cargoBin.TrimEnd('\') })) {
+    [Environment]::SetEnvironmentVariable("Path", (@($pathEntries) + $cargoBin) -join ';', "User")
+}
+```
+
+Restart PowerShell and the agent or terminal after changing the user PATH. If `sideeffect version` still fails, use `Get-Command sideeffect -All` and check the executable's location before changing PATH again.
 
 If you used `cargo build --release` instead of `cargo install`, the binary is in the repository's `target\release\sideeffect.exe`; from the repository root, invoke it as `& .\target\release\sideeffect.exe --version`.
 
