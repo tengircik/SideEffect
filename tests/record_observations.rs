@@ -3,6 +3,7 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs::{self, DirBuilder};
+use std::net::TcpListener;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -814,6 +815,98 @@ fn real_strace_capture_inspect_and_diff_observe_file_and_loopback_events() {
     assert!(
         !temporary_root.exists(),
         "temporary traces and target files must be removed after the test"
+    );
+}
+
+#[test]
+fn real_strace_capture_reports_refused_loopback_connection_as_failed_attempt() {
+    require_tool("strace", &["--version"]);
+    require_tool("python3", &["--version"]);
+
+    let directory = PrivateTempDirectory::new();
+    let trace_path = directory.path().join("refused-loopback.trace");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve loopback port");
+    let port = listener.local_addr().expect("read loopback port").port();
+    drop(listener);
+
+    const SCRIPT: &str = r#"
+import errno
+import socket
+import sys
+
+port = int(sys.argv[1])
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+    result = client.connect_ex(("127.0.0.1", port))
+if result != errno.ECONNREFUSED:
+    sys.exit(1)
+"#;
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["record", "--trace"])
+        .arg(&trace_path)
+        .args(["--", "python3", "-c", SCRIPT])
+        .arg(port.to_string())
+        .output()
+        .expect("launch SideEffect real strace capture");
+    assert_record_output_does_not_leak_capture(&output);
+    assert_success(&output, "record refused loopback connection");
+    assert!(trace_path.is_file(), "record should publish its real trace");
+
+    let document = inspect_trace(&trace_path);
+    assert_eq!(document["parse_status"], "complete");
+    let port_marker = format!("htons({port})");
+    let records = document["records"]
+        .as_array()
+        .expect("inspect records array");
+    let failed_connect = records
+        .iter()
+        .find(|record| {
+            record["kind"] == "syscall"
+                && record["syscall"] == "connect"
+                && record["raw_arguments"]
+                    .as_str()
+                    .is_some_and(|args| args.contains(&port_marker) && args.contains("127.0.0.1"))
+        })
+        .expect("real trace should retain the selected loopback connect attempt");
+    assert_eq!(failed_connect["outcome"], "failure");
+    assert!(
+        failed_connect["raw_result"]
+            .as_str()
+            .is_some_and(|result| result.starts_with("-1 ECONNREFUSED"))
+    );
+    assert!(
+        !records.iter().any(|record| {
+            record["kind"] == "syscall"
+                && record["syscall"] == "connect"
+                && record["raw_arguments"]
+                    .as_str()
+                    .is_some_and(|args| args.contains(&port_marker) && args.contains("127.0.0.1"))
+                && record["outcome"] == "success"
+        }),
+        "the refused connection must not appear as a successful network effect"
+    );
+
+    let evidence = &failed_connect["evidence"];
+    let byte_offset = evidence["byte_offset"]
+        .as_u64()
+        .expect("failed connect byte offset") as usize;
+    let byte_length = evidence["byte_length"]
+        .as_u64()
+        .expect("failed connect byte length") as usize;
+    let trace = fs::read(&trace_path).expect("read real trace bytes");
+    let evidence_end = byte_offset
+        .checked_add(byte_length)
+        .expect("evidence span must not overflow");
+    let evidence_bytes = trace
+        .get(byte_offset..evidence_end)
+        .expect("failed connect evidence span must be in the real trace");
+    assert_eq!(
+        evidence_bytes,
+        failed_connect["raw_line"].as_str().unwrap().as_bytes()
+    );
+    assert!(
+        evidence["line_number"]
+            .as_u64()
+            .is_some_and(|line| line > 0)
     );
 }
 
