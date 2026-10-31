@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Validate the development-only corpus and pre-recorded local-model responses.
+"""Validate the frozen development corpus and pre-recorded model outputs.
 
-This tool performs structural, digest, citation-ID, status, and explicitly
-human-supplied label checks. It does not judge whether model-authored claims
-are true or supported by cited evidence, and it never launches a model.
+Results v1 validates historical prose-response structure; results v2 validates
+the current selector contract. Neither mode judges semantic correctness, and
+this tool never launches a model.
 """
 
 from __future__ import annotations
@@ -33,7 +33,10 @@ MAX_QUESTION_BYTES = 2048
 MAX_STATEMENT_BYTES = 512
 MAX_STATEMENTS = 5
 MAX_EVIDENCE_IDS_PER_STATEMENT = 4
+MAX_SELECTED_EVIDENCE_IDS = 5
+MAX_RUN_MODEL_ID_BYTES = 128
 STATUS_VALUES = {"answered", "partial", "abstained"}
+SELECTION_STATUS_VALUES = {"selected", "partial_selection", "abstained"}
 ABSTAIN_REASONS = {"ambiguous", "unsupported_scope", "insufficient_evidence"}
 STATEMENT_KINDS = {"observation", "interpretation", "uncertainty"}
 LABEL_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,95}$")
@@ -252,10 +255,9 @@ def validate_response(response: Any, allowed_ids: set[str], case_id: str) -> tup
     return response, cited
 
 
-def _validate_results(results_path: Path, corpus: dict[str, Any], corpus_digest: str) -> dict[str, Any]:
-    raw = _read_regular_file(results_path, MAX_RESULTS_BYTES, "pre-recorded results")
-    results = _decode_json(raw, "pre-recorded results")
-    _require(isinstance(results, dict), "results must be an object")
+def _validate_results_v1(
+    results: dict[str, Any], corpus: dict[str, Any], corpus_digest: str
+) -> dict[str, Any]:
     result_keys = set(results)
     _require(result_keys in (
         {"schema", "schema_version", "corpus_sha256", "cases"},
@@ -387,6 +389,224 @@ def _validate_results(results_path: Path, corpus: dict[str, Any], corpus_digest:
         "semantic_text_truth_verified_automatically": False,
         "report_rows": report_rows,
     }
+
+
+def _validate_results_v2(
+    results: dict[str, Any], corpus: dict[str, Any], corpus_digest: str
+) -> dict[str, Any]:
+    result_keys = set(results)
+    _require(result_keys in (
+        {"schema", "schema_version", "corpus_sha256", "run", "cases"},
+        {"schema", "schema_version", "corpus_sha256", "run", "cases", "errors"},
+    ), "results contain missing or unexpected keys")
+    _require(results["schema"] == "sideeffect.local_model_explain_development_results", "unsupported results schema")
+    _require(results["schema_version"] == 2, "unsupported results version")
+    _require(results["corpus_sha256"] == corpus_digest, "results corpus digest does not match the pinned development corpus")
+    run = _exact_keys(
+        results["run"],
+        {"model_id", "model_sha256", "runtime_source_revision", "backend_preference"},
+        "results.run",
+    )
+    run["model_id"] = _bounded_string(run["model_id"], "results.run.model_id", MAX_RUN_MODEL_ID_BYTES)
+    _require(
+        run["model_id"] not in {".", ".."} and not any(separator in run["model_id"] for separator in ("/", "\\", ":")),
+        "results.run.model_id must not contain a filesystem path",
+    )
+    _require(
+        isinstance(run["model_sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", run["model_sha256"]) is not None,
+        "results.run.model_sha256 must be 64 lowercase hexadecimal characters",
+    )
+    _require(
+        isinstance(run["runtime_source_revision"], str)
+        and re.fullmatch(r"[0-9a-f]{40}", run["runtime_source_revision"]) is not None,
+        "results.run.runtime_source_revision must be 40 lowercase hexadecimal characters",
+    )
+    _require(
+        isinstance(run["backend_preference"], str)
+        and run["backend_preference"] in {"auto", "cpu", "cuda"},
+        "results.run.backend_preference must be auto, cpu, or cuda",
+    )
+    rows = results["cases"]
+    errors = results.get("errors", [])
+    _require(isinstance(rows, list) and len(rows) <= len(corpus["cases"]), "results cases must be a bounded array")
+    _require(isinstance(errors, list) and len(errors) <= len(corpus["cases"]), "results errors must be a bounded array")
+
+    expected_cases = {case["id"]: case for case in corpus["cases"]}
+    seen: set[str] = set()
+    execution_errors: list[dict[str, str]] = []
+    report_rows: list[dict[str, Any]] = []
+    case_signatures: dict[str, tuple[str, str, list[str]]] = {}
+    latencies: list[int] = []
+    valid_count = 0
+    consistent_count = 0
+    selected_required_label_hits = 0
+    selectable_required_label_count = 0
+    unavailable_required_label_count = 0
+
+    for index, row in enumerate(errors):
+        row = _exact_keys(row, {"case_id", "phase", "error"}, f"results.errors[{index}]")
+        case_id = row["case_id"]
+        _require(isinstance(case_id, str) and case_id in expected_cases and case_id not in seen, f"unknown or duplicate error case ID: {case_id}")
+        _require(isinstance(row["phase"], str) and row["phase"] in {"preview", "analysis"}, f"invalid error phase in case {case_id}")
+        message = _bounded_string(row["error"], f"error for {case_id}", 1024)
+        seen.add(case_id)
+        execution_errors.append({"case_id": case_id, "phase": row["phase"], "error": message})
+
+    for index, row in enumerate(rows):
+        row = _exact_keys(
+            row,
+            {"case_id", "response", "source_parse_status", "backend_used", "available_evidence", "latency_ms"},
+            f"results.cases[{index}]",
+        )
+        case_id = row["case_id"]
+        _require(isinstance(case_id, str) and case_id in expected_cases and case_id not in seen, f"unknown or duplicate result case ID: {case_id}")
+        seen.add(case_id)
+        case = expected_cases[case_id]
+
+        source_parse_status = row["source_parse_status"]
+        _require(
+            isinstance(source_parse_status, str) and source_parse_status in {"complete", "partial"},
+            f"invalid source_parse_status in case {case_id}",
+        )
+        backend_used = row["backend_used"]
+        _require(
+            isinstance(backend_used, str) and backend_used in {"not_run", "cpu", "cuda"},
+            f"invalid backend_used in case {case_id}",
+        )
+        backend_preference = results["run"]["backend_preference"]
+        _require(
+            backend_preference == "auto"
+            or backend_used == "not_run"
+            or backend_preference == backend_used,
+            f"backend_used is inconsistent with run.backend_preference in case {case_id}",
+        )
+        response = _exact_keys(
+            row["response"],
+            {"selection_status", "evidence_ids"},
+            f"selector response for {case_id}",
+        )
+        selection_status = response["selection_status"]
+        _require(
+            isinstance(selection_status, str) and selection_status in SELECTION_STATUS_VALUES,
+            f"invalid selection_status in case {case_id}",
+        )
+        evidence_ids = response["evidence_ids"]
+        _require(
+            isinstance(evidence_ids, list) and len(evidence_ids) <= MAX_SELECTED_EVIDENCE_IDS,
+            f"invalid or oversized selected evidence ID array in case {case_id}",
+        )
+        _require(
+            all(isinstance(item, str) and EVIDENCE_ID_PATTERN.fullmatch(item) for item in evidence_ids),
+            f"invalid selected evidence ID in case {case_id}",
+        )
+        _require(len(evidence_ids) == len(set(evidence_ids)), f"duplicate selected evidence ID in case {case_id}")
+
+        evidence_rows = row["available_evidence"]
+        _require(isinstance(evidence_rows, list) and len(evidence_rows) <= 64, f"available evidence must remain bounded in case {case_id}")
+        evidence_labels: dict[str, list[str]] = {}
+        for evidence_index, evidence_row in enumerate(evidence_rows):
+            evidence_row = _exact_keys(evidence_row, {"evidence_id", "semantic_labels"}, f"available_evidence[{evidence_index}] in case {case_id}")
+            evidence_id = evidence_row["evidence_id"]
+            _require(isinstance(evidence_id, str) and EVIDENCE_ID_PATTERN.fullmatch(evidence_id), f"invalid available evidence ID in case {case_id}")
+            _require(evidence_id not in evidence_labels, f"duplicate available evidence ID in case {case_id}")
+            evidence_labels[evidence_id] = _labels(evidence_row["semantic_labels"], f"available evidence labels in case {case_id}")
+        _require(all(item in evidence_labels for item in evidence_ids), f"selection contains an evidence ID outside its syscall-result preview in case {case_id}")
+
+        expected_state = (
+            "abstained" if not evidence_ids else
+            "selected" if source_parse_status == "complete" else
+            "partial_selection"
+        )
+        state_consistent = selection_status == expected_state
+        _require(state_consistent, f"selection_status, evidence_ids, and source_parse_status disagree in case {case_id}")
+        _require(
+            backend_used != "not_run" or selection_status == "abstained",
+            f"not_run backend requires an empty abstention in case {case_id}",
+        )
+        valid_count += 1
+        consistent_count += int(state_consistent)
+
+        latency = row["latency_ms"]
+        _require(type(latency) is int and 0 <= latency <= 120_000, f"invalid latency in case {case_id}")
+        latencies.append(latency)
+        selected_labels = sorted({label for evidence_id in evidence_ids for label in evidence_labels[evidence_id]})
+        available_labels = {label for labels in evidence_labels.values() for label in labels}
+        required_labels = set(case["required_evidence_labels"])
+        selectable_required = required_labels & available_labels
+        unavailable_required = required_labels - available_labels
+        selected_required_hits = selectable_required & set(selected_labels)
+        selected_required_label_hits += len(selected_required_hits)
+        selectable_required_label_count += len(selectable_required)
+        unavailable_required_label_count += len(unavailable_required)
+        case_signatures[case_id] = (source_parse_status, selection_status, selected_labels)
+        report_rows.append({
+            "case_id": case_id,
+            "selection_output_contract_valid": True,
+            "selection_state_consistent_with_source_parse": state_consistent,
+            "selection_status": selection_status,
+            "backend_used": backend_used,
+            "selected_evidence_ids": evidence_ids,
+            "selected_evidence_labels": selected_labels,
+            "required_evidence_labels_available_to_selector": sorted(selectable_required),
+            "required_evidence_labels_unavailable_to_selector": sorted(unavailable_required),
+            "selected_required_evidence_label_recall_over_available_labels": (
+                len(selected_required_hits) / len(selectable_required) if selectable_required else None
+            ),
+            "latency_ms": latency,
+        })
+
+    _require(seen == set(expected_cases), "results omit one or more corpus cases")
+    sorted_latencies = sorted(latencies)
+    p95 = sorted_latencies[math.ceil(0.95 * len(sorted_latencies)) - 1] if sorted_latencies else None
+    permutation_rows = []
+    for group in corpus["permutation_groups"]:
+        signatures = [case_signatures.get(case_id) for case_id in group["case_ids"]]
+        consistent = all(signature is not None for signature in signatures) and len(set(map(repr, signatures))) == 1
+        permutation_rows.append({"group_id": group["id"], "selection_consistent": consistent})
+    return {
+        "schema": "sideeffect.local_model_explain_selector_diagnostic_report",
+        "schema_version": 2,
+        "evaluation_status": "development_only_not_a_release_gate",
+        "corpus_sha256": corpus_digest,
+        "run": run,
+        "cases": len(corpus["cases"]),
+        "selection_output_contract_valid_count": valid_count,
+        "execution_error_count": len(execution_errors),
+        "execution_errors": execution_errors,
+        "selection_state_consistency_count": consistent_count,
+        "selected_required_evidence_label_recall_over_available_labels": (
+            selected_required_label_hits / selectable_required_label_count
+            if selectable_required_label_count else None
+        ),
+        "selectable_required_evidence_label_count": selectable_required_label_count,
+        "required_evidence_label_unavailable_to_selector_count": unavailable_required_label_count,
+        "p95_supplied_case_latency_ms": p95,
+        "supplied_case_latency_count": len(latencies),
+        "p95_supplied_case_latency_scope": "cases_with_valid_selector_results_only",
+        "latency_ms_source": "supplied_in_results_not_independently_measured_by_validator",
+        "backend_used_source": "supplied_product_output_not_independently_verified_by_validator",
+        "cuda_offload_evidence_verified_automatically": False,
+        "permutation_group_count": len(permutation_rows),
+        "selection_consistent_permutation_group_count": sum(row["selection_consistent"] for row in permutation_rows),
+        "permutation_groups": permutation_rows,
+        "available_evidence_labels_verified_automatically": False,
+        "evidence_label_recall_is_diagnostic": True,
+        "selection_quality_verified_automatically": False,
+        "semantic_correctness_verified_automatically": False,
+        "report_rows": report_rows,
+    }
+
+
+def _validate_results(results_path: Path, corpus: dict[str, Any], corpus_digest: str) -> dict[str, Any]:
+    raw = _read_regular_file(results_path, MAX_RESULTS_BYTES, "pre-recorded results")
+    results = _decode_json(raw, "pre-recorded results")
+    _require(isinstance(results, dict), "results must be an object")
+    version = results.get("schema_version")
+    if version == 1:
+        return _validate_results_v1(results, corpus, corpus_digest)
+    if version == 2:
+        return _validate_results_v2(results, corpus, corpus_digest)
+    raise ContractError("unsupported results version")
 
 
 def main() -> int:
