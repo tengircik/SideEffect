@@ -217,7 +217,7 @@ pub fn write_audit_session_json<W: Write>(
                     })
                     .unwrap_or(CoverageStatus::Unknown),
             ),
-            scope: escape_ascii(&source.scope),
+            scope: source.scope.clone(),
             scope_encoding: "non_ascii_and_controls_escaped_as_ascii",
             started_at_unix_ms: source.started_at_unix_ms,
             ended_at_unix_ms: source.ended_at_unix_ms,
@@ -247,7 +247,7 @@ pub fn write_audit_session_json<W: Write>(
         schema_version: 6,
         session_id: &manifest.session_id,
         platform: &manifest.platform,
-        architecture: escape_ascii(&manifest.architecture),
+        architecture: manifest.architecture.clone(),
         architecture_encoding: "non_ascii_and_controls_escaped_as_ascii",
         host_context: &manifest.host_context,
         status: session_status_name(manifest.status),
@@ -256,9 +256,29 @@ pub fn write_audit_session_json<W: Write>(
         ended_at_unix_ms: manifest.ended_at_unix_ms,
         coverage_note: "complete means selected collectors produced their declared artifacts; it does not establish exhaustive system coverage",
         authenticity: "not_established",
+        string_encoding: "non_ascii_and_controls_escaped_as_ascii",
         sources,
     };
-    serde_json::to_writer_pretty(writer, &review)
+    let mut value = serde_json::to_value(&review)?;
+    escape_json_review_strings(&mut value);
+    serde_json::to_writer_pretty(writer, &value)
+}
+
+fn escape_json_review_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = escape_ascii(text),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                escape_json_review_strings(item);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for item in fields.values_mut() {
+                escape_json_review_strings(item);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
 }
 
 #[derive(Serialize)]
@@ -276,6 +296,7 @@ struct SessionReview<'a> {
     ended_at_unix_ms: u128,
     coverage_note: &'static str,
     authenticity: &'static str,
+    string_encoding: &'static str,
     sources: Vec<SessionSourceReview<'a>>,
 }
 
@@ -529,6 +550,9 @@ mod tests {
     fn json_review_uses_an_ascii_escaped_scope_and_disclaims_authenticity() {
         let mut fixture = manifest("safe\n\u{202e}path", SourceStatus::Partial);
         fixture.architecture = "x86\u{202e}_64".to_owned();
+        fixture.sources[0].collector.as_mut().unwrap().version = "1.0\u{202e}txt.exe".to_owned();
+        fixture.host_context.as_mut().unwrap().os_name.value =
+            Some("Windows\u{202e}Host".to_owned());
         let mut output = Vec::new();
         write_audit_session_json(&fixture, &mut output).unwrap();
         assert!(output.is_ascii());
@@ -536,12 +560,23 @@ mod tests {
         assert_eq!(value["schema"], "sideeffect.audit_session_review");
         assert_eq!(value["schema_version"], 6);
         assert_eq!(value["authenticity"], "not_established");
+        assert_eq!(
+            value["string_encoding"],
+            "non_ascii_and_controls_escaped_as_ascii"
+        );
         assert_eq!(value["architecture"], "x86\\u{202e}_64");
         assert_eq!(
             value["architecture_encoding"],
             "non_ascii_and_controls_escaped_as_ascii"
         );
-        assert_eq!(value["host_context"]["os_name"]["value"], "Linux");
+        assert_eq!(
+            value["host_context"]["os_name"]["value"],
+            "Windows\\u{202e}Host"
+        );
+        assert_eq!(
+            value["sources"][0]["collector"]["version"],
+            "1.0\\u{202e}txt.exe"
+        );
         assert_eq!(value["sources"][0]["scope"], "safe\\n\\u{202e}path");
         assert_eq!(value["sources"][0]["status"], "partial");
         assert_eq!(value["sources"][0]["coverage_status"], "partial");
