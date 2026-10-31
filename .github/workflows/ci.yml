@@ -70,6 +70,9 @@ jobs:
       - name: Run real refused-connect capture integration test
         run: cargo test --locked --test record_observations real_strace_capture_reports_refused_loopback_connection_as_failed_attempt -- --exact
 
+      - name: Run real strace cancellation and tracee cleanup integration test
+        run: cargo test --locked --test record_observations real_strace_capture_cancellation_discards_partial_trace_and_reaps_tracee -- --exact
+
       - name: Run startup correlation against a real strace capture
         run: cargo test --locked --test startup_correlation_real_strace real_strace_capture_can_match_a_synthetic_literal_startup_row -- --exact
 

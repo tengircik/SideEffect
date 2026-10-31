@@ -977,3 +977,110 @@ fn bounded_duration_capture_publishes_partial_bundle_with_explicit_limit_status(
         "traced descendant continued running after the time-limited capture returned"
     );
 }
+
+#[test]
+fn real_strace_capture_cancellation_discards_partial_trace_and_reaps_tracee() {
+    // Prerequisites: Linux x86_64, external strace >= 6.8, and python3.
+    require_tool("strace", &["--version"]);
+    require_tool("python3", &["--version"]);
+
+    let temp = PrivateTempDirectory::new();
+    let trace_path = temp.path().join("cancelled.trace");
+    let ready_path = temp.path().join("target-ready.pid");
+    let script = format!(
+        "import os,time; open({:?}, 'w').write(str(os.getpid())); time.sleep(30)",
+        ready_path
+    );
+    let mut recorder = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["record", "--trace"])
+        .arg(&trace_path)
+        .args(["--", "python3", "-c", &script])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("launch SideEffect real strace capture");
+
+    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let target_pid = loop {
+        if let Ok(contents) = fs::read_to_string(&ready_path) {
+            if let Ok(pid) = contents.parse::<libc::pid_t>() {
+                break pid;
+            }
+        }
+        if let Some(status) = recorder.try_wait().expect("check recorder startup") {
+            panic!("real capture exited before target readiness: {status}");
+        }
+        if std::time::Instant::now() >= ready_deadline {
+            let _ = recorder.kill();
+            let _ = recorder.wait();
+            panic!("real strace target did not signal readiness within 10 seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+
+    // SAFETY: send SIGTERM only to the isolated SideEffect recorder process
+    // started by this test after its traced target has written the ready file.
+    let signal_result = unsafe { libc::kill(recorder.id() as libc::pid_t, libc::SIGTERM) };
+    if signal_result != 0 {
+        let _ = recorder.kill();
+        let _ = recorder.wait();
+        panic!(
+            "could not interrupt isolated real capture: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    let stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = recorder.try_wait().expect("wait for interrupted recorder") {
+            break status;
+        }
+        if std::time::Instant::now() >= stop_deadline {
+            let _ = recorder.kill();
+            let _ = recorder.wait();
+            // SAFETY: target_pid came from the test's own isolated Python target.
+            unsafe { libc::kill(target_pid, libc::SIGKILL) };
+            panic!("recorder did not stop after SIGTERM within 5 seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let output = recorder
+        .wait_with_output()
+        .expect("collect interrupted recorder output");
+    assert_eq!(status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("capture interrupted by signal 15; the partial trace was discarded"),
+        "unexpected cancellation diagnostic: {stderr}"
+    );
+    assert!(
+        !trace_path.exists(),
+        "interrupted capture must not publish a partial trace"
+    );
+
+    // --kill-on-exit is expected to stop the real traced target when SideEffect
+    // terminates strace. Give the kernel a short bounded interval to reap it.
+    let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let target_reaped = loop {
+        // SAFETY: signal 0 only checks the recorded test target PID.
+        let result = unsafe { libc::kill(target_pid, 0) };
+        if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            break true;
+        }
+        if std::time::Instant::now() >= reap_deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    if !target_reaped {
+        // SAFETY: target_pid is the Python process created by this test.
+        unsafe { libc::kill(target_pid, libc::SIGKILL) };
+        panic!("traced Python target survived real strace cancellation");
+    }
+    assert_eq!(
+        fs::read_dir(temp.path()).unwrap().count(),
+        1,
+        "cancellation should clean the private staging output and leave only the readiness marker"
+    );
+}
