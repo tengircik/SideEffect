@@ -1,6 +1,10 @@
 //! Read-only, on-demand system inventory sources.
 
+#[cfg(target_os = "linux")]
+mod access;
 mod debian;
+#[cfg(windows)]
+mod effective_access_windows;
 mod model;
 mod package_diff;
 #[cfg(target_os = "linux")]
@@ -29,6 +33,18 @@ mod startup_windows;
 mod systemd_units;
 mod windows_software_diff;
 
+#[cfg(target_os = "linux")]
+pub use access::{
+    ACCESS_ANALYSIS_SCHEMA, ACCESS_ANALYSIS_SCHEMA_VERSION, AccessAnalysisDocument,
+    AccessConclusion, AccessOperation, FactStatus, KernelProbeStatus,
+    analyze_current_process_access,
+};
+#[cfg(windows)]
+pub use effective_access_windows::{
+    WindowsAccessConclusion, WindowsAccessControlEvidence, WindowsAccessControlStatus,
+    WindowsAccessOperation, WindowsAccessStatus, WindowsDaclDecision, WindowsDaclEvaluationResult,
+    evaluate_windows_dacl_for_process,
+};
 pub use model::{
     INVENTORY_SCHEMA, INVENTORY_SCHEMA_VERSION, InventoryDiagnostic, InventoryDocument,
     InventoryEvidence, InventoryPackage, InventorySource, InventorySourceStatus, InventoryStatus,

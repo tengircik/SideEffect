@@ -121,7 +121,7 @@ Catalog installation is an explicit user action and is available only for catalo
 
 After installation, select the model for its task. An existing local GGUF can instead be registered with `sideeffect model add --name NAME --path FILE --for evidence|explanation|query[,TASK...] [--license ID]`; the user-provided license label is unverified metadata. `model select TASK ID` checks the model file and hash before saving the per-task selection. The exact model ID, hash, source/revision or user-provided marker, license/evaluation status and pinned runtime/backend metadata are included in each relevant preview digest and output. Changing the selection invalidates the old confirmation and requires a fresh preview. `model remove ID` requires typing the exact ID before deleting a verified catalog file; removing a custom model only removes its registration.
 
-The model manager and catalog can be inspected on Windows. Catalog query-plan inference and the evidence-selection command are Linux x86_64 only; the catalog explanation model and explanation command support Linux x86_64 and native Windows. Windows explanation supports `auto`, `cpu`, or `cuda`. A local custom GGUF can be registered only for a task supported on that platform. Runtime setup remains separate: SideEffect does not download or install llama.cpp or another runtime. Model/runtime compatibility does not imply model quality, and no candidate has passed its applicable semantic gate. See the task-specific setup and limitations in [evidence selection](LOCAL_MODEL_EVALUATION.md), [query plans](LOCAL_QUERY_PLAN_EVALUATION.md), and [explanations](LOCAL_MODEL_EXPLANATION_EVALUATION.md).
+The model manager and catalog can be inspected on Windows. Catalog query-plan inference and the evidence-selection command are Linux x86_64 only; the catalog explanation model and explanation command support Linux x86_64 and native Windows. Windows explanation supports `auto`, `cpu`, or `cuda`. A local custom GGUF can be registered only for a task supported on that platform. Runtime setup remains separate: SideEffect does not download or install llama.cpp or another runtime. Model/runtime compatibility does not imply model quality, and no candidate has passed its applicable semantic gate. For the Windows/NVIDIA explanation setup and its CUDA, runtime, and resource limitations, see [Windows local explanation model setup](LOCAL_MODEL_WINDOWS_SETUP.md). Also see the task-specific setup and limitations in [evidence selection](LOCAL_MODEL_EVALUATION.md), [query plans](LOCAL_QUERY_PLAN_EVALUATION.md), and [explanations](LOCAL_MODEL_EXPLANATION_EVALUATION.md).
 
 ## Build from source
 
@@ -258,6 +258,30 @@ This is a read-only check of explicit paths only. It records file type, UID/GID,
 ```
 
 This writes `sideeffect.windows_permission_inventory` v1 for explicit paths only. SideEffect opens each final path with `FILE_FLAG_OPEN_REPARSE_POINT`, then reads file attributes and owner/group/DACL from that same handle using read-control and file-attribute access. It records security descriptor bytes and hash, DACL state and control flags, and ACEs in original order; recognized basic allow/deny/audit ACE fields are decoded, while unknown ACEs remain raw evidence. It does not request SACLs, recurse, request elevation, follow the final reparse point, or calculate effective access. Inaccessible, malformed, unsupported, and over-limit items remain visible as partial or unknown. Bounds are 256 paths, 32,767 UTF-16 units per path, 1 Mi aggregate path units, 64 KiB per descriptor, 1,024 ACEs per descriptor, 8 MiB aggregate descriptor data, a five-second deadline checked between paths, and 64 MiB serialized output. An in-flight Windows API call cannot be canceled and may exceed that interval. Output uses the current-user-only DACL and no-clobber publisher; paths and ACL bytes are sensitive and should be reviewed before sharing.
+
+## Run a partial access check
+
+On Linux, run a non-mutating permission preflight for the current calling thread:
+
+```sh
+./target/release/sideeffect inventory access-check --operation read --output ./access-check.json /absolute/path/to/file
+```
+
+Use `read`, `write`, or `execute` and an absolute path. Linux pins the resolved final object and records the `faccessat2` result plus selected credentials and metadata. This is only a preflight under the current thread's credentials; it does not perform the requested operation or evaluate all configured policy. The calculated conclusion remains `unknown`. The report is private, no-clobber JSON and the command exits `2` to indicate a partial result.
+
+On Windows, first collect a process snapshot and use the selected process row's PID and observed `creation_time.filetime_100ns` value:
+
+```powershell
+sideeffect.exe inventory processes --output .\processes.json
+sideeffect.exe inventory access-check `
+  --pid 1234 `
+  --creation-time-filetime 134379260545106360 `
+  --operation read `
+  --output .\access-check.json `
+  C:\path\to\file.exe
+```
+
+Replace the example PID and FILETIME with values from the same process row in your snapshot. Windows evaluates only the selected local file object's DACL against that process's primary token. A DACL grant or denial is not a complete effective-access verdict: ancestor traversal, thread impersonation, integrity labels, remote policy, and other controls are not evaluated. Directories, reparse points, AppContainer processes, and unsupported ACE semantics return unsupported or unknown. No elevation is requested. The command writes a private, no-clobber report and exits `2` for its conditional/partial result. Treat the path, process identity, and descriptor digest as sensitive evidence.
 
 ## Inventory Linux startup configuration
 

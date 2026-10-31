@@ -30,6 +30,8 @@ use sideeffect::format::{
     RedactedDiffSummary, summarize_diff, write_text_diff, write_trace_evidence_text,
 };
 #[cfg(target_os = "linux")]
+use sideeffect::inventory::{AccessOperation, analyze_current_process_access};
+#[cfg(target_os = "linux")]
 use sideeffect::inventory::{InventoryStatus, collect_packages};
 use sideeffect::inventory::{
     PackageComparisonStatus, PermissionDiffStatus, ProcessDiffStatus, StartupDiffStatus,
@@ -46,6 +48,10 @@ use sideeffect::inventory::{PermissionInventoryStatus, collect_permissions};
 use sideeffect::inventory::{ProcessInventoryStatus, collect_processes};
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{StartupInventoryStatus, collect_startup};
+#[cfg(windows)]
+use sideeffect::inventory::{
+    WindowsAccessOperation, WindowsAccessStatus, evaluate_windows_dacl_for_process,
+};
 #[cfg(windows)]
 use sideeffect::inventory::{WindowsPermissionStatus, collect_windows_permissions};
 #[cfg(windows)]
@@ -86,6 +92,8 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect inventory startup --output <new-inventory.json>\n\
        sideeffect inventory path-executables --output <new-inventory.json>\n\
        sideeffect inventory permissions --output <new-inventory.json> <path>...\n\
+       sideeffect inventory access-check --operation read|write|execute --output <new-result.json> <absolute-path> (Linux; current credentials)\n\
+       sideeffect inventory access-check --pid <pid> --creation-time-filetime <100ns-value> --operation read|write|execute --output <new-result.json> <absolute-path> (Windows)\n\
        sideeffect audit --output <new-session-directory> [--packages] [--processes] [--startup] [--path-executables] [--permission <path>]... [--runtime-duration-seconds <1..3600> -- <program> [args...]]\n\
        sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect record --trace <new-trace-file> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect help [command [subcommand]]\n       sideeffect version\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. On Linux, inventory packages reads available local dpkg, RPM, pacman, and APK databases plus optional fixed-path Flatpak installed references; on Windows, it reads selected current-user and machine-wide Uninstall registry entries. Both are bounded source snapshots and can miss unregistered software. Windows does not use Win32_Product or launch uninstall commands. On Linux, inventory processes reads bounded numeric /proc status entries and executable-link identities; on Windows, it reads a Tool Help snapshot and queries accessible image paths. Neither adapter reads command lines or promises atomic or exhaustive coverage. On Linux, inventory startup discovers curated sources; on Windows, it inventories selected Run/RunOnce values, Startup folders, and visible service configuration and boot/logon triggers in tasks visible to the current token. For tasks, bounded Exec-action executable paths, arguments, and working directories are recorded as inert text; other action types remain unsupported with unknown action-specific fields. Neither platform establishes that a configured entry ran. Inventory permissions inspects only explicit Linux paths and records ownership/type/mode, supported POSIX ACLs, and Linux file-capability xattrs; it never follows the final path symlink or calculates effective access. Record follows a selected command's traced descendants and may enforce a requested wall-clock limit; this is observation, not isolation or a safety check.";
 
@@ -324,6 +332,44 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
                 && !paths.is_empty() =>
         {
             inventory_permissions(output, paths)
+        }
+        [
+            command,
+            subcommand,
+            operation_flag,
+            operation,
+            output_flag,
+            output,
+            path,
+        ] if command == "inventory"
+            && subcommand == "access-check"
+            && operation_flag == "--operation"
+            && output_flag == "--output" =>
+        {
+            inventory_access_check(operation, output, path, None)
+        }
+        [
+            command,
+            subcommand,
+            pid_flag,
+            pid,
+            creation_flag,
+            creation_time,
+            operation_flag,
+            operation,
+            output_flag,
+            output,
+            path,
+        ] if command == "inventory"
+            && subcommand == "access-check"
+            && pid_flag == "--pid"
+            && creation_flag == "--creation-time-filetime"
+            && operation_flag == "--operation"
+            && output_flag == "--output" =>
+        {
+            let pid = parse_positive_u32(pid, "process ID")?;
+            let creation_time = parse_positive_u64(creation_time, "process creation FILETIME")?;
+            inventory_access_check(operation, output, path, Some((pid, creation_time)))
         }
         [command, flag, path] if command == "inspect" && flag == "--bundle" => {
             inspect_bundle_with_format(&OsString::from("json"), path)
@@ -1364,7 +1410,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             }
         }
         "inventory" => {
-            "Usage: sideeffect inventory packages|processes|startup|path-executables|permissions --output FILE [PATH...]\nCollects bounded, local snapshots from sources supported on this platform. Sources are curated and coverage can be partial; inspect output and diagnostics before drawing conclusions."
+            "Usage: sideeffect inventory packages|processes|startup|path-executables|permissions|access-check ...\nCollects bounded, local snapshots from sources supported on this platform. Sources are curated and coverage can be partial; inspect output and diagnostics before drawing conclusions."
         }
         "inventory startup" => {
             #[cfg(target_os = "linux")]
@@ -1425,6 +1471,20 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
                 "Usage: sideeffect inventory permissions --output FILE PATH...\nPermission inventory is not supported on this platform."
             }
         }
+        "inventory access-check" => {
+            #[cfg(target_os = "linux")]
+            {
+                "Usage: sideeffect inventory access-check --operation read|write|execute --output FILE ABSOLUTE_PATH\nRuns a non-mutating faccessat2 permission preflight under the current calling thread's credentials and records the observed kernel result. It does not evaluate another process identity or prove that a later file operation succeeds; the calculated effective-access conclusion remains unknown. A partial result is written with exit status 2."
+            }
+            #[cfg(windows)]
+            {
+                "Usage: sideeffect inventory access-check --pid PID --creation-time-filetime FILETIME_100NS --operation read|write|execute --output FILE ABSOLUTE_PATH\nUses the selected process's primary token (PID plus creation time from a process snapshot) to evaluate only a local file object's DACL with Authz. The collector opens the path under its own token; ancestor traversal under the selected token, reparse targets, integrity labels, thread impersonation, and other policy are not evaluated. Overall access is conditional, never a definitive allow/deny. No elevation is requested."
+            }
+            #[cfg(not(any(target_os = "linux", windows)))]
+            {
+                "Usage: sideeffect inventory access-check ...\nAccess checks are not supported on this platform."
+            }
+        }
         "correlate-startup" => {
             "Usage: sideeffect correlate-startup STARTUP_INVENTORY.json TRACE\nFinds narrow exact-path candidate matches between supported saved startup configuration and successful exec evidence. A match does not prove that a hook caused or initiated execution."
         }
@@ -1478,6 +1538,85 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
 
 fn inspect(path: &OsString) -> Result<ExitCode, String> {
     inspect_with_format(&OsString::from("json"), path)
+}
+
+fn inventory_access_check(
+    operation: &OsString,
+    output: &OsString,
+    path: &OsString,
+    process_identity: Option<(u32, u64)>,
+) -> Result<ExitCode, String> {
+    let operation = operation
+        .to_str()
+        .ok_or_else(|| "access-check operation must be valid ASCII".to_owned())?;
+    #[cfg(target_os = "linux")]
+    {
+        if process_identity.is_some() {
+            return Err(
+                "Linux access-check supports only the calling thread's current credentials; it does not switch to another process identity"
+                    .to_owned(),
+            );
+        }
+        let operation = AccessOperation::parse(operation).map_err(str::to_owned)?;
+        let document = analyze_current_process_access(Path::new(path), operation);
+        let mut json = CappedBuffer::new(MAX_REPORT_BYTES);
+        serde_json::to_writer(&mut json, &document).map_err(|error| {
+            format!("could not serialize access-check result within the {MAX_REPORT_BYTES}-byte limit: {error}")
+        })?;
+        let published = publish_private_file(Path::new(output), &json.bytes, MAX_REPORT_BYTES)
+            .map_err(|error| format!("could not publish private access-check result: {error}"))?;
+        eprintln!(
+            "Saved a partial Linux permission-probe result to {}. Kernel probe status: {:?}; the calculated effective-access conclusion remains unknown.",
+            terminal_safe_path(&published),
+            document.observed_kernel_check.status,
+        );
+        Ok(ExitCode::from(2))
+    }
+    #[cfg(windows)]
+    {
+        let (process_id, creation_time) = process_identity.ok_or_else(|| {
+            "Windows access-check requires --pid and --creation-time-filetime from a process snapshot"
+                .to_owned()
+        })?;
+        let operation = match operation {
+            "read" => WindowsAccessOperation::ReadData,
+            "write" => WindowsAccessOperation::WriteData,
+            "execute" => WindowsAccessOperation::Execute,
+            _ => return Err("operation must be exactly read, write, or execute".to_owned()),
+        };
+        let document = evaluate_windows_dacl_for_process(
+            process_id,
+            creation_time,
+            Path::new(path),
+            operation,
+        );
+        let mut json = CappedBuffer::new(MAX_REPORT_BYTES);
+        serde_json::to_writer(&mut json, &document).map_err(|error| {
+            format!("could not serialize Windows access-check result within the {MAX_REPORT_BYTES}-byte limit: {error}")
+        })?;
+        let published =
+            publish_private_windows_file(Path::new(output), &json.bytes, MAX_REPORT_BYTES)
+                .map_err(|error| {
+                    format!("could not publish private Windows access-check result: {error}")
+                })?;
+        eprintln!(
+            "Saved a {} Windows DACL evaluation to {}. DACL result: {:?}; overall access remains {:?} because other controls are not evaluated.",
+            if document.status == WindowsAccessStatus::Conditional {
+                "conditional"
+            } else {
+                "partial"
+            },
+            terminal_safe_path(&published),
+            document.dacl_decision,
+            document.conclusion,
+        );
+        Ok(ExitCode::from(2))
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = (operation, output, path, process_identity);
+        Err("inventory access-check is not supported on this platform".to_owned())
+    }
 }
 
 fn events_trace(path: &OsString) -> Result<ExitCode, String> {
@@ -1817,6 +1956,22 @@ fn parse_reference_number(value: &OsString, label: &str) -> Result<u64, String> 
     }
     text.parse::<u64>()
         .map_err(|_| format!("{label} exceeds the supported numeric range"))
+}
+
+fn parse_positive_u32(value: &OsString, label: &str) -> Result<u32, String> {
+    let value = parse_reference_number(value, label)?;
+    if value == 0 {
+        return Err(format!("{label} must be greater than zero"));
+    }
+    u32::try_from(value).map_err(|_| format!("{label} exceeds the supported numeric range"))
+}
+
+fn parse_positive_u64(value: &OsString, label: &str) -> Result<u64, String> {
+    let value = parse_reference_number(value, label)?;
+    if value == 0 {
+        return Err(format!("{label} must be greater than zero"));
+    }
+    Ok(value)
 }
 
 fn inspect_with_format(format: &OsString, path: &OsString) -> Result<ExitCode, String> {

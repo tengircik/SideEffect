@@ -187,6 +187,7 @@ SideEffect provides a native Rust CLI for Linux x86_64 and Windows x64. The Linu
 - [Build, install, and platform compatibility](docs/INSTALL.md)
 - [Install SideEffect as an agent skill](docs/AGENT_SKILL.md)
 - [Product scope](docs/PRODUCT.md)
+- [Windows local explanation model setup](docs/LOCAL_MODEL_WINDOWS_SETUP.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Delivery plan](docs/PLAN.md)
 - [Linux real-trace benchmark methodology](docs/TRACE_BENCHMARKING.md)
