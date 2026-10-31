@@ -142,6 +142,14 @@ pub fn collect_and_publish(
                     "max_aggregate_status_bytes",
                     crate::inventory::MAX_AGGREGATE_STATUS_BYTES as u64,
                 ),
+                limit(
+                    "max_namespace_link_bytes",
+                    crate::inventory::MAX_NAMESPACE_LINK_BYTES as u64,
+                ),
+                limit(
+                    "max_aggregate_namespace_link_bytes",
+                    crate::inventory::MAX_AGGREGATE_NAMESPACE_LINK_BYTES as u64,
+                ),
             ],
         )?);
         artifacts.push(artifact("processes.json", &document)?);

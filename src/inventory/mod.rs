@@ -63,17 +63,21 @@ pub use permissions_windows::{
 };
 #[cfg(target_os = "linux")]
 pub use processes::{
-    MAX_AGGREGATE_STATUS_BYTES, MAX_PROCESS_DIRECTORIES, ProcessDiagnostic, ProcessEvidence,
-    ProcessExecutableEvidence, ProcessExecutableLink, ProcessExecutableLinkStatus,
-    ProcessInventoryDocument, ProcessInventorySource, ProcessInventoryStatus, ProcessRow,
-    ProcessStartTime, ProcessStartTimeEvidence, ProcessStartTimeStatus, collect_processes,
-    collect_processes_from,
+    MAX_AGGREGATE_NAMESPACE_LINK_BYTES, MAX_AGGREGATE_STATUS_BYTES, MAX_NAMESPACE_LINK_BYTES,
+    MAX_PROCESS_DIRECTORIES, MAX_PROCESS_STAT_BYTES, NamespacePidEvidence, NamespacePidStatus,
+    PROCESS_NAMESPACES, ProcessDiagnostic, ProcessEvidence, ProcessExecutableEvidence,
+    ProcessExecutableLink, ProcessExecutableLinkStatus, ProcessInventoryDocument,
+    ProcessInventorySource, ProcessInventoryStatus, ProcessNamespace, ProcessNamespaceEvidence,
+    ProcessNamespaceStatus, ProcessRow, ProcessStartTime, ProcessStartTimeEvidence,
+    ProcessStartTimeStatus, collect_processes, collect_processes_from,
 };
 #[cfg(windows)]
 pub use processes_windows::{
-    WindowsProcessCreationTime, WindowsProcessCreationTimeStatus, WindowsProcessDiagnostic,
-    WindowsProcessImage, WindowsProcessImageStatus, WindowsProcessInventoryDocument,
-    WindowsProcessInventoryStatus, WindowsProcessRow, collect_windows_processes,
+    MAX_AGGREGATE_TOKEN_SID_UTF16_UNITS, WindowsProcessCreationTime,
+    WindowsProcessCreationTimeStatus, WindowsProcessDiagnostic, WindowsProcessImage,
+    WindowsProcessImageStatus, WindowsProcessInventoryDocument, WindowsProcessInventoryStatus,
+    WindowsProcessRow, WindowsProcessTokenContext, WindowsProcessTokenContextStatus,
+    WindowsProcessTokenField, WindowsProcessTokenFieldStatus, collect_windows_processes,
 };
 #[cfg(target_os = "linux")]
 pub use startup::{

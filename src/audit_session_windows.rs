@@ -133,18 +133,22 @@ pub fn collect_and_publish(
             .map_err(|e| format!("could not serialize process inventory: {e}"))?;
         sources.push(source(
             SourceRole::Processes,
-            "visible Tool Help process snapshot and permitted image paths",
+            "visible Tool Help process snapshot, permitted image paths, and token context",
             doc.capture_started_at_unix_ms,
             doc.capture_ended_at_unix_ms,
             status,
             diagnostics,
-            vec![("max_processes", 8192), ("deadline_ms", 10000)],
+            vec![
+                ("max_processes", 8192),
+                ("deadline_ms", 10000),
+                ("max_token_sid_utf16_code_units", 2 * 1024 * 1024),
+            ],
         ));
         artifacts.push(artifact(
             ArtifactKind::WindowsProcesses,
             "processes.windows.json",
             "sideeffect.windows_process_inventory",
-            2,
+            3,
             value,
         ));
     }

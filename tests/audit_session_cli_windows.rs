@@ -115,7 +115,7 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
         ("packages", "bounded uninstall-registry registrations"),
         (
             "processes",
-            "visible Tool Help process snapshot and permitted image paths",
+            "visible Tool Help process snapshot, permitted image paths, and token context",
         ),
         (
             "permissions",

@@ -11,6 +11,9 @@ const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const MAX_PROCESSES: usize = 8_192;
 const MAX_IMAGE_PATH_UTF16_UNITS: usize = 32_768;
 const MAX_AGGREGATE_IMAGE_PATH_UTF16_UNITS: usize = 4 * 1024 * 1024;
+const MAX_TOKEN_INFO_BYTES: usize = 64 * 1024;
+const MAX_PROCESS_TOKEN_SID_UTF16_UNITS: usize = 256;
+pub const MAX_AGGREGATE_TOKEN_SID_UTF16_UNITS: usize = 2 * 1024 * 1024;
 const MAX_SCAN_DURATION: Duration = Duration::from_secs(10);
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_HANDLE: u32 = 6;
@@ -101,7 +104,45 @@ pub struct WindowsProcessRow {
     pub executable_name: String,
     pub creation_time: WindowsProcessCreationTime,
     pub image: WindowsProcessImage,
+    pub token_context: WindowsProcessTokenContext,
     pub evidence: WindowsProcessEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsProcessTokenContextStatus {
+    Observed,
+    IdentityUnverified,
+    ChangedDuringRead,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsProcessTokenFieldStatus {
+    Observed,
+    Inaccessible,
+    Vanished,
+    Malformed,
+    OverLimit,
+    IdentityUnverified,
+    Error,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WindowsProcessTokenField<T> {
+    pub status: WindowsProcessTokenFieldStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<T>,
+    pub source: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WindowsProcessTokenContext {
+    pub identity_status: WindowsProcessTokenContextStatus,
+    pub process_creation_time_filetime_100ns: Option<u64>,
+    pub user_sid: WindowsProcessTokenField<String>,
+    pub integrity_level_rid: WindowsProcessTokenField<u32>,
+    pub session_id: WindowsProcessTokenField<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -139,6 +180,8 @@ pub struct WindowsProcessDiagnostic {
     pub code: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<&'static str>,
     pub message: &'static str,
 }
 
@@ -148,6 +191,7 @@ pub struct WindowsProcessInventorySource {
     pub status: WindowsProcessInventoryStatus,
     pub entries_seen: usize,
     pub image_path_utf16_code_units: usize,
+    pub token_sid_utf16_code_units: usize,
     pub diagnostics: Vec<WindowsProcessDiagnostic>,
 }
 
@@ -198,6 +242,11 @@ trait WindowsProcessApi {
         aggregate_remaining: usize,
     ) -> WindowsProcessImage;
     fn read_creation_time(&mut self, process_id: u32) -> WindowsProcessCreationTime;
+    fn read_token_context(
+        &mut self,
+        process_id: u32,
+        aggregate_sid_remaining: usize,
+    ) -> WindowsProcessTokenContext;
 }
 
 struct NativeWindowsProcessApi;
@@ -261,6 +310,14 @@ impl WindowsProcessApi for NativeWindowsProcessApi {
     fn read_creation_time(&mut self, process_id: u32) -> WindowsProcessCreationTime {
         read_creation_time_native(process_id)
     }
+
+    fn read_token_context(
+        &mut self,
+        process_id: u32,
+        aggregate_sid_remaining: usize,
+    ) -> WindowsProcessTokenContext {
+        read_token_context_native(process_id, aggregate_sid_remaining)
+    }
 }
 
 struct RawEntry(ProcessEntry32W);
@@ -283,7 +340,7 @@ fn collect_windows_processes_with_api<A: WindowsProcessApi>(
                 None,
                 "Windows could not create a process snapshot.",
             ));
-            return finish(started_at, Vec::new(), diagnostics, 0, 0, true);
+            return finish(started_at, Vec::new(), diagnostics, 0, 0, 0, true);
         }
     };
     let mut entries = Vec::with_capacity(MAX_PROCESSES.min(512));
@@ -344,6 +401,7 @@ fn collect_windows_processes_with_api<A: WindowsProcessApi>(
     let mut seen = HashSet::with_capacity(entries.len());
     let mut rows = Vec::with_capacity(entries.len());
     let mut image_total = 0usize;
+    let mut token_sid_total = 0usize;
     for (index, raw) in entries.into_iter().enumerate() {
         if started.elapsed() >= MAX_SCAN_DURATION {
             truncated = true;
@@ -409,6 +467,30 @@ fn collect_windows_processes_with_api<A: WindowsProcessApi>(
                 creation_time.status,
             ));
         }
+        let sid_remaining = MAX_AGGREGATE_TOKEN_SID_UTF16_UNITS.saturating_sub(token_sid_total);
+        let mut token_context = api.read_token_context(entry.process_id, sid_remaining);
+        if let Some(sid) = token_context.user_sid.value.as_ref() {
+            token_sid_total = token_sid_total.saturating_add(sid.encode_utf16().count());
+        }
+        validate_token_context_identity(&mut token_context, &creation_time);
+        if token_context.identity_status != WindowsProcessTokenContextStatus::Observed {
+            truncated = true;
+            diagnostics.push(diagnostic(
+                "process_token_identity_unverified",
+                Some(entry.process_id),
+                "Token facts could not be tied to the process generation in the snapshot.",
+            ));
+        }
+        for (field, status) in [
+            ("user_sid", token_context.user_sid.status),
+            ("integrity_level", token_context.integrity_level_rid.status),
+            ("session_id", token_context.session_id.status),
+        ] {
+            if status != WindowsProcessTokenFieldStatus::Observed {
+                truncated = true;
+                diagnostics.push(token_field_diagnostic(entry.process_id, field, status));
+            }
+        }
         rows.push(WindowsProcessRow {
             process_id: entry.process_id,
             parent_process_id: entry.parent_process_id,
@@ -416,6 +498,7 @@ fn collect_windows_processes_with_api<A: WindowsProcessApi>(
             executable_name: name.clone(),
             image,
             creation_time,
+            token_context,
             evidence: WindowsProcessEvidence {
                 snapshot_source: "ToolHelp32Snapshot/PROCESSENTRY32W",
                 snapshot_index: index,
@@ -445,6 +528,7 @@ fn collect_windows_processes_with_api<A: WindowsProcessApi>(
         diagnostics,
         seen.len(),
         image_total,
+        token_sid_total,
         truncated,
     )
 }
@@ -513,6 +597,408 @@ fn read_creation_time_native(process_id: u32) -> WindowsProcessCreationTime {
         status: WindowsProcessCreationTimeStatus::Observed,
         filetime_100ns: Some(((creation.high as u64) << 32) | creation.low as u64),
         source: Some("OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)/GetProcessTimes"),
+    }
+}
+
+fn validate_token_context_identity(
+    context: &mut WindowsProcessTokenContext,
+    row_creation_time: &WindowsProcessCreationTime,
+) {
+    match row_creation_time
+        .filetime_100ns
+        .zip(context.process_creation_time_filetime_100ns)
+    {
+        Some((row, token)) if row == token => {
+            context.identity_status = WindowsProcessTokenContextStatus::Observed;
+        }
+        Some(_) => {
+            context.identity_status = WindowsProcessTokenContextStatus::ChangedDuringRead;
+            clear_token_context_values(context);
+        }
+        None => {
+            context.identity_status = WindowsProcessTokenContextStatus::IdentityUnverified;
+            clear_token_context_values(context);
+        }
+    }
+}
+
+fn clear_token_context_values(context: &mut WindowsProcessTokenContext) {
+    context.user_sid.status = WindowsProcessTokenFieldStatus::IdentityUnverified;
+    context.user_sid.value = None;
+    context.integrity_level_rid.status = WindowsProcessTokenFieldStatus::IdentityUnverified;
+    context.integrity_level_rid.value = None;
+    context.session_id.status = WindowsProcessTokenFieldStatus::IdentityUnverified;
+    context.session_id.value = None;
+}
+
+fn token_field_diagnostic(
+    process_id: u32,
+    field: &'static str,
+    status: WindowsProcessTokenFieldStatus,
+) -> WindowsProcessDiagnostic {
+    let (code, message) = match status {
+        WindowsProcessTokenFieldStatus::Observed => unreachable!(),
+        WindowsProcessTokenFieldStatus::Inaccessible => (
+            "process_token_field_inaccessible",
+            "Windows denied access to a process token field.",
+        ),
+        WindowsProcessTokenFieldStatus::Vanished => (
+            "process_token_field_vanished",
+            "The process or token disappeared during collection.",
+        ),
+        WindowsProcessTokenFieldStatus::Malformed => (
+            "process_token_field_malformed",
+            "Windows returned a malformed process token field.",
+        ),
+        WindowsProcessTokenFieldStatus::OverLimit => (
+            "process_token_context_limit_exceeded",
+            "The process token field exceeded its configured bound.",
+        ),
+        WindowsProcessTokenFieldStatus::IdentityUnverified => (
+            "process_token_identity_unverified",
+            "The token field could not be tied to a verified process generation.",
+        ),
+        WindowsProcessTokenFieldStatus::Error => (
+            "process_token_field_query_failed",
+            "Windows could not query a process token field.",
+        ),
+    };
+    diagnostic(code, Some(process_id), message).with_field(field)
+}
+
+#[repr(C)]
+struct SidAndAttributes {
+    sid: *mut c_void,
+    attributes: u32,
+}
+
+#[repr(C)]
+struct TokenUserInfo {
+    user: SidAndAttributes,
+}
+
+#[repr(C)]
+struct TokenMandatoryLabelInfo {
+    label: SidAndAttributes,
+}
+
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn OpenProcessToken(process: Handle, access: u32, token: *mut Handle) -> i32;
+    fn GetTokenInformation(
+        token: Handle,
+        class: u32,
+        information: *mut c_void,
+        information_length: u32,
+        return_length: *mut u32,
+    ) -> i32;
+    fn ConvertSidToStringSidW(sid: *mut c_void, string_sid: *mut *mut u16) -> i32;
+    fn IsValidSid(sid: *mut c_void) -> i32;
+    fn GetSidSubAuthorityCount(sid: *mut c_void) -> *mut u8;
+    fn GetSidSubAuthority(sid: *mut c_void, index: u32) -> *mut u32;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn LocalFree(memory: Handle) -> Handle;
+}
+
+struct OwnedToken(Handle);
+impl Drop for OwnedToken {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper owns a token handle returned by OpenProcessToken.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+struct LocalString(*mut u16);
+impl Drop for LocalString {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: this pointer was returned by ConvertSidToStringSidW.
+            unsafe { LocalFree(self.0.cast()) };
+        }
+    }
+}
+
+fn read_token_context_native(
+    process_id: u32,
+    aggregate_sid_remaining: usize,
+) -> WindowsProcessTokenContext {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if process.is_null() {
+        let status = token_field_status(unsafe { GetLastError() });
+        return token_context_for_process_error(status);
+    }
+    let process = OwnedHandle(process);
+    let generation = read_creation_time_from_handle(&process);
+    let Some(generation) = generation else {
+        return token_context_for_process_error(WindowsProcessTokenFieldStatus::IdentityUnverified);
+    };
+    let mut token_handle = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(process.0, 0x0008, &mut token_handle) } == 0 {
+        return token_context_with_generation(
+            generation,
+            token_fields_with_status(token_field_status(unsafe { GetLastError() })),
+        );
+    }
+    let token = OwnedToken(token_handle);
+    let sid_budget = aggregate_sid_remaining.min(MAX_PROCESS_TOKEN_SID_UTF16_UNITS);
+    let user_sid = if sid_budget == 0 {
+        token_field(
+            WindowsProcessTokenFieldStatus::OverLimit,
+            None,
+            "GetTokenInformation/TokenUser",
+        )
+    } else {
+        read_user_sid(&token, sid_budget)
+    };
+    let integrity_level_rid = read_integrity_level(&token);
+    let session_id = read_session_id(&token);
+    token_context_with_generation(generation, (user_sid, integrity_level_rid, session_id))
+}
+
+fn read_creation_time_from_handle(process: &OwnedHandle) -> Option<u64> {
+    let mut creation = FileTime { low: 0, high: 0 };
+    let mut exit = FileTime { low: 0, high: 0 };
+    let mut kernel = FileTime { low: 0, high: 0 };
+    let mut user = FileTime { low: 0, high: 0 };
+    (unsafe { GetProcessTimes(process.0, &mut creation, &mut exit, &mut kernel, &mut user) } != 0)
+        .then_some(((creation.high as u64) << 32) | creation.low as u64)
+}
+
+fn read_user_sid(token: &OwnedToken, sid_budget: usize) -> WindowsProcessTokenField<String> {
+    let buffer = match token_information(token, 1) {
+        Ok(buffer) => buffer,
+        Err(status) => return token_field(status, None, "GetTokenInformation/TokenUser"),
+    };
+    if buffer.len() < size_of::<TokenUserInfo>() {
+        return token_field(
+            WindowsProcessTokenFieldStatus::Malformed,
+            None,
+            "GetTokenInformation/TokenUser",
+        );
+    }
+    let info = buffer.as_ptr().cast::<TokenUserInfo>();
+    // SAFETY: the buffer is initialized by GetTokenInformation and large enough for TokenUserInfo.
+    let sid = unsafe { (*info).user.sid };
+    match sid_to_string(sid, sid_budget) {
+        Ok(value) => token_field(
+            WindowsProcessTokenFieldStatus::Observed,
+            Some(value),
+            "GetTokenInformation/TokenUser",
+        ),
+        Err(status) => token_field(status, None, "GetTokenInformation/TokenUser"),
+    }
+}
+
+fn read_integrity_level(token: &OwnedToken) -> WindowsProcessTokenField<u32> {
+    let buffer = match token_information(token, 25) {
+        Ok(buffer) => buffer,
+        Err(status) => return token_field(status, None, "GetTokenInformation/TokenIntegrityLevel"),
+    };
+    if buffer.len() < size_of::<TokenMandatoryLabelInfo>() {
+        return token_field(
+            WindowsProcessTokenFieldStatus::Malformed,
+            None,
+            "GetTokenInformation/TokenIntegrityLevel",
+        );
+    }
+    // SAFETY: the buffer is initialized by GetTokenInformation and large enough for this header.
+    let sid = unsafe {
+        (*buffer.as_ptr().cast::<TokenMandatoryLabelInfo>())
+            .label
+            .sid
+    };
+    // SAFETY: the SID pointer is returned as part of the validated token information buffer.
+    if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+        return token_field(
+            WindowsProcessTokenFieldStatus::Malformed,
+            None,
+            "GetTokenInformation/TokenIntegrityLevel",
+        );
+    }
+    // SAFETY: IsValidSid succeeded and the SID subauthority count is addressable.
+    let count = unsafe { GetSidSubAuthorityCount(sid) };
+    if count.is_null() || unsafe { *count } == 0 {
+        return token_field(
+            WindowsProcessTokenFieldStatus::Malformed,
+            None,
+            "GetTokenInformation/TokenIntegrityLevel",
+        );
+    }
+    // SAFETY: the index is the last subauthority advertised by the valid SID.
+    let rid = unsafe { GetSidSubAuthority(sid, (*count - 1) as u32) };
+    if rid.is_null() {
+        return token_field(
+            WindowsProcessTokenFieldStatus::Malformed,
+            None,
+            "GetTokenInformation/TokenIntegrityLevel",
+        );
+    }
+    token_field(
+        WindowsProcessTokenFieldStatus::Observed,
+        Some(unsafe { *rid }),
+        "GetTokenInformation/TokenIntegrityLevel",
+    )
+}
+
+fn read_session_id(token: &OwnedToken) -> WindowsProcessTokenField<u32> {
+    let mut value = 0_u32;
+    let mut needed = 0_u32;
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            12,
+            (&mut value as *mut u32).cast(),
+            size_of::<u32>() as u32,
+            &mut needed,
+        )
+    } == 0
+    {
+        return token_field(
+            token_field_status(unsafe { GetLastError() }),
+            None,
+            "GetTokenInformation/TokenSessionId",
+        );
+    }
+    if needed as usize != size_of::<u32>() {
+        return token_field(
+            WindowsProcessTokenFieldStatus::Malformed,
+            None,
+            "GetTokenInformation/TokenSessionId",
+        );
+    }
+    token_field(
+        WindowsProcessTokenFieldStatus::Observed,
+        Some(value),
+        "GetTokenInformation/TokenSessionId",
+    )
+}
+
+fn token_information(
+    token: &OwnedToken,
+    class: u32,
+) -> Result<Vec<usize>, WindowsProcessTokenFieldStatus> {
+    let mut needed = 0_u32;
+    unsafe { GetTokenInformation(token.0, class, std::ptr::null_mut(), 0, &mut needed) };
+    if needed == 0 || needed as usize > MAX_TOKEN_INFO_BYTES {
+        return Err(if needed as usize > MAX_TOKEN_INFO_BYTES {
+            WindowsProcessTokenFieldStatus::OverLimit
+        } else {
+            token_field_status(unsafe { GetLastError() })
+        });
+    }
+    let mut storage = vec![0_usize; (needed as usize).div_ceil(size_of::<usize>())];
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            class,
+            storage.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(token_field_status(unsafe { GetLastError() }));
+    }
+    if needed as usize > MAX_TOKEN_INFO_BYTES
+        || needed as usize > storage.len() * size_of::<usize>()
+    {
+        return Err(WindowsProcessTokenFieldStatus::OverLimit);
+    }
+    Ok(storage)
+}
+
+fn sid_to_string(
+    sid: *mut c_void,
+    sid_budget: usize,
+) -> Result<String, WindowsProcessTokenFieldStatus> {
+    if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+        return Err(WindowsProcessTokenFieldStatus::Malformed);
+    }
+    let mut text = std::ptr::null_mut();
+    if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+        return Err(token_field_status(unsafe { GetLastError() }));
+    }
+    let text = LocalString(text);
+    let mut len = 0usize;
+    while len <= MAX_PROCESS_TOKEN_SID_UTF16_UNITS && unsafe { *text.0.add(len) } != 0 {
+        len += 1;
+    }
+    if len == 0 {
+        return Err(WindowsProcessTokenFieldStatus::Malformed);
+    }
+    if len > MAX_PROCESS_TOKEN_SID_UTF16_UNITS || len > sid_budget {
+        return Err(WindowsProcessTokenFieldStatus::OverLimit);
+    }
+    String::from_utf16(unsafe { std::slice::from_raw_parts(text.0, len) })
+        .map_err(|_| WindowsProcessTokenFieldStatus::Malformed)
+}
+
+fn token_field<T>(
+    status: WindowsProcessTokenFieldStatus,
+    value: Option<T>,
+    source: &'static str,
+) -> WindowsProcessTokenField<T> {
+    WindowsProcessTokenField {
+        status,
+        value,
+        source,
+    }
+}
+
+fn token_field_status(error: u32) -> WindowsProcessTokenFieldStatus {
+    match error {
+        ERROR_ACCESS_DENIED => WindowsProcessTokenFieldStatus::Inaccessible,
+        ERROR_INVALID_HANDLE | ERROR_INVALID_PARAMETER | ERROR_NOT_FOUND => {
+            WindowsProcessTokenFieldStatus::Vanished
+        }
+        ERROR_INSUFFICIENT_BUFFER => WindowsProcessTokenFieldStatus::OverLimit,
+        _ => WindowsProcessTokenFieldStatus::Error,
+    }
+}
+
+fn token_fields_with_status(
+    status: WindowsProcessTokenFieldStatus,
+) -> (
+    WindowsProcessTokenField<String>,
+    WindowsProcessTokenField<u32>,
+    WindowsProcessTokenField<u32>,
+) {
+    (
+        token_field(status, None, "GetTokenInformation/TokenUser"),
+        token_field(status, None, "GetTokenInformation/TokenIntegrityLevel"),
+        token_field(status, None, "GetTokenInformation/TokenSessionId"),
+    )
+}
+
+fn token_context_with_generation(
+    generation: u64,
+    fields: (
+        WindowsProcessTokenField<String>,
+        WindowsProcessTokenField<u32>,
+        WindowsProcessTokenField<u32>,
+    ),
+) -> WindowsProcessTokenContext {
+    WindowsProcessTokenContext {
+        identity_status: WindowsProcessTokenContextStatus::IdentityUnverified,
+        process_creation_time_filetime_100ns: Some(generation),
+        user_sid: fields.0,
+        integrity_level_rid: fields.1,
+        session_id: fields.2,
+    }
+}
+
+fn token_context_for_process_error(
+    status: WindowsProcessTokenFieldStatus,
+) -> WindowsProcessTokenContext {
+    WindowsProcessTokenContext {
+        identity_status: WindowsProcessTokenContextStatus::IdentityUnverified,
+        process_creation_time_filetime_100ns: None,
+        user_sid: token_field(status, None, "GetTokenInformation/TokenUser"),
+        integrity_level_rid: token_field(status, None, "GetTokenInformation/TokenIntegrityLevel"),
+        session_id: token_field(status, None, "GetTokenInformation/TokenSessionId"),
     }
 }
 
@@ -636,7 +1122,15 @@ fn diagnostic(
     WindowsProcessDiagnostic {
         code,
         process_id,
+        field: None,
         message,
+    }
+}
+
+impl WindowsProcessDiagnostic {
+    fn with_field(mut self, field: &'static str) -> Self {
+        self.field = Some(field);
+        self
     }
 }
 
@@ -646,6 +1140,7 @@ fn finish(
     diagnostics: Vec<WindowsProcessDiagnostic>,
     entries_seen: usize,
     image_path_utf16_code_units: usize,
+    token_sid_utf16_code_units: usize,
     partial: bool,
 ) -> WindowsProcessInventoryDocument {
     let status = if partial || !diagnostics.is_empty() {
@@ -655,9 +1150,9 @@ fn finish(
     };
     WindowsProcessInventoryDocument {
         schema: "sideeffect.windows_process_inventory",
-        schema_version: 2,
+        schema_version: 3,
         platform: "windows",
-        scope: "toolhelp_process_snapshot_and_queryable_image_paths",
+        scope: "toolhelp_process_snapshot_image_paths_and_token_context",
         capture_started_at_unix_ms: started_at,
         capture_ended_at_unix_ms: now_ms(),
         status,
@@ -666,6 +1161,7 @@ fn finish(
             status,
             entries_seen,
             image_path_utf16_code_units,
+            token_sid_utf16_code_units,
             diagnostics,
         },
         processes,
@@ -685,6 +1181,7 @@ mod tests {
         next_index: usize,
         images: HashMap<u32, WindowsProcessImage>,
         creation_times: HashMap<u32, WindowsProcessCreationTime>,
+        token_contexts: HashMap<u32, WindowsProcessTokenContext>,
     }
 
     impl FakeProcessApi {
@@ -697,6 +1194,7 @@ mod tests {
                 next_index: 0,
                 images: HashMap::new(),
                 creation_times: HashMap::new(),
+                token_contexts: HashMap::new(),
             }
         }
     }
@@ -753,6 +1251,42 @@ mod tests {
                 .get(&process_id)
                 .cloned()
                 .unwrap_or_else(|| empty_creation_time(WindowsProcessCreationTimeStatus::Error))
+        }
+
+        fn read_token_context(
+            &mut self,
+            process_id: u32,
+            _aggregate_sid_remaining: usize,
+        ) -> WindowsProcessTokenContext {
+            if let Some(context) = self.token_contexts.get(&process_id) {
+                return context.clone();
+            }
+            match self
+                .creation_times
+                .get(&process_id)
+                .and_then(|time| time.filetime_100ns)
+            {
+                Some(generation) => WindowsProcessTokenContext {
+                    identity_status: WindowsProcessTokenContextStatus::IdentityUnverified,
+                    process_creation_time_filetime_100ns: Some(generation),
+                    user_sid: token_field(
+                        WindowsProcessTokenFieldStatus::Observed,
+                        Some("S-1-5-18".to_owned()),
+                        "synthetic TokenUser",
+                    ),
+                    integrity_level_rid: token_field(
+                        WindowsProcessTokenFieldStatus::Observed,
+                        Some(0x2000),
+                        "synthetic TokenIntegrityLevel",
+                    ),
+                    session_id: token_field(
+                        WindowsProcessTokenFieldStatus::Observed,
+                        Some(1),
+                        "synthetic TokenSessionId",
+                    ),
+                },
+                None => token_context_for_process_error(WindowsProcessTokenFieldStatus::Error),
+            }
         }
     }
 
@@ -819,7 +1353,7 @@ mod tests {
             None,
             "The process-count limit was reached; remaining entries were not checked.",
         )];
-        let doc = finish(now_ms(), Vec::new(), diagnostics, entries.len(), 0, true);
+        let doc = finish(now_ms(), Vec::new(), diagnostics, entries.len(), 0, 0, true);
         assert_eq!(doc.status, WindowsProcessInventoryStatus::Partial);
         assert_eq!(doc.source.entries_seen, MAX_PROCESSES);
         assert_eq!(doc.source.diagnostics[0].code, "process_limit_exceeded");
@@ -847,6 +1381,45 @@ mod tests {
         let malformed = decode_image_path(&[0xd800]);
         assert_eq!(malformed.status, WindowsProcessImageStatus::MalformedUtf16);
         assert_eq!(malformed.path.as_deref(), Some("�"));
+    }
+
+    #[test]
+    fn token_context_requires_matching_process_generation() {
+        let mut context = WindowsProcessTokenContext {
+            identity_status: WindowsProcessTokenContextStatus::IdentityUnverified,
+            process_creation_time_filetime_100ns: Some(123),
+            user_sid: token_field(
+                WindowsProcessTokenFieldStatus::Observed,
+                Some("S-1-5-18".to_owned()),
+                "fixture",
+            ),
+            integrity_level_rid: token_field(
+                WindowsProcessTokenFieldStatus::Observed,
+                Some(8192),
+                "fixture",
+            ),
+            session_id: token_field(WindowsProcessTokenFieldStatus::Observed, Some(1), "fixture"),
+        };
+        validate_token_context_identity(&mut context, &observed_creation_time(124));
+        assert_eq!(
+            context.identity_status,
+            WindowsProcessTokenContextStatus::ChangedDuringRead
+        );
+        assert_eq!(context.user_sid.value, None);
+        assert_eq!(
+            context.user_sid.status,
+            WindowsProcessTokenFieldStatus::IdentityUnverified
+        );
+
+        validate_token_context_identity(
+            &mut context,
+            &empty_creation_time(WindowsProcessCreationTimeStatus::Inaccessible),
+        );
+        assert_eq!(
+            context.identity_status,
+            WindowsProcessTokenContextStatus::IdentityUnverified
+        );
+        assert_eq!(context.session_id.value, None);
     }
 
     #[test]
