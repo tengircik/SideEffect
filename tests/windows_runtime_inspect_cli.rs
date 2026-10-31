@@ -418,6 +418,56 @@ fn timeline_windows_runtime_keeps_unknown_completeness_and_exit_two() {
 
 #[cfg(windows)]
 #[test]
+fn graph_windows_runtime_keeps_pid_context_separate_from_process_instance() {
+    let input = fixture(CollectionStatus::Partial);
+    let path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-graph-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, &input).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--windows-runtime"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(graph["schema"], "sideeffect.event_graph");
+    assert_eq!(graph["source_state"]["completeness"], "partial");
+    let nodes = graph["nodes"].as_array().unwrap();
+    let instance = nodes
+        .iter()
+        .find(|node| node["kind"] == "process_observation")
+        .unwrap();
+    let parent_context = nodes
+        .iter()
+        .find(|node| node["kind"] == "process_id_context")
+        .unwrap();
+    assert_eq!(
+        instance["process_observation"]["identity"]["process_id"],
+        42
+    );
+    assert_eq!(parent_context["reported_process_id"], 1);
+    assert_ne!(instance["id"], parent_context["id"]);
+    assert_eq!(graph["edges"].as_array().unwrap().len(), 2);
+    assert!(graph["edges"].as_array().unwrap().iter().any(|edge| {
+        edge["kind"] == "process_relationship"
+            && edge["relationship_resolution"] == "parent_instance_unresolved"
+            && edge["from_node_id"] == parent_context["id"]
+            && edge["to_node_id"] == instance["id"]
+    }));
+    assert!(graph["edges"].as_array().unwrap().iter().any(|edge| {
+        edge["kind"] == "event_process_link"
+            && edge["event_link_status"] == "context_candidate"
+            && edge["to_node_id"] == instance["id"]
+    }));
+}
+
+#[cfg(windows)]
+#[test]
 fn events_windows_runtime_marks_reused_process_ids_ambiguous() {
     let mut value: Value = serde_json::from_slice(&fixture(CollectionStatus::Complete)).unwrap();
     let mut duplicate = value["events"][0].clone();

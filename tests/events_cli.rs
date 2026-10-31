@@ -120,6 +120,53 @@ fn timeline_rejects_invalid_filter_before_reading_trace() {
 }
 
 #[test]
+fn graph_trace_keeps_event_process_link_and_source_evidence() {
+    let trace = TempTrace::with_contents(
+        b"123 1700000000.000001 openat(AT_FDCWD, \"/tmp/item\", O_RDONLY) = 4\nnot a recognized trace row\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--trace"])
+        .arg(&trace.0)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let graph: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(graph["schema"], "sideeffect.event_graph");
+    assert_eq!(graph["schema_version"], 1);
+    assert_eq!(graph["source_state"]["completeness"], "partial");
+    assert!(
+        graph["semantics"]
+            .as_str()
+            .unwrap()
+            .contains("do not establish ownership, causation")
+    );
+    assert_eq!(graph["nodes"].as_array().unwrap().len(), 2);
+    let event = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["kind"] == "event")
+        .unwrap();
+    let process = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["kind"] == "process_observation")
+        .unwrap();
+    assert_eq!(event["event"]["event_kind"], "openat");
+    assert_eq!(event["evidence"]["line_number"], 1);
+    assert_eq!(process["process_observation"]["identity"]["task_id"], 123);
+    assert_eq!(graph["edges"].as_array().unwrap().len(), 1);
+    assert_eq!(graph["edges"][0]["kind"], "event_process_link");
+    assert_eq!(graph["edges"][0]["event_link_status"], "observed");
+    assert_eq!(graph["edges"][0]["from_node_id"], event["id"]);
+    assert_eq!(graph["edges"][0]["to_node_id"], process["id"]);
+    assert_eq!(graph["edges"][0]["evidence"][0]["line_number"], 1);
+    assert_eq!(graph["diagnostics"][0]["code"], "unsupported_source_row");
+}
+
+#[test]
 fn events_trace_preserves_partial_diagnostics_and_uses_exit_two() {
     let trace = TempTrace::with_contents(b"not a recognized trace row\n");
     let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
@@ -154,6 +201,19 @@ fn windows_runtime_events_are_native_windows_only() {
 fn windows_runtime_timeline_is_native_windows_only() {
     let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .args(["timeline", "--windows-runtime", "capture.json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("supported only in native Windows builds")
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn windows_runtime_graph_is_native_windows_only() {
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--windows-runtime", "capture.json"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));

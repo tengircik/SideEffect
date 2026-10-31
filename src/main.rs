@@ -240,6 +240,10 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             inspect_windows_runtime_with_format(&OsString::from("json"), path)
         }
         [command, flag, path] if command == "events" && flag == "--trace" => events_trace(path),
+        [command, flag, path] if command == "graph" && flag == "--trace" => graph_trace(path),
+        [command, flag, path] if command == "graph" && flag == "--windows-runtime" => {
+            graph_windows_runtime(path)
+        }
         [command, flag, path] if command == "timeline" && flag == "--trace" => {
             timeline_trace(path, None)
         }
@@ -1427,7 +1431,7 @@ fn print_version() {
 
 fn print_usage() {
     println!(
-        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)\n       sideeffect timeline --trace <strace-trace-file> [--event-kind <kind>]\n       sideeffect timeline --windows-runtime <capture.json> [--event-kind <kind>] (native Windows)\n\nProvenance:\n       sideeffect provenance keygen <private-key.pk8> <public-key.hex>\n       sideeffect provenance sign-session <session-dir> --private-key <private-key.pk8> --output <signature.json>\n       sideeffect provenance verify-session <session-dir> --signature <signature.json> --public-key <public-key.hex>"
+        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)\n       sideeffect graph --trace <strace-trace-file>\n       sideeffect graph --windows-runtime <capture.json> (native Windows)\n       sideeffect timeline --trace <strace-trace-file> [--event-kind <kind>]\n       sideeffect timeline --windows-runtime <capture.json> [--event-kind <kind>] (native Windows)\n\nProvenance:\n       sideeffect provenance keygen <private-key.pk8> <public-key.hex>\n       sideeffect provenance sign-session <session-dir> --private-key <private-key.pk8> --output <signature.json>\n       sideeffect provenance verify-session <session-dir> --signature <signature.json> --public-key <public-key.hex>"
     );
 }
 
@@ -1465,6 +1469,9 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         }
         "events" => {
             "Usage: sideeffect events --trace TRACE\n       sideeffect events --windows-runtime CAPTURE.json (native Windows)\nAdapts one local runtime source into a versioned common event envelope and writes JSON only. Source-local order and timestamps are preserved; no cross-platform ordering, parentage, ownership, or causation is inferred. Partial or unknown source status exits with status 2. Windows runtime input is strictly bounded and schema-validated before adaptation."
+        }
+        "graph" => {
+            "Usage: sideeffect graph --trace TRACE\n       sideeffect graph --windows-runtime CAPTURE.json (native Windows)\nBuilds a bounded source-local graph of event rows, process observations, reported PID context, and evidence-linked relationships. PID-only context nodes are kept separate and never merged into process instances. Edges preserve observed, context-candidate, unresolved, or decoder-metadata-unverified status; they do not establish ownership, causation, or a complete process tree. Partial or unknown source status exits with status 2."
         }
         "timeline" => {
             "Usage: sideeffect timeline --trace TRACE [--event-kind KIND]\n       sideeffect timeline --windows-runtime CAPTURE.json [--event-kind KIND] (native Windows)\nBuilds a source-local timeline from bounded Linux strace or strictly validated Windows ETW v3 evidence. Items keep their source ordinal, original timestamp representation, and exact raw-record evidence reference; timestamps do not establish causal order. --event-kind matches an exact event kind. Unsupported rows remain in diagnostics. Partial or unknown source status exits with status 2."
@@ -1813,6 +1820,46 @@ fn events_trace(path: &OsString) -> Result<ExitCode, String> {
     let complete =
         envelope.source_state.completeness == sideeffect::event::SourceCompleteness::Complete;
     write_json(&envelope, "common event envelope")?;
+    Ok(if complete {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
+fn graph_trace(path: &OsString) -> Result<ExitCode, String> {
+    let bytes = read_bounded(path)?;
+    let trace = parse_trace_bytes(&bytes, ParseLimits::default())
+        .map_err(|error| format!("trace graph adaptation failed: {error}"))?;
+    let envelope = sideeffect::event::from_linux_strace(&trace, &bytes, "trace");
+    write_event_graph(&envelope)
+}
+
+#[cfg(windows)]
+fn graph_windows_runtime(path: &OsString) -> Result<ExitCode, String> {
+    let bytes = read_input_file(
+        Path::new(path),
+        sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
+        "Windows runtime capture",
+    )?;
+    let capture = sideeffect::windows_runtime::inspect_windows_runtime_bytes(&bytes)
+        .map_err(|error| format!("Windows runtime graph adaptation failed: {error}"))?;
+    let envelope = sideeffect::event::from_windows_runtime_capture(&capture);
+    write_event_graph(&envelope)
+}
+
+#[cfg(not(windows))]
+fn graph_windows_runtime(_path: &OsString) -> Result<ExitCode, String> {
+    Err("graph --windows-runtime is supported only in native Windows builds".to_owned())
+}
+
+fn write_event_graph(
+    envelope: &sideeffect::event::CommonEventEnvelope,
+) -> Result<ExitCode, String> {
+    let complete =
+        envelope.source_state.completeness == sideeffect::event::SourceCompleteness::Complete;
+    let graph = sideeffect::event::graph(envelope)?;
+    write_json(&graph, "event graph")?;
     Ok(if complete {
         ExitCode::SUCCESS
     } else {

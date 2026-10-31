@@ -205,6 +205,27 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
         }),
         "live ETW timeline should retain a filtered file event with exact source evidence"
     );
+    let graph = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--windows-runtime"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_eq!(graph.status.code(), Some(2));
+    let graph: Value = serde_json::from_slice(&graph.stdout).unwrap();
+    assert_eq!(graph["schema"], "sideeffect.event_graph");
+    assert_eq!(graph["source_state"], events["source_state"]);
+    assert!(graph["nodes"].as_array().unwrap().iter().any(|node| {
+        node["kind"] == "event"
+            && node["event"]["event_kind"] == "file_io_observation"
+            && node["evidence"]["json_pointer"]
+                .as_str()
+                .is_some_and(|pointer| pointer.starts_with("/events/"))
+    }));
+    assert!(graph["edges"].as_array().unwrap().iter().any(|edge| {
+        edge["kind"] == "event_process_link"
+            && edge["event_link_status"] == "context_candidate"
+            && edge["event_link_role"] == "windows_process_start_payload"
+    }));
     fs::remove_file(fixture_file).unwrap();
     fs::remove_file(output).unwrap();
     fs::remove_dir(directory).unwrap();

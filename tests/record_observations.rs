@@ -649,6 +649,37 @@ fn real_strace_capture_inspect_and_diff_observe_file_and_loopback_events() {
         String::from_utf8_lossy(&raw_trace[start..start + length])
             .contains(baseline_file.file_name().unwrap().to_str().unwrap())
     );
+    let graph_output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--trace"])
+        .arg(&baseline_path)
+        .output()
+        .expect("launch graph over the real strace capture");
+    assert!(
+        matches!(graph_output.status.code(), Some(0 | 2)),
+        "graph real strace capture failed (status: {:?}; stderr: {})",
+        graph_output.status.code(),
+        String::from_utf8_lossy(&graph_output.stderr)
+    );
+    let graph: Value =
+        serde_json::from_slice(&graph_output.stdout).expect("parse real-capture graph JSON");
+    assert_eq!(graph["schema"], "sideeffect.event_graph");
+    assert_eq!(graph["source_state"], timeline["source_state"]);
+    let graph_file_event = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| {
+            node["kind"] == "event"
+                && node["event"]["event_kind"] == "openat"
+                && node["evidence"]["line_number"] == baseline_file_open["evidence"]["line_number"]
+                && node["evidence"]["byte_offset"] == baseline_file_open["evidence"]["byte_offset"]
+        })
+        .expect("graph should include the observed real file-open event");
+    assert!(graph["edges"].as_array().unwrap().iter().any(|edge| {
+        edge["kind"] == "event_process_link"
+            && edge["event_link_status"] == "observed"
+            && edge["from_node_id"] == graph_file_event["id"]
+    }));
     assert_eq!(
         baseline_file_open["lexical_path_hint"]["path"],
         baseline_file.to_str().unwrap()
