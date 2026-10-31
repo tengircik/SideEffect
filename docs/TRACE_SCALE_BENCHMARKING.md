@@ -25,7 +25,19 @@ python3 scripts/trace_scale_benchmark.py \
   --output "$PWD/trace-scale-smoke.json"
 ```
 
-The workload source is generated in that temporary directory. It calls `os.getpid()` exactly N times; `strace` records only `getpid`, so unrelated Python startup file activity does not inflate the target. No command, path, dataset, or network input is accepted from the caller. This is intentionally a narrow synthetic syscall profile.
+The workload source is generated in that temporary directory. The default `getpid` profile calls `os.getpid()` exactly N times and traces only `getpid`, so unrelated Python startup file activity does not inflate the target. No command, path, dataset, or network input is accepted from the caller.
+
+The opt-in `file_io` profile traces repeated local file transfers with real `strace`:
+
+```sh
+python3 scripts/trace_scale_benchmark.py \
+  --sideeffect target/release/sideeffect \
+  --profile file_io --sizes 100 \
+  --runs 1 --warmups 0 \
+  --output "$PWD/trace-scale-file-io-smoke.json"
+```
+
+It generates a one-byte source file and transfers one byte per `os.sendfile()` call to a temporary destination. Only `sendfile` rows are traced, making N the expected parsed-row count; Python setup and cleanup file syscalls are outside that filter. Both files are private temporary data, with the destination bounded by the 100,000-row parser cap. This is a synthetic local file workload, not a representative application or a capture-completeness claim.
 
 ## Matrix and limits
 
@@ -62,6 +74,8 @@ The following smoke result was measured during harness development. It checks ex
 | Capture timing | 0.1159 s wall; child CPU 0.0172 s user + 0.0634 s system |
 | Inspect | 0.0205 s wall; 33,036 JSON bytes; child CPU 0.0056 s system (0 user seconds reported) |
 | Diff | 0.0199 s wall; 745 JSON bytes; child CPU 0.0055 s system (0 user seconds reported); one capture supplied twice |
+
+The opt-in `file_io` profile also passed a one-run smoke check on WSL2 Ubuntu (kernel `6.6.87.2-microsoft-standard-WSL2`, Python 3.14.4, `strace` 6.19, SideEffect 0.1.0): requested and parsed 64 `sendfile` rows, 2,816 trace bytes, 22,029 inspect JSON bytes, 0.115931 s capture wall time, 0.019758 s inspect wall time, and a complete self-diff of 745 bytes in 0.019794 s. It used `--runs 1 --warmups 0`; this smoke check does not measure larger file-I/O scales or establish native-Linux acceptance.
 
 ### Measured scale run
 

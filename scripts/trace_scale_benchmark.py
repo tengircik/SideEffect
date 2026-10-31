@@ -31,11 +31,37 @@ MAX_SCHEDULED_CASES = 100
 MAX_REQUESTED_SIZE = 10_000_000
 DEFAULT_SIZES = (10_000, 100_000, 1_000_000)
 
-WORKLOAD = """import os, sys
+WORKLOADS = {
+    "getpid": """import os, sys
 count = int(sys.argv[1])
 for _ in range(count):
     os.getpid()
-"""
+""",
+    "file_io": """import os, sys
+count = int(sys.argv[1])
+root = sys.argv[2]
+source = os.path.join(root, "source.bin")
+destination = os.path.join(root, "destination.bin")
+with open(source, "wb") as stream:
+    stream.write(b"S")
+source_fd = os.open(source, os.O_RDONLY)
+destination_fd = os.open(destination, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+try:
+    for _ in range(count):
+        if os.sendfile(destination_fd, source_fd, 0, 1) != 1:
+            raise RuntimeError("short sendfile operation")
+finally:
+    os.close(destination_fd)
+    os.close(source_fd)
+if os.path.getsize(destination) != count:
+    raise RuntimeError("destination size did not match the requested transfer count")
+""",
+}
+TRACE_FILTERS = {"getpid": "getpid", "file_io": "sendfile"}
+WORKLOAD_DESCRIPTIONS = {
+    "getpid": "calls os.getpid() exactly N times; no user inputs or network",
+    "file_io": "transfers one byte per os.sendfile() call from a generated private source file to a generated private destination file",
+}
 
 
 def _limit_file_size(limit):
@@ -125,7 +151,7 @@ def _sanitize_temporary_paths(value, temporary_root):
     return value
 
 
-def _trace_case(root, sideeffect, python, size, repetitions, warmups):
+def _trace_case(root, sideeffect, python, size, repetitions, warmups, profile):
     result = {
         "requested_records": size,
         "status": "failed",
@@ -136,7 +162,12 @@ def _trace_case(root, sideeffect, python, size, repetitions, warmups):
     script = root / ("workload-%d.py" % size)
     descriptor = os.open(script, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        stream.write(WORKLOAD)
+        stream.write(WORKLOADS[profile])
+    workload_arguments = [python, str(script), str(size)]
+    if profile == "file_io":
+        workload_root = root / ("file-io-%d" % size)
+        workload_root.mkdir(mode=0o700)
+        workload_arguments.append(str(workload_root))
 
     total_runs = warmups + repetitions
     for index in range(total_runs):
@@ -149,8 +180,8 @@ def _trace_case(root, sideeffect, python, size, repetitions, warmups):
         record = {"label": label}
         try:
             traced = _run(
-                ["strace", "-f", "-qq", "-e", "trace=getpid", "-o", str(trace),
-                 "--", python, str(script), str(size)],
+                ["strace", "-f", "-qq", "-e", "trace=" + TRACE_FILTERS[profile],
+                 "-o", str(trace), "--"] + workload_arguments,
                 trace_stdout, MAX_TRACE_BYTES, stderr,
             )
             trace_bytes = trace.stat().st_size if trace.exists() else 0
@@ -241,6 +272,8 @@ def main():
     parser.add_argument("--output", required=True, help="new private JSON report path")
     parser.add_argument("--sizes", default=",".join(map(str, DEFAULT_SIZES)),
                         help="comma-separated positive requested record counts (default: 10000,100000,1000000)")
+    parser.add_argument("--profile", choices=tuple(WORKLOADS), default="getpid",
+                        help="generated workload profile (default: getpid)")
     parser.add_argument("--runs", type=int, default=3, help="measured captures per size (default: 3)")
     parser.add_argument("--warmups", type=int, default=1, help="discarded captures per size (default: 1)")
     args = parser.parse_args()
@@ -297,7 +330,8 @@ def main():
                         "diff": {"status": "not_run"},
                     })
                     continue
-                matrix.append(_trace_case(root, sideeffect, python, size, args.runs, args.warmups))
+                matrix.append(_trace_case(root, sideeffect, python, size, args.runs,
+                                          args.warmups, args.profile))
             report = {
                 "kind": "sideeffect_linux_trace_scale_benchmark",
                 "host": {
@@ -308,8 +342,9 @@ def main():
                     **versions,
                 },
                 "method": {
-                    "capture": "real strace, -f -qq -e trace=getpid, around generated fixed Python workload",
-                    "workload": "calls os.getpid() exactly N times; no user inputs, network, or external data",
+                    "profile": args.profile,
+                    "capture": "real strace, -f -qq -e trace=%s, around generated fixed Python workload" % TRACE_FILTERS[args.profile],
+                    "workload": WORKLOAD_DESCRIPTIONS[args.profile],
                     "warmups_per_size": args.warmups,
                     "measured_runs_per_size": args.runs,
                     "cpu_measurement": "harness getrusage(RUSAGE_CHILDREN) deltas around each waited child process group",
@@ -332,7 +367,7 @@ def main():
                     "Parsed-record targets are checked against the actual inspect JSON count; mismatches are not reported as measured target runs.",
                     "Child CPU aggregates what the harness receives through RUSAGE_CHILDREN and does not isolate Python workload, strace, or SideEffect CPU.",
                     "Wall time includes process startup, file I/O, parsing, and JSON serialization as applicable.",
-                    "This synthetic getpid-only trace profile does not represent syscall diversity, real software, or capture completeness.",
+                    "The selected synthetic workload profile does not represent arbitrary software or establish capture completeness.",
                     "Temporary generated source, captures, inspect JSON, diff JSON, and diagnostics are removed on exit, including errors.",
                     "The report includes host identity and should be treated as private.",
                 ],
