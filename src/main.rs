@@ -32,8 +32,10 @@ use sideeffect::format::{
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{InventoryStatus, collect_packages};
 use sideeffect::inventory::{
-    PackageComparisonStatus, WindowsSoftwareComparisonStatus, compare_package_inventory_json,
-    compare_windows_software_inventory_json, is_windows_software_inventory_json,
+    PackageComparisonStatus, ProcessDiffStatus, WindowsSoftwareComparisonStatus,
+    compare_package_inventory_json, compare_process_inventory_json,
+    compare_windows_software_inventory_json, is_process_inventory_json,
+    is_windows_software_inventory_json,
 };
 use sideeffect::inventory::{PathExecutableInventory, collect_path_executables};
 #[cfg(target_os = "linux")]
@@ -2006,6 +2008,17 @@ fn explain_inventory_diff_files(
         MAX_REPORT_BYTES.saturating_sub(before.len()),
         "inventory comparison input",
     )?;
+    if is_process_inventory_json(&before) || is_process_inventory_json(&after) {
+        let comparison = compare_process_inventory_json(&before, &after)
+            .map_err(|error| format!("process inventory comparison failed: {error:?}"))?;
+        let partial = comparison.status == ProcessDiffStatus::Partial;
+        write_json(&comparison, "JSON process inventory comparison")?;
+        return Ok(if partial {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
     if is_windows_software_inventory_json(&before) || is_windows_software_inventory_json(&after) {
         let comparison = compare_windows_software_inventory_json(&before, &after)
             .map_err(|error| format!("Windows software inventory comparison failed: {error:?}"))?;

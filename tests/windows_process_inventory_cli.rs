@@ -80,6 +80,21 @@ fn windows_process_command_includes_current_test_process_and_refuses_overwrite()
         ));
     }
 
+    let comparison = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["explain", "--inventory-diff"])
+        .arg(&output)
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        comparison.status.success() || comparison.status.code() == Some(2),
+        "unexpected comparison result: {}",
+        String::from_utf8_lossy(&comparison.stderr)
+    );
+    let compared: Value = serde_json::from_slice(&comparison.stdout).unwrap();
+    assert_eq!(compared["schema"], "sideeffect.process_inventory_diff");
+    assert_eq!(compared["platform"], "windows");
+
     let second = run(&directory, &output);
     assert!(!second.status.success());
     assert_eq!(fs::read(&output).unwrap(), bytes);

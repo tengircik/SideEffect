@@ -12,6 +12,7 @@ mod path_executables;
 mod permissions;
 #[cfg(windows)]
 mod permissions_windows;
+mod process_diff;
 #[cfg(target_os = "linux")]
 mod processes;
 #[cfg(windows)]
@@ -37,6 +38,10 @@ pub use package_diff::{
     compare_package_inventories, compare_package_inventory_json,
 };
 pub use path_executables::{PathExecutableInventory, collect_path_executables};
+pub use process_diff::{
+    ProcessDelta, ProcessDiff, ProcessDiffCounts, ProcessDiffError, ProcessDiffStatus,
+    ProcessEvidenceRef, ProcessSide, compare_process_inventory_json, is_process_inventory_json,
+};
 pub use windows_software_diff::{
     WindowsSoftwareChangeKind, WindowsSoftwareComparisonCounts,
     WindowsSoftwareComparisonDiagnostic, WindowsSoftwareComparisonError,
