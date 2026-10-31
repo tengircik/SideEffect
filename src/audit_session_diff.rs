@@ -484,43 +484,49 @@ mod tests {
         session_for(
             bytes,
             id,
-            SourceRole::Packages,
-            ArtifactKind::Packages,
-            "sideeffect.inventory",
-            2,
-            "available_package_manager_databases",
+            SessionSpec {
+                role: SourceRole::Packages,
+                kind: ArtifactKind::Packages,
+                schema: "sideeffect.inventory",
+                schema_version: 2,
+                scope: "available_package_manager_databases",
+            },
             source_status,
         )
+    }
+
+    struct SessionSpec<'a> {
+        role: SourceRole,
+        kind: ArtifactKind,
+        schema: &'a str,
+        schema_version: u32,
+        scope: &'a str,
     }
 
     fn session_for(
         bytes: &[u8],
         id: &str,
-        role: SourceRole,
-        kind: ArtifactKind,
-        schema: &str,
-        schema_version: u32,
-        scope: &str,
+        spec: SessionSpec<'_>,
         source_status: SourceStatus,
     ) -> (AuditSessionManifest, String) {
         let digest = format!("{:x}", Sha256::digest(bytes));
         let reference = SessionArtifactRef {
-            kind,
-            path: match kind {
+            kind: spec.kind,
+            path: match spec.kind {
                 ArtifactKind::Permissions => "permissions.json",
                 _ => "packages.json",
             }
             .into(),
-            schema: schema.into(),
-            schema_version,
+            schema: spec.schema.into(),
+            schema_version: spec.schema_version,
             byte_length: bytes.len() as u64,
             sha256: digest.clone(),
         };
         let source = AuditSessionSource {
-            role,
+            role: spec.role,
             collector: None,
             platform: "linux".into(),
-            scope: scope.into(),
+            scope: spec.scope.into(),
             started_at_unix_ms: 1000,
             ended_at_unix_ms: 1001,
             status: source_status,
@@ -824,21 +830,25 @@ mod tests {
         let (before, _) = session_for(
             &before_bytes,
             "0123456789abcdef0123456789abcdef",
-            SourceRole::Permissions,
-            ArtifactKind::Permissions,
-            "sideeffect.permission_inventory",
-            1,
-            "selected explicit paths",
+            SessionSpec {
+                role: SourceRole::Permissions,
+                kind: ArtifactKind::Permissions,
+                schema: "sideeffect.permission_inventory",
+                schema_version: 1,
+                scope: "selected explicit paths",
+            },
             SourceStatus::Complete,
         );
         let (after, _) = session_for(
             &after_bytes,
             "1123456789abcdef0123456789abcdef",
-            SourceRole::Permissions,
-            ArtifactKind::Permissions,
-            "sideeffect.permission_inventory",
-            1,
-            "selected explicit paths",
+            SessionSpec {
+                role: SourceRole::Permissions,
+                kind: ArtifactKind::Permissions,
+                schema: "sideeffect.permission_inventory",
+                schema_version: 1,
+                scope: "selected explicit paths",
+            },
             SourceStatus::Complete,
         );
         let left = [VerifiedArtifactBytes {
