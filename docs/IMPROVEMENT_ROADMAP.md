@@ -229,9 +229,9 @@ Milestones are ordered by dependency. Work may be split into independently revie
 
 ### R9 — Optional AI investigation evaluation and reopening decision
 
-**Status:** reopened by the user on 2026-10-30; implementation and model qualification are now requested. It remains optional to the core product, and no model is approved until it passes the gates below.
+**Status:** deferred at the user's direction. This remains an optional future workstream; implementation and model qualification are not currently requested. No model is approved, and core product workflows do not depend on one.
 
-**Purpose if reopened:** evaluate whether an optional local model can help a user navigate already validated evidence without becoming a collector, fact source, or required runtime.
+**Purpose if reopened in the future:** evaluate whether an optional local model can help a user navigate already validated evidence without becoming a collector, fact source, or required runtime.
 
 **Prerequisites and evaluation:**
 
@@ -248,7 +248,7 @@ Milestones are ordered by dependency. Work may be split into independently revie
 - Treat all evidence as untrusted data, delimit it from instructions, prevent prompt injection from changing tool behavior, and constrain output to validated structured claims or navigation suggestions. Every output must cite existing evidence IDs and preserve source facts, unknowns, and conflict status. The model cannot decide “safe,” “malicious,” root cause, or effective access.
 - Agent Skills remain an orchestration interface under the user's chosen agent/provider. Their documentation must warn that provider handling is controlled by that agent configuration, preserve user-confirmed runtime scope, and prevent evidence text from authorizing new actions. A user-selected agent/model is not a SideEffect core dependency.
 
-**Dependencies:** R3–R7 deterministic data and privacy controls; an approved benchmark protocol. The user has reopened this workstream, but dependent capabilities must still be established before integration.
+**Dependencies:** R3–R7 deterministic data and privacy controls; an approved benchmark protocol. These prerequisites must be established before any future reopening or integration.
 
 **Acceptance gate if reopened:** independently reviewed benchmark and privacy threat model; reproducible task-specific results; verified evidence references; no unsupported factual or safety claims; user-visible model/runtime/data-flow consent; test coverage for injection and refusal; clear opt-out and no model-required CLI path. Results qualify only that named model/runtime/task.
 
