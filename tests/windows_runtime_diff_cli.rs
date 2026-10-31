@@ -389,6 +389,13 @@ fn exact_event_match_excludes_qpc_but_keeps_both_source_values() {
         report["normalization_ledger"][1]["source_values_retained_as"],
         "before/after event references timestamp_qpc"
     );
+
+    let (_temp, text_output) = run_diff(&before, &after, &["--format", "text"]);
+    assert_eq!(text_output.status.code(), Some(0));
+    let text = String::from_utf8(text_output.stdout).unwrap();
+    assert!(text.contains("field=\"timestamp_qpc\""));
+    assert!(text.contains("ordinal=1 timestamp_qpc=1"));
+    assert!(text.contains("ordinal=1 timestamp_qpc=99"));
 }
 
 #[test]
