@@ -121,6 +121,35 @@ The workspace and binary were accessed under `/mnt/c` while trace/report tempora
 - every requested size, measured parsed-row count, trace bytes, inspect wall/CPU/output, diff wall/CPU/output, and status;
 - failures, partial parses, limit stops, and unattempted sizes with their reported reasons.
 
+### Measured file-I/O scale run
+
+The opt-in `file_io` profile was measured on 2026-10-31 under WSL2 Ubuntu x86_64 (kernel `6.6.87.2-microsoft-standard-WSL2`) with Python 3.14.4, `strace` 6.19, and SideEffect 0.1.0. Cargo and rustc were both 1.93.1. The release binary was built from `HEAD` `2cb4eba` plus the then-current uncommitted source patch (SHA-256 `81faf08ebfc7c1990833e180348d4e3e606335e7a00ee1d4fb46b5b247a1a037`); the binary SHA-256 was `ea1f88146b5caf0fb29a2aa4935f591cbbc811a7be783284c189be1914a10695` (ELF build ID `5717ca0213b0a0227100af876a5b7ea70340e03b`). The build and benchmark commands both exited 0:
+
+```sh
+cargo build --release --locked --bin sideeffect
+python3 scripts/trace_scale_benchmark.py \
+  --sideeffect target/release/sideeffect \
+  --profile file_io --sizes 10000,100000 \
+  --runs 3 --warmups 1 \
+  --output /tmp/sideeffect-trace-scale-fileio-20261031-2.json
+```
+
+The report was mode 0600 in WSL `/tmp`; generated traces and intermediate inspect/diff output were removed after the run. All measured captures and diffs completed, and every inspect run parsed exactly its requested number of rows.
+
+| Requested / observed rows | Trace bytes per run | Inspect JSON bytes per run | Capture wall seconds, measured runs 0 / 1 / 2 | Inspect wall seconds, measured runs 0 / 1 / 2 | Diff wall / JSON bytes | Status |
+| ---: | ---: | ---: | --- | --- | --- | --- |
+| 10,000 / 10,000 | 440,000 | 3,426,737 | 1.719384 / 1.719280 / 1.719151 | 0.068644 / 0.068525 / 0.068499 | 0.036373 s / 745 | complete |
+| 100,000 / 100,000 | 4,400,000 | 34,464,011 | 16.804202 / 16.653484 / 16.703597 | 0.321199 / 0.321170 / 0.321568 | 0.221617 s / 745 | complete |
+
+`RUSAGE_CHILDREN` CPU values are aggregate waited-child deltas, not isolated workload, tracer, or SideEffect profiles.
+
+| Rows | Capture user / system, runs 0 / 1 / 2 | Inspect user / system, runs 0 / 1 / 2 | Diff user / system |
+| ---: | --- | --- | --- |
+| 10,000 | 0.167689 / 1.402071; 0.124902 / 1.425803; 0.132536 / 1.408281 | 0.011939 / 0.014923; 0.015950 / 0.010633; 0.015094 / 0.011321 | 0.003191 / 0.019144 |
+| 100,000 | 1.382236 / 13.899365; 1.374727 / 13.785124; 1.209451 / 13.984741 | 0.102314 / 0.169211; 0.136154 / 0.136154; 0.114409 / 0.159355 | 0.087688 / 0.087688 |
+
+One warm-up at each size also captured and parsed completely: 440,000 trace bytes and 3,426,737 inspect JSON bytes at 10k, and 4,400,000 trace bytes and 34,464,011 inspect JSON bytes at 100k. The diff compared the first two distinct complete measured captures. This generated `sendfile` workload checks one repeated local file-I/O pattern only; results include WSL and `/mnt/c` worktree effects and do not establish native Linux distribution performance, Windows behavior, representative application overhead, or capture completeness.
+
 Do not substitute requested rows for observed parsed rows, omit failed runs, or infer timings for an unattempted size. If run under WSL, label all results WSL-only and include the WSL kernel/version details; they do not establish native Linux distribution performance or native Windows behavior. Do not commit raw captures or private reports.
 
 ## Measurement limits
