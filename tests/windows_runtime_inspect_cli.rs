@@ -134,6 +134,22 @@ fn rehashed_capture(mut value: Value) -> Vec<u8> {
 }
 
 #[cfg(windows)]
+fn tcp_send_payload(process_id: u32) -> String {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&process_id.to_le_bytes());
+    payload.extend_from_slice(&12_u32.to_le_bytes());
+    payload.extend_from_slice(&[127, 0, 0, 1]); // destination address
+    payload.extend_from_slice(&[127, 0, 0, 1]); // source address
+    payload.extend_from_slice(&443_u16.to_be_bytes());
+    payload.extend_from_slice(&50_000_u16.to_be_bytes());
+    payload.extend_from_slice(&1_u32.to_le_bytes()); // start time
+    payload.extend_from_slice(&2_u32.to_le_bytes()); // end time
+    payload.extend_from_slice(&99_u32.to_le_bytes());
+    payload.extend_from_slice(&0x7788_u64.to_le_bytes());
+    payload.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(windows)]
 fn network_event(start_event: &Value, record_ordinal: u64, process_id: u32) -> Value {
     let mut network = start_event.clone();
     network["record_ordinal"] = json!(record_ordinal);
@@ -141,12 +157,26 @@ fn network_event(start_event: &Value, record_ordinal: u64, process_id: u32) -> V
     network["event_version"] = json!(2);
     network["opcode"] = json!(10);
     network["event_kind"] = json!("network_observation");
+    network["header_flags"] = json!(0x40);
+    network["raw_payload_hex"] = json!(tcp_send_payload(process_id));
     network["observation_decoding"] = json!({
         "status": "decoded",
+        "diagnostic": null,
         "observation": {
             "schema": "windows.kernel_tcp_ipv4_send",
             "schema_version": 2,
-            "activity": { "kind": "network", "observation": { "payload_process_id": process_id } }
+            "activity": { "kind": "network", "observation": {
+                "transport": "tcp",
+                "operation": "send",
+                "payload_process_id": process_id,
+                "source_address": { "v4": [127, 0, 0, 1] },
+                "destination_address": { "v4": [127, 0, 0, 1] },
+                "source_port": 50000,
+                "destination_port": 443,
+                "packet_size": 12,
+                "sequence_number": 99,
+                "connection_id": 0x7788
+            } }
         }
     });
     network["payload_decoding"] = Value::Null;
@@ -328,21 +358,7 @@ fn events_windows_runtime_marks_reused_process_ids_ambiguous() {
 #[test]
 fn events_windows_runtime_links_network_payload_and_labels_file_header_candidate() {
     let mut value: Value = serde_json::from_slice(&fixture(CollectionStatus::Complete)).unwrap();
-    let mut network = value["events"][0].clone();
-    network["record_ordinal"] = json!(2);
-    network["provider_guid"] = json!("9a280ac0-c8e0-11d1-84e2-00c04fb998a2");
-    network["event_version"] = json!(2);
-    network["opcode"] = json!(10);
-    network["event_kind"] = json!("network_observation");
-    network["observation_decoding"] = json!({
-        "status": "decoded",
-        "observation": {
-            "schema": "windows.kernel_tcp_ipv4_send",
-            "schema_version": 2,
-            "activity": { "kind": "network", "observation": { "payload_process_id": 42 } }
-        }
-    });
-    network["payload_decoding"] = Value::Null;
+    let network = network_event(&value["events"][0], 2, 42);
     let mut file = network.clone();
     file["record_ordinal"] = json!(3);
     file["provider_guid"] = json!("90cbdc39-4a3e-11d1-84f4-0000f80464e3");
@@ -375,6 +391,68 @@ fn events_windows_runtime_links_network_payload_and_labels_file_header_candidate
         link["role"] == "windows_file_disk_header_pid_context_candidate"
             && link["status"] == "context_candidate"
     }));
+}
+
+#[cfg(windows)]
+#[test]
+fn events_windows_runtime_redecodes_network_payload_and_rejects_forged_sidecar_pid() {
+    let mut value: Value = serde_json::from_slice(&fixture(CollectionStatus::Complete)).unwrap();
+    let start = value["events"][0].clone();
+    let mut network = network_event(&start, 2, 42);
+    network["observation_decoding"]["observation"]["activity"]["observation"]["payload_process_id"] =
+        json!(999);
+    value["events"].as_array_mut().unwrap().push(network);
+    let (path, output) = with_events_input(&rehashed_capture(value));
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let link = envelope["event_process_links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|link| link["role"] == "windows_network_payload_pid")
+        .unwrap();
+    assert_eq!(link["process_observation_id"], 1);
+    assert_eq!(link["reported_process_id"], Value::Null);
+    assert!(
+        envelope["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| { diagnostic["code"] == "network_decoder_metadata_mismatch" })
+    );
+    assert_eq!(envelope["source_state"]["completeness"], "partial");
+}
+
+#[cfg(windows)]
+#[test]
+fn events_windows_runtime_keeps_malformed_network_payload_unresolved() {
+    let mut value: Value = serde_json::from_slice(&fixture(CollectionStatus::Complete)).unwrap();
+    let mut network = network_event(&value["events"][0], 2, 42);
+    network["raw_payload_hex"] = json!("01");
+    value["events"].as_array_mut().unwrap().push(network);
+    let (path, output) = with_events_input(&rehashed_capture(value));
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let link = envelope["event_process_links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|link| link["role"] == "windows_network_payload_pid")
+        .unwrap();
+    assert_eq!(link["status"], "unresolved");
+    assert_eq!(link["reported_process_id"], Value::Null);
+    assert_eq!(envelope["events"].as_array().unwrap().len(), 2);
+    assert!(
+        envelope["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| { diagnostic["code"] == "network_payload_malformed" })
+    );
 }
 
 #[cfg(windows)]

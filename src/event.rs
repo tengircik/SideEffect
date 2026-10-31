@@ -869,6 +869,7 @@ struct EtwEventView<'a> {
     opcode: u8,
     event_kind: &'a str,
     header_process_id: u32,
+    header_flags: u16,
     timestamp_qpc: i64,
     raw_payload_hex: &'a str,
     process_payload: Option<EtwProcessPayloadView<'a>>,
@@ -950,6 +951,7 @@ impl EtwCaptureView for crate::record::WindowsRuntimeCapture {
             opcode: event.opcode,
             event_kind: event.event_kind,
             header_process_id: event.header_process_id,
+            header_flags: event.header_flags,
             timestamp_qpc: event.timestamp_qpc,
             raw_payload_hex: &event.raw_payload_hex,
             process_payload: event
@@ -1020,6 +1022,7 @@ impl EtwCaptureView for crate::windows_runtime::WindowsRuntimeCapture {
             opcode: event.opcode,
             event_kind: &event.event_kind,
             header_process_id: event.header_process_id,
+            header_flags: event.header_flags,
             timestamp_qpc: event.timestamp_qpc,
             raw_payload_hex: &event.raw_payload_hex,
             process_payload: event
@@ -1550,7 +1553,7 @@ fn derive_windows_process_relationships(
                 || lifecycle_unknown_pids.contains(&process_id)
                 || generation_evidence_unreliable
             {
-                if !push_bounded_process_link(
+                let _ = push_bounded_process_link(
                     links,
                     MAX_ETW_EVENTS,
                     EventProcessLink {
@@ -1572,9 +1575,7 @@ fn derive_windows_process_relationships(
                     &mut process_diagnostic_count,
                     Some(event.record_ordinal),
                     Some(event_evidence),
-                ) {
-                    partial = true;
-                }
+                );
                 continue;
             }
             if let Some(process) = active.remove(&process_id) {
@@ -1623,7 +1624,19 @@ fn derive_windows_process_relationships(
             continue;
         }
 
-        if let Some(process_id) = validated_network_payload_pid(&event) {
+        let network_pid = cross_checked_network_payload_pid(&event);
+        if let Some((process_id, mismatch)) = network_pid.pid() {
+            if mismatch {
+                push_process_diagnostic(
+                    diagnostics,
+                    &mut process_diagnostic_count,
+                    "network_decoder_metadata_mismatch",
+                    "serialized network decoder metadata did not match a fresh decode of the retained raw payload; attribution uses only the raw payload PID",
+                    Some(event.record_ordinal),
+                    Some(event_evidence.clone()),
+                );
+                partial = true;
+            }
             let unique_process = if generation_evidence_unreliable
                 || ambiguous_pids.contains(&process_id)
                 || lifecycle_unknown_pids.contains(&process_id)
@@ -1681,6 +1694,35 @@ fn derive_windows_process_relationships(
             ) {
                 partial = true;
             }
+        } else if let Some(reason) = network_pid.diagnostic() {
+            push_process_diagnostic(
+                diagnostics,
+                &mut process_diagnostic_count,
+                reason.0,
+                reason.1,
+                Some(event.record_ordinal),
+                Some(event_evidence.clone()),
+            );
+            if network_pid.is_network() {
+                let _ = push_bounded_process_link(
+                    links,
+                    MAX_ETW_EVENTS,
+                    EventProcessLink {
+                        event: event_evidence.clone(),
+                        process_observation_id: None,
+                        reported_process_id: None,
+                        role: EventProcessLinkRole::WindowsNetworkPayloadPid,
+                        status: EventProcessLinkStatus::Unresolved,
+                        basis: "raw_network_payload_could_not_validate_a_supported_payload_pid"
+                            .to_owned(),
+                    },
+                    diagnostics,
+                    &mut process_diagnostic_count,
+                    Some(event.record_ordinal),
+                    Some(event_evidence.clone()),
+                );
+            }
+            partial = true;
         } else if is_file_or_disk_observation(&event)
             && event.header_process_id > 0
             && !ambiguous_pids.contains(&event.header_process_id)
@@ -1937,50 +1979,94 @@ fn normalized_guid(value: &str) -> Option<String> {
 }
 
 #[cfg(windows)]
-fn validated_network_payload_pid(event: &EtwEventView<'_>) -> Option<u32> {
-    let value = event.observation_decoding?;
-    if value.get("status").and_then(serde_json::Value::as_str) != Some("decoded")
-        || value
-            .pointer("/observation/activity/kind")
-            .and_then(serde_json::Value::as_str)
-            != Some("network")
-        || value
-            .pointer("/observation/schema_version")
-            .and_then(serde_json::Value::as_u64)
-            != Some(2)
-        || event.event_kind != "network_observation"
-        || event.event_id != 0
-        || event.event_version != 2
-    {
-        return None;
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum NetworkPayloadPidCheck {
+    NotNetworkProvider,
+    Matched(u32),
+    Mismatch(u32),
+    Unsupported,
+    Malformed,
+    InvalidProcessId,
+}
+
+#[cfg(windows)]
+impl NetworkPayloadPidCheck {
+    fn pid(self) -> Option<(u32, bool)> {
+        match self {
+            Self::Matched(pid) => Some((pid, false)),
+            Self::Mismatch(pid) => Some((pid, true)),
+            _ => None,
+        }
     }
-    let schema = value.pointer("/observation/schema")?.as_str()?;
-    let guid = normalized_guid(event.provider_guid)?;
-    let supported = match guid.as_str() {
-        "9a280ac0-c8e0-11d1-84e2-00c04fb998a2" => match event.opcode {
-            10 => schema == "windows.kernel_tcp_ipv4_send",
-            11 | 13 | 14 | 16 | 18 => schema == "windows.kernel_tcp_ipv4_typegroup1",
-            12 | 15 => schema == "windows.kernel_tcp_ipv4_typegroup2",
-            26 => schema == "windows.kernel_tcp_ipv6_send",
-            27 | 29 | 30 | 32 | 34 => schema == "windows.kernel_tcp_ipv6_typegroup3",
-            28 | 31 => schema == "windows.kernel_tcp_ipv6_typegroup4",
-            _ => false,
-        },
-        "bf3a50c5-a9c9-4988-a005-2df0b7c80f80" => match event.opcode {
-            10 | 11 => schema == "windows.kernel_udp_ipv4_typegroup1",
-            26 | 27 => schema == "windows.kernel_udp_ipv6_typegroup2",
-            _ => false,
-        },
-        _ => false,
+
+    fn is_network(self) -> bool {
+        !matches!(self, Self::NotNetworkProvider)
+    }
+
+    fn diagnostic(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::NotNetworkProvider | Self::Matched(_) => None,
+            Self::Mismatch(_) => Some((
+                "network_decoder_metadata_mismatch",
+                "serialized network decoder metadata did not match a fresh decode of the retained raw payload",
+            )),
+            Self::Unsupported => Some((
+                "network_payload_unsupported",
+                "TCP/UDP event payload layout or descriptor is outside the supported decoder contract; payload PID remains unresolved",
+            )),
+            Self::Malformed => Some((
+                "network_payload_malformed",
+                "TCP/UDP event raw payload could not be decoded; payload PID remains unresolved",
+            )),
+            Self::InvalidProcessId => Some((
+                "network_payload_invalid_process_id",
+                "decoded TCP/UDP payload contains an invalid process ID; attribution remains unresolved",
+            )),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn cross_checked_network_payload_pid(event: &EtwEventView<'_>) -> NetworkPayloadPidCheck {
+    let Some(raw_payload) = decode_hex(event.raw_payload_hex) else {
+        let network_provider = normalized_guid(event.provider_guid).is_some_and(|guid| {
+            matches!(
+                guid.as_str(),
+                "9a280ac0-c8e0-11d1-84e2-00c04fb998a2" | "bf3a50c5-a9c9-4988-a005-2df0b7c80f80"
+            )
+        });
+        return if network_provider {
+            NetworkPayloadPidCheck::Malformed
+        } else {
+            NetworkPayloadPidCheck::NotNetworkProvider
+        };
     };
-    if !supported {
-        return None;
+    match crate::record::cross_check_network_payload(crate::record::NetworkPayloadInput {
+        provider_guid: event.provider_guid,
+        event_id: event.event_id,
+        event_version: event.event_version,
+        opcode: event.opcode,
+        header_flags: event.header_flags,
+        event_kind: event.event_kind,
+        raw_payload: &raw_payload,
+        serialized_decoding: event.observation_decoding,
+    }) {
+        crate::record::NetworkPayloadCrossCheck::NotNetworkProvider => {
+            NetworkPayloadPidCheck::NotNetworkProvider
+        }
+        crate::record::NetworkPayloadCrossCheck::Matched(pid) => {
+            NetworkPayloadPidCheck::Matched(pid)
+        }
+        crate::record::NetworkPayloadCrossCheck::Mismatch(pid) => {
+            NetworkPayloadPidCheck::Mismatch(pid)
+        }
+        crate::record::NetworkPayloadCrossCheck::Unsupported => NetworkPayloadPidCheck::Unsupported,
+        crate::record::NetworkPayloadCrossCheck::Malformed => NetworkPayloadPidCheck::Malformed,
+        crate::record::NetworkPayloadCrossCheck::InvalidProcessId => {
+            NetworkPayloadPidCheck::InvalidProcessId
+        }
     }
-    value
-        .pointer("/observation/activity/observation/payload_process_id")?
-        .as_u64()
-        .and_then(|pid| u32::try_from(pid).ok())
-        .filter(|pid| *pid > 0)
 }
 
 #[cfg(windows)]

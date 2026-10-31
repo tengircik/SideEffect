@@ -28,6 +28,10 @@ pub use windows_etw::{
     DecodedProcessPayload as WindowsDecodedProcessPayload, StopReason as WindowsRuntimeStopReason,
     WindowsRuntimeCapture, record_windows_runtime_capture,
 };
+#[cfg(windows)]
+pub(crate) use windows_etw::{
+    NetworkPayloadCrossCheck, NetworkPayloadInput, cross_check_network_payload,
+};
 
 #[cfg(target_os = "linux")]
 pub use linux::{
