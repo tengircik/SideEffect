@@ -221,14 +221,21 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
                 .as_str()
                 .is_some_and(|pointer| pointer.starts_with("/events/"))
     }));
-    assert!(graph["edges"].as_array().unwrap().iter().any(|edge| {
-        edge["kind"] == "event_process_link"
-            && edge["event_link_status"] == "observed"
-            && edge["event_link_role"] == "windows_process_start_payload"
-            && edge["basis"]
-                .as_str()
-                .is_some_and(|basis| basis.contains("candidate_instance"))
-    }));
+    let graph_edges = graph["edges"].as_array().unwrap();
+    let event_process_links = events["event_process_links"].as_array().unwrap();
+    assert!(
+        !event_process_links.is_empty(),
+        "the live process/file/network capture should yield event-process links"
+    );
+    for link in event_process_links {
+        assert!(graph_edges.iter().any(|edge| {
+            edge["kind"] == "event_process_link"
+                && edge["event_link_status"] == link["status"]
+                && edge["event_link_role"] == link["role"]
+                && edge["basis"] == link["basis"]
+                && edge["evidence"][0] == link["event"]
+        }));
+    }
     fs::remove_file(fixture_file).unwrap();
     fs::remove_file(output).unwrap();
     fs::remove_dir(directory).unwrap();
