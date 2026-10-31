@@ -39,6 +39,7 @@ pub struct WindowsRuntimeDiffSummary {
     pub capture_completeness: &'static str,
     pub before: CaptureSide,
     pub after: CaptureSide,
+    pub representation_comparison: RepresentationComparison,
     pub categories: Vec<CategoryCountDelta>,
     /// Declares every source field omitted from exact event equality.
     pub normalization_ledger: Vec<NormalizationLedgerEntry>,
@@ -47,6 +48,14 @@ pub struct WindowsRuntimeDiffSummary {
     pub event_changes: Vec<EventDelta>,
     pub diagnostics: Vec<&'static str>,
     pub limitations: Vec<&'static str>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RepresentationComparison {
+    /// Equality of the validated, canonical capture representation fingerprints;
+    /// this does not compare source JSON whitespace or authenticate a producer.
+    pub same_validated_representation_fingerprint: bool,
+    pub basis: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -237,6 +246,11 @@ pub fn compare_windows_runtime_captures(
         capture_completeness: "unknown",
         before: capture_side(before),
         after: capture_side(after),
+        representation_comparison: RepresentationComparison {
+            same_validated_representation_fingerprint: before.document_sha256
+                == after.document_sha256,
+            basis: "sha256_of_canonical_validated_capture_representation",
+        },
         categories,
         normalization_ledger: vec![
             NormalizationLedgerEntry {
@@ -1445,6 +1459,11 @@ mod tests {
         assert_eq!(summary.schema_version, 3);
         assert_eq!(summary.comparison_status, ComparisonStatus::Complete);
         assert_eq!(summary.capture_completeness, "unknown");
+        assert!(
+            !summary
+                .representation_comparison
+                .same_validated_representation_fingerprint
+        );
         assert_eq!(summary.before.document_sha256, "a".repeat(64));
         assert_eq!(summary.after.document_sha256, "b".repeat(64));
         assert_eq!(

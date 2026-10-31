@@ -69,7 +69,17 @@ pub fn write_windows_runtime_diff_html<W: Write>(
         summary.after.diagnostics_count,
     )?;
     write_value(writer, &summary.after.event_loss.observation)?;
-    writer.write_all(b"</dd>\n</dl></section>\n<p>Category counts and one-sided observations do not establish event absence, operation success, causation, or target attribution. Event ordinals refer to positions in one capture document; they are not byte offsets. Candidate matches do not prove the same underlying execution.</p>\n<section><h2>Exact-match normalization ledger (")?;
+    writer.write_all(b"</dd>\n</dl></section>\n<section><h2>Validated capture representation</h2><dl><dt>Same validated representation fingerprint</dt><dd>")?;
+    write!(
+        writer,
+        "{}",
+        summary
+            .representation_comparison
+            .same_validated_representation_fingerprint
+    )?;
+    writer.write_all(b"</dd><dt>Comparison basis</dt><dd>")?;
+    write_value(writer, summary.representation_comparison.basis)?;
+    writer.write_all(b"</dd></dl><p>This compares canonical validated capture fingerprints. It does not compare source JSON formatting or authenticate the producer.</p></section>\n<p>Category counts and one-sided observations do not establish event absence, operation success, causation, or target attribution. Event ordinals refer to positions in one capture document; they are not byte offsets. Candidate matches do not prove the same underlying execution.</p>\n<section><h2>Exact-match normalization ledger (")?;
     write!(writer, "{}", summary.normalization_ledger.len())?;
     writer.write_all(b")</h2><p>Fields excluded from exact equality retain their source values in the ledger and event references.</p><ul>")?;
     for entry in &summary.normalization_ledger {
@@ -322,6 +332,10 @@ mod tests {
                 },
                 diagnostics_count: 0,
             },
+            representation_comparison: crate::windows_runtime_diff::RepresentationComparison {
+                same_validated_representation_fingerprint: false,
+                basis: "sha256_of_canonical_validated_capture_representation",
+            },
             categories: vec![CategoryCountDelta {
                 category: "process.start",
                 before_count: 1,
@@ -384,6 +398,7 @@ mod tests {
         assert!(html.contains(">none</dd>"));
         assert!(html.contains("candidate matching does not establish event identity"));
         assert!(html.contains("Exact-match normalization ledger"));
+        assert!(html.contains("Same validated representation fingerprint"));
         assert!(html.contains("timestamp_qpc"));
         assert!(
             html.contains("event absence, operation success, causation, or target attribution")

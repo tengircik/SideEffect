@@ -373,6 +373,10 @@ fn exact_event_match_excludes_qpc_but_keeps_both_source_values() {
 
     assert_eq!(output.status.code(), Some(0));
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["representation_comparison"]["same_validated_representation_fingerprint"],
+        false
+    );
     let unchanged = report["event_changes"]
         .as_array()
         .unwrap()
@@ -396,6 +400,22 @@ fn exact_event_match_excludes_qpc_but_keeps_both_source_values() {
     assert!(text.contains("field=\"timestamp_qpc\""));
     assert!(text.contains("ordinal=1 timestamp_qpc=1"));
     assert!(text.contains("ordinal=1 timestamp_qpc=99"));
+}
+
+#[test]
+fn identical_capture_reports_matching_validated_representation_fingerprint() {
+    let capture = capture(CollectionStatus::Complete, &["process.start"]);
+    let (_temp, output) = run_diff(&capture, &capture, &[]);
+    assert_eq!(output.status.code(), Some(0));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["representation_comparison"]["same_validated_representation_fingerprint"],
+        true
+    );
+    assert_eq!(
+        report["representation_comparison"]["basis"],
+        "sha256_of_canonical_validated_capture_representation"
+    );
 }
 
 #[test]

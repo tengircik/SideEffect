@@ -28,6 +28,17 @@ pub fn write_windows_runtime_diff_text<W: Write>(
     writer.write_all(b"\nCapture completeness: unknown\n")?;
     write_side(writer, "Before", &summary.before, before.collection_status)?;
     write_side(writer, "After", &summary.after, after.collection_status)?;
+    writer.write_all(b"\nValidated capture representation comparison:\n  same fingerprint=")?;
+    writer.write_all(
+        summary
+            .representation_comparison
+            .same_validated_representation_fingerprint
+            .to_string()
+            .as_bytes(),
+    )?;
+    writer.write_all(b" basis=")?;
+    write_quoted(writer, summary.representation_comparison.basis)?;
+    writer.write_all(b"\n")?;
     writer.write_all(b"\nExact-match normalization ledger:\n")?;
     if summary.normalization_ledger.is_empty() {
         writer.write_all(b"  No fields are excluded from exact event equality.\n")?;
@@ -260,6 +271,10 @@ mod tests {
                 },
                 diagnostics_count: 0,
             },
+            representation_comparison: crate::windows_runtime_diff::RepresentationComparison {
+                same_validated_representation_fingerprint: false,
+                basis: "sha256_of_canonical_validated_capture_representation",
+            },
             categories: vec![crate::windows_runtime_diff::CategoryCountDelta {
                 category: "process.start",
                 before_count: 1,
@@ -340,6 +355,7 @@ mod tests {
         assert!(output.contains("Before event ordinals: 1"));
         assert!(output.contains("After event ordinals: none"));
         assert!(output.contains("Exact-match normalization ledger"));
+        assert!(output.contains("same fingerprint=false"));
         assert!(output.contains("field=\"timestamp_qpc\""));
     }
 }
