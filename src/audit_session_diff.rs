@@ -230,7 +230,12 @@ fn compare_source_role(
         return result.not_compared("native_input_limit_exceeded");
     }
     match compare_native(role, left_ref.kind, left_bytes.bytes, right_bytes.bytes) {
-        Ok((status, value)) => {
+        Ok((mut status, mut value)) => {
+            if left.status != SourceStatus::Complete || right.status != SourceStatus::Complete {
+                suppress_session_incomplete_presence(role, &mut value);
+                status = "partial";
+                result.reason_code = Some("session_source_incomplete");
+            }
             result.status = status;
             result.comparison = Some(value);
             result
@@ -241,6 +246,104 @@ fn compare_source_role(
         Err(NativeCompareError::Incompatible) => result.incomparable("native_contract_mismatch"),
         Err(NativeCompareError::Limit) => result.not_compared("native_comparison_limit_exceeded"),
     }
+}
+
+/// A source-level session status is authoritative for unmatched-row claims, even if the
+/// referenced artifact's own document claims complete coverage. Matched changes remain useful.
+fn suppress_session_incomplete_presence(role: SourceRole, comparison: &mut Value) {
+    let (before_only_kind, after_only_kind, before_count, after_count, suppressed_count) =
+        match role {
+            SourceRole::Packages => (
+                "removed",
+                "added",
+                "removals",
+                "additions",
+                "unmatched_rows_with_incomplete_source",
+            ),
+            SourceRole::Processes => (
+                "removed",
+                "added",
+                "removals",
+                "additions",
+                "unmatched_rows_suppressed_for_partial_source",
+            ),
+            SourceRole::Permissions => (
+                "removed",
+                "added",
+                "removals",
+                "additions",
+                "unmatched_rows_suppressed_for_partial_source",
+            ),
+            SourceRole::Startup => (
+                "observed_before_only",
+                "observed_after_only",
+                "observed_before_only",
+                "observed_after_only",
+                "unmatched_rows_suppressed_for_incomplete_source",
+            ),
+            SourceRole::Runtime | SourceRole::PathExecutables => return,
+        };
+
+    let Some(deltas) = comparison.get_mut("deltas").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut before_only = 0usize;
+    let mut after_only = 0usize;
+    deltas.retain(|delta| {
+        let kind = delta.get("kind").and_then(Value::as_str);
+        match kind {
+            Some(kind) if kind == before_only_kind => {
+                before_only = before_only.saturating_add(1);
+                false
+            }
+            Some(kind) if kind == after_only_kind => {
+                after_only = after_only.saturating_add(1);
+                false
+            }
+            _ => true,
+        }
+    });
+    let suppressed = before_only.saturating_add(after_only);
+    if let Some(counts) = comparison.get_mut("counts").and_then(Value::as_object_mut) {
+        subtract_count(counts, before_count, before_only);
+        subtract_count(counts, after_count, after_only);
+        add_count(counts, suppressed_count, suppressed);
+    }
+    if let Some(status) = comparison.get_mut("status") {
+        *status = Value::String("partial".into());
+    }
+    if let Some(diagnostics) = comparison
+        .get_mut("diagnostics")
+        .and_then(Value::as_array_mut)
+    {
+        // Package diagnostics are a closed enum in Rust; use its existing equivalent.
+        let diagnostic = if role == SourceRole::Packages {
+            "source_incomplete"
+        } else {
+            "session_source_incomplete"
+        };
+        if !diagnostics
+            .iter()
+            .any(|item| item.as_str() == Some(diagnostic))
+        {
+            diagnostics.push(Value::String(diagnostic.into()));
+        }
+    }
+}
+
+fn subtract_count(counts: &mut serde_json::Map<String, Value>, key: &str, amount: usize) {
+    if let Some(count) = counts.get(key).and_then(Value::as_u64) {
+        *counts.get_mut(key).expect("count key was just read") =
+            Value::from(count.saturating_sub(amount as u64));
+    }
+}
+
+fn add_count(counts: &mut serde_json::Map<String, Value>, key: &str, amount: usize) {
+    let current = counts.get(key).and_then(Value::as_u64).unwrap_or(0);
+    counts.insert(
+        key.into(),
+        Value::from(current.saturating_add(amount as u64)),
+    );
 }
 
 impl SessionSourceDiff {
@@ -661,6 +764,68 @@ mod tests {
         assert_eq!(comparison["counts"]["changes"], 1);
         assert_eq!(comparison["counts"]["additions"], 0);
         assert_eq!(comparison["counts"]["removals"], 0);
+    }
+
+    #[test]
+    fn session_partial_status_suppresses_presence_deltas_from_complete_package_documents() {
+        let with_unmatched = |version: &str, unmatched_name: &str| {
+            let mut document: serde_json::Value =
+                serde_json::from_slice(&inventory("demo", version, "complete", "complete"))
+                    .unwrap();
+            let mut unmatched = document["packages"][0].clone();
+            unmatched["name"] = serde_json::Value::String(unmatched_name.into());
+            document["packages"] = serde_json::json!([document["packages"][0].clone(), unmatched]);
+            document["sources"][0]["records_seen"] = serde_json::json!(2);
+            serde_json::to_vec(&document).unwrap()
+        };
+        let before_bytes = with_unmatched("1", "old-package");
+        let after_bytes = with_unmatched("2", "new-package");
+        let (before, before_digest) = session(
+            &before_bytes,
+            "0123456789abcdef0123456789abcdef",
+            SourceStatus::Partial,
+        );
+        let (after, after_digest) = session(
+            &after_bytes,
+            "1123456789abcdef0123456789abcdef",
+            SourceStatus::Complete,
+        );
+        let left = [VerifiedArtifactBytes {
+            kind: ArtifactKind::Packages,
+            path: "packages.json",
+            bytes: &before_bytes,
+        }];
+        let right = [VerifiedArtifactBytes {
+            kind: ArtifactKind::Packages,
+            path: "packages.json",
+            bytes: &after_bytes,
+        }];
+
+        let report = compare_audit_sessions(&before, &after, &left, &right);
+        assert_eq!(report.item_comparison_status, "partial");
+        let source = &report.source_diffs[0];
+        assert_eq!(source.status, "partial");
+        assert_eq!(source.reason_code, Some("session_source_incomplete"));
+        let comparison = source.comparison.as_ref().unwrap();
+        assert_eq!(comparison["status"], "partial");
+        assert_eq!(comparison["counts"]["changes"], 1);
+        assert_eq!(comparison["counts"]["additions"], 0);
+        assert_eq!(comparison["counts"]["removals"], 0);
+        assert_eq!(
+            comparison["counts"]["unmatched_rows_with_incomplete_source"],
+            2
+        );
+        assert_eq!(comparison["deltas"].as_array().unwrap().len(), 1);
+        assert_eq!(comparison["deltas"][0]["kind"], "changed");
+        assert!(
+            comparison["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic == "source_incomplete")
+        );
+        assert_eq!(source.before_artifacts[0].sha256, before_digest);
+        assert_eq!(source.after_artifacts[0].sha256, after_digest);
     }
 
     #[test]
