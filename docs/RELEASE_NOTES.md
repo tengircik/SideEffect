@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Upgraded `sideeffect.windows_runtime_diff_summary` to v3 with a field-level ledger for the two fields excluded from exact event equality (`record_ordinal` and `timestamp_qpc`). Both original values are preserved in capture-linked before/after event references. Schemas v1-v2 remain historical output formats and are not imported.
+- Upgraded `sideeffect.windows_runtime_diff_summary` to v3 with a field-level ledger for the two fields excluded from exact event equality (`record_ordinal` and `timestamp_qpc`). Both original values are preserved in capture-linked before/after event references. The summary also reports equality of canonical validated capture representation fingerprints, without claiming source JSON byte equality or producer authenticity. Schemas v1-v2 remain historical output formats and are not imported.
 
 Version 0.1.0 was published on 2026-10-30. This page records its release scope and compatibility evidence. Download the release archives and provenance from the [GitHub release page](https://github.com/tengircik/SideEffect/releases/tag/v0.1.0).
 
