@@ -409,16 +409,16 @@ Both commands write JSON only to stdout and read the selected file without modif
 To organize the adapted facts into an evidence-linked graph, run:
 
 ```sh
-./target/release/sideeffect graph --trace ./run.trace
+./target/release/sideeffect graph --trace ./run.trace --event-kind openat
 ```
 
 On native Windows:
 
 ```powershell
-sideeffect.exe graph --windows-runtime .\\runtime.windows.json
+sideeffect.exe graph --windows-runtime .\\runtime.windows.json --event-kind file_io_observation
 ```
 
-Graph nodes retain event or process-observation evidence. Edges preserve the adapter's relationship kind, status, basis, and source references. A PID without a uniquely resolved process observation gets its own context node for that edge; SideEffect does not merge equal PID values or promote event context to ownership. Partial/unknown source status and diagnostics are retained, and the graph does not imply causation or a complete process tree.
+Graph nodes retain event or process-observation evidence. Edges preserve the adapter's relationship kind, status, basis, and source references. `--event-kind` performs an exact event-kind match, retaining matched events, their direct process links, and one-hop relationships around those linked processes. The filter metadata is included in JSON while source diagnostics and completeness still describe the full input. A PID without a uniquely resolved process observation gets its own context node for that edge; SideEffect does not merge equal PID values or promote event context to ownership. Partial/unknown source status and diagnostics are retained, and the graph does not imply causation or a complete process tree.
 
 For a source-local timeline over Linux strace evidence, with an optional exact event-kind filter:
 

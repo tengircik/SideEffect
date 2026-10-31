@@ -124,16 +124,16 @@ The command writes versioned JSON to stdout and never runs represented commands 
 ### Explore an evidence-linked event graph
 
 ```sh
-sideeffect graph --trace ./capture.trace
+sideeffect graph --trace ./capture.trace --event-kind openat
 ```
 
 On native Windows, adapt a validated ETW capture:
 
 ```powershell
-sideeffect.exe graph --windows-runtime .\\runtime.windows.json
+sideeffect.exe graph --windows-runtime .\\runtime.windows.json --event-kind file_io_observation
 ```
 
-The graph contains source-local event and process-observation nodes, process-relationship edges, and event-to-process links. Unresolved PID context is represented by a separate node for each edge; equal PID values are never merged into one process instance. Every node and edge retains its source evidence, link status, and derivation basis. Context candidates and decoder-metadata relationships stay labeled as such. The graph does not establish ownership, causation, or a complete process tree. Partial or unknown input exits with status `2`.
+The graph contains source-local event and process-observation nodes, process-relationship edges, and event-to-process links. `--event-kind` matches one exact kind and keeps its direct process links plus one-hop process relationships; diagnostics and source status still describe the full input. Unresolved PID context is represented by a separate node for each edge; equal PID values are never merged into one process instance. Every node and edge retains its source evidence, link status, and derivation basis. Context candidates and decoder-metadata relationships stay labeled as such. The graph does not establish ownership, causation, or a complete process tree. Partial or unknown input exits with status `2`.
 
 ### Browse a source-local event timeline
 
