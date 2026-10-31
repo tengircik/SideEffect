@@ -15,11 +15,11 @@ git clone https://github.com/ggml-org/llama.cpp.git
 Set-Location .\llama.cpp
 git checkout --detach 19cce6919992fdffd92e0ac152caaf1e2b8f254e
 git rev-parse HEAD
-cmake -B build -DGGML_CUDA=ON
+cmake -B build -DGGML_CUDA=ON -DLLAMA_BUILD_COMMIT=19cce6919992fdffd92e0ac152caaf1e2b8f254e
 cmake --build build --config Release --target llama-completion
 ```
 
-Confirm that `git rev-parse HEAD` prints exactly `19cce6919992fdffd92e0ac152caaf1e2b8f254e`. Locate the resulting `llama-completion.exe` in the build output. The exact output subdirectory can depend on the generator and build configuration. Keep track of the source, build tools, CUDA Toolkit, and binary you chose. You can record the executable's local hash with:
+Confirm that `git rev-parse HEAD` prints exactly `19cce6919992fdffd92e0ac152caaf1e2b8f254e`. Pass the full revision through `LLAMA_BUILD_COMMIT`: llama.cpp's default version string reports only a seven-character short hash, which is too short for SideEffect's pinned revision check. Locate the resulting `llama-completion.exe` in the build output. The exact output subdirectory can depend on the generator and build configuration. Keep track of the source, build tools, CUDA Toolkit, and binary you chose. You can record the executable's local hash with:
 
 ```powershell
 Get-FileHash -Algorithm SHA256 .\path\to\llama-completion.exe
