@@ -4443,20 +4443,21 @@ fn model_list() -> Result<ExitCode, String> {
                 && accepted.license_url == model.license_url
         });
         println!(
-            "- {} — {}\n  task: {}; platform: {}; size: {}; license: {} ({})\n  evaluation: {}; source: {} @ {}\n  license accepted: {}; status: {}{}",
+            "- {} — {}\n  task: {}; platform: {} ({}); size: {}; license: {} ({})\n  evaluation: {}; source: {} @ {}\n  selected for task: {}; license accepted: {}; status: {}",
             model.id,
             terminal_safe_text(model.name),
             model_task_label(model.task),
             model_task_platform(model.task),
+            platform_support_label(model_task_supported_here(model.task)),
             human_file_size(model.size_bytes),
             model.license_id,
             model.license_url,
             evaluation_status_label(model.evaluation),
             model.repository,
             model.revision,
+            if selected { "yes" } else { "no" },
             license_accepted,
-            installed,
-            if selected { "; selected" } else { "" }
+            installed
         );
     }
     if registry.custom_models.is_empty() {
@@ -4464,24 +4465,40 @@ fn model_list() -> Result<ExitCode, String> {
     } else {
         println!("User-provided models (unreviewed):");
         for model in &registry.custom_models {
+            let (license, license_status) = match model.license_id.as_deref() {
+                Some(license) => (terminal_safe_text(license), "user-provided and unverified"),
+                None => ("not provided".to_owned(), "not provided"),
+            };
             let tasks = model
                 .tasks
                 .iter()
-                .map(|task| model_task_label(*task))
+                .map(|task| {
+                    format!(
+                        "{} ({}; {})",
+                        model_task_label(*task),
+                        platform_support_label(model_task_supported_here(*task)),
+                        if registry
+                            .selected_by_task
+                            .get(task)
+                            .is_some_and(|id| id == &model.id)
+                        {
+                            "selected"
+                        } else {
+                            "not selected"
+                        }
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             println!(
-                "- {} — {}\n  tasks: {}; size: {}; SHA-256: {}\n  license: {}; evaluation: not assessed{}",
+                "- {} — {}\n  tasks: {}; size: {}; SHA-256: {}\n  license: {}; license status: {}; evaluation: not assessed; accuracy recommendation: none{}",
                 model.id,
                 terminal_safe_text(&model.name),
                 tasks,
                 human_file_size(model.size_bytes),
                 model.sha256,
-                model
-                    .license_id
-                    .as_deref()
-                    .map(terminal_safe_text)
-                    .unwrap_or_else(|| "not provided".to_owned()),
+                license,
+                license_status,
                 if model.path.exists() {
                     ""
                 } else {
@@ -4531,6 +4548,15 @@ fn model_show(id: &OsString) -> Result<ExitCode, String> {
             "catalog_entry": model,
             "installation_status": installation,
             "license_terms_url": model.license_url,
+            "task_support": {
+                "task": model_task_cli_name(model.task),
+                "platform_scope": model_task_platform(model.task),
+                "supported_here": model_task_supported_here(model.task),
+            },
+            "selected_for_task": registry
+                .selected_by_task
+                .get(&model.task)
+                .is_some_and(|selected| selected == model.id),
             "recommended_for_accuracy": false,
         });
         write_json(&value, "model catalog entry")?;
@@ -4541,7 +4567,43 @@ fn model_show(id: &OsString) -> Result<ExitCode, String> {
         .iter()
         .find(|model| model.id == id)
         .ok_or_else(|| "model ID is not present in the catalog or user registry".to_owned())?;
-    write_json(model, "registered user-provided model")?;
+    let task_support = model
+        .tasks
+        .iter()
+        .map(|task| {
+            serde_json::json!({
+                "task": model_task_cli_name(*task),
+                "supported_here": model_task_supported_here(*task),
+                "selected": registry
+                    .selected_by_task
+                    .get(task)
+                    .is_some_and(|selected| selected == &model.id),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut value = serde_json::to_value(model)
+        .map_err(|_| "could not serialize registered user-provided model".to_owned())?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        "registered user-provided model did not serialize as an object".to_owned()
+    })?;
+    object.insert("task_support".to_owned(), serde_json::json!(task_support));
+    object.insert(
+        "license_status".to_owned(),
+        serde_json::json!(if model.license_id.is_some() {
+            "user-provided and unverified"
+        } else {
+            "not provided"
+        }),
+    );
+    object.insert(
+        "evaluation_status".to_owned(),
+        serde_json::json!("not assessed"),
+    );
+    object.insert(
+        "recommended_for_accuracy".to_owned(),
+        serde_json::json!(false),
+    );
+    write_json(&value, "registered user-provided model")?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -4851,6 +4913,14 @@ fn model_task_platform(task: ModelTask) -> &'static str {
     match task {
         ModelTask::EvidenceSelection | ModelTask::QueryPlan => "Linux x86_64 only",
         ModelTask::Explanation => "Linux x86_64 and native Windows",
+    }
+}
+
+fn platform_support_label(supported: bool) -> &'static str {
+    if supported {
+        "supported here"
+    } else {
+        "not supported here"
     }
 }
 
