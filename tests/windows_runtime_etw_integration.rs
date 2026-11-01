@@ -123,6 +123,54 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
         "target process start was not decoded; target PID {target_pid}; process observations: {}",
         serde_json::to_string(&process_observations).unwrap()
     );
+    let envelope_output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["events", "--windows-runtime"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        matches!(envelope_output.status.code(), Some(0 | 2)),
+        "common event adapter failed on its real ETW capture: {}",
+        String::from_utf8_lossy(&envelope_output.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&envelope_output.stdout).unwrap();
+    assert_eq!(envelope["schema"], "sideeffect.common_event_envelope");
+    assert_eq!(envelope["schema_version"], 4);
+    let target_version = events
+        .iter()
+        .find(|event| {
+            event["event_kind"] == "process_start"
+                && event["payload_decoding"]["process_id"] == target_pid
+        })
+        .and_then(|event| event["event_version"].as_u64())
+        .unwrap();
+    let loss_free = document["event_loss"]["events_lost"] == 0
+        && document["event_loss"]["log_buffers_lost"] == 0
+        && document["event_loss"]["real_time_buffers_lost"] == 0
+        && document["event_loss"]["loss_statistics_available"] == true
+        && document["event_loss"]["final_snapshot_available"] == true;
+    let target_identity_status = envelope["process_observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|process| process["identity"]["process_id"] == target_pid)
+        .map(|process| process["identity"]["identity_status"].as_str().unwrap());
+    if target_version <= 3 && loss_free {
+        assert_eq!(target_identity_status, Some("observed_start"));
+        assert!(
+            envelope["event_process_links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|link| {
+                    link["role"] == "windows_process_start_payload"
+                        && link["status"] == "observed"
+                        && link["process_observation_id"].is_number()
+                })
+        );
+    } else {
+        assert_ne!(target_identity_status, Some("observed_start"));
+    }
     assert!(
         events.iter().any(|event| {
             event["observation_decoding"]["status"] == "decoded"

@@ -48,7 +48,7 @@ fn events_trace_writes_versioned_json_in_source_order() {
     );
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["schema"], "sideeffect.common_event_envelope");
-    assert_eq!(envelope["schema_version"], 3);
+    assert_eq!(envelope["schema_version"], 4);
     assert_eq!(envelope["source_state"]["completeness"], "complete");
     assert_eq!(envelope["events"].as_array().unwrap().len(), 1);
     assert_eq!(envelope["events"][0]["source_local_ordinal"], 1);
@@ -85,7 +85,7 @@ fn timeline_filters_exact_kind_and_retains_raw_evidence_and_diagnostics() {
     assert_eq!(output.status.code(), Some(2));
     let timeline: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(timeline["schema"], "sideeffect.event_timeline");
-    assert_eq!(timeline["schema_version"], 3);
+    assert_eq!(timeline["schema_version"], 4);
     assert_eq!(timeline["source_state"]["completeness"], "partial");
     assert_eq!(timeline["filter"]["event_kind"], "close");
     assert!(
@@ -126,7 +126,7 @@ fn timeline_process_observation_filters_by_local_link_and_preserves_evidence() {
 
     assert_eq!(output.status.code(), Some(2));
     let timeline: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(timeline["schema_version"], 3);
+    assert_eq!(timeline["schema_version"], 4);
     assert_eq!(timeline["filter"]["process_observation_id"], 1);
     assert_eq!(timeline["source_state"]["completeness"], "partial");
     assert_eq!(timeline["items"].as_array().unwrap().len(), 1);
@@ -307,7 +307,7 @@ fn graph_trace_keeps_event_process_link_and_source_evidence() {
     assert_eq!(output.status.code(), Some(2));
     let graph: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(graph["schema"], "sideeffect.event_graph");
-    assert_eq!(graph["schema_version"], 3);
+    assert_eq!(graph["schema_version"], 4);
     assert_eq!(graph["source_state"]["completeness"], "partial");
     assert!(
         graph["semantics"]
@@ -392,7 +392,7 @@ fn graph_process_observation_filter_selects_source_local_context_and_links() {
         String::from_utf8_lossy(&output.stderr)
     );
     let graph: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(graph["schema_version"], 3);
+    assert_eq!(graph["schema_version"], 4);
     assert_eq!(graph["filter"]["event_kind"], serde_json::Value::Null);
     assert_eq!(graph["filter"]["process_observation_id"], 1);
     assert!(

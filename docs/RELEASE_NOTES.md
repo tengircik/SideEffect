@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Upgraded the common event envelope, event graph, and event timeline to v4. Native Windows process start/end identity now requires raw Kernel-Process v0-v3 PID/parent-PID bytes to match the serialized TDH sidecar under an exact header pointer-width flag. Unsupported or malformed records remain raw, add bounded diagnostics, invalidate lifecycle continuity, and leave links unresolved. Raw image names remain decoder metadata; ETW loss, PID reuse ambiguity, and non-causal parent-PID semantics are preserved.
 - Added native Windows `evidence --windows-runtime` lookup for one ETW event, requiring the validated capture fingerprint, record ordinal, and raw-payload digest to match before returning the event row and source pointer. Partial status and unknown completeness remain explicit; producer authenticity and serialized decode metadata are not verified.
 - Upgraded `sideeffect.windows_runtime_diff_summary` to v3 with a field-level ledger for the two fields excluded from exact event equality (`record_ordinal` and `timestamp_qpc`). Both original values are preserved in capture-linked before/after event references. The summary also reports equality of canonical validated capture representation fingerprints, without claiming source JSON byte equality or producer authenticity. Schemas v1-v2 remain historical output formats and are not imported.
 

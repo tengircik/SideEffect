@@ -46,6 +46,13 @@ fn process_event(
         "process_end" => (2, "process_end"),
         _ => unreachable!(),
     };
+    let mut raw_process_payload = vec![0u8; 8];
+    raw_process_payload.extend_from_slice(&pid.to_le_bytes());
+    raw_process_payload.extend_from_slice(&parent.to_le_bytes());
+    let raw_payload_hex: String = raw_process_payload
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     NativeRuntimeEvent {
         record_ordinal: ordinal,
         provider_guid: "{3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c}".to_owned(),
@@ -55,9 +62,9 @@ fn process_event(
         event_kind: event_kind.to_owned(),
         header_process_id: 1,
         header_thread_id: 2,
-        header_flags: 0,
+        header_flags: 0x0040,
         timestamp_qpc: i64::try_from(ordinal).unwrap(),
-        raw_payload_hex: "00".to_owned(),
+        raw_payload_hex,
         payload_decoding: Some(DecodedProcessPayload {
             status: ProcessDecodeStatus::Decoded,
             schema_name: Some("windows.kernel_process_typegroup1".to_owned()),

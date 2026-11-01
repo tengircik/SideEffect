@@ -13,11 +13,11 @@ use crate::model::{
 };
 
 pub const COMMON_EVENT_SCHEMA: &str = "sideeffect.common_event_envelope";
-pub const COMMON_EVENT_SCHEMA_VERSION: u32 = 3;
+pub const COMMON_EVENT_SCHEMA_VERSION: u32 = 4;
 pub const EVENT_GRAPH_SCHEMA: &str = "sideeffect.event_graph";
-pub const EVENT_GRAPH_SCHEMA_VERSION: u32 = 3;
+pub const EVENT_GRAPH_SCHEMA_VERSION: u32 = 4;
 pub const EVENT_TIMELINE_SCHEMA: &str = "sideeffect.event_timeline";
-pub const EVENT_TIMELINE_SCHEMA_VERSION: u32 = 3;
+pub const EVENT_TIMELINE_SCHEMA_VERSION: u32 = 4;
 #[cfg(windows)]
 const WINDOWS_RUNTIME_SCHEMA: &str = "sideeffect.windows_runtime_capture";
 #[cfg(windows)]
@@ -169,9 +169,9 @@ pub enum ProcessIdentity {
         process_id: u32,
         identity_status: ProcessIdentityStatus,
     },
-    /// Supported serialized ETW decoder metadata anchors this candidate to
-    /// its source-local start record; the offline adapter does not re-decode
-    /// the raw payload bytes.
+    /// Supported raw ETW process payload IDs are checked against the TDH
+    /// decoder sidecar before an instance is treated as observed. This is a
+    /// capture-local identity claim, not producer authentication.
     WindowsProcessInstance {
         process_id: u32,
         start_record_ordinal: u64,
@@ -200,8 +200,9 @@ pub enum ProcessIdentityStatus {
     TaskIdOnlyGenerationUnknown,
     ReturnedChildPidOnly,
     ObservedStart,
-    /// Imported ETW decoder fields are structurally supported but are not
-    /// re-decoded from the retained raw payload by the offline adapter.
+    /// Kept for historical schema compatibility. Current adapters do not emit
+    /// this status for supported process start records whose raw payload IDs
+    /// match their decoder sidecar.
     DecoderMetadataUnverified,
     AmbiguousPidReuse,
     LifecycleContinuityUnknown,
@@ -218,8 +219,8 @@ pub enum ProcessRelationshipKind {
 #[serde(rename_all = "snake_case")]
 pub enum RelationshipResolution {
     Observed,
-    /// The relationship is derived from serialized ETW decoder metadata that
-    /// has not been independently checked against the raw payload bytes.
+    /// Historical status for relationships derived from decoder metadata
+    /// without checking raw ETW payload bytes.
     DecoderMetadataUnverified,
     ParentInstanceUnresolved,
     ParentPidAmbiguous,
@@ -1494,7 +1495,6 @@ struct EtwProcessPayloadView<'a> {
     pointer_size_bytes: Option<u8>,
     process_id: Option<u32>,
     parent_process_id: Option<u32>,
-    image_file_name: Option<&'a str>,
 }
 
 #[cfg(windows)]
@@ -1573,7 +1573,6 @@ impl EtwCaptureView for crate::record::WindowsRuntimeCapture {
                     pointer_size_bytes: payload.pointer_size_bytes,
                     process_id: payload.process_id,
                     parent_process_id: payload.parent_process_id,
-                    image_file_name: payload.image_file_name.as_deref(),
                 }),
             observation_decoding: event.observation_decoding.as_ref(),
         })
@@ -1644,7 +1643,6 @@ impl EtwCaptureView for crate::windows_runtime::WindowsRuntimeCapture {
                     pointer_size_bytes: payload.pointer_size_bytes,
                     process_id: payload.process_id,
                     parent_process_id: payload.parent_process_id,
-                    image_file_name: payload.image_file_name.as_deref(),
                 }),
             observation_decoding: event.observation_decoding.as_ref(),
         })
@@ -1901,7 +1899,6 @@ fn from_windows_etw_source(capture: &impl EtwCaptureView) -> CommonEventEnvelope
 struct ActiveWindowsProcess {
     observation_index: usize,
     parent_process_id: u32,
-    image_file_name: String,
 }
 
 #[cfg(windows)]
@@ -1914,6 +1911,7 @@ fn derive_windows_process_relationships(
     links: &mut Vec<EventProcessLink>,
     diagnostics: &mut Vec<EventDiagnostic>,
 ) -> bool {
+    let mut generation_evidence_unreliable = generation_evidence_unreliable;
     let mut active = BTreeMap::<u32, ActiveWindowsProcess>::new();
     let mut ambiguous_pids = BTreeSet::<u32>::new();
     let mut lifecycle_unknown_pids = BTreeSet::<u32>::new();
@@ -1931,36 +1929,46 @@ fn derive_windows_process_relationships(
         };
 
         if event.event_kind == "process_start" {
-            let Some(payload) = validated_process_payload(&event, "process_start") else {
-                invalidate_active_windows_instances(
-                    &mut active,
-                    &mut lifecycle_unknown_pids,
-                    observations,
-                    &mut deferred_lifecycle_invalidations,
-                );
-                if let Some(process_id) = event
-                    .process_payload
-                    .and_then(|payload| payload.process_id)
-                    .filter(|process_id| *process_id > 0)
-                {
-                    lifecycle_unknown_pids.insert(process_id);
+            let payload = match validated_process_payload(&event, "process_start") {
+                Ok(payload) => payload,
+                Err(error) => {
+                    invalidate_active_windows_instances(
+                        &mut active,
+                        &mut lifecycle_unknown_pids,
+                        observations,
+                        &mut deferred_lifecycle_invalidations,
+                    );
+                    generation_evidence_unreliable = true;
+                    push_process_diagnostic(
+                        diagnostics,
+                        &mut process_diagnostic_count,
+                        error.diagnostic_code(),
+                        &error.diagnostic_message("process-start"),
+                        Some(event.record_ordinal),
+                        Some(event_evidence.clone()),
+                    );
+                    let _ = push_bounded_process_link(
+                        links,
+                        MAX_ETW_EVENTS,
+                        EventProcessLink {
+                            event: event_evidence.clone(),
+                            process_observation_id: None,
+                            reported_process_id: None,
+                            role: EventProcessLinkRole::WindowsProcessStartPayload,
+                            status: EventProcessLinkStatus::Unresolved,
+                            basis: error.diagnostic_code().to_owned(),
+                        },
+                        diagnostics,
+                        &mut process_diagnostic_count,
+                        Some(event.record_ordinal),
+                        Some(event_evidence),
+                    );
+                    partial = true;
+                    continue;
                 }
-                push_process_diagnostic(
-                    diagnostics,
-                    &mut process_diagnostic_count,
-                    "process_start_payload_unavailable",
-                    "process-start row lacks a supported, validated process payload; active lifecycle continuity is unknown",
-                    Some(event.record_ordinal),
-                    Some(event_evidence),
-                );
-                partial = true;
-                continue;
             };
-            let process_id = payload.process_id.expect("validated process ID");
-            let parent_id = payload
-                .parent_process_id
-                .expect("validated parent process ID");
-            let image = payload.image_file_name.expect("validated image name");
+            let process_id = payload.process_id;
+            let parent_id = payload.parent_process_id;
             let existing = active.remove(&process_id);
             let previously_ambiguous = ambiguous_pids.contains(&process_id);
             let identity_status = if existing.is_some() || ambiguous_pids.contains(&process_id) {
@@ -2043,7 +2051,6 @@ fn derive_windows_process_relationships(
                         observation_index: usize::try_from(observation_id - 1)
                             .expect("bounded process observation index"),
                         parent_process_id: parent_id,
-                        image_file_name: image.to_owned(),
                     },
                 );
             }
@@ -2056,7 +2063,7 @@ fn derive_windows_process_relationships(
                     reported_process_id: None,
                     role: EventProcessLinkRole::WindowsProcessStartPayload,
                     status: EventProcessLinkStatus::Observed,
-                    basis: "supported_serialized_process_decoder_metadata_identifies_candidate_instance"
+                    basis: "supported_raw_process_payload_ids_match_serialized_decoder_sidecar"
                         .to_owned(),
                 },
                 diagnostics,
@@ -2117,7 +2124,7 @@ fn derive_windows_process_relationships(
                     reported_from_process_id: Some(parent_id),
                     resolution,
                     basis: if resolution == RelationshipResolution::Observed {
-                        "serialized_parent_pid_matches_one_active_process_decoder_metadata_candidate".to_owned()
+                        "raw_and_serialized_reported_parent_pid_match_one_active_capture_local_process_instance".to_owned()
                     } else if resolution == RelationshipResolution::ParentPidAmbiguous {
                         "serialized_parent_pid_is_ambiguous_in_capture".to_owned()
                     } else if generation_evidence_unreliable {
@@ -2135,29 +2142,46 @@ fn derive_windows_process_relationships(
         }
 
         if event.event_kind == "process_end" {
-            let Some(payload) = validated_process_payload(&event, "process_end") else {
-                invalidate_active_windows_instances(
-                    &mut active,
-                    &mut lifecycle_unknown_pids,
-                    observations,
-                    &mut deferred_lifecycle_invalidations,
-                );
-                push_process_diagnostic(
-                    diagnostics,
-                    &mut process_diagnostic_count,
-                    "process_end_payload_unavailable",
-                    "unsupported process-end row breaks lifecycle continuity; active instances are no longer linked",
-                    Some(event.record_ordinal),
-                    Some(event_evidence),
-                );
-                partial = true;
-                continue;
+            let payload = match validated_process_payload(&event, "process_end") {
+                Ok(payload) => payload,
+                Err(error) => {
+                    invalidate_active_windows_instances(
+                        &mut active,
+                        &mut lifecycle_unknown_pids,
+                        observations,
+                        &mut deferred_lifecycle_invalidations,
+                    );
+                    generation_evidence_unreliable = true;
+                    push_process_diagnostic(
+                        diagnostics,
+                        &mut process_diagnostic_count,
+                        error.diagnostic_code(),
+                        &error.diagnostic_message("process-end"),
+                        Some(event.record_ordinal),
+                        Some(event_evidence.clone()),
+                    );
+                    let _ = push_bounded_process_link(
+                        links,
+                        MAX_ETW_EVENTS,
+                        EventProcessLink {
+                            event: event_evidence.clone(),
+                            process_observation_id: None,
+                            reported_process_id: None,
+                            role: EventProcessLinkRole::WindowsProcessEndPayload,
+                            status: EventProcessLinkStatus::Unresolved,
+                            basis: error.diagnostic_code().to_owned(),
+                        },
+                        diagnostics,
+                        &mut process_diagnostic_count,
+                        Some(event.record_ordinal),
+                        Some(event_evidence),
+                    );
+                    partial = true;
+                    continue;
+                }
             };
-            let process_id = payload.process_id.expect("validated process ID");
-            let parent_id = payload
-                .parent_process_id
-                .expect("validated parent process ID");
-            let image = payload.image_file_name.expect("validated image name");
+            let process_id = payload.process_id;
+            let parent_id = payload.parent_process_id;
             if ambiguous_pids.contains(&process_id)
                 || lifecycle_unknown_pids.contains(&process_id)
                 || generation_evidence_unreliable
@@ -2188,7 +2212,7 @@ fn derive_windows_process_relationships(
                 continue;
             }
             if let Some(process) = active.remove(&process_id) {
-                if process.parent_process_id == parent_id && process.image_file_name == image {
+                if process.parent_process_id == parent_id {
                     observations[process.observation_index].end_evidence =
                         Some(event_evidence.clone());
                     if !push_bounded_process_link(
@@ -2200,7 +2224,7 @@ fn derive_windows_process_relationships(
                             reported_process_id: None,
                             role: EventProcessLinkRole::WindowsProcessEndPayload,
                             status: EventProcessLinkStatus::Observed,
-                            basis: "validated_process_end_pid_parent_and_image_match_active_start"
+                            basis: "raw_and_serialized_process_end_ids_match_active_start_ids"
                                 .to_owned(),
                         },
                         diagnostics,
@@ -2366,46 +2390,19 @@ fn derive_windows_process_relationships(
         links,
         &deferred_lifecycle_invalidations,
     );
-    mark_windows_decoder_metadata_unverified(observations, relationships, links);
+    keep_windows_network_links_context_only(links);
     partial
 }
 
 #[cfg(windows)]
-fn mark_windows_decoder_metadata_unverified(
-    observations: &mut [ProcessObservation],
-    relationships: &mut [ProcessRelationship],
-    links: &mut [EventProcessLink],
-) {
-    for observation in observations {
-        if let ProcessIdentity::WindowsProcessInstance {
-            identity_status, ..
-        } = &mut observation.identity
-        {
-            if *identity_status == ProcessIdentityStatus::ObservedStart {
-                *identity_status = ProcessIdentityStatus::DecoderMetadataUnverified;
-            }
-        }
-    }
-    for relationship in relationships {
-        if relationship.resolution == RelationshipResolution::Observed {
-            relationship.resolution = RelationshipResolution::DecoderMetadataUnverified;
-            relationship.basis.push_str(
-                "; derived from serialized ETW decoder metadata, not re-decoded from raw payload bytes",
-            );
-        }
-    }
+fn keep_windows_network_links_context_only(links: &mut [EventProcessLink]) {
     for link in links {
-        if matches!(
-            link.role,
-            EventProcessLinkRole::WindowsProcessStartPayload
-                | EventProcessLinkRole::WindowsProcessEndPayload
-                | EventProcessLinkRole::WindowsNetworkPayloadPid
-        ) && link.status == EventProcessLinkStatus::Observed
+        if link.role == EventProcessLinkRole::WindowsNetworkPayloadPid
+            && link.status == EventProcessLinkStatus::Observed
         {
             link.status = EventProcessLinkStatus::ContextCandidate;
-            link.basis.push_str(
-                "; serialized ETW decoder metadata is not re-decoded from raw payload bytes",
-            );
+            link.basis
+                .push_str("; network attribution remains context-only");
         }
     }
 }
@@ -2538,38 +2535,152 @@ fn mark_windows_observation_unresolved(
 }
 
 #[cfg(windows)]
-fn validated_process_payload<'a>(
-    event: &EtwEventView<'a>,
+#[derive(Clone, Copy)]
+struct ValidatedWindowsProcessPayload {
+    process_id: u32,
+    parent_process_id: u32,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+enum WindowsProcessPayloadError {
+    Unsupported,
+    Malformed,
+    Mismatch,
+    InvalidProcessId,
+}
+
+#[cfg(windows)]
+impl WindowsProcessPayloadError {
+    fn diagnostic_code(self) -> &'static str {
+        match self {
+            Self::Unsupported => "process_payload_unsupported",
+            Self::Malformed => "process_payload_malformed",
+            Self::Mismatch => "process_payload_sidecar_mismatch",
+            Self::InvalidProcessId => "process_payload_invalid_process_id",
+        }
+    }
+
+    fn diagnostic_message(self, kind: &str) -> String {
+        let reason = match self {
+            Self::Unsupported => {
+                "descriptor, schema, or header pointer-width flags are outside the reviewed layout contract"
+            }
+            Self::Malformed => {
+                "retained raw payload or serialized process sidecar is missing, truncated, or malformed"
+            }
+            Self::Mismatch => {
+                "raw process IDs, header pointer width, and serialized process sidecar do not agree"
+            }
+            Self::InvalidProcessId => {
+                "raw process payload contains a zero or unrepresentable process ID"
+            }
+        };
+        format!("{kind} row is unresolved: {reason}; lifecycle continuity is unknown")
+    }
+}
+
+#[cfg(windows)]
+fn validated_process_payload(
+    event: &EtwEventView<'_>,
     expected_kind: &str,
-) -> Option<EtwProcessPayloadView<'a>> {
+) -> Result<ValidatedWindowsProcessPayload, WindowsProcessPayloadError> {
     const PROCESS_PROVIDER_GUID: &str = "3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c";
-    let payload = event.process_payload?;
-    let process_id = payload.process_id?;
-    let parent_id = payload.parent_process_id?;
-    let image = payload.image_file_name?;
+    const EVENT_HEADER_FLAG_32_BIT_HEADER: u16 = 0x0020;
+    const EVENT_HEADER_FLAG_64_BIT_HEADER: u16 = 0x0040;
     if normalized_guid(event.provider_guid).as_deref() != Some(PROCESS_PROVIDER_GUID)
         || event.event_id != 0
         || event.event_kind != expected_kind
         || (expected_kind == "process_start" && event.opcode != 1)
         || (expected_kind == "process_end" && event.opcode != 2)
-        || !payload.decoded
-        || !matches!(
-            (payload.schema_name, payload.schema_version),
-            (Some("windows.kernel_process_typegroup1"), Some(version))
-                if version == event.event_version
-        ) && !matches!(
-            (payload.schema_name, payload.schema_version),
-            (Some("Process_V2_TypeGroup1"), Some(2))
-        )
-        || event.event_version > 3
-        || !matches!(payload.pointer_size_bytes, Some(4 | 8))
-        || process_id == 0
-        || image.is_empty()
     {
-        return None;
+        return Err(WindowsProcessPayloadError::Unsupported);
     }
-    let _ = parent_id;
-    Some(payload)
+    let expected_schema = match event.event_version {
+        0 => "Process_V0_TypeGroup1",
+        1 => "Process_V1_TypeGroup1",
+        2 => "Process_V2_TypeGroup1",
+        3 => "Process_TypeGroup1",
+        _ => return Err(WindowsProcessPayloadError::Unsupported),
+    };
+    let payload = event
+        .process_payload
+        .ok_or(WindowsProcessPayloadError::Malformed)?;
+    let sidecar_process_id = payload
+        .process_id
+        .ok_or(WindowsProcessPayloadError::Malformed)?;
+    let sidecar_parent_process_id = payload
+        .parent_process_id
+        .ok_or(WindowsProcessPayloadError::Malformed)?;
+    let schema_matches = payload.schema_name == Some("windows.kernel_process_typegroup1")
+        || payload.schema_name == Some(expected_schema);
+    if !payload.decoded || !schema_matches || payload.schema_version != Some(event.event_version) {
+        return Err(WindowsProcessPayloadError::Unsupported);
+    }
+    let flags = event.header_flags;
+    let pointer_size = match (
+        flags & EVENT_HEADER_FLAG_32_BIT_HEADER != 0,
+        flags & EVENT_HEADER_FLAG_64_BIT_HEADER != 0,
+    ) {
+        (true, false) => 4usize,
+        (false, true) => 8usize,
+        _ => return Err(WindowsProcessPayloadError::Unsupported),
+    };
+    if payload.pointer_size_bytes != Some(pointer_size as u8) {
+        return Err(WindowsProcessPayloadError::Mismatch);
+    }
+    let raw_payload =
+        decode_hex(event.raw_payload_hex).ok_or(WindowsProcessPayloadError::Malformed)?;
+    let (pid_offset, parent_offset, field_width) = match event.event_version {
+        // Process_V0_TypeGroup1 declares both IDs as Pointer fields.
+        0 => (0usize, pointer_size, pointer_size),
+        // V1 puts PageDirectoryBase before 32-bit ProcessId/ParentId.
+        // V2 and V3 put UniqueProcessKey in that pointer-sized position.
+        1..=3 => (pointer_size, pointer_size + 4, 4usize),
+        _ => return Err(WindowsProcessPayloadError::Unsupported),
+    };
+    let process_id = decode_windows_process_id(&raw_payload, pid_offset, field_width)?;
+    let parent_process_id = decode_windows_process_id(&raw_payload, parent_offset, field_width)?;
+    if process_id == 0 {
+        return Err(WindowsProcessPayloadError::InvalidProcessId);
+    }
+    if sidecar_process_id != process_id || sidecar_parent_process_id != parent_process_id {
+        return Err(WindowsProcessPayloadError::Mismatch);
+    }
+    Ok(ValidatedWindowsProcessPayload {
+        process_id,
+        parent_process_id,
+    })
+}
+
+#[cfg(windows)]
+fn decode_windows_process_id(
+    bytes: &[u8],
+    offset: usize,
+    width: usize,
+) -> Result<u32, WindowsProcessPayloadError> {
+    let end = offset
+        .checked_add(width)
+        .ok_or(WindowsProcessPayloadError::Malformed)?;
+    let field = bytes
+        .get(offset..end)
+        .ok_or(WindowsProcessPayloadError::Malformed)?;
+    match width {
+        4 => {
+            let field: [u8; 4] = field
+                .try_into()
+                .map_err(|_| WindowsProcessPayloadError::Malformed)?;
+            Ok(u32::from_le_bytes(field))
+        }
+        8 => {
+            let field: [u8; 8] = field
+                .try_into()
+                .map_err(|_| WindowsProcessPayloadError::Malformed)?;
+            u32::try_from(u64::from_le_bytes(field))
+                .map_err(|_| WindowsProcessPayloadError::Malformed)
+        }
+        _ => Err(WindowsProcessPayloadError::Unsupported),
+    }
 }
 
 #[cfg(windows)]
@@ -2737,4 +2848,223 @@ fn truncate_utf8(value: &str, maximum_bytes: usize) -> String {
         end -= 1;
     }
     value[..end].to_owned()
+}
+
+#[cfg(all(test, windows))]
+mod windows_process_payload_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct TestOverrides {
+        raw_payload: Option<Vec<u8>>,
+        header_flags: Option<u16>,
+        descriptor: Option<(&'static str, u16, u8)>,
+        missing_sidecar: bool,
+    }
+
+    fn encode_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn validate(
+        version: u8,
+        pointer_size: usize,
+        raw_process_id: u32,
+        sidecar_process_id: u32,
+        raw_parent_id: u32,
+        sidecar_parent_id: u32,
+        overrides: TestOverrides,
+    ) -> Result<ValidatedWindowsProcessPayload, WindowsProcessPayloadError> {
+        let mut raw = Vec::new();
+        match version {
+            0 => {
+                if pointer_size == 4 {
+                    raw.extend_from_slice(&raw_process_id.to_le_bytes());
+                    raw.extend_from_slice(&raw_parent_id.to_le_bytes());
+                } else {
+                    raw.extend_from_slice(&u64::from(raw_process_id).to_le_bytes());
+                    raw.extend_from_slice(&u64::from(raw_parent_id).to_le_bytes());
+                }
+            }
+            1..=3 => {
+                raw.resize(pointer_size, 0);
+                raw.extend_from_slice(&raw_process_id.to_le_bytes());
+                raw.extend_from_slice(&raw_parent_id.to_le_bytes());
+            }
+            _ => {}
+        }
+        let raw = overrides
+            .raw_payload
+            .as_deref()
+            .map(encode_hex)
+            .unwrap_or_else(|| encode_hex(&raw));
+        let schema = match version {
+            0 => "Process_V0_TypeGroup1",
+            1 => "Process_V1_TypeGroup1",
+            2 => "Process_V2_TypeGroup1",
+            3 => "Process_TypeGroup1",
+            _ => "unsupported",
+        };
+        let (provider_guid, event_id, opcode) =
+            overrides
+                .descriptor
+                .unwrap_or(("{3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c}", 0, 1));
+        let event = EtwEventView {
+            record_ordinal: 1,
+            provider_guid,
+            event_id,
+            event_version: version,
+            opcode,
+            event_kind: "process_start",
+            header_process_id: 99,
+            header_flags: overrides.header_flags.unwrap_or(if pointer_size == 4 {
+                0x20
+            } else {
+                0x40
+            }),
+            timestamp_qpc: 1,
+            raw_payload_hex: &raw,
+            process_payload: (!overrides.missing_sidecar).then_some(EtwProcessPayloadView {
+                decoded: true,
+                schema_name: Some(schema),
+                schema_version: Some(version),
+                pointer_size_bytes: Some(pointer_size as u8),
+                process_id: Some(sidecar_process_id),
+                parent_process_id: Some(sidecar_parent_id),
+            }),
+            observation_decoding: None,
+        };
+        validated_process_payload(&event, "process_start")
+    }
+
+    #[test]
+    fn exact_supported_layouts_cross_check_raw_ids_for_both_pointer_widths() {
+        for (version, width) in [
+            (0, 4),
+            (0, 8),
+            (1, 4),
+            (1, 8),
+            (2, 4),
+            (2, 8),
+            (3, 4),
+            (3, 8),
+        ] {
+            let payload =
+                validate(version, width, 321, 321, 12, 12, TestOverrides::default()).unwrap();
+            assert_eq!(payload.process_id, 321, "version={version}, width={width}");
+            assert_eq!(
+                payload.parent_process_id, 12,
+                "version={version}, width={width}"
+            );
+        }
+    }
+
+    #[test]
+    fn mismatch_truncation_unsupported_and_pointer_flags_are_distinct() {
+        assert!(matches!(
+            validate(2, 8, 321, 322, 12, 12, TestOverrides::default()),
+            Err(WindowsProcessPayloadError::Mismatch)
+        ));
+        assert!(matches!(
+            validate(2, 8, 321, 321, 12, 13, TestOverrides::default()),
+            Err(WindowsProcessPayloadError::Mismatch)
+        ));
+        assert!(matches!(
+            validate(
+                2,
+                8,
+                321,
+                321,
+                12,
+                12,
+                TestOverrides {
+                    raw_payload: Some(vec![1, 2, 3]),
+                    ..TestOverrides::default()
+                }
+            ),
+            Err(WindowsProcessPayloadError::Malformed)
+        ));
+        assert!(matches!(
+            validate(4, 8, 321, 321, 12, 12, TestOverrides::default()),
+            Err(WindowsProcessPayloadError::Unsupported)
+        ));
+        assert!(matches!(
+            validate(
+                2,
+                8,
+                321,
+                321,
+                12,
+                12,
+                TestOverrides {
+                    header_flags: Some(0),
+                    ..TestOverrides::default()
+                }
+            ),
+            Err(WindowsProcessPayloadError::Unsupported)
+        ));
+        assert!(matches!(
+            validate(
+                2,
+                8,
+                321,
+                321,
+                12,
+                12,
+                TestOverrides {
+                    header_flags: Some(0x60),
+                    ..TestOverrides::default()
+                }
+            ),
+            Err(WindowsProcessPayloadError::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn zero_raw_process_id_is_invalid_not_a_sidecar_mismatch() {
+        assert!(matches!(
+            validate(2, 8, 0, 0, 12, 12, TestOverrides::default()),
+            Err(WindowsProcessPayloadError::InvalidProcessId)
+        ));
+    }
+
+    #[test]
+    fn descriptor_and_sidecar_gates_reject_unreviewed_events() {
+        for descriptor in [
+            ("{00000000-0000-0000-0000-000000000000}", 0, 1),
+            ("{3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c}", 1, 1),
+            ("{3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c}", 0, 2),
+        ] {
+            assert!(matches!(
+                validate(
+                    2,
+                    8,
+                    321,
+                    321,
+                    12,
+                    12,
+                    TestOverrides {
+                        descriptor: Some(descriptor),
+                        ..TestOverrides::default()
+                    }
+                ),
+                Err(WindowsProcessPayloadError::Unsupported)
+            ));
+        }
+        assert!(matches!(
+            validate(
+                2,
+                8,
+                321,
+                321,
+                12,
+                12,
+                TestOverrides {
+                    missing_sidecar: true,
+                    ..TestOverrides::default()
+                }
+            ),
+            Err(WindowsProcessPayloadError::Malformed)
+        ));
+    }
 }

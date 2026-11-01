@@ -62,14 +62,14 @@ fn fixture(status: CollectionStatus) -> Vec<u8> {
             record_ordinal: 1,
             provider_guid: "{3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c}".to_owned(),
             event_id: 0,
-            event_version: 0,
+            event_version: 2,
             opcode: 1,
             event_kind: "process_start".to_owned(),
             header_process_id: 8,
             header_thread_id: 9,
-            header_flags: 0,
+            header_flags: 0x0040,
             timestamp_qpc: 10,
-            raw_payload_hex: "01".to_owned(),
+            raw_payload_hex: "00000000000000002a00000001000000".to_owned(),
             payload_decoding: Some(DecodedProcessPayload {
                 status: ProcessDecodeStatus::Decoded,
                 schema_name: Some("Process_V2_TypeGroup1".to_owned()),
@@ -293,7 +293,7 @@ fn events_windows_runtime_validates_capture_and_preserves_source_context() {
     );
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["schema"], "sideeffect.common_event_envelope");
-    assert_eq!(envelope["schema_version"], 3);
+    assert_eq!(envelope["schema_version"], 4);
     assert_eq!(envelope["source"]["platform"], "windows");
     assert_eq!(envelope["source"]["schema"], WINDOWS_RUNTIME_CAPTURE_SCHEMA);
     assert_eq!(
@@ -369,7 +369,7 @@ fn timeline_windows_runtime_filters_kind_and_preserves_source_evidence_and_diagn
     );
     let timeline: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(timeline["schema"], "sideeffect.event_timeline");
-    assert_eq!(timeline["schema_version"], 3);
+    assert_eq!(timeline["schema_version"], 4);
     assert_eq!(timeline["source"]["platform"], "windows");
     assert_eq!(timeline["source"]["schema"], WINDOWS_RUNTIME_CAPTURE_SCHEMA);
     assert_eq!(timeline["source_state"]["completeness"], "partial");
@@ -440,7 +440,7 @@ fn timeline_windows_process_observation_preserves_candidate_link_and_partial_sta
 
     assert_eq!(output.status.code(), Some(2));
     let timeline: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(timeline["schema_version"], 3);
+    assert_eq!(timeline["schema_version"], 4);
     assert_eq!(timeline["filter"]["process_observation_id"], 1);
     assert_eq!(timeline["source_state"]["completeness"], "partial");
     assert_eq!(timeline["items"].as_array().unwrap().len(), 1);
@@ -461,15 +461,12 @@ fn timeline_windows_process_observation_preserves_candidate_link_and_partial_sta
         timeline["event_process_links"][0]["role"],
         "windows_process_start_payload"
     );
-    assert_eq!(
-        timeline["event_process_links"][0]["status"],
-        "context_candidate"
-    );
+    assert_eq!(timeline["event_process_links"][0]["status"], "observed");
     assert!(
         timeline["event_process_links"][0]["basis"]
             .as_str()
             .unwrap()
-            .contains("not re-decoded")
+            .contains("raw_process_payload_ids_match")
     );
     assert!(
         timeline["diagnostics"]
@@ -685,7 +682,7 @@ fn graph_windows_runtime_keeps_pid_context_separate_from_process_instance() {
     assert_eq!(output.status.code(), Some(2));
     let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(graph["schema"], "sideeffect.event_graph");
-    assert_eq!(graph["schema_version"], 3);
+    assert_eq!(graph["schema_version"], 4);
     assert_eq!(graph["filter"]["event_kind"], "process_start");
     assert_eq!(graph["source_state"]["completeness"], "partial");
     let nodes = graph["nodes"].as_array().unwrap();
@@ -712,7 +709,7 @@ fn graph_windows_runtime_keeps_pid_context_separate_from_process_instance() {
     }));
     assert!(graph["edges"].as_array().unwrap().iter().any(|edge| {
         edge["kind"] == "event_process_link"
-            && edge["event_link_status"] == "context_candidate"
+            && edge["event_link_status"] == "observed"
             && edge["to_node_id"] == instance["id"]
     }));
 }
@@ -737,7 +734,7 @@ fn graph_process_observation_filter_preserves_candidate_context_and_relationship
 
     assert_eq!(output.status.code(), Some(2));
     let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(graph["schema_version"], 3);
+    assert_eq!(graph["schema_version"], 4);
     assert_eq!(graph["filter"]["event_kind"], Value::Null);
     assert_eq!(graph["filter"]["process_observation_id"], 1);
     assert_eq!(graph["source_state"]["completeness"], "partial");
@@ -752,17 +749,20 @@ fn graph_process_observation_filter_preserves_candidate_context_and_relationship
     let selected_process = nodes.iter().find(|node| node["id"] == "process:1").unwrap();
     assert_eq!(
         selected_process["process_observation"]["identity"]["identity_status"],
-        "decoder_metadata_unverified"
+        "observed_start"
     );
     let event = nodes.iter().find(|node| node["kind"] == "event").unwrap();
     assert_eq!(event["event"]["event_kind"], "process_start");
     assert_eq!(event["evidence"]["json_pointer"], "/events/0");
     assert!(graph["edges"].as_array().unwrap().iter().any(|edge| {
         edge["kind"] == "event_process_link"
-            && edge["event_link_status"] == "context_candidate"
+            && edge["event_link_status"] == "observed"
             && edge["event_link_role"] == "windows_process_start_payload"
             && edge["to_node_id"] == "process:1"
-            && edge["basis"].as_str().unwrap().contains("not re-decoded")
+            && edge["basis"]
+                .as_str()
+                .unwrap()
+                .contains("raw_process_payload_ids_match")
     }));
     assert!(graph["edges"].as_array().unwrap().iter().any(|edge| {
         edge["kind"] == "process_relationship"
@@ -984,7 +984,7 @@ fn events_windows_runtime_keeps_malformed_network_payload_unresolved() {
 
 #[cfg(windows)]
 #[test]
-fn events_windows_runtime_labels_serialized_decoder_metadata_as_unverified() {
+fn events_windows_runtime_keeps_truncated_process_payload_unresolved() {
     let mut value: Value = serde_json::from_slice(&fixture(CollectionStatus::Partial)).unwrap();
     value["events"][0]["raw_payload_hex"] = json!("01");
     value["events"][0]["payload_decoding"]["process_id"] = json!(1000);
@@ -994,18 +994,15 @@ fn events_windows_runtime_labels_serialized_decoder_metadata_as_unverified() {
     assert_eq!(output.status.code(), Some(2));
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
-        envelope["process_observations"][0]["identity"]["identity_status"],
-        "decoder_metadata_unverified"
+        envelope["process_observations"].as_array().unwrap().len(),
+        0
     );
-    assert_eq!(
-        envelope["event_process_links"][0]["status"],
-        "context_candidate"
-    );
+    assert_eq!(envelope["event_process_links"][0]["status"], "unresolved");
     assert!(
         envelope["event_process_links"][0]["basis"]
             .as_str()
             .unwrap()
-            .contains("not re-decoded from raw payload bytes")
+            .contains("process_payload_malformed")
     );
 }
 
@@ -1061,7 +1058,7 @@ fn events_windows_runtime_invalid_start_invalidates_active_pid_before_network_ev
             .as_array()
             .unwrap()
             .iter()
-            .any(|diagnostic| { diagnostic["code"] == "process_start_payload_unavailable" })
+            .any(|diagnostic| { diagnostic["code"] == "process_payload_unsupported" })
     );
 }
 
@@ -1148,6 +1145,7 @@ fn events_windows_runtime_resolves_parent_pid_only_to_active_unique_start_instan
     parent["payload_decoding"]["process_id"] = json!(1);
     parent["payload_decoding"]["parent_process_id"] = json!(0);
     parent["payload_decoding"]["image_file_name"] = json!("parent.exe");
+    parent["raw_payload_hex"] = json!("00000000000000000100000000000000");
     value["events"] = json!([parent, child]);
     let (path, output) = with_events_input(&rehashed_capture(value));
     fs::remove_file(path).unwrap();
@@ -1156,7 +1154,7 @@ fn events_windows_runtime_resolves_parent_pid_only_to_active_unique_start_instan
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         envelope["process_relationships"][0]["resolution"],
-        "decoder_metadata_unverified"
+        "observed"
     );
     assert_eq!(
         envelope["process_relationships"][0]["from_observation_id"],
@@ -1197,7 +1195,7 @@ fn events_windows_runtime_closes_matching_process_instance_with_end_evidence() {
             .iter()
             .any(|link| {
                 link["role"] == "windows_process_end_payload"
-                    && link["status"] == "context_candidate"
+                    && link["status"] == "observed"
                     && link["process_observation_id"] == 1
                     && link["event"]["json_pointer"] == "/events/1"
             })
@@ -1337,7 +1335,10 @@ fn evidence_lookup_resolves_validated_capture_ordinal_and_payload_digest() {
     let bytes = fixture(CollectionStatus::Complete);
     let value: Value = serde_json::from_slice(&bytes).unwrap();
     let capture_digest = value["document_sha256"].as_str().unwrap();
-    let payload_digest = format!("{:x}", Sha256::digest([1u8]));
+    let payload_digest = format!(
+        "{:x}",
+        Sha256::digest([0u8, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 1, 0, 0, 0])
+    );
     let (path, output) = with_evidence_input(&bytes, capture_digest, "1", &payload_digest);
 
     assert_eq!(output.status.code(), Some(2));
@@ -1362,7 +1363,10 @@ fn evidence_lookup_resolves_validated_capture_ordinal_and_payload_digest() {
         report["decode_metadata_status"],
         "serialized_metadata_not_independently_verified"
     );
-    assert_eq!(report["event"]["raw_payload_hex"], "01");
+    assert_eq!(
+        report["event"]["raw_payload_hex"],
+        "00000000000000002a00000001000000"
+    );
     fs::remove_file(path).unwrap();
 }
 
@@ -1372,7 +1376,10 @@ fn evidence_lookup_rejects_mismatched_capture_payload_and_missing_ordinal() {
     let bytes = fixture(CollectionStatus::Complete);
     let value: Value = serde_json::from_slice(&bytes).unwrap();
     let capture_digest = value["document_sha256"].as_str().unwrap();
-    let payload_digest = format!("{:x}", Sha256::digest([1u8]));
+    let payload_digest = format!(
+        "{:x}",
+        Sha256::digest([0u8, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 1, 0, 0, 0])
+    );
 
     let (path, wrong_capture) = with_evidence_input(&bytes, &"0".repeat(64), "1", &payload_digest);
     assert_eq!(wrong_capture.status.code(), Some(1));
@@ -1404,7 +1411,10 @@ fn evidence_lookup_preserves_partial_capture_state() {
     let bytes = fixture(CollectionStatus::Partial);
     let value: Value = serde_json::from_slice(&bytes).unwrap();
     let capture_digest = value["document_sha256"].as_str().unwrap();
-    let payload_digest = format!("{:x}", Sha256::digest([1u8]));
+    let payload_digest = format!(
+        "{:x}",
+        Sha256::digest([0u8, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 1, 0, 0, 0])
+    );
     let (path, output) = with_evidence_input(&bytes, capture_digest, "1", &payload_digest);
 
     assert_eq!(output.status.code(), Some(2));
