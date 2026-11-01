@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const REGISTRY_SCHEMA: &str = "sideeffect.local_model_registry";
-pub const REGISTRY_SCHEMA_VERSION: u32 = 1;
+pub const REGISTRY_SCHEMA_VERSION: u32 = 2;
 pub const MAX_REGISTRY_BYTES: usize = 64 * 1024;
 pub const MAX_REGISTERED_MODELS: usize = 32;
 pub const MAX_MODEL_NAME_BYTES: usize = 128;
@@ -22,6 +22,8 @@ pub const MAX_MODEL_PATH_BYTES: usize = 32 * 1024;
 /// The largest model file currently supported by any one local analysis path.
 /// Task-specific limits are enforced below before registration and use.
 pub const MAX_MODEL_FILE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+/// Bound work spent verifying a user-selected executable before an analysis.
+pub const MAX_RUNTIME_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 
 pub fn model_file_size_limit(task: ModelTask) -> u64 {
     max_bytes_for_task(task)
@@ -161,6 +163,14 @@ pub struct RegisteredModel {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ConfiguredRuntime {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelRegistry {
     pub schema: String,
     pub schema_version: u32,
@@ -168,6 +178,20 @@ pub struct ModelRegistry {
     pub accepted_licenses: Vec<AcceptedModelLicense>,
     pub custom_models: Vec<RegisteredModel>,
     pub selected_by_task: BTreeMap<ModelTask, String>,
+    /// User-selected existing local llama.cpp executable paths. These paths
+    /// are configuration only; setting or displaying them never executes a runtime.
+    pub runtime_by_task: BTreeMap<ModelTask, ConfiguredRuntime>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelRegistryV1 {
+    schema: String,
+    schema_version: u32,
+    #[serde(default)]
+    accepted_licenses: Vec<AcceptedModelLicense>,
+    custom_models: Vec<RegisteredModel>,
+    selected_by_task: BTreeMap<ModelTask, String>,
 }
 
 /// Holds the cross-process exclusive lock for one registry read-modify-write
@@ -233,6 +257,7 @@ impl Default for ModelRegistry {
             accepted_licenses: Vec::new(),
             custom_models: Vec::new(),
             selected_by_task: BTreeMap::new(),
+            runtime_by_task: BTreeMap::new(),
         }
     }
 }
@@ -266,8 +291,40 @@ impl ModelRegistry {
         if bytes.len() > MAX_REGISTRY_BYTES {
             return Err(format!("model registry exceeds {MAX_REGISTRY_BYTES} bytes"));
         }
-        let registry: Self = serde_json::from_slice(bytes)
+        let header: serde_json::Value = serde_json::from_slice(bytes)
             .map_err(|error| format!("could not parse model registry: {error}"))?;
+        let schema = header
+            .get("schema")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "model registry schema is missing or invalid".to_owned())?;
+        if schema != REGISTRY_SCHEMA {
+            return Err("model registry schema or version is unsupported".to_owned());
+        }
+        let version = header
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| "model registry schema version is missing or invalid".to_owned())?;
+        let registry = match version {
+            1 => {
+                let old: ModelRegistryV1 = serde_json::from_slice(bytes)
+                    .map_err(|error| format!("could not parse model registry v1: {error}"))?;
+                if old.schema != REGISTRY_SCHEMA || old.schema_version != 1 {
+                    return Err("model registry schema or version is unsupported".to_owned());
+                }
+                Self {
+                    schema: old.schema,
+                    schema_version: REGISTRY_SCHEMA_VERSION,
+                    accepted_licenses: old.accepted_licenses,
+                    custom_models: old.custom_models,
+                    selected_by_task: old.selected_by_task,
+                    runtime_by_task: BTreeMap::new(),
+                }
+            }
+            REGISTRY_SCHEMA_VERSION => serde_json::from_slice(bytes)
+                .map_err(|error| format!("could not parse model registry v2: {error}"))?,
+            _ => return Err("model registry schema or version is unsupported".to_owned()),
+        };
         registry.validate()?;
         Ok(registry)
     }
@@ -319,6 +376,24 @@ impl ModelRegistry {
         for (task, id) in &self.selected_by_task {
             if id.len() > 96 || !is_safe_id(id) || !model_supports(task, id, &self.custom_models) {
                 return Err("selected model ID is invalid or unsupported for its task".to_owned());
+            }
+        }
+        if self.runtime_by_task.len() > 3 {
+            return Err("model registry contains too many runtime paths".to_owned());
+        }
+        for runtime in self.runtime_by_task.values() {
+            if !runtime.path.is_absolute()
+                || runtime.path.as_os_str().is_empty()
+                || runtime.path.to_string_lossy().len() > MAX_MODEL_PATH_BYTES
+                || runtime.size_bytes == 0
+                || runtime.size_bytes > MAX_RUNTIME_FILE_BYTES
+                || runtime.sha256.len() != 64
+                || !runtime.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(
+                    "configured runtime metadata is invalid or exceeds a configured limit"
+                        .to_owned(),
+                );
             }
         }
         Ok(())
@@ -436,6 +511,27 @@ impl ModelRegistry {
         self.resolve(id, task)
     }
 
+    pub fn set_runtime(
+        &mut self,
+        task: ModelTask,
+        path: &Path,
+    ) -> Result<ConfiguredRuntime, String> {
+        if path.as_os_str().is_empty() || path.to_string_lossy().len() > MAX_MODEL_PATH_BYTES {
+            return Err("runtime path is empty or exceeds the path length limit".to_owned());
+        }
+        let resolved = path
+            .canonicalize()
+            .map_err(|_| "runtime path does not identify an existing local file".to_owned())?;
+        let runtime = inspect_runtime_file(&resolved)?;
+        self.runtime_by_task.insert(task, runtime.clone());
+        self.validate()?;
+        Ok(runtime)
+    }
+
+    pub fn clear_runtime(&mut self, task: ModelTask) -> Result<bool, String> {
+        Ok(self.runtime_by_task.remove(&task).is_some())
+    }
+
     pub fn resolve(&self, id: &str, task: ModelTask) -> Result<ResolvedModel, String> {
         if let Some(catalog) = catalog_model(id) {
             if catalog.task != task {
@@ -486,6 +582,100 @@ impl ModelRegistry {
             recommended: false,
         })
     }
+}
+
+/// Re-hash a configured runtime without executing it. This detects replacement
+/// or modification since configuration; callers still must treat the runtime
+/// and its dependencies as executable code.
+pub fn verify_configured_runtime(runtime: &ConfiguredRuntime) -> Result<(), String> {
+    let current = inspect_runtime_file(&runtime.path)?;
+    if current != *runtime {
+        return Err(
+            "configured runtime file changed since it was saved; configure it again".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn inspect_runtime_file(path: &Path) -> Result<ConfiguredRuntime, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| "runtime path does not identify an existing local file".to_owned())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("runtime path must identify a plain regular file".to_owned());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("runtime path must not be a Windows reparse point".to_owned());
+        }
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_RUNTIME_FILE_BYTES {
+        return Err("runtime file is empty or exceeds the configured size limit".to_owned());
+    }
+    let canonical = fs::canonicalize(path)
+        .map_err(|_| "runtime path does not identify an existing local file".to_owned())?;
+    if canonical.as_os_str().to_string_lossy().len() > MAX_MODEL_PATH_BYTES {
+        return Err("runtime path exceeds its maximum length".to_owned());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options
+        .open(&canonical)
+        .map_err(|_| "could not open runtime file for verification".to_owned())?;
+    let opened = file
+        .metadata()
+        .map_err(|_| "could not inspect runtime file for verification".to_owned())?;
+    if !opened.is_file() || opened.len() != metadata.len() || opened.len() > MAX_RUNTIME_FILE_BYTES
+    {
+        return Err(
+            "runtime file changed or exceeded its size limit during verification".to_owned(),
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("runtime path resolves to a reparse point".to_owned());
+        }
+    }
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| "could not read runtime file for verification".to_owned())?;
+        if count == 0 {
+            break;
+        }
+        total = total
+            .checked_add(count as u64)
+            .filter(|size| *size <= MAX_RUNTIME_FILE_BYTES)
+            .ok_or_else(|| "runtime file exceeded its size limit during verification".to_owned())?;
+        hasher.update(&buffer[..count]);
+    }
+    if total != opened.len() {
+        return Err("runtime file changed while it was being verified".to_owned());
+    }
+    Ok(ConfiguredRuntime {
+        path: canonical,
+        size_bytes: total,
+        sha256: format!("{:x}", hasher.finalize()),
+    })
 }
 
 pub fn catalog_model(id: &str) -> Option<&'static CatalogModel> {

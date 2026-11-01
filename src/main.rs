@@ -6,7 +6,7 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::process::ExitStatusExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -80,13 +80,14 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect explain --inventory-diff <before.json> <after.json>\n\
        sideeffect compare-sessions <before-session-directory> <after-session-directory>\n\
        sideeffect model-preview --question <question> <strace-trace-file>\n\
-       sideeffect model-analyze --question <question> --runtime <llama-cli> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
+       sideeffect model-analyze --question <question> [--runtime <llama-cli>] --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect model-explain-preview --question <question> --backend auto|cpu|cuda <strace-trace-file>\n\
-       sideeffect model-explain --question <question> --backend auto|cpu|cuda --runtime <llama-completion> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
+       sideeffect model-explain --question <question> --backend auto|cpu|cuda [--runtime <llama-completion>] --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect model-query-preview --question <question> <strace-trace-file>\n\
-       sideeffect model-query --question <question> --runtime <llama-completion> --confirm-sha256 <preview-digest> <strace-trace-file>\n\
+       sideeffect model-query --question <question> [--runtime <llama-completion>] --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect model list | show <id> | install <id> | setup <id> | add | select <task> <id> | remove <id>\n\
-       sideeffect model doctor --task explanation --runtime <llama-completion> [--backend auto|cpu|cuda]\n\
+       sideeffect model runtime set <task> <existing-file> | show [task] | clear <task>\n\
+       sideeffect model doctor --task explanation [--runtime <llama-completion>] [--backend auto|cpu|cuda]\n\
        sideeffect correlate-startup <startup-inventory.json> <strace-trace-file>\n\
        sideeffect associated-behavior <startup-inventory.json> <runtime-evidence-file>\n\
        sideeffect attribute --windows-runtime <capture.json>\n\
@@ -200,13 +201,38 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         [command, operation, task, id] if command == "model" && operation == "select" => {
             model_select(task, id)
         }
+        [command, operation, action, task, path]
+            if command == "model" && operation == "runtime" && action == "set" =>
+        {
+            model_runtime_set(task, path)
+        }
+        [command, operation, action, task]
+            if command == "model" && operation == "runtime" && action == "show" =>
+        {
+            model_runtime_show(Some(task))
+        }
+        [command, operation, action]
+            if command == "model" && operation == "runtime" && action == "show" =>
+        {
+            model_runtime_show(None)
+        }
+        [command, operation, action, task]
+            if command == "model" && operation == "runtime" && action == "clear" =>
+        {
+            model_runtime_clear(task)
+        }
+        [command, operation, task_flag, task]
+            if command == "model" && operation == "doctor" && task_flag == "--task" =>
+        {
+            model_doctor(task, None, None)
+        }
         [command, operation, task_flag, task, runtime_flag, runtime]
             if command == "model"
                 && operation == "doctor"
                 && task_flag == "--task"
                 && runtime_flag == "--runtime" =>
         {
-            model_doctor(task, runtime, None)
+            model_doctor(task, Some(runtime), None)
         }
         [
             command,
@@ -223,7 +249,15 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             && runtime_flag == "--runtime"
             && backend_flag == "--backend" =>
         {
-            model_doctor(task, runtime, Some(backend))
+            model_doctor(task, Some(runtime), Some(backend))
+        }
+        [command, operation, task_flag, task, backend_flag, backend]
+            if command == "model"
+                && operation == "doctor"
+                && task_flag == "--task"
+                && backend_flag == "--backend" =>
+        {
+            model_doctor(task, None, Some(backend))
         }
         [command, operation, id] if command == "model" && operation == "remove" => model_remove(id),
         [command, operation, arguments @ ..] if command == "model" && operation == "add" => {
@@ -358,7 +392,23 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             && runtime_flag == "--runtime"
             && confirm_flag == "--confirm-sha256" =>
         {
-            model_explanation_file(question, backend, runtime, digest, trace)
+            model_explanation_file(question, backend, Some(runtime), digest, trace)
+        }
+        [
+            command,
+            question_flag,
+            question,
+            backend_flag,
+            backend,
+            confirm_flag,
+            digest,
+            trace,
+        ] if command == "model-explain"
+            && question_flag == "--question"
+            && backend_flag == "--backend"
+            && confirm_flag == "--confirm-sha256" =>
+        {
+            model_explanation_file(question, backend, None, digest, trace)
         }
         [
             command,
@@ -374,7 +424,20 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             && runtime_flag == "--runtime"
             && confirm_flag == "--confirm-sha256" =>
         {
-            model_analyze_file(question, runtime, digest, trace)
+            model_analyze_file(question, Some(runtime), digest, trace)
+        }
+        [
+            command,
+            question_flag,
+            question,
+            confirm_flag,
+            digest,
+            trace,
+        ] if command == "model-analyze"
+            && question_flag == "--question"
+            && confirm_flag == "--confirm-sha256" =>
+        {
+            model_analyze_file(question, None, digest, trace)
         }
         [
             command,
@@ -390,7 +453,20 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             && runtime_flag == "--runtime"
             && confirm_flag == "--confirm-sha256" =>
         {
-            model_query_file(question, runtime, digest, trace)
+            model_query_file(question, Some(runtime), digest, trace)
+        }
+        [
+            command,
+            question_flag,
+            question,
+            confirm_flag,
+            digest,
+            trace,
+        ] if command == "model-query"
+            && question_flag == "--question"
+            && confirm_flag == "--confirm-sha256" =>
+        {
+            model_query_file(question, None, digest, trace)
         }
         [command, diff_flag, left, right] if command == "explain" && diff_flag == "--diff" => {
             explain_diff_files(left, right)
@@ -1615,13 +1691,13 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect attribute --windows-runtime CAPTURE.json\nWrites a separate evidence-linked candidate view over a validated Windows ETW v3 capture. Descendant process links require supported process-start payloads and observed active parent IDs. Network association uses the decoded payload process ID. File and disk header PIDs remain context candidates, not ownership. Capture bytes are unchanged. Missing lifecycle data, ambiguity, unsupported records, or reported/unavailable loss is surfaced as partial or unassigned evidence; no causal or absence claims are made."
         }
         "model" => {
-            "Usage: sideeffect model list\n       sideeffect model show ID\n       sideeffect model install ID\n       sideeffect model setup ID\n       sideeffect model add --name NAME --path FILE --for evidence|explanation|query [--license ID]\n       sideeffect model select evidence|explanation|query ID\n       sideeffect model remove ID\n       sideeffect model doctor --task explanation --runtime LLAMA_COMPLETION [--backend auto|cpu|cuda]\n\nLists pinned catalog candidates and user-provided models. Catalog evaluation status is shown separately from runtime compatibility. Installing a catalog model requires explicit license acceptance; analysis never downloads weights implicitly. The setup command installs and selects the catalog model for its declared task. Registering a local model records its size and SHA-256, but does not verify task compatibility, licensing, or quality. Removing a custom registration leaves the model file untouched. Select a model for its task before running a model preview."
+            "Usage: sideeffect model list\n       sideeffect model show ID\n       sideeffect model install ID\n       sideeffect model setup ID\n       sideeffect model add --name NAME --path FILE --for evidence|explanation|query [--license ID]\n       sideeffect model select evidence|explanation|query ID\n       sideeffect model remove ID\n       sideeffect model runtime set evidence|explanation|query EXISTING_FILE\n       sideeffect model runtime show [evidence|explanation|query]\n       sideeffect model runtime clear evidence|explanation|query\n       sideeffect model doctor --task explanation [--runtime LLAMA_COMPLETION] [--backend auto|cpu|cuda]\n\nLists pinned catalog candidates and user-provided models. Catalog evaluation status is shown separately from runtime compatibility. Installing a catalog model requires explicit license acceptance; analysis never downloads weights implicitly. The setup command installs and selects the catalog model for its declared task. Runtime configuration stores a per-task path without executing the file; runtime revision checks happen only when doctor or analysis is run. Catalog models still carry their task-specific evaluation warnings, and no model is approved for answer quality. Registering a local model records its size and SHA-256, but does not verify task compatibility, licensing, or quality. Removing a custom registration leaves the model file untouched. Select a model for its task before running a model preview."
         }
         "model doctor" => {
-            "Usage: sideeffect model doctor --task explanation --runtime LLAMA_COMPLETION [--backend auto|cpu|cuda]\nChecks the selected explanation model registration and SHA-256, then runs only bounded runtime version and (unless CPU is selected) device-enumeration checks. It does not read a trace, load model weights for inference, or run inference. A reported CUDA device is not proof of successful GPU inference. The selected runtime is executable code and must be trusted separately."
+            "Usage: sideeffect model doctor --task explanation [--runtime LLAMA_COMPLETION] [--backend auto|cpu|cuda]\nUses --runtime when supplied, otherwise the configured explanation runtime. It checks the selected model registration and SHA-256, then runs only bounded runtime version and (unless CPU is selected) device-enumeration checks. It does not read a trace, load model weights, or run inference. A reported CUDA device is not proof of successful GPU inference. The selected runtime is executable code and must be trusted separately."
         }
         "model setup" => {
-            "Usage: sideeffect model setup MODEL_ID\nShows the catalog license and model evaluation status, downloads the exact pinned file after explicit typed acceptance, verifies its size and SHA-256, then selects it for its declared task. The local inference runtime is installed or built separately and its path is still supplied to analysis commands."
+            "Usage: sideeffect model setup MODEL_ID\nShows the catalog license and model evaluation status, downloads the exact pinned file after explicit typed acceptance, verifies its size and SHA-256, then selects it for its declared task. The local inference runtime is obtained separately; configure its existing path with 'sideeffect model runtime set TASK PATH' or pass --runtime on an analysis command."
         }
         "model list" => {
             "Usage: sideeffect model list\nLists pinned catalog candidates, installation status, task, license, exact size, evaluation status, and selected model per task. Every listed model's SHA-256 is rechecked before use."
@@ -1635,23 +1711,26 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         "model remove" => {
             "Usage: sideeffect model remove MODEL_ID\nFor a catalog model, requires typing the exact ID and removes only that verified catalog file plus task selections. For a user-provided model, removes only its registration; the original file is left untouched."
         }
+        "model runtime" => {
+            "Usage: sideeffect model runtime set evidence|explanation|query EXISTING_FILE\n       sideeffect model runtime show [evidence|explanation|query]\n       sideeffect model runtime clear evidence|explanation|query\nSet accepts an existing regular file and stores its canonical path in the private per-user registry. Set, show, and clear do not execute the path. Show marks missing or changed entries; reset them with set. Explicit --runtime paths override the configured path. The runtime and its libraries are executable dependencies; use only files you trust."
+        }
         "model-preview" => {
             "Usage: sideeffect model-preview --question QUESTION TRACE\nPreviews the bounded typed facts, selected evidence model identity, JSON schema, and request digest. Select and install a model first with the model commands. Review this exact request before confirming local analysis. Partial parsing is visible and exits with status 2."
         }
         "model-analyze" => {
-            "Usage: sideeffect model-analyze --question QUESTION --runtime LLAMA_CLI --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the selected local evidence model on Linux x86_64 after explicit digest confirmation. The model may select at most one source evidence ID as an unverified hint; it can be wrong and is not a finding. SideEffect does not upload evidence. See docs/LOCAL_MODEL_EVALUATION.md."
+            "Usage: sideeffect model-analyze --question QUESTION [--runtime LLAMA_CLI] --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the selected local evidence model on Linux x86_64 after explicit digest confirmation, using --runtime when supplied or the configured evidence runtime. The model may select at most one source evidence ID as an unverified hint; it can be wrong and is not a finding. SideEffect does not upload evidence. See docs/LOCAL_MODEL_EVALUATION.md."
         }
         "model-explain-preview" => {
             "Usage: sideeffect model-explain-preview --question QUESTION --backend auto|cpu|cuda TRACE\nPreviews the bounded typed evidence, coverage, and selected explanation model identity. Review the exact prompt and digest before inference. 'auto' prefers a supported GPU and otherwise reports CPU use; it does not silently fall back after a GPU failure. This command does not run a model."
         }
         "model-explain" => {
-            "Usage: sideeffect model-explain --question QUESTION --backend auto|cpu|cuda --runtime LLAMA_COMPLETION --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the selected local model after confirmation of the exact evidence preview. The model may select up to five syscall-result evidence IDs; SideEffect returns only the exact matching preview rows. This is an unverified evidence-selection aid, not an answer or finding. 'auto' prefers CUDA when the pinned runtime reports a device; CUDA errors do not silently fall back to CPU. SideEffect does not upload data or auto-download a model during analysis. The selected runtime is executable code that must be trusted separately; see docs/LOCAL_MODEL_EXPLANATION_EVALUATION.md."
+            "Usage: sideeffect model-explain --question QUESTION --backend auto|cpu|cuda [--runtime LLAMA_COMPLETION] --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the selected local model after confirmation of the exact evidence preview, using --runtime when supplied or the configured explanation runtime. The model may select up to five syscall-result evidence IDs; SideEffect returns only the exact matching preview rows. This is an unverified evidence-selection aid, not an answer or finding. 'auto' prefers CUDA when the pinned runtime reports a device; CUDA errors do not silently fall back to CPU. SideEffect does not upload data or auto-download a model during analysis. The selected runtime is executable code that must be trusted separately; see docs/LOCAL_MODEL_EXPLANATION_EVALUATION.md."
         }
         "model-query-preview" => {
             "Usage: sideeffect model-query-preview --question QUESTION TRACE\nPreviews the bounded local query request, selected model identity, and typed evidence facts. Queryable facts are shown for review but are not sent to the model. Review this exact question, scope, and digest before optional local inference. Partial input exits with status 2."
         }
         "model-query" => {
-            "Usage: sideeffect model-query --question QUESTION --runtime LLAMA_COMPLETION --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the selected optional local query model on Linux x86_64 only after explicit preview-digest confirmation. It executes only validated exact-match AND filters over observed typed facts, never commands or model-authored expressions. No model is downloaded during analysis or evidence uploaded. Model results are unverified review aids. See docs/LOCAL_QUERY_PLAN_EVALUATION.md."
+            "Usage: sideeffect model-query --question QUESTION [--runtime LLAMA_COMPLETION] --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the selected optional local query model on Linux x86_64 only after explicit preview-digest confirmation, using --runtime when supplied or the configured query runtime. It executes only validated exact-match AND filters over observed typed facts, never commands or model-authored expressions. No model is downloaded during analysis or evidence uploaded. Model results are unverified review aids. See docs/LOCAL_QUERY_PLAN_EVALUATION.md."
         }
         _ => return Err(format!("unknown help topic: {topic}\n\n{USAGE}")),
     };
@@ -3250,7 +3329,7 @@ fn model_explanation_preview_file(
 
 fn model_query_file(
     question: &OsString,
-    runtime: &OsString,
+    runtime: Option<&OsString>,
     digest: &OsString,
     trace: &OsString,
 ) -> Result<ExitCode, String> {
@@ -3269,12 +3348,9 @@ fn model_query_file(
     }
     let bytes = read_bounded(trace)?;
     let model = selected_model(ModelTask::QueryPlan)?;
+    let runtime = resolve_runtime_path(ModelTask::QueryPlan, runtime)?;
     let analysis = sideeffect::local_query_plan::analyze_query_plan_bytes_for_model(
-        &bytes,
-        question,
-        Path::new(runtime),
-        &model,
-        digest,
+        &bytes, question, &runtime, &model, digest,
     )?;
     let partial = analysis.coverage["parse_status"] == "partial";
     write_json(&analysis, "local query-plan analysis")?;
@@ -3288,7 +3364,7 @@ fn model_query_file(
 fn model_explanation_file(
     question: &OsString,
     backend: &OsString,
-    runtime: &OsString,
+    runtime: Option<&OsString>,
     digest: &OsString,
     trace: &OsString,
 ) -> Result<ExitCode, String> {
@@ -3313,14 +3389,10 @@ fn model_explanation_file(
     }
     let bytes = read_bounded(trace)?;
     let model = selected_model(ModelTask::Explanation)?;
+    let runtime = resolve_runtime_path(ModelTask::Explanation, runtime)?;
     let analysis =
         sideeffect::local_model_explanation_runtime::analyze_model_explanation_bytes_for_model(
-            &bytes,
-            question,
-            backend,
-            Path::new(runtime),
-            &model,
-            digest,
+            &bytes, question, backend, &runtime, &model, digest,
         )?;
     let selected = analysis.interpretation.selection_status
         == sideeffect::local_model_explanation::ExplanationSelectionStatus::Selected;
@@ -3334,7 +3406,7 @@ fn model_explanation_file(
 
 fn model_analyze_file(
     question: &OsString,
-    runtime: &OsString,
+    runtime: Option<&OsString>,
     digest: &OsString,
     trace: &OsString,
 ) -> Result<ExitCode, String> {
@@ -3353,12 +3425,9 @@ fn model_analyze_file(
     }
     let bytes = read_bounded(trace)?;
     let model = selected_model(ModelTask::EvidenceSelection)?;
+    let runtime = resolve_runtime_path(ModelTask::EvidenceSelection, runtime)?;
     let analysis = sideeffect::local_model::analyze_trace_bytes_for_model(
-        &bytes,
-        question,
-        Path::new(runtime),
-        &model,
-        digest,
+        &bytes, question, &runtime, &model, digest,
     )?;
     let partial = analysis.evidence_summary["parse_status"] == "partial";
     write_json(&analysis, "local model evidence selection")?;
@@ -3379,19 +3448,66 @@ fn selected_model(task: ModelTask) -> Result<ResolvedModel, String> {
     sideeffect::model_manager::load_registry()?.selected(task)
 }
 
+fn resolve_runtime_path(task: ModelTask, explicit: Option<&OsString>) -> Result<PathBuf, String> {
+    if let Some(path) = explicit {
+        if path.is_empty()
+            || path.to_string_lossy().len() > sideeffect::model_manager::MAX_MODEL_PATH_BYTES
+        {
+            return Err("runtime path is empty or exceeds the path length limit".to_owned());
+        }
+        return Ok(PathBuf::from(path));
+    }
+
+    let configured = sideeffect::model_manager::load_registry()?
+        .runtime_by_task
+        .get(&task)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "no runtime is configured for {}; run 'sideeffect model runtime set {} PATH' or pass --runtime PATH",
+                model_task_label(task),
+                model_task_cli_name(task)
+            )
+        })?;
+    revalidate_configured_runtime_path(task, &configured).map(|runtime| runtime.path)
+}
+
+fn revalidate_configured_runtime_path(
+    task: ModelTask,
+    runtime: &sideeffect::model_manager::ConfiguredRuntime,
+) -> Result<sideeffect::model_manager::ConfiguredRuntime, String> {
+    let canonical = runtime.path.canonicalize().map_err(|_| {
+        format!(
+            "configured runtime for {} is missing or inaccessible; run 'sideeffect model runtime set {} PATH' again or pass --runtime PATH",
+            model_task_label(task),
+            model_task_cli_name(task)
+        )
+    })?;
+    if canonical != runtime.path {
+        return Err(format!(
+            "configured runtime for {} changed since it was saved; run 'sideeffect model runtime set {} PATH' again",
+            model_task_label(task),
+            model_task_cli_name(task)
+        ));
+    }
+    sideeffect::model_manager::verify_configured_runtime(runtime).map_err(|_| {
+        format!(
+            "configured runtime for {} is missing, changed, or invalid; run 'sideeffect model runtime set {} PATH' again or pass --runtime PATH",
+            model_task_label(task), model_task_cli_name(task)
+        )
+    })?;
+    Ok(runtime.clone())
+}
+
 fn model_doctor(
     task: &OsString,
-    runtime_path: &OsString,
+    runtime_path: Option<&OsString>,
     backend: Option<&OsString>,
 ) -> Result<ExitCode, String> {
     if task.to_str() != Some("explanation") {
         return Err("model doctor currently supports only --task explanation".to_owned());
     }
-    if runtime_path.is_empty()
-        || runtime_path.to_string_lossy().len() > sideeffect::model_manager::MAX_MODEL_PATH_BYTES
-    {
-        return Err("runtime path is empty or exceeds the path length limit".to_owned());
-    }
+    let runtime_path = resolve_runtime_path(ModelTask::Explanation, runtime_path)?;
     let backend_name = match backend {
         None => Some("auto"),
         Some(value) => value.to_str(),
@@ -3423,7 +3539,7 @@ fn model_doctor(
         }),
     };
     let runtime = sideeffect::local_model_explanation_runtime::doctor_explanation_runtime(
-        Path::new(runtime_path),
+        &runtime_path,
         backend,
     );
     let ready = model["status"] == "verified"
@@ -3765,6 +3881,79 @@ fn model_select(task: &OsString, id: &OsString) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn model_runtime_set(task: &OsString, path: &OsString) -> Result<ExitCode, String> {
+    let task = parse_model_task(task.to_str().ok_or("model task must be valid UTF-8")?)?;
+    if !model_task_supported_here(task) {
+        return Err(format!(
+            "local model task '{}' is not supported on this platform",
+            model_task_label(task)
+        ));
+    }
+    let resolved = sideeffect::model_manager::update_registry(|registry| {
+        registry.set_runtime(task, Path::new(path))
+    })?;
+    println!(
+        "Configured runtime path for {}: {}. This command did not execute the file; runtime compatibility is checked when you run doctor or analysis.",
+        model_task_label(task),
+        terminal_safe_path(&resolved.path)
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn model_runtime_show(task: Option<&OsString>) -> Result<ExitCode, String> {
+    let registry = sideeffect::model_manager::load_registry()?;
+    let tasks = if let Some(task) = task {
+        vec![parse_model_task(
+            task.to_str().ok_or("model task must be valid UTF-8")?,
+        )?]
+    } else {
+        vec![
+            ModelTask::EvidenceSelection,
+            ModelTask::Explanation,
+            ModelTask::QueryPlan,
+        ]
+    };
+    println!("Configured runtime paths (not executed by this command):");
+    for task in tasks {
+        match registry.runtime_by_task.get(&task) {
+            Some(runtime) => {
+                let status = if revalidate_configured_runtime_path(task, runtime).is_ok() {
+                    "available regular file"
+                } else {
+                    "missing, changed, or invalid; reconfigure before use"
+                };
+                println!(
+                    "- {}: {} ({status}; {} bytes; SHA-256 {})",
+                    model_task_cli_name(task),
+                    terminal_safe_path(&runtime.path),
+                    runtime.size_bytes,
+                    runtime.sha256
+                );
+            }
+            None => println!("- {}: not configured", model_task_cli_name(task)),
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn model_runtime_clear(task: &OsString) -> Result<ExitCode, String> {
+    let task = parse_model_task(task.to_str().ok_or("model task must be valid UTF-8")?)?;
+    let cleared =
+        sideeffect::model_manager::update_registry(|registry| registry.clear_runtime(task))?;
+    if cleared {
+        println!(
+            "Cleared the configured runtime path for {}.",
+            model_task_label(task)
+        );
+    } else {
+        println!(
+            "No runtime path was configured for {}.",
+            model_task_label(task)
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn model_remove(id: &OsString) -> Result<ExitCode, String> {
     let id = id.to_str().ok_or("model ID must be valid UTF-8")?;
     if sideeffect::model_manager::catalog_model(id).is_some() {
@@ -3803,6 +3992,14 @@ fn model_task_label(task: ModelTask) -> &'static str {
         ModelTask::EvidenceSelection => "evidence selection",
         ModelTask::Explanation => "explanation",
         ModelTask::QueryPlan => "query plan",
+    }
+}
+
+fn model_task_cli_name(task: ModelTask) -> &'static str {
+    match task {
+        ModelTask::EvidenceSelection => "evidence",
+        ModelTask::Explanation => "explanation",
+        ModelTask::QueryPlan => "query",
     }
 }
 

@@ -81,6 +81,7 @@ impl SelectedTestModel {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sideeffect"));
         command
             .env("XDG_DATA_HOME", &self.data_root)
+            .env("HOME", &self.data_root)
             .env("LOCALAPPDATA", &self.data_root);
         command
     }
@@ -91,6 +92,11 @@ impl SelectedTestModel {
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    #[allow(dead_code)]
+    pub fn data_root(&self) -> &std::path::Path {
+        &self.data_root
     }
 }
 
@@ -107,6 +113,7 @@ fn run_in_data_root<'a>(
     let mut command = Command::new(env!("CARGO_BIN_EXE_sideeffect"));
     command
         .env("XDG_DATA_HOME", data_root)
+        .env("HOME", data_root)
         .env("LOCALAPPDATA", data_root)
         .args(arguments)
         .output()
