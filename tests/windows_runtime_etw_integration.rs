@@ -171,6 +171,63 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
     } else {
         assert_ne!(target_identity_status, Some("observed_start"));
     }
+    let attribution_output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["attribute", "--windows-runtime"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        matches!(attribution_output.status.code(), Some(0 | 2)),
+        "attribution adapter failed on its real ETW capture: {}",
+        String::from_utf8_lossy(&attribution_output.stderr)
+    );
+    let attribution: Value = serde_json::from_slice(&attribution_output.stdout).unwrap();
+    assert_eq!(
+        attribution["schema"],
+        "sideeffect.windows_runtime_attribution"
+    );
+    assert_eq!(attribution["schema_version"], 2);
+    assert_eq!(attribution["target_process_id"], target_pid);
+    if target_version <= 3 {
+        assert_eq!(
+            attribution["target_start_status"],
+            "observed_once",
+            "supported target process-start version {target_version} was not raw-checked into attribution: {}",
+            serde_json::to_string(&attribution).unwrap()
+        );
+        let target_processes = attribution["processes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|process| process["role"] == "target")
+            .collect::<Vec<_>>();
+        assert_eq!(target_processes.len(), 1);
+        assert_eq!(target_processes[0]["process_id"], target_pid);
+        assert_eq!(
+            target_processes[0]["identity_status"],
+            "recorder_target_pid_matches_observed_process_start"
+        );
+        assert_eq!(
+            target_processes[0]["start_event"]["record_ordinal"],
+            events
+                .iter()
+                .find(|event| {
+                    event["event_kind"] == "process_start"
+                        && event["payload_decoding"]["process_id"] == target_pid
+                })
+                .unwrap()["record_ordinal"]
+        );
+    } else {
+        assert_eq!(attribution["status"], "partial");
+        assert_eq!(attribution["target_start_status"], "not_observed");
+        assert!(
+            attribution["processes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|process| process["role"] != "target")
+        );
+    }
     assert!(
         events.iter().any(|event| {
             event["observation_decoding"]["status"] == "decoded"
