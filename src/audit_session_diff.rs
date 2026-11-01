@@ -1097,7 +1097,14 @@ mod tests {
     fn path_executable_session_diff_suppresses_unmatched_candidates_for_partial_sources() {
         fn path_doc(candidate_status: &str, unmatched_name: &str) -> Vec<u8> {
             fn hex(bytes: &[u8]) -> String {
-                bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+                use std::fmt::Write as _;
+
+                let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+                for byte in bytes {
+                    write!(&mut output, "{byte:02x}")
+                        .expect("writing formatted bytes to String cannot fail");
+                }
+                output
             }
             let exact = |display: &str, bytes: &str| {
                 serde_json::json!({
