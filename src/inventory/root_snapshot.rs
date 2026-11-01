@@ -240,7 +240,7 @@ mod platform {
             display_path: root_path.to_string_lossy().into_owned(),
             path_bytes_hex: exact_hex(raw_path),
             object_type: "directory",
-            device_or_volume_serial: Some(root_stat.st_dev as u64),
+            device_or_volume_serial: Some(root_stat.st_dev),
             inode_or_file_index: (root_stat.st_ino != 0).then_some(root_stat.st_ino),
         });
         let dup_fd = unsafe { libc::fcntl(root_fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
@@ -345,7 +345,7 @@ mod platform {
                 object_type: object_type(stat.st_mode),
                 size_bytes: u64::try_from(stat.st_size).ok(),
                 modified_at_unix_ms: modified_ms(&stat),
-                device_or_volume_serial: Some(stat.st_dev as u64),
+                device_or_volume_serial: Some(stat.st_dev),
                 inode_or_file_index: Some(stat.st_ino),
                 evidence: RootEntryEvidence {
                     source: "selected_root_directory_entry",
