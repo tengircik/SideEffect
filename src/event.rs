@@ -13,9 +13,11 @@ use crate::model::{
 };
 
 pub const COMMON_EVENT_SCHEMA: &str = "sideeffect.common_event_envelope";
-pub const COMMON_EVENT_SCHEMA_VERSION: u32 = 2;
+pub const COMMON_EVENT_SCHEMA_VERSION: u32 = 3;
 pub const EVENT_GRAPH_SCHEMA: &str = "sideeffect.event_graph";
-pub const EVENT_GRAPH_SCHEMA_VERSION: u32 = 2;
+pub const EVENT_GRAPH_SCHEMA_VERSION: u32 = 3;
+pub const EVENT_TIMELINE_SCHEMA: &str = "sideeffect.event_timeline";
+pub const EVENT_TIMELINE_SCHEMA_VERSION: u32 = 3;
 #[cfg(windows)]
 const WINDOWS_RUNTIME_SCHEMA: &str = "sideeffect.windows_runtime_capture";
 #[cfg(windows)]
@@ -140,7 +142,11 @@ pub struct EventDiagnostic {
 pub struct ProcessObservation {
     pub source_local_id: u64,
     pub identity: ProcessIdentity,
+    /// Exact evidence anchoring the observation. Its meaning depends on the
+    /// identity kind; a task context's first row is not proof of task start,
+    /// and a returned child PID is supported only by the caller's result row.
     pub evidence: EvidenceReference,
+    /// Exact terminal evidence when the source establishes one.
     pub end_evidence: Option<EvidenceReference>,
 }
 
@@ -148,9 +154,13 @@ pub struct ProcessObservation {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProcessIdentity {
     /// The strace line prefix identifies a task/thread context. It is not
-    /// normalized to an OS process identity or a PID generation.
+    /// normalized to an OS process identity or PID generation. Epoch values
+    /// are source-local segments split only by an observed task termination;
+    /// they do not identify kernel process generations.
     LinuxTraceTaskContext {
         task_id: u32,
+        observed_task_epoch: Option<u64>,
+        epoch_basis: LinuxTaskEpochBasis,
         identity_status: ProcessIdentityStatus,
     },
     /// A successful creation syscall returned this child PID. No later rows
@@ -168,6 +178,20 @@ pub enum ProcessIdentity {
         reported_parent_process_id: Option<u32>,
         identity_status: ProcessIdentityStatus,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinuxTaskEpochBasis {
+    /// First context observed for this numeric trace prefix; it may predate
+    /// the beginning of the supplied trace.
+    FirstObservedTaskContext,
+    /// Context observed after an exact prefixed strace task-termination row.
+    AfterObservedTaskTermination,
+    /// The trace parse is partial, so source-local task continuity is unknown.
+    ContinuityUnknownDueToPartialParse,
+    /// A bounded counter could not represent the next source-local epoch.
+    EpochNumberUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -693,8 +717,8 @@ pub fn timeline(
         .cloned()
         .collect();
     Ok(EventTimeline {
-        schema: "sideeffect.event_timeline",
-        schema_version: 2,
+        schema: EVENT_TIMELINE_SCHEMA,
+        schema_version: EVENT_TIMELINE_SCHEMA_VERSION,
         source: envelope.source.clone(),
         source_state: envelope.source_state.clone(),
         ordering: "source_local_ordinal; timestamps are source text and do not establish causal order",
@@ -708,6 +732,16 @@ pub fn timeline(
         event_process_links,
         diagnostics: envelope.diagnostics.clone(),
     })
+}
+
+fn push_unique_source_diagnostic(
+    diagnostics: &mut Vec<String>,
+    seen_codes: &mut BTreeSet<&'static str>,
+    code: &'static str,
+) {
+    if seen_codes.insert(code) {
+        diagnostics.push(code.to_owned());
+    }
 }
 
 fn push_process_diagnostic(
@@ -784,10 +818,13 @@ pub fn from_linux_strace(
     let process_lineage_matches_records =
         crate::trace::process_tree::derive_process_lineage(&trace.records) == trace.process_lineage;
     let mut events = Vec::with_capacity(trace.records.len().min(MAX_COMMON_EVENTS));
-    let mut process_observations = Vec::new();
+    let mut process_observations = Vec::<ProcessObservation>::new();
     let mut process_relationships = Vec::new();
     let mut event_process_links = Vec::new();
     let mut task_observations = BTreeMap::<u32, u64>::new();
+    let mut task_epoch_counts = BTreeMap::<u32, u64>::new();
+    let mut seen_task_ids = BTreeSet::<u32>::new();
+    let mut task_termination_diagnostic_codes = BTreeSet::<&'static str>::new();
     let mut adapted_evidence = HashMap::<(u64, u64, u64), AdaptedLinuxTraceRow>::new();
     let mut diagnostics = Vec::new();
     let mut process_diagnostic_count = 0;
@@ -906,6 +943,83 @@ pub fn from_linux_strace(
         }
         previous_ordinal = record.evidence.line_number;
 
+        if trace.parse_status == ParseCompleteness::Complete
+            && record.kind == TraceRecordKind::Control
+            && crate::trace::strace::task_termination_kind(record).is_some()
+        {
+            match record.process_id.filter(|task_id| *task_id > 0) {
+                Some(task_id) => {
+                    if let Some(observation_id) = task_observations.remove(&task_id) {
+                        let observation_index = observation_id
+                            .checked_sub(1)
+                            .and_then(|index| usize::try_from(index).ok());
+                        match observation_index
+                            .and_then(|index| process_observations.get_mut(index))
+                        {
+                            Some(observation) => {
+                                observation.end_evidence = Some(evidence.clone());
+                            }
+                            None => {
+                                push_process_diagnostic(
+                                    &mut diagnostics,
+                                    &mut process_diagnostic_count,
+                                    "task_termination_observation_invalid",
+                                    "recognized task termination did not resolve to a retained source-local observation",
+                                    Some(ordinal),
+                                    Some(evidence.clone()),
+                                );
+                                push_unique_source_diagnostic(
+                                    &mut source_state_diagnostics,
+                                    &mut task_termination_diagnostic_codes,
+                                    "task_termination_observation_invalid",
+                                );
+                                process_relationships_partial = true;
+                            }
+                        }
+                        seen_task_ids.insert(task_id);
+                    } else {
+                        let code = if seen_task_ids.contains(&task_id) {
+                            "task_termination_without_active_observation"
+                        } else {
+                            "task_termination_without_observed_context"
+                        };
+                        push_process_diagnostic(
+                            &mut diagnostics,
+                            &mut process_diagnostic_count,
+                            code,
+                            "recognized task termination has no active observed task context to close",
+                            Some(ordinal),
+                            Some(evidence.clone()),
+                        );
+                        push_unique_source_diagnostic(
+                            &mut source_state_diagnostics,
+                            &mut task_termination_diagnostic_codes,
+                            code,
+                        );
+                        seen_task_ids.insert(task_id);
+                        process_relationships_partial = true;
+                    }
+                }
+                None => {
+                    push_process_diagnostic(
+                        &mut diagnostics,
+                        &mut process_diagnostic_count,
+                        "task_termination_missing_task_id",
+                        "recognized task termination has no positive trace task ID and cannot close a context",
+                        Some(ordinal),
+                        Some(evidence.clone()),
+                    );
+                    push_unique_source_diagnostic(
+                        &mut source_state_diagnostics,
+                        &mut task_termination_diagnostic_codes,
+                        "task_termination_missing_task_id",
+                    );
+                    process_relationships_partial = true;
+                }
+            }
+            continue;
+        }
+
         if events.len() >= MAX_COMMON_EVENTS {
             diagnostics.push(EventDiagnostic {
                 code: "event_limit_reached".to_owned(),
@@ -967,16 +1081,63 @@ pub fn from_linux_strace(
             {
                 if process_observations.len() < MAX_COMMON_PROCESS_OBSERVATIONS {
                     let id = process_observations.len() as u64 + 1;
+                    let (observed_task_epoch, epoch_basis) = if trace.parse_status
+                        == ParseCompleteness::Complete
+                    {
+                        let next_epoch = task_epoch_counts
+                            .get(&task_id)
+                            .copied()
+                            .unwrap_or(0)
+                            .checked_add(1);
+                        match next_epoch {
+                            Some(epoch) => {
+                                task_epoch_counts.insert(task_id, epoch);
+                                (
+                                    Some(epoch),
+                                    if epoch == 1 && !seen_task_ids.contains(&task_id) {
+                                        LinuxTaskEpochBasis::FirstObservedTaskContext
+                                    } else {
+                                        LinuxTaskEpochBasis::AfterObservedTaskTermination
+                                    },
+                                )
+                            }
+                            None => {
+                                push_process_diagnostic(
+                                    &mut diagnostics,
+                                    &mut process_diagnostic_count,
+                                    "task_epoch_limit_reached",
+                                    "source-local task epoch counter overflowed; task context continuity remains unknown",
+                                    Some(ordinal),
+                                    Some(event.evidence.clone()),
+                                );
+                                push_unique_source_diagnostic(
+                                    &mut source_state_diagnostics,
+                                    &mut task_termination_diagnostic_codes,
+                                    "task_epoch_limit_reached",
+                                );
+                                process_relationships_partial = true;
+                                (None, LinuxTaskEpochBasis::EpochNumberUnavailable)
+                            }
+                        }
+                    } else {
+                        (
+                            None,
+                            LinuxTaskEpochBasis::ContinuityUnknownDueToPartialParse,
+                        )
+                    };
                     process_observations.push(ProcessObservation {
                         source_local_id: id,
                         identity: ProcessIdentity::LinuxTraceTaskContext {
                             task_id,
+                            observed_task_epoch,
+                            epoch_basis,
                             identity_status: ProcessIdentityStatus::TaskIdOnlyGenerationUnknown,
                         },
                         evidence: event.evidence.clone(),
                         end_evidence: None,
                     });
                     entry.insert(id);
+                    seen_task_ids.insert(task_id);
                 } else {
                     push_process_diagnostic(
                         &mut diagnostics,

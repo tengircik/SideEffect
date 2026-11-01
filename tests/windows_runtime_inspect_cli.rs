@@ -293,7 +293,7 @@ fn events_windows_runtime_validates_capture_and_preserves_source_context() {
     );
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["schema"], "sideeffect.common_event_envelope");
-    assert_eq!(envelope["schema_version"], 2);
+    assert_eq!(envelope["schema_version"], 3);
     assert_eq!(envelope["source"]["platform"], "windows");
     assert_eq!(envelope["source"]["schema"], WINDOWS_RUNTIME_CAPTURE_SCHEMA);
     assert_eq!(
@@ -369,7 +369,7 @@ fn timeline_windows_runtime_filters_kind_and_preserves_source_evidence_and_diagn
     );
     let timeline: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(timeline["schema"], "sideeffect.event_timeline");
-    assert_eq!(timeline["schema_version"], 2);
+    assert_eq!(timeline["schema_version"], 3);
     assert_eq!(timeline["source"]["platform"], "windows");
     assert_eq!(timeline["source"]["schema"], WINDOWS_RUNTIME_CAPTURE_SCHEMA);
     assert_eq!(timeline["source_state"]["completeness"], "partial");
@@ -440,7 +440,7 @@ fn timeline_windows_process_observation_preserves_candidate_link_and_partial_sta
 
     assert_eq!(output.status.code(), Some(2));
     let timeline: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(timeline["schema_version"], 2);
+    assert_eq!(timeline["schema_version"], 3);
     assert_eq!(timeline["filter"]["process_observation_id"], 1);
     assert_eq!(timeline["source_state"]["completeness"], "partial");
     assert_eq!(timeline["items"].as_array().unwrap().len(), 1);
@@ -685,7 +685,7 @@ fn graph_windows_runtime_keeps_pid_context_separate_from_process_instance() {
     assert_eq!(output.status.code(), Some(2));
     let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(graph["schema"], "sideeffect.event_graph");
-    assert_eq!(graph["schema_version"], 2);
+    assert_eq!(graph["schema_version"], 3);
     assert_eq!(graph["filter"]["event_kind"], "process_start");
     assert_eq!(graph["source_state"]["completeness"], "partial");
     let nodes = graph["nodes"].as_array().unwrap();
@@ -737,7 +737,7 @@ fn graph_process_observation_filter_preserves_candidate_context_and_relationship
 
     assert_eq!(output.status.code(), Some(2));
     let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(graph["schema_version"], 2);
+    assert_eq!(graph["schema_version"], 3);
     assert_eq!(graph["filter"]["event_kind"], Value::Null);
     assert_eq!(graph["filter"]["process_observation_id"], 1);
     assert_eq!(graph["source_state"]["completeness"], "partial");
