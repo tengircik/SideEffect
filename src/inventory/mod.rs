@@ -24,6 +24,7 @@ mod processes;
 #[cfg(windows)]
 mod processes_windows;
 mod root_snapshot;
+mod root_snapshot_diff;
 #[cfg(target_os = "linux")]
 mod startup;
 mod startup_diff;
@@ -129,6 +130,10 @@ pub use processes_windows::{
 pub use root_snapshot::{
     ROOT_SNAPSHOT_SCHEMA, ROOT_SNAPSHOT_SCHEMA_VERSION, RootDiagnostic, RootEntry,
     RootEntryEvidence, RootIdentity, RootSnapshot, RootSnapshotLimits, collect_root_snapshot,
+};
+pub use root_snapshot_diff::{
+    RootSnapshotDelta, RootSnapshotDiff, RootSnapshotDiffCounts, RootSnapshotDiffError,
+    RootSnapshotSide, compare_selected_root_inventory_json, is_selected_root_inventory_json,
 };
 #[cfg(target_os = "linux")]
 pub use startup::{

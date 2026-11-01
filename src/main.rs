@@ -37,8 +37,9 @@ use sideeffect::inventory::{
     PackageComparisonStatus, PermissionDiffStatus, ProcessDiffStatus, StartupDiffStatus,
     WindowsSoftwareComparisonStatus, compare_package_inventory_json,
     compare_permission_inventory_json, compare_process_inventory_json,
-    compare_startup_inventory_json, compare_windows_software_inventory_json,
-    is_permission_inventory_json, is_process_inventory_json, is_startup_inventory_json,
+    compare_selected_root_inventory_json, compare_startup_inventory_json,
+    compare_windows_software_inventory_json, is_permission_inventory_json,
+    is_process_inventory_json, is_selected_root_inventory_json, is_startup_inventory_json,
     is_windows_software_inventory_json,
 };
 use sideeffect::inventory::{PathExecutableInventory, collect_path_executables};
@@ -3242,6 +3243,17 @@ fn explain_inventory_diff_files(
         MAX_REPORT_BYTES.saturating_sub(before.len()),
         "inventory comparison input",
     )?;
+    if is_selected_root_inventory_json(&before) || is_selected_root_inventory_json(&after) {
+        let comparison = compare_selected_root_inventory_json(&before, &after)
+            .map_err(|error| format!("selected-root inventory comparison failed: {error:?}"))?;
+        let partial = comparison.status == "partial";
+        write_json(&comparison, "JSON selected-root inventory comparison")?;
+        return Ok(if partial {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
     if is_permission_inventory_json(&before) || is_permission_inventory_json(&after) {
         let comparison = compare_permission_inventory_json(&before, &after)
             .map_err(|error| format!("permission inventory comparison failed: {error:?}"))?;

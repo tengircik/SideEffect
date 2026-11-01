@@ -4,7 +4,7 @@
 
 The security requirements and current safeguards are summarized in [SECURITY.md](../SECURITY.md); requirements marked future remain release gates.
 
-The first R5 selected-root collector emits `sideeffect.selected_root_inventory` v1 from one user-supplied directory. It enumerates direct children only through a pinned directory handle and records exact platform path/name encodings, bounded metadata, local file-ID hints, and per-entry ordinals. It does not read file contents, recurse, or currently participate in session comparison. Collection order is source-defined and unstable; capture is non-atomic. A complete document means only that the bounded enumeration completed, not that the directory was stable or exhaustively represented at one instant.
+The first R5 selected-root collector emits `sideeffect.selected_root_inventory` v1 from one user-supplied directory. It enumerates direct children only through a pinned directory handle and records exact platform path/name encodings, bounded metadata, local file-ID hints, and per-entry ordinals. `explain --inventory-diff` compares two standalone v1 documents by exact root and child path encodings; child order and local file IDs are not match keys. Unmatched additions/removals are suppressed unless both snapshots are complete and known root object-ID hints do not conflict. It does not read file contents, recurse, or participate in session comparison. Collection order is source-defined and unstable; capture is non-atomic. A complete document means only that the bounded enumeration completed, not that the directory was stable or exhaustively represented at one instant.
 
 ## Shared audit-session manifest contract
 
