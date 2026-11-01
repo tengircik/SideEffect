@@ -49,10 +49,15 @@ fn process_event(
     let mut raw_process_payload = vec![0u8; 8];
     raw_process_payload.extend_from_slice(&pid.to_le_bytes());
     raw_process_payload.extend_from_slice(&parent.to_le_bytes());
-    let raw_payload_hex: String = raw_process_payload
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let raw_payload_hex = {
+        use std::fmt::Write as _;
+
+        let mut encoded = String::with_capacity(raw_process_payload.len().saturating_mul(2));
+        for byte in &raw_process_payload {
+            write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        encoded
+    };
     NativeRuntimeEvent {
         record_ordinal: ordinal,
         provider_guid: "{3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c}".to_owned(),

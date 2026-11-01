@@ -2863,7 +2863,13 @@ mod windows_process_payload_tests {
     }
 
     fn encode_hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        use std::fmt::Write as _;
+
+        let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+        for byte in bytes {
+            write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        encoded
     }
 
     fn validate(
