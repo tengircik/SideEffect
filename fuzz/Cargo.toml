@@ -18,5 +18,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "inspect_windows_runtime_bytes"
+path = "fuzz_targets/inspect_windows_runtime_bytes.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
