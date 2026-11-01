@@ -23,6 +23,7 @@ mod process_diff;
 mod processes;
 #[cfg(windows)]
 mod processes_windows;
+mod root_snapshot;
 #[cfg(target_os = "linux")]
 mod startup;
 mod startup_diff;
@@ -124,6 +125,10 @@ pub use processes_windows::{
     WindowsProcessImageStatus, WindowsProcessInventoryDocument, WindowsProcessInventoryStatus,
     WindowsProcessRow, WindowsProcessTokenContext, WindowsProcessTokenContextStatus,
     WindowsProcessTokenField, WindowsProcessTokenFieldStatus, collect_windows_processes,
+};
+pub use root_snapshot::{
+    ROOT_SNAPSHOT_SCHEMA, ROOT_SNAPSHOT_SCHEMA_VERSION, RootDiagnostic, RootEntry,
+    RootEntryEvidence, RootIdentity, RootSnapshot, RootSnapshotLimits, collect_root_snapshot,
 };
 #[cfg(target_os = "linux")]
 pub use startup::{

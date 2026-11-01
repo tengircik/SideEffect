@@ -217,6 +217,14 @@ sideeffect inventory path-executables --output ./path-executables.json
 
 The same command works on native Windows. It snapshots only the invoking process's current `PATH` and, on Windows, captured `PATHEXT`. It checks each directory one level deep, preserves order and duplicate components, and maps empty components to the current working directory with an explicit marker. Linux candidates are regular files with an execute bit; Windows candidates are regular files with a captured `PATHEXT` suffix; if `PATHEXT` is unavailable, regular-file rows remain unknown. These are metadata heuristics: SideEffect does not execute candidate files or recursively inspect directories. It skips symlinks/reparse points observed by metadata checks; concurrent filesystem replacements can race between a check and enumeration. It does not determine shell command resolution. Limits are 256 components, 4 KiB per Linux component or 32,767 UTF-16 units per Windows component, 20,000 directory entries, 16 MiB aggregate path/name bytes on Linux or UTF-16 code units on Windows, five seconds checked between operations, and 64 MiB serialized output. Limit, inaccessible, symlink/reparse, and unavailable-source conditions are represented as partial/unknown; partial results are written and exit with status `2`. The output is private and no-clobber. PATH values, names, and paths are sensitive; inspect the JSON before sharing.
 
+## Snapshot one selected directory
+
+```sh
+sideeffect inventory root --output ./root-before.json ./selected-directory
+```
+
+On native Windows, use `sideeffect.exe inventory root --output .\root-before.json .\selected-directory`. This opens the explicitly selected directory and records only its direct children. It reports exact platform path/name encodings, entry type, size, modification time, and available platform-local file-ID hints. It never reads file contents, recurses, follows child symlinks/reparse points, or requests elevation. File IDs are point-in-time hints and are not persistent identities. Enumeration order is unspecified, and the snapshot is non-atomic: entries may change during collection. Limits are one root path of at most 4,095 Linux path bytes or 32,766 Windows UTF-16 units, 10,000 direct entries, 32,767 bytes/UTF-16 units per name, 8 MiB aggregate name bytes (Windows UTF-16 units count as two bytes), a five-second between-operation deadline, and the standard 64 MiB JSON output cap. Limits and access/race failures produce a partial artifact and exit status `2`; a syscall already in progress cannot be cancelled. The output is private and no-clobber. Paths and metadata may reveal sensitive information; inspect before sharing. A single snapshot does not establish installation, deletion, or absence, and selected-root comparison is not implemented yet.
+
 ## Experimental Windows process, file, and network capture
 
 ```powershell

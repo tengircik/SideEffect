@@ -46,6 +46,7 @@ use sideeffect::inventory::{PathExecutableInventory, collect_path_executables};
 use sideeffect::inventory::{PermissionInventoryStatus, collect_permissions};
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{ProcessInventoryStatus, collect_processes};
+use sideeffect::inventory::{RootSnapshot, collect_root_snapshot};
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{StartupInventoryStatus, collect_startup};
 #[cfg(windows)]
@@ -94,6 +95,7 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect inventory processes --output <new-inventory.json>\n\
        sideeffect inventory startup --output <new-inventory.json>\n\
        sideeffect inventory path-executables --output <new-inventory.json>\n\
+       sideeffect inventory root --output <new-inventory.json> <selected-directory>\n\
        sideeffect inventory permissions --output <new-inventory.json> <path>...\n\
        sideeffect inventory access-check --operation read|write|execute --output <new-result.json> <absolute-path> (Linux; current credentials)\n\
        sideeffect inventory access-check --pid <pid> --creation-time-filetime <100ns-value> --operation read|write|execute --output <new-result.json> <absolute-path> (Windows)\n\
@@ -503,6 +505,11 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
                 && option == "--output" =>
         {
             inventory_path_executables(output)
+        }
+        [command, subcommand, option, output, root]
+            if command == "inventory" && subcommand == "root" && option == "--output" =>
+        {
+            inventory_root(output, root)
         }
         [command, subcommand, option, output, paths @ ..]
             if command == "inventory"
@@ -1195,6 +1202,31 @@ fn inventory_path_executables(output: &OsString) -> Result<ExitCode, String> {
     })
 }
 
+fn inventory_root(output: &OsString, root: &OsString) -> Result<ExitCode, String> {
+    let document: RootSnapshot = collect_root_snapshot(Path::new(root));
+    let complete = document.status == "complete";
+    let mut json = CappedBuffer::new(MAX_REPORT_BYTES);
+    serde_json::to_writer(&mut json, &document).map_err(|error| {
+        format!("could not serialize selected-root inventory within the {MAX_REPORT_BYTES} byte limit: {error}")
+    })?;
+    #[cfg(target_os = "linux")]
+    let published = publish_private_file(Path::new(output), &json.bytes, MAX_REPORT_BYTES)
+        .map_err(|error| format!("could not publish private selected-root inventory: {error}"))?;
+    #[cfg(windows)]
+    let published = publish_private_windows_file(Path::new(output), &json.bytes, MAX_REPORT_BYTES)
+        .map_err(|error| format!("could not publish private selected-root inventory: {error}"))?;
+    eprintln!(
+        "Saved a {} metadata-only snapshot of the selected directory and its direct children to {}. It does not recurse or read file contents; enumeration is non-atomic and file identities are local hints.",
+        if complete { "complete" } else { "partial" },
+        terminal_safe_path(&published)
+    );
+    Ok(if complete {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
 fn inventory_permissions(output: &OsString, paths: &[OsString]) -> Result<ExitCode, String> {
     #[cfg(target_os = "linux")]
     {
@@ -1606,7 +1638,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             }
         }
         "inventory" => {
-            "Usage: sideeffect inventory packages|processes|startup|path-executables|permissions|access-check ...\nCollects bounded, local snapshots from sources supported on this platform. Sources are curated and coverage can be partial; inspect output and diagnostics before drawing conclusions."
+            "Usage: sideeffect inventory packages|processes|startup|path-executables|root|permissions|access-check ...\nCollects bounded, local snapshots from sources supported on this platform. Sources are curated and coverage can be partial; inspect output and diagnostics before drawing conclusions."
         }
         "inventory startup" => {
             #[cfg(target_os = "linux")]
@@ -1652,6 +1684,9 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         }
         "inventory path-executables" => {
             "Usage: sideeffect inventory path-executables --output FILE\nSnapshots the current process PATH and checks one directory level using platform metadata heuristics. It never executes candidates; symlinks/reparse points and limits make results partial."
+        }
+        "inventory root" => {
+            "Usage: sideeffect inventory root --output NEW_FILE SELECTED_DIRECTORY\nOpens one explicitly selected directory and inventories only its direct children using metadata. It does not read contents, recurse, follow child symlinks/reparse points, request elevation, or claim an atomic snapshot. Paths and metadata may be sensitive; partial results exit with status 2."
         }
         "inventory permissions" => {
             #[cfg(target_os = "linux")]
