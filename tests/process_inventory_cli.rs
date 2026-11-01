@@ -42,7 +42,23 @@ fn live_proc_inventory_writes_private_schema_without_fixed_count_assumptions() {
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     let value: serde_json::Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
     assert_eq!(value["schema"], "sideeffect.process_inventory");
-    assert_eq!(value["schema_version"], 3);
+    assert_eq!(value["schema_version"], 4);
+    assert_eq!(value["boot_epoch"]["status"], "observed");
+    assert_eq!(
+        value["boot_epoch"]["normalized_id"].as_str().unwrap().len(),
+        36
+    );
+    assert_eq!(
+        value["boot_epoch"]["evidence"]["source"],
+        "/proc/sys/kernel/random/boot_id"
+    );
+    assert_eq!(
+        value["boot_epoch"]["evidence"]["record_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
     assert_eq!(value["platform"], "linux");
     assert_eq!(
         value["scope"],

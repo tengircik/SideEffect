@@ -47,6 +47,7 @@ pub struct ProcessDiffCounts {
     pub unmatched_rows_suppressed_for_partial_source: usize,
     pub rows_with_missing_or_unobserved_generation: usize,
     pub ambiguous_pid_groups: usize,
+    pub process_rows_not_compared: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -335,7 +336,12 @@ fn validate(v: &Value, kind: Kind) -> Result<(), ProcessDiffError> {
             "toolhelp_process_snapshot_image_paths_and_token_context",
         ),
     };
-    if strv(v, "schema")? != schema || u64v(v, "schema_version")? != 3 {
+    let version = u64v(v, "schema_version")?;
+    let supported_version = match kind {
+        Kind::Linux => matches!(version, 3 | 4),
+        Kind::Windows => version == 3,
+    };
+    if strv(v, "schema")? != schema || !supported_version {
         return Err(ProcessDiffError::UnsupportedSchema);
     }
     if strv(v, "platform")? != platform {
@@ -346,17 +352,32 @@ fn validate(v: &Value, kind: Kind) -> Result<(), ProcessDiffError> {
     }
     let (top, source_keys) = match kind {
         Kind::Linux => (
-            &[
-                "schema",
-                "schema_version",
-                "platform",
-                "scope",
-                "capture_started_at_unix_ms",
-                "capture_ended_at_unix_ms",
-                "status",
-                "source",
-                "processes",
-            ][..],
+            if u64v(v, "schema_version")? == 4 {
+                &[
+                    "schema",
+                    "schema_version",
+                    "platform",
+                    "scope",
+                    "capture_started_at_unix_ms",
+                    "capture_ended_at_unix_ms",
+                    "status",
+                    "boot_epoch",
+                    "source",
+                    "processes",
+                ][..]
+            } else {
+                &[
+                    "schema",
+                    "schema_version",
+                    "platform",
+                    "scope",
+                    "capture_started_at_unix_ms",
+                    "capture_ended_at_unix_ms",
+                    "status",
+                    "source",
+                    "processes",
+                ][..]
+            },
             &[
                 "id",
                 "status",
@@ -388,7 +409,22 @@ fn validate(v: &Value, kind: Kind) -> Result<(), ProcessDiffError> {
         ),
     };
     only_keys(v, top)?;
+    if kind == Kind::Linux && u64v(v, "schema_version")? == 4 {
+        validate_boot_epoch(
+            v.get("boot_epoch")
+                .ok_or(ProcessDiffError::MalformedInput)?,
+        )?;
+    }
     if !matches!(strv(v, "status")?, "complete" | "partial") {
+        return Err(ProcessDiffError::MalformedInput);
+    }
+    if kind == Kind::Linux
+        && u64v(v, "schema_version")? == 4
+        && v.pointer("/boot_epoch/status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status != "observed")
+        && strv(v, "status")? != "partial"
+    {
         return Err(ProcessDiffError::MalformedInput);
     }
     let source = v.get("source").ok_or(ProcessDiffError::MalformedInput)?;
@@ -450,6 +486,71 @@ fn validate(v: &Value, kind: Kind) -> Result<(), ProcessDiffError> {
         }
     }
     Ok(())
+}
+
+fn validate_boot_epoch(epoch: &Value) -> Result<(), ProcessDiffError> {
+    only_keys(epoch, &["status", "normalized_id", "evidence"])?;
+    let status = strv(epoch, "status")?;
+    if !matches!(
+        status,
+        "observed" | "unavailable" | "malformed" | "over_limit"
+    ) {
+        return Err(ProcessDiffError::MalformedInput);
+    }
+    optional_string(epoch, "normalized_id")?;
+    match epoch.get("evidence") {
+        Some(evidence) => {
+            only_keys(evidence, &["source", "byte_length", "record_sha256"])?;
+            let source = strv(evidence, "source")?;
+            let length = u64v(evidence, "byte_length")?;
+            let digest = strv(evidence, "record_sha256")?;
+            if source.len() > 256
+                || length > 64
+                || source != "/proc/sys/kernel/random/boot_id"
+                || digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err(ProcessDiffError::MalformedInput);
+            }
+        }
+        None => {
+            if !matches!(status, "unavailable" | "over_limit") {
+                return Err(ProcessDiffError::MalformedInput);
+            }
+        }
+    }
+    if matches!(status, "unavailable" | "over_limit") && epoch.get("evidence").is_some() {
+        return Err(ProcessDiffError::MalformedInput);
+    }
+    if status == "observed" {
+        let id = epoch
+            .get("normalized_id")
+            .and_then(Value::as_str)
+            .ok_or(ProcessDiffError::MalformedInput)?;
+        let length = epoch
+            .pointer("/evidence/byte_length")
+            .and_then(Value::as_u64);
+        if !valid_normalized_uuid(id) || !matches!(length, Some(36 | 37)) {
+            return Err(ProcessDiffError::MalformedInput);
+        }
+    } else if epoch.get("normalized_id").is_some_and(|v| !v.is_null()) {
+        return Err(ProcessDiffError::MalformedInput);
+    }
+    Ok(())
+}
+
+fn valid_normalized_uuid(value: &str) -> bool {
+    value.len() == 36
+        && [8, 13, 18, 23]
+            .iter()
+            .all(|index| value.as_bytes()[*index] == b'-')
+        && value
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
+        && value == value.to_ascii_lowercase()
 }
 
 fn validate_linux_row(row: &Value) -> Result<(), ProcessDiffError> {
@@ -1024,6 +1125,47 @@ fn evidence(row: &Value, index: usize, kind: Kind) -> ProcessEvidenceRef {
 }
 
 fn compare(left: &Value, right: &Value, kind: Kind) -> Result<ProcessDiff, ProcessDiffError> {
+    if kind == Kind::Linux {
+        let before = observed_boot_epoch(left);
+        let after = observed_boot_epoch(right);
+        let reason = match (before, after) {
+            (Some(a), Some(b)) if a != b => Some("boot_epoch_mismatch"),
+            (Some(_), Some(_)) => None,
+            _ => Some("identity_context_unknown"),
+        };
+        if let Some(reason) = reason {
+            let mut diagnostics = vec![reason];
+            if !status_complete(left)
+                || !status_complete(right)
+                || left.pointer("/source/status").and_then(Value::as_str) != Some("complete")
+                || right.pointer("/source/status").and_then(Value::as_str) != Some("complete")
+            {
+                diagnostics.push("source_incomplete");
+            }
+            return Ok(ProcessDiff {
+                schema: "sideeffect.process_inventory_diff",
+                schema_version: 2,
+                platform: "linux",
+                before_captured_at_unix_ms: left
+                    .get("capture_ended_at_unix_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u128,
+                after_captured_at_unix_ms: right
+                    .get("capture_ended_at_unix_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u128,
+                status: ProcessDiffStatus::Partial,
+                coverage_note: "Cross-snapshot process deltas require matching observed Linux boot epochs. Boot IDs are evidence from the supplied procfs view; they do not authenticate a host or distinguish cloned VM state. A bounded pair of snapshots is not process history, exhaustive inventory, causation, or proof of absence.",
+                counts: ProcessDiffCounts {
+                    process_rows_not_compared: arr(left, "processes")?.len()
+                        + arr(right, "processes")?.len(),
+                    ..ProcessDiffCounts::default()
+                },
+                diagnostics,
+                deltas: Vec::new(),
+            });
+        }
+    }
     let lrows = arr(left, "processes")?;
     let rrows = arr(right, "processes")?;
     let mut lm = BTreeMap::<(u32, u64), Vec<(usize, &Value)>>::new();
@@ -1176,7 +1318,7 @@ fn compare(left: &Value, right: &Value, kind: Kind) -> Result<ProcessDiff, Proce
     delta.sort_by_key(|d| (d.process_id, d.generation, d.kind));
     let result = ProcessDiff {
         schema: "sideeffect.process_inventory_diff",
-        schema_version: 1,
+        schema_version: 2,
         platform: if kind == Kind::Linux {
             "linux"
         } else {
@@ -1203,11 +1345,19 @@ fn compare(left: &Value, right: &Value, kind: Kind) -> Result<ProcessDiff, Proce
     Ok(result)
 }
 
+fn observed_boot_epoch(document: &Value) -> Option<&str> {
+    if u64v(document, "schema_version").ok()? != 4 {
+        return None;
+    }
+    let epoch = document.get("boot_epoch")?;
+    (epoch.get("status")?.as_str()? == "observed").then(|| epoch.get("normalized_id")?.as_str())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn linux(status: &str, rows: Value) -> Value {
-        serde_json::json!({"schema":LINUX,"schema_version":3,"platform":"linux","scope":"visible_numeric_proc_status_stat_executable_and_namespace_entries","capture_started_at_unix_ms":1,"capture_ended_at_unix_ms":2,"status":status,"source":{"id":"procfs_status","status":status,"directories_seen":rows.as_array().map_or(0,Vec::len),"status_bytes_read":0,"diagnostics":[]},"processes":rows})
+        serde_json::json!({"schema":LINUX,"schema_version":4,"platform":"linux","scope":"visible_numeric_proc_status_stat_executable_and_namespace_entries","capture_started_at_unix_ms":1,"capture_ended_at_unix_ms":2,"status":status,"boot_epoch":{"status":"observed","normalized_id":"01234567-89ab-cdef-0123-456789abcdef","evidence":{"source":"/proc/sys/kernel/random/boot_id","byte_length":37,"record_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}},"source":{"id":"procfs_status","status":status,"directories_seen":rows.as_array().map_or(0,Vec::len),"status_bytes_read":0,"diagnostics":[]},"processes":rows})
     }
     fn lrow(pid: u32, generation: Option<u64>, name: &str) -> Value {
         let start = if let Some(g) = generation {
@@ -1216,6 +1366,106 @@ mod tests {
             serde_json::json!({"status":"vanished"})
         };
         serde_json::json!({"pid":pid,"start_time":start,"executable_link":{"status":"observed","target_display":"/usr/bin/demo","target_bytes_hex":"2f","byte_length":1,"sha256":"private-path-hash","evidence":{"source":"/proc/7/exe","byte_length":1,"sha256":"private-path-hash"}},"name":name,"uid":[1,1,1,1],"gid":[2,2,2,2],"cap_eff":"0000","seccomp":0,"namespace_pids":{"status":"not_reported"},"namespaces":[],"evidence":[{"field":"name","line":1,"byte_offset":2,"byte_length":3,"line_sha256":"private-line-hash","raw_source_line":"private raw source line"}]})
+    }
+
+    #[test]
+    fn linux_boot_epoch_gates_all_cross_snapshot_deltas() {
+        let rows = serde_json::json!([lrow(7, Some(10), "demo")]);
+        let before = linux("complete", rows.clone());
+        let mut after = linux("complete", rows.clone());
+        after["boot_epoch"]["normalized_id"] =
+            serde_json::json!("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        let mismatch = compare_process_inventory_json(
+            before.to_string().as_bytes(),
+            after.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(mismatch.schema_version, 2);
+        assert_eq!(mismatch.status, ProcessDiffStatus::Partial);
+        assert_eq!(mismatch.diagnostics, ["boot_epoch_mismatch"]);
+        assert!(mismatch.deltas.is_empty());
+        assert_eq!(mismatch.counts.process_rows_not_compared, 2);
+
+        let legacy = {
+            let mut value = linux("complete", rows.clone());
+            value["schema_version"] = serde_json::json!(3);
+            value.as_object_mut().unwrap().remove("boot_epoch");
+            value
+        };
+        let unknown = compare_process_inventory_json(
+            legacy.to_string().as_bytes(),
+            before.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert!(unknown.diagnostics.contains(&"identity_context_unknown"));
+        assert!(!unknown.diagnostics.contains(&"source_incomplete"));
+        assert!(unknown.deltas.is_empty());
+        assert_eq!(unknown.counts.process_rows_not_compared, 2);
+
+        let mut malformed_evidence = before.clone();
+        malformed_evidence["boot_epoch"]["evidence"]["record_sha256"] = serde_json::json!("ABCDEF");
+        assert!(matches!(
+            compare_process_inventory_json(
+                malformed_evidence.to_string().as_bytes(),
+                before.to_string().as_bytes()
+            ),
+            Err(ProcessDiffError::MalformedInput)
+        ));
+
+        let mut inconsistent_evidence = before.clone();
+        inconsistent_evidence["boot_epoch"]["status"] = serde_json::json!("unavailable");
+        inconsistent_evidence["boot_epoch"]
+            .as_object_mut()
+            .unwrap()
+            .remove("normalized_id");
+        inconsistent_evidence["status"] = serde_json::json!("partial");
+        inconsistent_evidence["source"]["status"] = serde_json::json!("partial");
+        assert!(matches!(
+            compare_process_inventory_json(
+                inconsistent_evidence.to_string().as_bytes(),
+                before.to_string().as_bytes()
+            ),
+            Err(ProcessDiffError::MalformedInput)
+        ));
+
+        let mut unavailable = before.clone();
+        unavailable["boot_epoch"] = serde_json::json!({"status":"unavailable"});
+        unavailable["status"] = serde_json::json!("partial");
+        unavailable["source"]["status"] = serde_json::json!("partial");
+        let unknown = compare_process_inventory_json(
+            unavailable.to_string().as_bytes(),
+            before.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert!(unknown.diagnostics.contains(&"identity_context_unknown"));
+        assert!(unknown.diagnostics.contains(&"source_incomplete"));
+        assert!(unknown.deltas.is_empty());
+        assert_eq!(unknown.counts.process_rows_not_compared, 2);
+    }
+
+    #[test]
+    fn matching_linux_boot_epoch_preserves_existing_duplicate_and_partial_rules() {
+        let before = linux("complete", serde_json::json!([lrow(7, Some(10), "old")]));
+        let after = linux("complete", serde_json::json!([lrow(7, Some(10), "new")]));
+        let diff = compare_process_inventory_json(
+            before.to_string().as_bytes(),
+            after.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(diff.deltas.len(), 1);
+        assert_eq!(diff.deltas[0].kind, "changed");
+
+        let duplicate = linux(
+            "complete",
+            serde_json::json!([lrow(7, Some(10), "one"), lrow(7, Some(11), "two")]),
+        );
+        let ambiguous = compare_process_inventory_json(
+            duplicate.to_string().as_bytes(),
+            after.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert!(ambiguous.deltas.is_empty());
+        assert_eq!(ambiguous.diagnostics, ["ambiguous_pid_identity"]);
     }
     fn windows() -> Value {
         serde_json::json!({"schema":WINDOWS,"schema_version":3,"platform":"windows","scope":"toolhelp_process_snapshot_image_paths_and_token_context","capture_started_at_unix_ms":1,"capture_ended_at_unix_ms":2,"status":"complete","source":{"id":"toolhelp_process_snapshot","status":"complete","entries_seen":1,"image_path_utf16_code_units":10,"token_sid_utf16_code_units":10,"diagnostics":[]},"processes":[{"process_id":10,"parent_process_id":1,"thread_count":2,"executable_name":"demo.exe","creation_time":{"status":"observed","filetime_100ns":123,"source":"GetProcessTimes"},"image":{"status":"observed","path":"C:\\demo.exe","utf16_code_units":10},"token_context":{"identity_status":"observed","process_creation_time_filetime_100ns":123,"user_sid":{"status":"observed","value":"S-1-5-18","source":"TokenUser"},"integrity_level_rid":{"status":"observed","value":8192,"source":"TokenIntegrityLevel"},"session_id":{"status":"observed","value":0,"source":"TokenSessionId"}},"evidence":{"snapshot_source":"Toolhelp32Snapshot","snapshot_index":0,"process_id":10,"parent_process_id":1,"thread_count":2,"executable_name":"demo.exe","image_source":"QueryFullProcessImageNameW"}}]})

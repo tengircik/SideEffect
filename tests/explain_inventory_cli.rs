@@ -205,12 +205,13 @@ fn explain_inventory_diff_routes_linux_process_snapshots_by_generation() {
     let make_process = |name: &str| {
         serde_json::json!({
             "schema": "sideeffect.process_inventory",
-            "schema_version": 3,
+            "schema_version": 4,
             "platform": "linux",
             "scope": "visible_numeric_proc_status_stat_executable_and_namespace_entries",
             "capture_started_at_unix_ms": 10,
             "capture_ended_at_unix_ms": 11,
             "status": "complete",
+            "boot_epoch": {"status":"observed","normalized_id":"01234567-89ab-cdef-0123-456789abcdef","evidence":{"source":"/proc/sys/kernel/random/boot_id","byte_length":37,"record_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}},
             "source": {"id":"procfs_status","status":"complete","directories_seen":1,"status_bytes_read":64,"diagnostics":[]},
             "processes": [{
                 "pid": 77,

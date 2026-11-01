@@ -827,7 +827,10 @@ mod tests {
         use std::time::Duration;
 
         let executable = std::env::current_exe().expect("locate test executable");
-        let arguments = [OsString::from("--list")];
+        let arguments = [
+            OsString::from("windows_explanation_process_limit_is_accepted_by_job_object_runner"),
+            OsString::from("--list"),
+        ];
         let output = crate::local_model_runtime::run_bounded_windows(
             &executable,
             &arguments,

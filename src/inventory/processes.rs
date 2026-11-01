@@ -14,6 +14,7 @@ pub const MAX_EXECUTABLE_LINK_BYTES: usize = 4 * 1024;
 pub const MAX_AGGREGATE_EXECUTABLE_LINK_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_NAMESPACE_LINK_BYTES: usize = 128;
 pub const MAX_AGGREGATE_NAMESPACE_LINK_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_BOOT_ID_BYTES: usize = 64;
 pub const PROCESS_NAMESPACES: &[&str] = &["cgroup", "ipc", "mnt", "net", "pid", "user", "uts"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -32,8 +33,34 @@ pub struct ProcessInventoryDocument {
     pub capture_started_at_unix_ms: u128,
     pub capture_ended_at_unix_ms: u128,
     pub status: ProcessInventoryStatus,
+    pub boot_epoch: ProcessBootEpoch,
     pub source: ProcessInventorySource,
     pub processes: Vec<ProcessRow>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProcessBootEpoch {
+    pub status: ProcessBootEpochStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalized_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<ProcessBootEpochEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessBootEpochStatus {
+    Observed,
+    Unavailable,
+    Malformed,
+    OverLimit,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProcessBootEpochEvidence {
+    pub source: String,
+    pub byte_length: usize,
+    pub record_sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -257,6 +284,21 @@ fn collect_with_limits(root: &Path, limits: Limits) -> ProcessInventoryDocument 
     let mut namespace_bytes = 0usize;
     let mut directories_seen = 0usize;
     let mut partial = false;
+    let boot_epoch = read_boot_epoch(root);
+    if boot_epoch.status != ProcessBootEpochStatus::Observed {
+        partial = true;
+        diagnostics.push(diag(
+            match boot_epoch.status {
+                ProcessBootEpochStatus::Unavailable => "boot_epoch_unavailable",
+                ProcessBootEpochStatus::Malformed => "boot_epoch_malformed",
+                ProcessBootEpochStatus::OverLimit => "boot_epoch_over_limit",
+                ProcessBootEpochStatus::Observed => unreachable!(),
+            },
+            None,
+            None,
+            "The procfs boot epoch was unavailable, malformed, or over its byte limit.",
+        ));
+    }
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(_) => {
@@ -266,7 +308,7 @@ fn collect_with_limits(root: &Path, limits: Limits) -> ProcessInventoryDocument 
                 None,
                 "Could not enumerate the procfs root.",
             ));
-            return finish(started, rows, diagnostics, 0, 0, true);
+            return finish(started, rows, diagnostics, 0, 0, true, boot_epoch);
         }
     };
     let mut pids = Vec::new();
@@ -464,6 +506,7 @@ fn collect_with_limits(root: &Path, limits: Limits) -> ProcessInventoryDocument 
         directories_seen,
         total_bytes,
         partial,
+        boot_epoch,
     )
 }
 
@@ -474,6 +517,7 @@ fn finish(
     directories_seen: usize,
     status_bytes_read: usize,
     partial: bool,
+    boot_epoch: ProcessBootEpoch,
 ) -> ProcessInventoryDocument {
     let status = if partial {
         ProcessInventoryStatus::Partial
@@ -482,12 +526,13 @@ fn finish(
     };
     ProcessInventoryDocument {
         schema: "sideeffect.process_inventory",
-        schema_version: 3,
+        schema_version: 4,
         platform: "linux",
         scope: "visible_numeric_proc_status_stat_executable_and_namespace_entries",
         capture_started_at_unix_ms: started,
         capture_ended_at_unix_ms: now_ms(),
         status,
+        boot_epoch,
         source: ProcessInventorySource {
             id: "procfs_status",
             status,
@@ -496,6 +541,63 @@ fn finish(
             diagnostics,
         },
         processes,
+    }
+}
+
+fn read_boot_epoch(root: &Path) -> ProcessBootEpoch {
+    let path = root.join("sys/kernel/random/boot_id");
+    let unavailable = || ProcessBootEpoch {
+        status: ProcessBootEpochStatus::Unavailable,
+        normalized_id: None,
+        evidence: None,
+    };
+    let mut bytes = Vec::new();
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(_) => return unavailable(),
+    };
+    if file
+        .take(MAX_BOOT_ID_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return unavailable();
+    }
+    if bytes.len() > MAX_BOOT_ID_BYTES {
+        return ProcessBootEpoch {
+            status: ProcessBootEpochStatus::OverLimit,
+            normalized_id: None,
+            evidence: None,
+        };
+    }
+    let record = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    let valid_shape = record.len() == 36
+        && [8, 13, 18, 23].iter().all(|index| record[*index] == b'-')
+        && record
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit());
+    let normalized_id = if valid_shape {
+        Some(String::from_utf8(record.to_ascii_lowercase()).expect("ASCII UUID"))
+    } else {
+        None
+    };
+    ProcessBootEpoch {
+        status: if normalized_id.is_some() {
+            ProcessBootEpochStatus::Observed
+        } else {
+            ProcessBootEpochStatus::Malformed
+        },
+        normalized_id,
+        evidence: Some(boot_epoch_evidence(&bytes)),
+    }
+}
+
+fn boot_epoch_evidence(bytes: &[u8]) -> ProcessBootEpochEvidence {
+    ProcessBootEpochEvidence {
+        source: "/proc/sys/kernel/random/boot_id".to_owned(),
+        byte_length: bytes.len(),
+        record_sha256: sha256_hex(bytes),
     }
 }
 
@@ -1188,6 +1290,13 @@ mod tests {
             ));
             fs::create_dir(&p).unwrap();
             fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
+            let boot_id = p.join("sys/kernel/random");
+            fs::create_dir_all(&boot_id).unwrap();
+            fs::write(
+                boot_id.join("boot_id"),
+                b"01234567-89AB-CDEF-0123-456789ABCDEF\n",
+            )
+            .unwrap();
             Self(p)
         }
         fn status(&self, pid: u32, bytes: &[u8]) {
@@ -1217,6 +1326,46 @@ mod tests {
         }
     }
     const VALID:&[u8]=b"Name:\ttest\nUmask:\t0022\nState:\tR (running)\nTgid:\t42\nPid:\t42\nPPid:\t1\nNSpid:\t42\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t2\n";
+
+    #[test]
+    fn boot_epoch_normalizes_uuid_and_retains_exact_byte_evidence() {
+        let root = Temp::new();
+        let epoch = read_boot_epoch(&root.0);
+        assert_eq!(epoch.status, ProcessBootEpochStatus::Observed);
+        assert_eq!(
+            epoch.normalized_id.as_deref(),
+            Some("01234567-89ab-cdef-0123-456789abcdef")
+        );
+        let evidence = epoch.evidence.unwrap();
+        assert_eq!(evidence.byte_length, 37);
+        assert_eq!(
+            evidence.record_sha256,
+            sha256_hex(b"01234567-89AB-CDEF-0123-456789ABCDEF\n")
+        );
+    }
+
+    #[test]
+    fn boot_epoch_reports_unavailable_malformed_and_over_limit() {
+        let root = Temp::new();
+        let path = root.0.join("sys/kernel/random/boot_id");
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            read_boot_epoch(&root.0).status,
+            ProcessBootEpochStatus::Unavailable
+        );
+        fs::write(&path, b"not-a-uuid\n").unwrap();
+        let malformed = read_boot_epoch(&root.0);
+        assert_eq!(malformed.status, ProcessBootEpochStatus::Malformed);
+        assert_eq!(
+            malformed.evidence.unwrap().record_sha256,
+            sha256_hex(b"not-a-uuid\n")
+        );
+        fs::write(&path, vec![b'a'; MAX_BOOT_ID_BYTES + 1]).unwrap();
+        assert_eq!(
+            read_boot_epoch(&root.0).status,
+            ProcessBootEpochStatus::OverLimit
+        );
+    }
     #[test]
     fn parses_valid_status_and_exact_line_evidence() {
         let (row, d) = parse_status(42, VALID);

@@ -953,7 +953,7 @@ fn runtime_coverage_detail(manifest: &CoverageManifest) -> Option<&RuntimeCovera
 
 fn artifact_version_supported(kind: ArtifactKind, observed: u32, current: u32) -> bool {
     observed == current
-        || (matches!(observed, 1 | 2)
+        || (matches!(observed, 1..=3)
             && matches!(
                 kind,
                 ArtifactKind::Processes | ArtifactKind::WindowsProcesses
@@ -992,7 +992,7 @@ fn artifact_contract(
 ) -> Result<(&'static str, &'static str, u32), ValidationError> {
     Ok(match kind {
         ArtifactKind::Packages => ("packages.json", "sideeffect.inventory", 2),
-        ArtifactKind::Processes => ("processes.json", "sideeffect.process_inventory", 3),
+        ArtifactKind::Processes => ("processes.json", "sideeffect.process_inventory", 4),
         ArtifactKind::Permissions => ("permissions.json", "sideeffect.permission_inventory", 1),
         ArtifactKind::Startup => ("startup.json", "sideeffect.startup_inventory", 2),
         ArtifactKind::PathExecutables => (
@@ -2200,12 +2200,22 @@ mod tests {
     }
 
     #[test]
-    fn process_artifact_contracts_accept_legacy_v1_v2_and_current_v3() {
+    fn process_artifact_contracts_accept_legacy_versions_and_platform_current_versions() {
         for kind in [ArtifactKind::Processes, ArtifactKind::WindowsProcesses] {
-            assert!(super::artifact_version_supported(kind, 1, 3));
-            assert!(super::artifact_version_supported(kind, 2, 3));
-            assert!(super::artifact_version_supported(kind, 3, 3));
-            assert!(!super::artifact_version_supported(kind, 4, 3));
+            let current = if kind == ArtifactKind::Processes {
+                4
+            } else {
+                3
+            };
+            for old in 1..current {
+                assert!(super::artifact_version_supported(kind, old, current));
+            }
+            assert!(super::artifact_version_supported(kind, current, current));
+            assert!(!super::artifact_version_supported(
+                kind,
+                current + 1,
+                current
+            ));
         }
         assert!(!super::artifact_version_supported(
             ArtifactKind::Packages,

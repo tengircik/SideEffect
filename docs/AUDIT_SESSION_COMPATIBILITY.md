@@ -1,6 +1,6 @@
 # Audit session compatibility
 
-The `sideeffect.audit_session` v7 manifest is a platform-neutral envelope. Readers accept v1-v7 manifests; v1 has no `coverage_manifest`, so its coverage status is rendered as `unknown`. Native inventory and runtime artifacts keep their own schemas. Process artifact readers accept historical v1-v2 and current v3 contracts so earlier sessions remain reviewable; new collectors write v3. Other artifact contracts remain exact. The reader does not migrate artifact versions or treat an unknown source as complete. Unknown platform strings and artifact contracts are rejected.
+The `sideeffect.audit_session` v7 manifest is a platform-neutral envelope. Readers accept v1-v7 manifests; v1 has no `coverage_manifest`, so its coverage status is rendered as `unknown`. Native inventory and runtime artifacts keep their own schemas. Process artifact readers accept historical v1-v3 contracts so earlier sessions remain reviewable; Linux writes process schema v4 and Windows continues to write schema v3. Other artifact contracts remain exact. The reader does not migrate artifact versions or treat an unknown source as complete. Unknown platform strings and artifact contracts are rejected.
 
 V2 introduced a bounded `coverage_manifest` with version 1 and one status per selected source role. Current producers emit coverage manifest version 2; readers continue to accept version 1. `CoverageStatus` is a coarser summary of the detailed per-source `SourceStatus`: `complete` maps to `configured` for startup and `observed` for other roles; `partial`, `not_checked`, and `unsupported` map directly; `access_denied` maps to `inaccessible`; and `unknown`, `not_applicable`, `unavailable`, `failed`, `timed_out`, and `output_limit_exceeded` map to `unknown`. The original source status remains available in each source entry. `not_observed` is reserved and is not emitted by current producers because an empty inventory or zero runtime events cannot establish absence. Here `observed` means a selected inventory completed its declared read; it does not claim runtime activity. Runtime capture remains partial today. These values describe the selected collector result only; they do not assert exhaustive OS coverage.
 
@@ -25,7 +25,7 @@ The item comparison status is reported separately from manifest comparability. M
 | Platform | Source role | Fixed artifact | Native schema | Version |
 | --- | --- | --- | --- | ---: |
 | Linux | packages | `packages.json` | `sideeffect.inventory` | 2 |
-| Linux | processes | `processes.json` | `sideeffect.process_inventory` | 3 |
+| Linux | processes | `processes.json` | `sideeffect.process_inventory` | 4 |
 | Linux | permissions | `permissions.json` | `sideeffect.permission_inventory` | 1 |
 | Linux | startup | `startup.json` | `sideeffect.startup_inventory` | 2 |
 | Linux | path_executables | `path-executables.json` | `sideeffect.path_executable_inventory` | 1 |
