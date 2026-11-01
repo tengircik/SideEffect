@@ -41,14 +41,37 @@ fn process_event(
     parent: u32,
     image: &str,
 ) -> NativeRuntimeEvent {
+    process_event_with_layout(ordinal, kind, pid, parent, image, 2, 8)
+}
+
+fn process_event_with_layout(
+    ordinal: u64,
+    kind: &str,
+    pid: u32,
+    parent: u32,
+    image: &str,
+    version: u8,
+    pointer_size: usize,
+) -> NativeRuntimeEvent {
     let (opcode, event_kind) = match kind {
         "process_start" => (1, "process_start"),
         "process_end" => (2, "process_end"),
         _ => unreachable!(),
     };
-    let mut raw_process_payload = vec![0u8; 8];
-    raw_process_payload.extend_from_slice(&pid.to_le_bytes());
-    raw_process_payload.extend_from_slice(&parent.to_le_bytes());
+    let mut raw_process_payload = Vec::new();
+    if version == 0 {
+        if pointer_size == 4 {
+            raw_process_payload.extend_from_slice(&pid.to_le_bytes());
+            raw_process_payload.extend_from_slice(&parent.to_le_bytes());
+        } else {
+            raw_process_payload.extend_from_slice(&u64::from(pid).to_le_bytes());
+            raw_process_payload.extend_from_slice(&u64::from(parent).to_le_bytes());
+        }
+    } else {
+        raw_process_payload.resize(pointer_size, 0);
+        raw_process_payload.extend_from_slice(&pid.to_le_bytes());
+        raw_process_payload.extend_from_slice(&parent.to_le_bytes());
+    }
     let raw_payload_hex = {
         use std::fmt::Write as _;
 
@@ -62,19 +85,19 @@ fn process_event(
         record_ordinal: ordinal,
         provider_guid: "{3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c}".to_owned(),
         event_id: 0,
-        event_version: 2,
+        event_version: version,
         opcode,
         event_kind: event_kind.to_owned(),
         header_process_id: 1,
         header_thread_id: 2,
-        header_flags: 0x0040,
+        header_flags: if pointer_size == 4 { 0x0020 } else { 0x0040 },
         timestamp_qpc: i64::try_from(ordinal).unwrap(),
         raw_payload_hex,
         payload_decoding: Some(DecodedProcessPayload {
             status: ProcessDecodeStatus::Decoded,
             schema_name: Some("windows.kernel_process_typegroup1".to_owned()),
-            schema_version: Some(2),
-            pointer_size_bytes: Some(8),
+            schema_version: Some(version),
+            pointer_size_bytes: Some(pointer_size as u8),
             process_id: Some(pid),
             parent_process_id: Some(parent),
             image_file_name: Some(image.to_owned()),
@@ -94,8 +117,8 @@ fn observation_event(
     let descriptor = if network {
         (
             "{9a280ac0-c8e0-11d1-84e2-00c04fb998a2}",
-            12,
-            "windows.kernel_tcp_ipv4_typegroup2",
+            11,
+            "windows.kernel_tcp_ipv4_typegroup1",
             2,
             "network",
         )
@@ -108,18 +131,57 @@ fn observation_event(
             "file",
         )
     };
-    let mut observation = json!({
-        "status":"decoded",
-        "diagnostic":null,
-        "observation":{
-            "schema":descriptor.2,
-            "schema_version":descriptor.3,
-            "activity":{"kind":descriptor.4,"observation":{"operation":"fixture"}}
+    let (raw_payload_hex, observation) = if network {
+        let payload_pid = payload_pid.unwrap_or_default();
+        let mut raw_payload = Vec::new();
+        raw_payload.extend_from_slice(&payload_pid.to_le_bytes());
+        raw_payload.extend_from_slice(&12_u32.to_le_bytes());
+        raw_payload.extend_from_slice(&[127, 0, 0, 1]);
+        raw_payload.extend_from_slice(&[127, 0, 0, 1]);
+        raw_payload.extend_from_slice(&443_u16.to_be_bytes());
+        raw_payload.extend_from_slice(&50_000_u16.to_be_bytes());
+        raw_payload.extend_from_slice(&99_u32.to_le_bytes());
+        raw_payload.extend_from_slice(&0x7788_u64.to_le_bytes());
+        let observation = json!({
+            "status":"decoded",
+            "diagnostic":null,
+            "observation":{
+                "schema":descriptor.2,
+                "schema_version":descriptor.3,
+                "activity":{"kind":"network","observation":{
+                    "transport":"tcp",
+                    "operation":"receive",
+                    "payload_process_id":payload_pid,
+                    "source_address":{"v4":[127,0,0,1]},
+                    "destination_address":{"v4":[127,0,0,1]},
+                    "source_port":50000,
+                    "destination_port":443,
+                    "packet_size":12,
+                    "sequence_number":99,
+                    "connection_id":30600
+                }}
+            }
+        });
+        let mut encoded = String::with_capacity(raw_payload.len().saturating_mul(2));
+        use std::fmt::Write as _;
+        for byte in &raw_payload {
+            write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
         }
-    });
-    if let Some(pid) = payload_pid {
-        observation["observation"]["activity"]["observation"]["payload_process_id"] = json!(pid);
-    }
+        (encoded, observation)
+    } else {
+        (
+            "00".to_owned(),
+            json!({
+                "status":"decoded",
+                "diagnostic":null,
+                "observation":{
+                    "schema":descriptor.2,
+                    "schema_version":descriptor.3,
+                    "activity":{"kind":descriptor.4,"observation":{"operation":"fixture"}}
+                }
+            }),
+        )
+    };
     NativeRuntimeEvent {
         record_ordinal: ordinal,
         provider_guid: descriptor.0.to_owned(),
@@ -129,9 +191,9 @@ fn observation_event(
         event_kind: kind.to_owned(),
         header_process_id: header_pid,
         header_thread_id: 2,
-        header_flags: 0,
+        header_flags: if network { 0x0040 } else { 0 },
         timestamp_qpc: i64::try_from(ordinal).unwrap(),
-        raw_payload_hex: "00".to_owned(),
+        raw_payload_hex,
         payload_decoding: None,
         observation_decoding: Some(observation),
     }
@@ -255,6 +317,8 @@ fn links_supported_descendant_and_network_payloads_but_keeps_header_pid_as_conte
         String::from_utf8_lossy(&output.stderr)
     );
     let summary = output_json(&output);
+    assert_eq!(summary["schema_version"], 2);
+    assert_eq!(summary["algorithm"]["version"], 2);
     assert_eq!(summary["status"], "complete");
     assert_eq!(
         summary["capture"]["sha256"],
@@ -272,6 +336,10 @@ fn links_supported_descendant_and_network_payloads_but_keeps_header_pid_as_conte
     assert_eq!(
         summary["event_attributions"][3]["attribution"],
         "descendant_network_payload_pid_match"
+    );
+    assert_eq!(
+        summary["event_attributions"][3]["basis"],
+        "raw_network_payload_pid_matches_serialized_sidecar_and_active_target_tree_instance"
     );
     assert_eq!(
         summary["event_attributions"][4]["attribution"],
@@ -350,12 +418,12 @@ fn overlapping_pid_lifecycle_is_reported_ambiguous_and_not_network_attributed() 
 }
 
 #[test]
-fn process_end_with_mismatched_start_identity_ends_attribution_as_ambiguous() {
+fn process_end_with_mismatched_parent_ends_attribution_as_ambiguous() {
     let bytes = capture(
         vec![
             process_event(1, "process_start", 100, 5, "target.exe"),
             process_event(2, "process_start", 200, 100, "child.exe"),
-            process_event(3, "process_end", 200, 100, "other.exe"),
+            process_event(3, "process_end", 200, 101, "child.exe"),
             observation_event(4, "network_observation", 200, Some(200)),
         ],
         true,
@@ -366,12 +434,327 @@ fn process_end_with_mismatched_start_identity_ends_attribution_as_ambiguous() {
     assert_eq!(summary["summary"]["ambiguous_process_ids"], 1);
     assert_eq!(
         summary["unassigned_events"][0]["reason"],
-        "process_end_parent_or_image_does_not_match_active_start_payload"
+        "process_end_parent_does_not_match_active_start_payload"
     );
     assert_eq!(
         summary["unassigned_events"][1]["reason"],
         "network_payload_process_id_is_ambiguous"
     );
+}
+
+#[test]
+fn process_end_image_metadata_does_not_define_process_identity() {
+    let bytes = capture(
+        vec![
+            process_event(1, "process_start", 100, 5, "target.exe"),
+            process_event(2, "process_end", 100, 5, "different-untrusted-image.exe"),
+        ],
+        false,
+    );
+    let output = run(&bytes);
+    assert!(output.status.success());
+    let summary = output_json(&output);
+    assert_eq!(summary["processes"][0]["end_event"]["record_ordinal"], 2);
+    assert_eq!(
+        summary["event_attributions"][1]["basis"],
+        "raw_checked_process_end_pid_and_parent_match_active_process_start"
+    );
+}
+
+#[test]
+fn process_payload_raw_and_sidecar_must_match_for_pid_and_parent_id() {
+    for mismatch_parent in [false, true] {
+        let mut row = process_event(1, "process_start", 100, 5, "target.exe");
+        let payload = row.payload_decoding.as_mut().unwrap();
+        if mismatch_parent {
+            payload.parent_process_id = Some(6);
+        } else {
+            payload.process_id = Some(101);
+        }
+        let bytes = capture(vec![row], false);
+        let output = run(&bytes);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "network row result: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let summary = output_json(&output);
+        assert_eq!(summary["status"], "partial");
+        assert_eq!(summary["target_start_status"], "not_observed");
+        assert!(summary["processes"].as_array().unwrap().is_empty());
+        assert_eq!(
+            summary["unassigned_events"][0]["reason"],
+            "process_start_payload_is_not_supported_and_validated"
+        );
+        assert!(
+            summary["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "process_payload_sidecar_mismatch")
+        );
+    }
+}
+
+#[test]
+fn network_attribution_requires_raw_payload_sidecar_pid_match() {
+    let mut forged = observation_event(2, "network_observation", 999, Some(100));
+    forged.observation_decoding.as_mut().unwrap()["observation"]["activity"]["observation"]["payload_process_id"] =
+        json!(101);
+    let output = run(&capture(
+        vec![
+            process_event(1, "process_start", 100, 5, "target.exe"),
+            forged,
+        ],
+        false,
+    ));
+    assert_eq!(output.status.code(), Some(2));
+    let summary = output_json(&output);
+    assert_eq!(summary["event_attributions"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        summary["unassigned_events"][0]["event"]["record_ordinal"],
+        2
+    );
+    assert_eq!(
+        summary["unassigned_events"][0]["reason"],
+        "network_payload_sidecar_does_not_match_raw_payload"
+    );
+    assert!(
+        summary["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "network_decoder_metadata_mismatch")
+    );
+}
+
+#[test]
+fn malformed_and_unsupported_network_payloads_are_partial_and_unassigned() {
+    let mut malformed = observation_event(2, "network_observation", 999, Some(100));
+    malformed.raw_payload_hex = "00".to_owned();
+    let mut unsupported = observation_event(3, "network_observation", 999, Some(100));
+    unsupported.opcode = 99;
+    for (mut row, expected_diagnostic) in [
+        (malformed, "network_payload_malformed"),
+        (unsupported, "network_payload_unsupported"),
+    ] {
+        row.record_ordinal = 2;
+        let output = run(&capture(
+            vec![process_event(1, "process_start", 100, 5, "target.exe"), row],
+            false,
+        ));
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "network row result: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let summary = output_json(&output);
+        assert_eq!(summary["status"], "partial");
+        assert_eq!(summary["event_attributions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            summary["unassigned_events"][0]["event"]["record_ordinal"],
+            2
+        );
+        assert!(
+            summary["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == expected_diagnostic)
+        );
+    }
+}
+
+#[test]
+fn malformed_or_unsupported_process_payloads_remain_unresolved() {
+    let mut cases = Vec::new();
+    let mut truncated = process_event(1, "process_start", 100, 5, "target.exe");
+    truncated.raw_payload_hex = "00".to_owned();
+    cases.push((truncated, "process_payload_malformed"));
+
+    let mut missing_pointer_flags = process_event(1, "process_start", 100, 5, "target.exe");
+    missing_pointer_flags.header_flags = 0;
+    cases.push((missing_pointer_flags, "process_payload_unsupported"));
+
+    let mut conflicting_pointer_flags = process_event(1, "process_start", 100, 5, "target.exe");
+    conflicting_pointer_flags.header_flags = 0x0060;
+    cases.push((conflicting_pointer_flags, "process_payload_unsupported"));
+
+    let mut unsupported_version = process_event(1, "process_start", 100, 5, "target.exe");
+    unsupported_version.event_version = 4;
+    cases.push((unsupported_version, "process_payload_unsupported"));
+
+    let mut wrong_provider = process_event(1, "process_start", 100, 5, "target.exe");
+    wrong_provider.provider_guid = "00000000-0000-0000-0000-000000000000".to_owned();
+    cases.push((wrong_provider, "process_payload_unsupported"));
+
+    let mut wrong_event_id = process_event(1, "process_start", 100, 5, "target.exe");
+    wrong_event_id.event_id = 1;
+    cases.push((wrong_event_id, "process_payload_unsupported"));
+
+    let mut wrong_opcode = process_event(1, "process_start", 100, 5, "target.exe");
+    wrong_opcode.opcode = 9;
+    cases.push((wrong_opcode, "process_payload_unsupported"));
+
+    cases.push((
+        process_event(1, "process_start", 0, 5, "target.exe"),
+        "process_payload_invalid_process_id",
+    ));
+
+    for (row, expected_diagnostic) in cases {
+        let bytes = capture(vec![row], false);
+        let output = run(&bytes);
+        assert_eq!(output.status.code(), Some(2));
+        let summary = output_json(&output);
+        assert_eq!(summary["status"], "partial");
+        assert_eq!(summary["target_start_status"], "not_observed");
+        assert!(summary["event_attributions"].as_array().unwrap().is_empty());
+        assert!(
+            summary["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == expected_diagnostic)
+        );
+    }
+}
+
+#[test]
+fn malformed_child_start_invalidates_active_lifecycle_continuity() {
+    let mut invalid_child = process_event(2, "process_start", 200, 100, "child.exe");
+    invalid_child.raw_payload_hex = "00".to_owned();
+    let bytes = capture(
+        vec![
+            process_event(1, "process_start", 100, 5, "target.exe"),
+            invalid_child,
+            observation_event(3, "network_observation", 100, Some(100)),
+        ],
+        false,
+    );
+    let output = run(&bytes);
+    assert_eq!(output.status.code(), Some(2));
+    let summary = output_json(&output);
+    assert_eq!(
+        summary["processes"][0]["identity_status"],
+        "ambiguous_pid_lifecycle"
+    );
+    assert_eq!(
+        summary["unassigned_events"][0]["event"]["record_ordinal"],
+        2
+    );
+    assert_eq!(
+        summary["unassigned_events"][1]["event"]["record_ordinal"],
+        3
+    );
+    assert_eq!(
+        summary["unassigned_events"][1]["reason"],
+        "network_payload_process_id_is_ambiguous"
+    );
+}
+
+#[test]
+fn rehashed_process_end_with_wrong_kind_invalidates_lifecycle_before_network_rows() {
+    for event_id in [0, 1] {
+        let mut wrong_kind_end = process_event(2, "process_end", 100, 5, "target.exe");
+        wrong_kind_end.event_id = event_id;
+        wrong_kind_end.event_kind = "unsupported_or_malformed_provider_event".to_owned();
+        let output = run(&capture(
+            vec![
+                process_event(1, "process_start", 100, 5, "target.exe"),
+                wrong_kind_end,
+                observation_event(3, "network_observation", 999, Some(100)),
+            ],
+            false,
+        ));
+        assert_eq!(output.status.code(), Some(2));
+        let summary = output_json(&output);
+        assert_eq!(
+            summary["processes"][0]["identity_status"],
+            "ambiguous_pid_lifecycle"
+        );
+        assert_eq!(
+            summary["unassigned_events"][0]["event"]["record_ordinal"],
+            2
+        );
+        assert_eq!(
+            summary["unassigned_events"][1]["event"]["record_ordinal"],
+            3
+        );
+        assert_eq!(
+            summary["unassigned_events"][1]["reason"],
+            "network_payload_process_id_is_ambiguous"
+        );
+        assert!(
+            summary["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "process_payload_unsupported")
+        );
+    }
+}
+
+#[test]
+fn rehashed_network_row_with_wrong_kind_is_checked_and_partial() {
+    let mut wrong_kind_network = observation_event(2, "network_observation", 999, Some(100));
+    wrong_kind_network.event_kind = "unsupported_or_malformed_provider_event".to_owned();
+    let output = run(&capture(
+        vec![
+            process_event(1, "process_start", 100, 5, "target.exe"),
+            wrong_kind_network,
+        ],
+        false,
+    ));
+    assert_eq!(output.status.code(), Some(2));
+    let summary = output_json(&output);
+    assert_eq!(summary["status"], "partial");
+    assert_eq!(
+        summary["unassigned_events"][0]["event"]["record_ordinal"],
+        2
+    );
+    assert_eq!(
+        summary["unassigned_events"][0]["reason"],
+        "network_payload_sidecar_does_not_match_raw_payload"
+    );
+    assert!(
+        summary["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "network_decoder_metadata_mismatch")
+    );
+}
+
+#[test]
+fn reviewed_process_layouts_validate_for_each_version_and_pointer_width() {
+    for version in 0..=3 {
+        for pointer_size in [4, 8] {
+            let row = process_event_with_layout(
+                1,
+                "process_start",
+                100,
+                5,
+                "target.exe",
+                version,
+                pointer_size,
+            );
+            let output = run(&capture(vec![row], false));
+            assert!(
+                output.status.success(),
+                "version={version}, pointer_size={pointer_size}, status={:?}: stdout={} stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let summary = output_json(&output);
+            assert_eq!(summary["target_start_status"], "observed_once");
+            assert_eq!(summary["summary"]["observed_target_process_instances"], 1);
+        }
+    }
 }
 
 #[test]

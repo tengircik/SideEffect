@@ -25,111 +25,15 @@ use windows_sys::Win32::System::Diagnostics::Etw::{
     SystemTraceControlGuid, WNODE_FLAG_TRACED_GUID,
 };
 
-/// Result of checking a serialized TCP/UDP observation against its retained payload.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum NetworkPayloadCrossCheck {
-    NotNetworkProvider,
-    Matched(u32),
-    Mismatch(u32),
-    Unsupported,
-    Malformed,
-    InvalidProcessId,
-}
-
-pub(crate) struct NetworkPayloadInput<'a> {
-    pub provider_guid: &'a str,
-    pub event_id: u16,
-    pub event_version: u8,
-    pub opcode: u8,
-    pub header_flags: u16,
-    pub event_kind: &'a str,
-    pub raw_payload: &'a [u8],
-    pub serialized_decoding: Option<&'a serde_json::Value>,
-}
-
-/// Re-decode supported classic TCP/UDP records and use only the raw payload's PID.
-pub(crate) fn cross_check_network_payload(
-    input: NetworkPayloadInput<'_>,
-) -> NetworkPayloadCrossCheck {
-    let Some(normalized) = normalize_provider_guid(input.provider_guid) else {
-        return NetworkPayloadCrossCheck::NotNetworkProvider;
-    };
-    let network_provider = matches!(
-        normalized.as_str(),
-        "9a280ac0-c8e0-11d1-84e2-00c04fb998a2" | "bf3a50c5-a9c9-4988-a005-2df0b7c80f80"
-    );
-    if !network_provider {
-        return NetworkPayloadCrossCheck::NotNetworkProvider;
-    }
-    let pointer_width = match input.header_flags {
-        flags
-            if flags & (EVENT_HEADER_FLAG_32_BIT_HEADER as u16) != 0
-                && flags & (EVENT_HEADER_FLAG_64_BIT_HEADER as u16) == 0 =>
-        {
-            Some(PointerWidth::Bits32)
-        }
-        flags
-            if flags & (EVENT_HEADER_FLAG_64_BIT_HEADER as u16) != 0
-                && flags & (EVENT_HEADER_FLAG_32_BIT_HEADER as u16) == 0 =>
-        {
-            Some(PointerWidth::Bits64)
-        }
-        _ => None,
-    };
-    let decoded = decode_classic_event(
-        &normalized,
-        input.event_id,
-        input.event_version,
-        input.opcode,
-        pointer_width,
-        input.raw_payload,
-    );
-    let Some(observation) = decoded.observation.as_ref() else {
-        return if decoded.status == IoDecodeStatus::MalformedPayload {
-            NetworkPayloadCrossCheck::Malformed
-        } else {
-            NetworkPayloadCrossCheck::Unsupported
-        };
-    };
-    let Activity::Network(network) = &observation.activity else {
-        return NetworkPayloadCrossCheck::Unsupported;
-    };
-    let Ok(raw_value) = serde_json::to_value(&decoded) else {
-        return NetworkPayloadCrossCheck::Malformed;
-    };
-    let matches = input.event_kind == "network_observation"
-        && input
-            .serialized_decoding
-            .is_some_and(|serialized| *serialized == raw_value);
-    if network.payload_process_id == 0 {
-        NetworkPayloadCrossCheck::InvalidProcessId
-    } else if matches {
-        NetworkPayloadCrossCheck::Matched(network.payload_process_id)
-    } else {
-        NetworkPayloadCrossCheck::Mismatch(network.payload_process_id)
-    }
-}
-
-fn normalize_provider_guid(value: &str) -> Option<String> {
-    let value = value.trim();
-    let value = if let Some(inner) = value.strip_prefix('{') {
-        inner.strip_suffix('}')?
-    } else {
-        value
-    };
-    (value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| match index {
-            8 | 13 | 18 | 23 => byte == b'-',
-            _ => byte.is_ascii_hexdigit(),
-        }))
-    .then(|| value.to_ascii_lowercase())
-}
-
 #[path = "payload_decode.rs"]
 mod payload_decode;
 use super::windows_io_decode::{
     Activity, DecodeResult as IoDecodeResult, DecodeStatus as IoDecodeStatus, PointerWidth,
     decode_classic_event,
+};
+#[cfg(test)]
+use super::windows_io_decode::{
+    NetworkPayloadCrossCheck, NetworkPayloadInput, cross_check_network_payload,
 };
 use payload_decode::decode_event_payload;
 pub use payload_decode::{DecodeStatus, DecodedProcessPayload};

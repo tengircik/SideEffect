@@ -1486,7 +1486,6 @@ struct EtwEventView<'a> {
     observation_decoding: Option<&'a serde_json::Value>,
 }
 
-#[cfg(windows)]
 #[derive(Clone, Copy)]
 struct EtwProcessPayloadView<'a> {
     decoded: bool,
@@ -1495,6 +1494,17 @@ struct EtwProcessPayloadView<'a> {
     pointer_size_bytes: Option<u8>,
     process_id: Option<u32>,
     parent_process_id: Option<u32>,
+}
+
+struct WindowsProcessEventView<'a> {
+    provider_guid: &'a str,
+    event_id: u16,
+    event_version: u8,
+    opcode: u8,
+    event_kind: &'a str,
+    header_flags: u16,
+    raw_payload_hex: &'a str,
+    process_payload: Option<EtwProcessPayloadView<'a>>,
 }
 
 #[cfg(windows)]
@@ -2534,25 +2544,22 @@ fn mark_windows_observation_unresolved(
     }
 }
 
-#[cfg(windows)]
 #[derive(Clone, Copy)]
-struct ValidatedWindowsProcessPayload {
-    process_id: u32,
-    parent_process_id: u32,
+pub(crate) struct ValidatedWindowsProcessPayload {
+    pub(crate) process_id: u32,
+    pub(crate) parent_process_id: u32,
 }
 
-#[cfg(windows)]
 #[derive(Clone, Copy, Debug)]
-enum WindowsProcessPayloadError {
+pub(crate) enum WindowsProcessPayloadError {
     Unsupported,
     Malformed,
     Mismatch,
     InvalidProcessId,
 }
 
-#[cfg(windows)]
 impl WindowsProcessPayloadError {
-    fn diagnostic_code(self) -> &'static str {
+    pub(crate) fn diagnostic_code(self) -> &'static str {
         match self {
             Self::Unsupported => "process_payload_unsupported",
             Self::Malformed => "process_payload_malformed",
@@ -2561,6 +2568,7 @@ impl WindowsProcessPayloadError {
         }
     }
 
+    #[cfg(windows)]
     fn diagnostic_message(self, kind: &str) -> String {
         let reason = match self {
             Self::Unsupported => {
@@ -2583,6 +2591,56 @@ impl WindowsProcessPayloadError {
 #[cfg(windows)]
 fn validated_process_payload(
     event: &EtwEventView<'_>,
+    expected_kind: &str,
+) -> Result<ValidatedWindowsProcessPayload, WindowsProcessPayloadError> {
+    validate_windows_process_payload_contract(
+        WindowsProcessEventView {
+            provider_guid: event.provider_guid,
+            event_id: event.event_id,
+            event_version: event.event_version,
+            opcode: event.opcode,
+            event_kind: event.event_kind,
+            header_flags: event.header_flags,
+            raw_payload_hex: event.raw_payload_hex,
+            process_payload: event.process_payload,
+        },
+        expected_kind,
+    )
+}
+
+/// Apply the common raw-payload contract to a retained native Windows ETW event.
+/// This is shared by the common event adapter and offline attribution so the two
+/// outputs cannot assign different confidence to the same process row.
+pub(crate) fn validate_native_windows_process_payload(
+    event: &crate::windows_runtime::NativeRuntimeEvent,
+    expected_kind: &str,
+) -> Result<ValidatedWindowsProcessPayload, WindowsProcessPayloadError> {
+    let payload = event.payload_decoding.as_ref();
+    let process_payload = payload.map(|payload| EtwProcessPayloadView {
+        decoded: payload.status == crate::windows_runtime::ProcessDecodeStatus::Decoded,
+        schema_name: payload.schema_name.as_deref(),
+        schema_version: payload.schema_version,
+        pointer_size_bytes: payload.pointer_size_bytes,
+        process_id: payload.process_id,
+        parent_process_id: payload.parent_process_id,
+    });
+    validate_windows_process_payload_contract(
+        WindowsProcessEventView {
+            provider_guid: &event.provider_guid,
+            event_id: event.event_id,
+            event_version: event.event_version,
+            opcode: event.opcode,
+            event_kind: &event.event_kind,
+            header_flags: event.header_flags,
+            raw_payload_hex: &event.raw_payload_hex,
+            process_payload,
+        },
+        expected_kind,
+    )
+}
+
+fn validate_windows_process_payload_contract(
+    event: WindowsProcessEventView<'_>,
     expected_kind: &str,
 ) -> Result<ValidatedWindowsProcessPayload, WindowsProcessPayloadError> {
     const PROCESS_PROVIDER_GUID: &str = "3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c";
@@ -2653,7 +2711,6 @@ fn validated_process_payload(
     })
 }
 
-#[cfg(windows)]
 fn decode_windows_process_id(
     bytes: &[u8],
     offset: usize,
@@ -2683,7 +2740,6 @@ fn decode_windows_process_id(
     }
 }
 
-#[cfg(windows)]
 fn normalized_guid(value: &str) -> Option<String> {
     let value = value.trim();
     let value = value
@@ -2788,6 +2844,35 @@ fn cross_checked_network_payload_pid(event: &EtwEventView<'_>) -> NetworkPayload
     }
 }
 
+/// Reuse the common event adapter's raw network decoder for offline attribution.
+pub(crate) fn cross_checked_native_network_payload_pid(
+    event: &crate::windows_runtime::NativeRuntimeEvent,
+) -> crate::record::NetworkPayloadCrossCheck {
+    let Some(raw_payload) = decode_hex(&event.raw_payload_hex) else {
+        let network_provider = normalized_guid(&event.provider_guid).is_some_and(|guid| {
+            matches!(
+                guid.as_str(),
+                "9a280ac0-c8e0-11d1-84e2-00c04fb998a2" | "bf3a50c5-a9c9-4988-a005-2df0b7c80f80"
+            )
+        });
+        return if network_provider {
+            crate::record::NetworkPayloadCrossCheck::Malformed
+        } else {
+            crate::record::NetworkPayloadCrossCheck::NotNetworkProvider
+        };
+    };
+    crate::record::cross_check_network_payload(crate::record::NetworkPayloadInput {
+        provider_guid: &event.provider_guid,
+        event_id: event.event_id,
+        event_version: event.event_version,
+        opcode: event.opcode,
+        header_flags: event.header_flags,
+        event_kind: &event.event_kind,
+        raw_payload: &raw_payload,
+        serialized_decoding: event.observation_decoding.as_ref(),
+    })
+}
+
 #[cfg(windows)]
 fn is_file_or_disk_observation(event: &EtwEventView<'_>) -> bool {
     let Some(value) = event.observation_decoding else {
@@ -2821,7 +2906,6 @@ fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-#[cfg(windows)]
 fn decode_hex(value: &str) -> Option<Vec<u8>> {
     if value.len() % 2 != 0 {
         return None;

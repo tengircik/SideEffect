@@ -252,6 +252,79 @@ pub(super) fn decode_classic_event(
     }
 }
 
+/// Result of checking a serialized TCP/UDP observation against its retained payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NetworkPayloadCrossCheck {
+    NotNetworkProvider,
+    Matched(u32),
+    Mismatch(u32),
+    Unsupported,
+    Malformed,
+    InvalidProcessId,
+}
+
+pub(crate) struct NetworkPayloadInput<'a> {
+    pub provider_guid: &'a str,
+    pub event_id: u16,
+    pub event_version: u8,
+    pub opcode: u8,
+    pub header_flags: u16,
+    pub event_kind: &'a str,
+    pub raw_payload: &'a [u8],
+    pub serialized_decoding: Option<&'a serde_json::Value>,
+}
+
+/// Re-decode a supported classic TCP/UDP event and use only its raw PID.
+pub(crate) fn cross_check_network_payload(
+    input: NetworkPayloadInput<'_>,
+) -> NetworkPayloadCrossCheck {
+    let Some(normalized) = normalize_guid(input.provider_guid) else {
+        return NetworkPayloadCrossCheck::NotNetworkProvider;
+    };
+    let network_provider = normalized.eq_ignore_ascii_case(TCP_IP_GUID)
+        || normalized.eq_ignore_ascii_case(UDP_IP_GUID);
+    if !network_provider {
+        return NetworkPayloadCrossCheck::NotNetworkProvider;
+    }
+    let pointer_width = match input.header_flags {
+        flags if flags & 0x0020 != 0 && flags & 0x0040 == 0 => Some(PointerWidth::Bits32),
+        flags if flags & 0x0040 != 0 && flags & 0x0020 == 0 => Some(PointerWidth::Bits64),
+        _ => None,
+    };
+    let decoded = decode_classic_event(
+        normalized,
+        input.event_id,
+        input.event_version,
+        input.opcode,
+        pointer_width,
+        input.raw_payload,
+    );
+    let Some(observation) = decoded.observation.as_ref() else {
+        return if decoded.status == DecodeStatus::MalformedPayload {
+            NetworkPayloadCrossCheck::Malformed
+        } else {
+            NetworkPayloadCrossCheck::Unsupported
+        };
+    };
+    let Activity::Network(network) = &observation.activity else {
+        return NetworkPayloadCrossCheck::Unsupported;
+    };
+    let Ok(raw_value) = serde_json::to_value(&decoded) else {
+        return NetworkPayloadCrossCheck::Malformed;
+    };
+    let matches = input.event_kind == "network_observation"
+        && input
+            .serialized_decoding
+            .is_some_and(|serialized| *serialized == raw_value);
+    if network.payload_process_id == 0 {
+        NetworkPayloadCrossCheck::InvalidProcessId
+    } else if matches {
+        NetworkPayloadCrossCheck::Matched(network.payload_process_id)
+    } else {
+        NetworkPayloadCrossCheck::Mismatch(network.payload_process_id)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Provider {
     FileIo,

@@ -231,7 +231,7 @@ Milestones are ordered by dependency. Work may be split into independently revie
 
 ### R9 — Optional AI investigation evaluation and implementation
 
-**Status:** active under the current project objective; experimental and not release-approved. No model is approved, and core product workflows do not depend on one. Continue implementation only behind the deterministic evidence, privacy, security, resource, and quality gates below.
+**Status:** deferred and queued for later; experimental, incomplete, and not release-approved. No model is approved, and core product workflows do not depend on one. Further implementation and qualification are paused until the project resumes this work; any resumed work must pass the deterministic evidence, privacy, security, resource, and quality gates below.
 
 **Purpose:** evaluate whether an optional local model can help a user navigate already validated evidence without becoming a collector, fact source, or required runtime.
 
@@ -304,11 +304,11 @@ Status describes the coverage in current repository documentation as reviewed fo
 | 6 | Hash checks byte identity, not source authenticity | Explicit limitation; current hashes are not signatures/authentication | R8 |
 | 6 provenance manifest | Evidence ID, source, collector/OS, interval, privilege, settings, hashes, diagnostics, parent session | Partial; bundles and audit sessions carry bounded metadata, not the proposed signed provenance package/key lifecycle | R0, R8 |
 | 6 signatures | Exact-byte Ed25519 detached signing and verification with a supplied public key | Partial; the `provenance sign`/`verify` utility and tamper-detection tests exist, but trusted key binding, lifecycle, chains, and bundle signing do not | R8 |
-| 7 | AI can help but cannot be evidence or security authority | Partial; optional local model is experimental and unqualified; core deterministic path exists | R9 (active evaluation) |
+| 7 | AI can help but cannot be evidence or security authority | Partial; optional local model is experimental and unqualified; core deterministic path exists | R9 (deferred/queued; evaluation incomplete) |
 | 7.1 | Prompt injection in paths, args, process names and reports; provider privacy | Partial; untrusted input and Agent Skill boundaries are documented; investigation workflow needs benchmarked adversarial controls | R7, R9 |
 | 7.1 layered design | collectors → deterministic analysis → structured findings → AI interpretation → human review | Partial; components exist separately but full bounded investigation interface does not | R3–R7, R9 |
 | 7.1 evidence IDs | Model restricted to supplied evidence IDs and user remains decision maker | Partial; existing model tasks validate selected IDs within bounded requests; no approved quality claim | R9 |
-| 7.2 | Local model currently experimental; usefulness benchmark before expansion | Explicit limitation; implementation/evaluation active, no model release-approved | R9 |
+| 7.2 | Local model currently experimental; usefulness benchmark before expansion | Explicit limitation; implementation/evaluation deferred and queued, experimental/incomplete, no model release-approved | R9 |
 | 7.2 benchmark scenarios | Normal/suspicious, failed operation, misleading names, incomplete capture, similar traces, injection | Missing as a broad reviewed benchmark | R9 |
 | 8 | Self-security architecture: local, no auto-elevation, safe output, bounded input | Partial/existing for documented commands; broader future collectors/UI need equivalent review | R1, R7, cross-phase gates |
 | 8.1 | Long lines, invalid UTF-8, controls, numbers, continuations, contradictions, HTML injection, fuzzing | Partial; bounds and selected tests exist; broad fuzzing and hostile-schema coverage remain future work | R1, R7 |
@@ -333,7 +333,7 @@ Status describes the coverage in current repository documentation as reviewed fo
 | 10.6 query engine | Read-only structured/SQL-like search over events and relationships | Missing as a general investigation query engine | R7 |
 | 10.6 cases | Saved scope, evidence, findings and investigation status | Missing | R7 |
 | 10.6 reports | Technical, security/analyst and executive views from evidence-linked facts | Partial static HTML and deterministic summaries exist; role-specific report set missing | R7 |
-| 10.7 AI assistant | Natural language query, explanation and report only after deterministic engine | Experimental task-specific plumbing exists; no general approved assistant | R9 active, gated by R3–R7 |
+| 10.7 AI assistant | Natural language query, explanation and report only after deterministic engine | Experimental task-specific plumbing exists; no general approved assistant | R9 deferred/queued, gated by R3–R7 |
 | 11 | Priority order and acceptance before expanding analysis | Partial; existing milestones are gated, comprehensive future gates are now proposed | R0–R9 |
 | 12 | Local evidence-based software behavior product, not AV/EDR/SIEM/sandbox | Existing product boundary; future broader platform is bounded and not complete coverage | Product boundaries; R0–R9 |
 | 12 questions 1–10 | Origin, files, children, endpoints, access, startup, changes, diffs, deviations, evidence | Partial across separate bounded commands; integrated answers vary by current source scope | R2–R7; unknowns stay explicit |
@@ -358,9 +358,9 @@ Status describes the coverage in current repository documentation as reviewed fo
 | System Change Intelligence | Partial source inventories, no scoped cross-source install diff | R5 |
 | Effective Access Analyzer | Missing beyond selected-path facts | R6 |
 | Investigation Engine | Missing general query/case/report engine | R7 |
-| AI Investigation Assistant | Active evaluation; experimental, no model release-approved | R9 |
+| AI Investigation Assistant | Deferred/queued evaluation; experimental and incomplete, no model release-approved | R9 |
 | Top three: baseline, semantic diff, system change intelligence | Not integrated; prioritized after reliability and event/identity foundations | R1 → R3 → R4/R5 |
 
 ## Relationship to existing planning documents
 
-`PLAN.md` remains the historical and current implementation record for M0–M13 and release status. This document adds work after those bounded milestones; it does not rewrite acceptance already met, silently upgrade claims, or replace the compatibility matrix. Update this roadmap's status and the relevant source documentation as each milestone is implemented and validated. R9 and further M8/local-model work are active under the current project objective, remain experimental and optional, and must preserve the quality, privacy, security, and core-independence gates defined above.
+`PLAN.md` remains the historical and current implementation record for M0–M13 and release status. This document adds work after those bounded milestones; it does not rewrite acceptance already met, silently upgrade claims, or replace the compatibility matrix. Update this roadmap's status and the relevant source documentation as each milestone is implemented and validated. R9 and further M8/local-model work are deferred and queued for later; they remain experimental, incomplete, and optional, with no model approved. Core workflows must remain useful without a model, and any resumed work must preserve the quality, privacy, security, and core-independence gates defined above.

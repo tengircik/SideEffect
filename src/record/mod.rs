@@ -5,7 +5,6 @@ mod paths;
 mod windows;
 #[cfg(windows)]
 mod windows_etw;
-#[cfg(windows)]
 mod windows_io_decode;
 
 #[cfg(target_os = "linux")]
@@ -28,8 +27,7 @@ pub use windows_etw::{
     DecodedProcessPayload as WindowsDecodedProcessPayload, StopReason as WindowsRuntimeStopReason,
     WindowsRuntimeCapture, record_windows_runtime_capture,
 };
-#[cfg(windows)]
-pub(crate) use windows_etw::{
+pub(crate) use windows_io_decode::{
     NetworkPayloadCrossCheck, NetworkPayloadInput, cross_check_network_payload,
 };
 
