@@ -4,7 +4,7 @@
 
 This roadmap is based on the repository documentation and the technical critiques listed in the traceability matrix below. It is a planning synthesis, not a new code audit. Existing implementation status remains governed by `PRODUCT.md`, `ARCHITECTURE.md`, `PLAN.md`, the [source acceptance matrix](SOURCE_ACCEPTANCE.md), compatibility records, and the security policy. A planned capability does not imply that a collector can observe every relevant system action.
 
-## Implementation status (2026-10-31)
+## Implementation status (2026-11-01)
 
 These are audited status summaries, not phase acceptance. “Partial” means useful code exists while the named phase gate remains open.
 
