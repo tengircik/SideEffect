@@ -1,8 +1,8 @@
 use std::io::{self, Write};
 
 use crate::model::{
-    CaptureCompleteness, DeltaKind, EventCategory, EvidenceReference, ObservedDelta, TraceDiff,
-    TraceRecordKind,
+    CaptureCompleteness, DeltaKind, EventCategory, EvidenceReference, ObservedDelta,
+    SemanticRecordClass, SyscallOutcome, TraceDiff, TraceRecordKind,
 };
 use crate::trace::{LexicalPathBasis, LexicalPathHint};
 
@@ -76,24 +76,90 @@ pub fn write_html_diff<W: Write>(diff: &TraceDiff<'_>, writer: &mut W) -> io::Re
             write_value(writer, field)?;
         }
     }
+    writer.write_all(b"</dd>\n<dt>Normalization ledger (field: transformation)</dt><dd><ul>\n")?;
+    for entry in &diff.matching_policy.normalization_ledger {
+        writer.write_all(b"<li><span class=\"value\">")?;
+        write_value(writer, &entry.field)?;
+        writer.write_all(b"</span>: <span class=\"value\">")?;
+        write_value(writer, &entry.transformation)?;
+        writer.write_all(b"</span></li>\n")?;
+    }
+    writer.write_all(b"</ul>")?;
     writer.write_all(b"</dd>\n<dt>Excluded control records</dt><dd>Baseline: ")?;
     write!(writer, "{}", diff.left_excluded_control_records)?;
     writer.write_all(b"; candidate: ")?;
     write!(writer, "{}", diff.right_excluded_control_records)?;
-    writer.write_all(b"</dd>\n</dl></section>\n<p>To verify a cited row locally, run <code>sideeffect evidence TRACE SHA256 LINE BYTE_OFFSET BYTE_LENGTH</code>. For Before evidence, substitute the first input path and Before source SHA-256 shown above; for After, use the second input and After source SHA-256. Use that reference's line, byte, and length values. Input paths are omitted from this report.</p>\n<section><h2>Observed differences (")?;
-    write!(writer, "{}", diff.changes.len())?;
-    writer.write_all(b")</h2>")?;
+    writer.write_all(b"</dd>\n</dl></section>\n<p>To verify a cited row locally, run <code>sideeffect evidence TRACE SHA256 LINE BYTE_OFFSET BYTE_LENGTH</code>. For Before evidence, substitute the first input path and Before source SHA-256 shown above; for After, use the second input and After source SHA-256. Use that reference's line, byte, and length values. Input paths are omitted from this report.</p>\n<section><h2>Exact raw-line multiset view (")?;
+    write!(writer, "{}", diff.raw_line_deltas.len())?;
+    writer.write_all(b")</h2><p>Raw line text remains in the source traces; this view contains source references only.</p><ol>\n")?;
+    for delta in &diff.raw_line_deltas {
+        writer.write_all(b"<li>")?;
+        writer.write_all(match delta.kind {
+            DeltaKind::Added => b"Candidate ",
+            DeltaKind::Changed => b"Changed ",
+            DeltaKind::Removed => b"Baseline ",
+        })?;
+        writer.write_all(delta_name(delta.kind).as_bytes())?;
+        writer.write_all(b" line=")?;
+        write!(writer, "{}", delta.evidence.line_number)?;
+        writer.write_all(b" byte=")?;
+        write!(writer, "{}", delta.evidence.byte_offset)?;
+        writer.write_all(b" length=")?;
+        write!(writer, "{}", delta.evidence.byte_length)?;
+        writer.write_all(b"</li>\n")?;
+    }
+    writer.write_all(b"</ol></section>\n<section><h2>Normalized parsed-record view (")?;
+    write!(writer, "{}", diff.normalized_changes.len())?;
+    writer.write_all(b")</h2><p>The field ledger below ignores only the parsed PID and timestamp prefixes. Syscall, arguments, and results remain exact; lexical hints are display-only.</p>")?;
 
-    if diff.changes.is_empty() {
+    if diff.normalized_changes.is_empty() {
         writer.write_all(b"<p>No observed syscall-row differences.</p>")?;
     } else {
         writer.write_all(b"<ol>\n")?;
-        for change in &diff.changes {
+        for change in &diff.normalized_changes {
             write_delta(writer, change)?;
         }
         writer.write_all(b"</ol>\n")?;
     }
+    writer.write_all(
+        b"<h2>Conservative semantic annotations (typed record class and outcome only)</h2><ol>\n",
+    )?;
+    for semantic in &diff.semantic_changes {
+        writer.write_all(b"<li>")?;
+        writer.write_all(delta_name(semantic.kind).as_bytes())?;
+        writer.write_all(b" class=")?;
+        writer.write_all(semantic_class_name(semantic.record_class).as_bytes())?;
+        writer.write_all(b" record_kind=")?;
+        writer.write_all(record_kind_name(semantic.record_kind).as_bytes())?;
+        writer.write_all(b" before_outcome=")?;
+        writer.write_all(optional_outcome_name(semantic.before_outcome).as_bytes())?;
+        writer.write_all(b" after_outcome=")?;
+        writer.write_all(optional_outcome_name(semantic.after_outcome).as_bytes())?;
+        write_evidence(writer, "Before evidence", &semantic.before)?;
+        write_evidence(writer, "After evidence", &semantic.after)?;
+        writer.write_all(b"</li>\n")?;
+    }
+    writer.write_all(b"</ol>\n")?;
     writer.write_all(b"</section>\n</main>\n</body>\n</html>\n")
+}
+
+fn semantic_class_name(class: SemanticRecordClass) -> &'static str {
+    match class {
+        SemanticRecordClass::FileSyscallRecord => "file_syscall_record",
+        SemanticRecordClass::NetworkSyscallRecord => "network_syscall_record",
+        SemanticRecordClass::OtherSyscallRecord => "other_syscall_record",
+        SemanticRecordClass::ProcessSyscallRecord => "process_syscall_record",
+    }
+}
+
+fn optional_outcome_name(outcome: Option<SyscallOutcome>) -> &'static str {
+    match outcome {
+        None => "absent",
+        Some(SyscallOutcome::Success) => "success",
+        Some(SyscallOutcome::Failure) => "failure",
+        Some(SyscallOutcome::InProgress) => "in_progress",
+        Some(SyscallOutcome::Unknown) => "unknown",
+    }
 }
 
 fn write_delta<W: Write>(writer: &mut W, change: &ObservedDelta<'_>) -> io::Result<()> {
@@ -294,15 +360,20 @@ mod tests {
                     "raw_result".to_owned(),
                 ],
                 display_only_fields: vec!["lexical_path_hint".to_owned()],
+                normalization_ledger: Vec::new(),
             },
             left_excluded_control_records: 1,
             right_excluded_control_records: 2,
-            changes: vec![ObservedDelta {
+            raw_line_deltas: Vec::new(),
+            semantic_changes: Vec::new(),
+            normalized_changes: vec![ObservedDelta {
                 kind: DeltaKind::Changed,
                 category: EventCategory::File,
                 record_kind: TraceRecordKind::Syscall,
                 syscall: "openat",
                 raw_arguments: args,
+                before_outcome: None,
+                after_outcome: None,
                 before_lexical_path_hint: None,
                 after_lexical_path_hint: None,
                 before_result: Some("-1 ENOENT"),
@@ -348,6 +419,14 @@ mod tests {
             "Identity metadata only; not authentication, redaction, or capture completeness."
         ));
         assert!(output.contains("Excluded control records</dt><dd>Baseline: 1; candidate: 2"));
+        assert!(output.contains("Exact raw-line multiset view (0)"));
+        assert!(output.contains("Normalized parsed-record view (1)"));
+        assert!(
+            output.contains(
+                "Conservative semantic annotations (typed record class and outcome only)"
+            )
+        );
+        assert!(output.contains("Normalization ledger (field: transformation)"));
         assert!(output.contains("<h3>Changed</h3>"));
         assert!(output.contains("Before evidence (CLI argument 1)"));
         assert!(output.contains("After evidence (CLI argument 2)"));
@@ -382,8 +461,8 @@ mod tests {
             basis: LexicalPathBasis::AtFdcwdAnnotation,
         };
         let mut diff = make_diff("AT_FDCWD, \"relative.txt\", O_RDONLY");
-        diff.changes[0].before_lexical_path_hint = Some(&before_hint);
-        diff.changes[0].after_lexical_path_hint = Some(&after_hint);
+        diff.normalized_changes[0].before_lexical_path_hint = Some(&before_hint);
+        diff.normalized_changes[0].after_lexical_path_hint = Some(&after_hint);
         let output = render(&diff);
         assert!(output.contains("Before lexical path hint (display only; not used for matching)"));
         assert!(output.contains("&lt;img src=x onerror=alert(1)&gt;"));

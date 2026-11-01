@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::trace::LexicalPathHint;
 
 pub const TRACE_DOCUMENT_SCHEMA_VERSION: u32 = 7;
-pub const TRACE_DIFF_SCHEMA_VERSION: u32 = 3;
+pub const TRACE_DIFF_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -135,6 +135,46 @@ pub struct MatchingPolicy {
     pub exact_fields: Vec<String>,
     /// Derived display hints are exposed but never used as comparison keys.
     pub display_only_fields: Vec<String>,
+    /// Complete ledger of fields touched or excluded by the normalized view.
+    pub normalization_ledger: Vec<NormalizationLedgerEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct NormalizationLedgerEntry {
+    pub field: String,
+    pub transformation: String,
+}
+
+/// An exact raw-line multiset difference. Raw line text stays in its source
+/// trace; this layer exposes only the source record reference.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RawLineDelta {
+    pub kind: DeltaKind,
+    pub evidence: EvidenceReference,
+}
+
+/// A deliberately narrow annotation of the parsed record class and observed
+/// parser outcome. It does not describe higher-level effects or causes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticRecordClass {
+    FileSyscallRecord,
+    NetworkSyscallRecord,
+    OtherSyscallRecord,
+    ProcessSyscallRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SemanticDelta {
+    pub kind: DeltaKind,
+    pub record_class: SemanticRecordClass,
+    pub record_kind: TraceRecordKind,
+    /// None means this side is absent from the delta; Some(Unknown) means it
+    /// exists but the parser has no typed outcome for it.
+    pub before_outcome: Option<SyscallOutcome>,
+    pub after_outcome: Option<SyscallOutcome>,
+    pub before: Vec<EvidenceReference>,
+    pub after: Vec<EvidenceReference>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -144,6 +184,10 @@ pub struct ObservedDelta<'a> {
     pub record_kind: TraceRecordKind,
     pub syscall: &'a str,
     pub raw_arguments: &'a str,
+    /// None for an absent side; an existing row without a supported parser
+    /// outcome is represented as Some(Unknown).
+    pub before_outcome: Option<SyscallOutcome>,
+    pub after_outcome: Option<SyscallOutcome>,
     /// Optional derived path hint from the before-side evidence. Display only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub before_lexical_path_hint: Option<&'a LexicalPathHint>,
@@ -168,8 +212,13 @@ pub struct TraceDiff<'a> {
     pub right_source_sha256: &'a str,
     pub capture_completeness: CaptureCompleteness,
     pub matching_policy: MatchingPolicy,
+    /// Exact raw-line multiset differences, linked to original source records.
+    pub raw_line_deltas: Vec<RawLineDelta>,
+    /// Conservative typed annotations aligned one-to-one with normalized deltas.
+    pub semantic_changes: Vec<SemanticDelta>,
     /// Control rows are visible as counts but are outside the initial syscall comparison.
     pub left_excluded_control_records: u64,
     pub right_excluded_control_records: u64,
-    pub changes: Vec<ObservedDelta<'a>>,
+    /// Parsed-record comparison using exactly `matching_policy`.
+    pub normalized_changes: Vec<ObservedDelta<'a>>,
 }

@@ -41,14 +41,51 @@ pub fn write_text_diff<W: Write>(diff: &TraceDiff<'_>, writer: &mut W) -> io::Re
         "Excluded control records: baseline={}, candidate={}",
         diff.left_excluded_control_records, diff.right_excluded_control_records
     )?;
+    writer.write_all(b"Normalization ledger (field: transformation):\n")?;
+    for entry in &diff.matching_policy.normalization_ledger {
+        writer.write_all(b"   ")?;
+        write_quoted(writer, &entry.field)?;
+        writer.write_all(b": ")?;
+        write_quoted(writer, &entry.transformation)?;
+        writer.write_all(b"\n")?;
+    }
 
-    if diff.changes.is_empty() {
-        writer.write_all(b"\nNo observed syscall-row differences.\n")?;
+    writeln!(
+        writer,
+        "\nExact raw-line multiset deltas: {}",
+        diff.raw_line_deltas.len()
+    )?;
+    if diff.raw_line_deltas.is_empty() {
+        writer.write_all(b"   (none)\n")?;
+    } else {
+        for delta in &diff.raw_line_deltas {
+            writer.write_all(b"   ")?;
+            writer.write_all(match delta.kind {
+                DeltaKind::Added => b"Candidate ",
+                DeltaKind::Changed => b"Changed ",
+                DeltaKind::Removed => b"Baseline ",
+            })?;
+            writer.write_all(delta_name(delta.kind).as_bytes())?;
+            writeln!(
+                writer,
+                " line={} byte={} length={}",
+                delta.evidence.line_number, delta.evidence.byte_offset, delta.evidence.byte_length
+            )?;
+        }
+    }
+    writer.write_all(b"\nNormalized parsed-record view (exact current policy):\n")?;
+
+    if diff.normalized_changes.is_empty() {
+        writer.write_all(b"   No observed syscall-row differences.\n")?;
         return Ok(());
     }
 
-    writeln!(writer, "\nObserved differences: {}", diff.changes.len())?;
-    for (index, change) in diff.changes.iter().enumerate() {
+    writeln!(
+        writer,
+        "Normalized differences: {}",
+        diff.normalized_changes.len()
+    )?;
+    for (index, change) in diff.normalized_changes.iter().enumerate() {
         writeln!(writer, "\n{}. {}", index + 1, delta_name(change.kind))?;
         writer.write_all(b"   Category: ")?;
         writer.write_all(category_name(change.category).as_bytes())?;
@@ -74,7 +111,48 @@ pub fn write_text_diff<W: Write>(diff: &TraceDiff<'_>, writer: &mut W) -> io::Re
         write_evidence_section(writer, "Baseline evidence", &change.before)?;
         write_evidence_section(writer, "Candidate evidence", &change.after)?;
     }
+    writer.write_all(
+        b"\nConservative semantic annotations (typed record class and outcome only):\n",
+    )?;
+    for (index, semantic) in diff.semantic_changes.iter().enumerate() {
+        writeln!(
+            writer,
+            "   {}. {} class={} record_kind={} baseline_outcome={} candidate_outcome={}",
+            index + 1,
+            delta_name(semantic.kind),
+            semantic_class_name(semantic.record_class),
+            record_kind_name(semantic.record_kind),
+            optional_outcome_name(semantic.before_outcome),
+            optional_outcome_name(semantic.after_outcome)
+        )?;
+        write_evidence_section(writer, "      Baseline evidence", &semantic.before)?;
+        write_evidence_section(writer, "      Candidate evidence", &semantic.after)?;
+    }
     Ok(())
+}
+
+fn semantic_class_name(class: crate::model::SemanticRecordClass) -> &'static str {
+    use crate::model::SemanticRecordClass::*;
+    match class {
+        FileSyscallRecord => "file_syscall_record",
+        NetworkSyscallRecord => "network_syscall_record",
+        OtherSyscallRecord => "other_syscall_record",
+        ProcessSyscallRecord => "process_syscall_record",
+    }
+}
+
+fn outcome_name(outcome: crate::model::SyscallOutcome) -> &'static str {
+    use crate::model::SyscallOutcome::*;
+    match outcome {
+        Success => "success",
+        Failure => "failure",
+        InProgress => "in_progress",
+        Unknown => "unknown",
+    }
+}
+
+fn optional_outcome_name(outcome: Option<crate::model::SyscallOutcome>) -> &'static str {
+    outcome.map(outcome_name).unwrap_or("absent")
 }
 
 fn write_optional_path_hint<W: Write>(
@@ -224,10 +302,13 @@ mod tests {
                     "raw_result".to_owned(),
                 ],
                 display_only_fields: vec!["lexical_path_hint".to_owned()],
+                normalization_ledger: Vec::new(),
             },
             left_excluded_control_records: 2,
             right_excluded_control_records: 3,
-            changes,
+            raw_line_deltas: Vec::new(),
+            semantic_changes: Vec::new(),
+            normalized_changes: changes,
         }
     }
 
@@ -245,6 +326,8 @@ mod tests {
             record_kind: TraceRecordKind::Syscall,
             syscall,
             raw_arguments: args,
+            before_outcome: None,
+            after_outcome: None,
             before_lexical_path_hint: None,
             after_lexical_path_hint: None,
             before_result: results.0,
@@ -293,7 +376,7 @@ mod tests {
         let mut output = Vec::new();
         write_text_diff(&diff, &mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(output.starts_with("SideEffect trace comparison\nSchema version: 3\n"));
+        assert!(output.starts_with("SideEffect trace comparison\nSchema version: 4\n"));
         assert!(output.contains("Baseline source SHA-256: 1111111111111111111111111111111111111111111111111111111111111111"));
         assert!(output.contains("Candidate source SHA-256: 2222222222222222222222222222222222222222222222222222222222222222"));
         assert!(output.contains("Capture completeness: unknown (not established by parsing)"));

@@ -180,9 +180,11 @@ struct TraceDiff {
     right_source_sha256: String,
     capture_completeness: CaptureCompleteness,
     matching_policy: MatchingPolicy,
+    raw_line_deltas: Vec<RawLineDelta>,
+    semantic_changes: Vec<SemanticDelta>,
     left_excluded_control_records: u64,
     right_excluded_control_records: u64,
-    changes: Vec<ObservedDelta>,
+    normalized_changes: Vec<ObservedDelta>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -198,6 +200,43 @@ struct MatchingPolicy {
     multiplicity: String,
     exact_fields: Vec<String>,
     display_only_fields: Vec<String>,
+    normalization_ledger: Vec<NormalizationLedgerEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct NormalizationLedgerEntry {
+    field: String,
+    transformation: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct RawLineDelta {
+    kind: DeltaKind,
+    evidence: EvidenceReference,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct SemanticDelta {
+    kind: DeltaKind,
+    record_class: SemanticRecordClass,
+    record_kind: TraceRecordKind,
+    before_outcome: Option<SyscallOutcome>,
+    after_outcome: Option<SyscallOutcome>,
+    before: Vec<EvidenceReference>,
+    after: Vec<EvidenceReference>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)]
+enum SemanticRecordClass {
+    FileSyscallRecord,
+    NetworkSyscallRecord,
+    OtherSyscallRecord,
+    ProcessSyscallRecord,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -208,6 +247,8 @@ struct ObservedDelta {
     record_kind: TraceRecordKind,
     syscall: String,
     raw_arguments: String,
+    before_outcome: Option<SyscallOutcome>,
+    after_outcome: Option<SyscallOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     before_lexical_path_hint: Option<LexicalPathHint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -285,13 +326,18 @@ fn diff_json_round_trips_through_the_typed_diff_schema() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let document: TraceDiff = serde_json::from_slice(&output.stdout)
         .expect("diff output must satisfy the versioned typed diff schema");
-    assert_eq!(document.schema_version, 3);
+    assert_eq!(document.schema_version, 4);
     assert_eq!(document.capture_completeness, CaptureCompleteness::Unknown);
     assert_eq!(document.matching_policy.multiplicity, "multiset");
-    assert!(!document.changes.is_empty());
+    assert!(!document.normalized_changes.is_empty());
+    assert!(!document.raw_line_deltas.is_empty());
+    assert_eq!(
+        document.semantic_changes.len(),
+        document.normalized_changes.len()
+    );
     assert!(
         document
-            .changes
+            .normalized_changes
             .iter()
             .all(|change| { !change.before.is_empty() || !change.after.is_empty() })
     );
