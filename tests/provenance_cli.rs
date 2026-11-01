@@ -129,3 +129,80 @@ fn session_signature_cli_round_trip_and_detects_manifest_byte_changes() {
     assert_eq!(tampered.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&tampered.stderr).contains("signature verification failed"));
 }
+
+#[test]
+fn provenance_commands_reject_malformed_and_unknown_session_manifests() {
+    let temp = TestDirectory::new();
+    let session = temp.0.join("session");
+    let audit = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&session)
+        .arg("--path-executables")
+        .output()
+        .unwrap();
+    assert!(
+        audit.status.success() || audit.status.code() == Some(2),
+        "audit failed: {}",
+        String::from_utf8_lossy(&audit.stderr)
+    );
+
+    let manifest_path = session.join("session.json");
+    let original = fs::read(&manifest_path).unwrap();
+    let signature = temp.0.join("signature.json");
+    let public = temp.0.join("public.hex");
+
+    fs::write(&manifest_path, b"{").unwrap();
+    let malformed_sign = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("provenance")
+        .arg("sign-session")
+        .arg(&session)
+        .arg("--private-key")
+        .arg(temp.0.join("missing.pk8"))
+        .arg("--output")
+        .arg(&signature)
+        .output()
+        .unwrap();
+    assert_eq!(malformed_sign.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&malformed_sign.stderr).contains("invalid audit-session manifest")
+    );
+
+    fs::write(&manifest_path, &original).unwrap();
+    let mut unknown: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    unknown["unexpected_manifest_field"] = serde_json::json!(true);
+    fs::write(&manifest_path, serde_json::to_vec(&unknown).unwrap()).unwrap();
+    let unknown_verify = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("provenance")
+        .arg("verify-session")
+        .arg(&session)
+        .arg("--signature")
+        .arg(&signature)
+        .arg("--public-key")
+        .arg(&public)
+        .output()
+        .unwrap();
+    assert_eq!(unknown_verify.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&unknown_verify.stderr).contains("invalid audit-session manifest")
+    );
+
+    let mut unsupported: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    unsupported["schema_version"] = serde_json::json!(999);
+    fs::write(&manifest_path, serde_json::to_vec(&unsupported).unwrap()).unwrap();
+    let unsupported_verify = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("provenance")
+        .arg("verify-session")
+        .arg(&session)
+        .arg("--signature")
+        .arg(&signature)
+        .arg("--public-key")
+        .arg(&public)
+        .output()
+        .unwrap();
+    assert_eq!(unsupported_verify.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&unsupported_verify.stderr)
+            .contains("invalid audit-session manifest")
+    );
+}
