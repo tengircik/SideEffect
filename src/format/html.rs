@@ -122,7 +122,7 @@ pub fn write_html_diff<W: Write>(diff: &TraceDiff<'_>, writer: &mut W) -> io::Re
         writer.write_all(b"</ol>\n")?;
     }
     writer.write_all(
-        b"<h2>Conservative semantic annotations (typed record class and outcome only)</h2><ol>\n",
+        b"<h2>Conservative semantic annotations (typed record class and outcome only)</h2><p>Parsed outcomes describe syscall results only; they do not establish operation effects, system changes, causes, or safety.</p><ol>\n",
     )?;
     for semantic in &diff.semantic_changes {
         writer.write_all(b"<li>")?;
@@ -135,6 +135,13 @@ pub fn write_html_diff<W: Write>(diff: &TraceDiff<'_>, writer: &mut W) -> io::Re
         writer.write_all(optional_outcome_name(semantic.before_outcome).as_bytes())?;
         writer.write_all(b" after_outcome=")?;
         writer.write_all(optional_outcome_name(semantic.after_outcome).as_bytes())?;
+        if let Some(transition) =
+            outcome_transition(semantic.before_outcome, semantic.after_outcome)
+        {
+            writer.write_all(b"<p>Observed syscall result: ")?;
+            write_value(writer, transition)?;
+            writer.write_all(b"</p>")?;
+        }
         write_evidence(writer, "Before evidence", &semantic.before)?;
         write_evidence(writer, "After evidence", &semantic.after)?;
         writer.write_all(b"</li>\n")?;
@@ -159,6 +166,21 @@ fn optional_outcome_name(outcome: Option<SyscallOutcome>) -> &'static str {
         Some(SyscallOutcome::Failure) => "failure",
         Some(SyscallOutcome::InProgress) => "in_progress",
         Some(SyscallOutcome::Unknown) => "unknown",
+    }
+}
+
+fn outcome_transition(
+    before: Option<SyscallOutcome>,
+    after: Option<SyscallOutcome>,
+) -> Option<&'static str> {
+    match (before, after) {
+        (Some(SyscallOutcome::Success), Some(SyscallOutcome::Failure)) => {
+            Some("success -> failure")
+        }
+        (Some(SyscallOutcome::Failure), Some(SyscallOutcome::Success)) => {
+            Some("failure -> success")
+        }
+        _ => None,
     }
 }
 
@@ -336,7 +358,8 @@ mod tests {
     use crate::limits::MAX_REPORT_BYTES;
     use crate::model::{
         CaptureCompleteness, DeltaKind, EventCategory, EvidenceReference, MatchingPolicy,
-        ObservedDelta, TRACE_DIFF_SCHEMA_VERSION, TraceDiff, TraceRecordKind,
+        ObservedDelta, SemanticDelta, SemanticRecordClass, SyscallOutcome,
+        TRACE_DIFF_SCHEMA_VERSION, TraceDiff, TraceRecordKind,
     };
     use crate::trace::{LexicalPathBasis, LexicalPathHint};
     use std::io::{self, Write};
@@ -398,6 +421,21 @@ mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
+    fn semantic(
+        before_outcome: Option<SyscallOutcome>,
+        after_outcome: Option<SyscallOutcome>,
+    ) -> SemanticDelta {
+        SemanticDelta {
+            kind: DeltaKind::Changed,
+            record_class: SemanticRecordClass::FileSyscallRecord,
+            record_kind: TraceRecordKind::Syscall,
+            before_outcome,
+            after_outcome,
+            before: Vec::new(),
+            after: Vec::new(),
+        }
+    }
+
     #[test]
     fn renders_diff_content_and_provenance_in_static_offline_document() {
         let output = render(&make_diff("AT_FDCWD, \"config.ini\", O_RDONLY"));
@@ -448,6 +486,38 @@ mod tests {
         assert!(!output.contains("src=\"http"));
         assert_eq!(output.matches("href=").count(), 1);
         assert!(!output.contains("href=\"http"));
+    }
+
+    #[test]
+    fn renders_only_supported_known_outcome_transitions_as_parsed_results() {
+        let mut diff = make_diff("AT_FDCWD, \"config.ini\", O_RDONLY");
+        diff.semantic_changes = vec![
+            semantic(Some(SyscallOutcome::Success), Some(SyscallOutcome::Failure)),
+            semantic(Some(SyscallOutcome::Failure), Some(SyscallOutcome::Success)),
+            semantic(None, Some(SyscallOutcome::Success)),
+            semantic(Some(SyscallOutcome::Success), Some(SyscallOutcome::Success)),
+            semantic(Some(SyscallOutcome::Unknown), Some(SyscallOutcome::Failure)),
+            semantic(
+                Some(SyscallOutcome::InProgress),
+                Some(SyscallOutcome::Success),
+            ),
+        ];
+        let output = render(&diff);
+
+        assert_eq!(output.matches("Observed syscall result:").count(), 2);
+        assert!(output.contains(
+            "Observed syscall result: <span class=\"value\">success -&gt; failure</span>"
+        ));
+        assert!(output.contains(
+            "Observed syscall result: <span class=\"value\">failure -&gt; success</span>"
+        ));
+        assert!(output.contains("before_outcome=absent after_outcome=success"));
+        assert!(output.contains("before_outcome=success after_outcome=success"));
+        assert!(output.contains("before_outcome=unknown after_outcome=failure"));
+        assert!(output.contains("before_outcome=in_progress after_outcome=success"));
+        assert!(output.contains(
+            "they do not establish operation effects, system changes, causes, or safety."
+        ));
     }
 
     #[test]
