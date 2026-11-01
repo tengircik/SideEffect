@@ -69,13 +69,40 @@ def _result(corpus: dict[str, Any], digest: str, version: int) -> dict[str, Any]
         "corpus_sha256": digest,
         "cases": cases,
     }
-    if version == 2:
+    if version in {2, 3}:
         results["run"] = {
             "model_id": "test-model",
             "model_sha256": "a" * 64,
             "runtime_source_revision": "b" * 40,
             "backend_preference": "auto",
         }
+    if version == 3:
+        for row in results["cases"]:
+            case = next(item for item in corpus["cases"] if item["id"] == row["case_id"])
+            row["preview_request_sha256"] = "c" * 64
+            target_digest = evaluation._review_target_sha256(row, case["question"], digest)
+            row["review_target_sha256"] = target_digest
+            selected_ids = row["response"]["evidence_ids"]
+            row["human_reviews"] = [
+                {
+                    "review_target_sha256": target_digest,
+                    "preview_request_sha256": row["preview_request_sha256"],
+                    "reviewer_id": reviewer_id,
+                    "blind_to_model_identity": True,
+                    "independence_attested": True,
+                    "answerability": "answerable",
+                    "required_evidence_labels": ["requested_fact"],
+                    "selected_evidence_judgments": [
+                        {
+                            "evidence_id": evidence_id,
+                            "supported_required_evidence_labels": ["requested_fact"],
+                            "unsupported_inference": False,
+                        }
+                        for evidence_id in selected_ids
+                    ],
+                }
+                for reviewer_id in ("reviewer-a", "reviewer-b")
+            ]
     return results
 
 
@@ -230,6 +257,174 @@ class ExplainEvaluatorV2Tests(unittest.TestCase):
         missing["cases"].pop()
         with self.assertRaisesRegex(evaluation.ContractError, "omit one or more corpus cases"):
             self._validate(missing)
+
+
+class ExplainEvaluatorV3HumanReviewTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.corpus, cls.digest = evaluation.load_corpus()
+
+    def _validate(self, results: dict[str, Any]) -> dict[str, Any]:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.json"
+            path.write_text(json.dumps(results), encoding="utf-8")
+            return evaluation._validate_results(path, self.corpus, self.digest)
+
+    def test_v3_reports_blinded_peer_agreement_and_reviewed_inference_counts(self) -> None:
+        results = _result(self.corpus, self.digest, version=3)
+        changed = next(item for item in results["cases"] if item["case_id"] == "exec-success-name")
+        changed["human_reviews"][1]["answerability"] = "uncertain"
+        changed["human_reviews"][1]["required_evidence_labels"] = ["different_fact"]
+        if changed["human_reviews"][1]["selected_evidence_judgments"]:
+            changed["human_reviews"][1]["selected_evidence_judgments"][0]["supported_required_evidence_labels"] = ["different_fact"]
+            changed["human_reviews"][1]["selected_evidence_judgments"][0]["unsupported_inference"] = True
+
+        report = self._validate(results)
+        self.assertEqual(report["schema_version"], 3)
+        self.assertEqual(report["human_review_gate_status"], "reviewer_threshold_met_self_attested")
+        self.assertEqual(report["human_review_gate_reviewer_id_count"], 2)
+        self.assertFalse(report["human_review_identity_or_independence_verified_automatically"])
+        self.assertFalse(report["human_review_is_model_quality_gate"])
+        self.assertTrue(report["selector_answerability_agreement_is_diagnostic"])
+        self.assertFalse(report["selector_answerability_agreement_has_pass_threshold"])
+        self.assertFalse(report["semantic_truth_inferred_from_selector_structure"])
+        reviewers = {row["reviewer_id"]: row for row in report["human_reviewers"]}
+        self.assertTrue(reviewers["reviewer-a"]["fully_completed_blinded_independent_review"])
+        self.assertEqual(reviewers["reviewer-a"]["required_evidence_label_coverage"], 17 / 26)
+        self.assertLess(reviewers["reviewer-a"]["peer_answerability_agreement_rate"], 1.0)
+        self.assertEqual(reviewers["reviewer-a"]["selector_answerability_denominator"], 26)
+        self.assertEqual(reviewers["reviewer-a"]["selector_answerability_false_positive_count"], 0)
+        expected_false_negatives = sum(
+            row["response"]["selection_status"] == "abstained"
+            for row in results["cases"]
+        )
+        self.assertEqual(reviewers["reviewer-a"]["selector_answerability_false_negative_count"], expected_false_negatives)
+        self.assertEqual(
+            reviewers["reviewer-a"]["selector_answerability_agreement_count"],
+            26 - expected_false_negatives,
+        )
+        self.assertEqual(reviewers["reviewer-b"]["selector_answerability_denominator"], 25)
+        self.assertEqual(reviewers["reviewer-b"]["selector_answerability_uncertain_excluded_count"], 1)
+        self.assertEqual(reviewers["reviewer-b"]["unsupported_inference_count"], 1)
+        case = next(row for row in report["human_review_cases"] if row["case_id"] == "exec-success-name")
+        self.assertEqual(case["unsupported_inference_count"], 1)
+        self.assertEqual(case["answerability_agreement_rate"], 0.0)
+
+    def test_v3_requires_two_distinct_fully_blinded_reviewer_ids_for_gate_status(self) -> None:
+        results = _result(self.corpus, self.digest, version=3)
+        for row in results["cases"]:
+            row["human_reviews"] = row["human_reviews"][:1]
+        report = self._validate(results)
+        self.assertEqual(report["human_review_gate_status"], "not_independently_reviewed")
+        self.assertEqual(report["human_review_gate_reviewer_id_count"], 1)
+
+        results = _result(self.corpus, self.digest, version=3)
+        row = results["cases"][0]
+        row["human_reviews"][1]["blind_to_model_identity"] = False
+        report = self._validate(results)
+        self.assertEqual(report["human_review_gate_status"], "not_independently_reviewed")
+
+    def test_v3_rejects_incomplete_or_mismatched_case_reviews(self) -> None:
+        mutations = [
+            ("unselected evidence", lambda row: row["human_reviews"][0]["selected_evidence_judgments"].append({
+                "evidence_id": "E999",
+                "supported_required_evidence_labels": [],
+                "unsupported_inference": False,
+            })),
+            ("missing selected judgment", lambda row: row["human_reviews"][0].update(selected_evidence_judgments=[])),
+            ("unknown review field", lambda row: row["human_reviews"][0].update(private_note="unexpected")),
+            ("review digest mismatch", lambda row: row["human_reviews"][0].update(review_target_sha256="0" * 64)),
+            ("preview digest mismatch", lambda row: row["human_reviews"][0].update(preview_request_sha256="0" * 64)),
+            ("duplicate reviewer", lambda row: row["human_reviews"].__setitem__(1, dict(row["human_reviews"][0]))),
+            ("unblinded false type", lambda row: row["human_reviews"][0].update(blind_to_model_identity="yes")),
+            ("unsupported label", lambda row: row["human_reviews"][0]["selected_evidence_judgments"][0].update(
+                supported_required_evidence_labels=["not-required"]
+            )),
+        ]
+        for name, mutate in mutations:
+            with self.subTest(name=name):
+                results = _result(self.corpus, self.digest, version=3)
+                row = next(item for item in results["cases"] if item["case_id"] == "exec-success-name")
+                mutate(row)
+                with self.assertRaises(evaluation.ContractError):
+                    self._validate(results)
+
+    def test_v3_binds_digest_to_validated_selector_target_fields(self) -> None:
+        results = _result(self.corpus, self.digest, version=3)
+        row = next(item for item in results["cases"] if item["case_id"] == "exec-success-name")
+        row["available_evidence"][0]["semantic_labels"] = ["changed_after_review"]
+        with self.assertRaisesRegex(evaluation.ContractError, "review target digest mismatch"):
+            self._validate(results)
+
+        results = _result(self.corpus, self.digest, version=3)
+        row = next(item for item in results["cases"] if item["case_id"] == "exec-success-name")
+        row["source_parse_status"] = "partial"
+        row["response"]["selection_status"] = "partial_selection"
+        with self.assertRaisesRegex(evaluation.ContractError, "review target digest mismatch"):
+            self._validate(results)
+
+        results = _result(self.corpus, self.digest, version=3)
+        row = next(item for item in results["cases"] if item["case_id"] == "exec-success-name")
+        row["review_target_sha256"] = "not-a-digest"
+        with self.assertRaisesRegex(evaluation.ContractError, "64 lowercase hexadecimal"):
+            self._validate(results)
+
+        results = _result(self.corpus, self.digest, version=3)
+        row = next(item for item in results["cases"] if item["case_id"] == "exec-success-name")
+        row["preview_request_sha256"] = "not-a-digest"
+        with self.assertRaisesRegex(evaluation.ContractError, "preview_request_sha256 must be 64 lowercase hexadecimal"):
+            self._validate(results)
+
+        results = _result(self.corpus, self.digest, version=3)
+        row = next(item for item in results["cases"] if item["case_id"] == "exec-success-name")
+        row["preview_request_sha256"] = "d" * 64
+        with self.assertRaisesRegex(evaluation.ContractError, "review target digest mismatch"):
+            self._validate(results)
+
+    def test_review_target_canonical_bytes_ignore_object_key_insertion_order(self) -> None:
+        results = _result(self.corpus, self.digest, version=3)
+        row = next(item for item in results["cases"] if item["case_id"] == "exec-success-name")
+        case = next(item for item in self.corpus["cases"] if item["id"] == row["case_id"])
+        baseline = evaluation._review_target_sha256(row, case["question"], self.digest)
+        reordered = json.loads(json.dumps(row))
+        reordered["response"] = dict(reversed(list(reordered["response"].items())))
+        reordered["available_evidence"][0] = dict(reversed(list(reordered["available_evidence"][0].items())))
+        self.assertEqual(
+            evaluation._review_target_sha256(reordered, case["question"], self.digest),
+            baseline,
+        )
+
+    def test_review_target_binds_question_response_parse_state_and_evidence_ids(self) -> None:
+        results = _result(self.corpus, self.digest, version=3)
+        row = next(item for item in results["cases"] if item["case_id"] == "exec-success-name")
+        case = next(item for item in self.corpus["cases"] if item["id"] == row["case_id"])
+        baseline = evaluation._review_target_sha256(row, case["question"], self.digest)
+        self.assertNotEqual(evaluation._review_target_sha256(row, case["question"] + "?", self.digest), baseline)
+        for mutate in (
+            lambda target: target["response"].update(selection_status="partial_selection"),
+            lambda target: target.update(source_parse_status="partial"),
+            lambda target: target["available_evidence"][0].update(evidence_id="E002"),
+            lambda target: target.update(preview_request_sha256="d" * 64),
+            lambda target: target.update(case_id="different-case"),
+        ):
+            changed = json.loads(json.dumps(row))
+            mutate(changed)
+            self.assertNotEqual(
+                evaluation._review_target_sha256(changed, case["question"], self.digest),
+                baseline,
+            )
+
+    def test_v3_execution_errors_prevent_full_review_completion(self) -> None:
+        results = _result(self.corpus, self.digest, version=3)
+        failed = results["cases"].pop()
+        results["errors"] = [{
+            "case_id": failed["case_id"],
+            "phase": "analysis",
+            "error": "Synthetic test failure.",
+        }]
+        report = self._validate(results)
+        self.assertEqual(report["human_review_gate_status"], "not_independently_reviewed")
+        self.assertTrue(all(not reviewer["fully_completed_blinded_independent_review"] for reviewer in report["human_reviewers"]))
 
 
 if __name__ == "__main__":
