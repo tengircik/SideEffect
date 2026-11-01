@@ -187,3 +187,21 @@ fn configured_runtime_detects_content_replacement_without_executing_it() {
     assert!(error.contains("changed since it was saved"));
     fs::remove_file(path).expect("remove inert test file");
 }
+
+#[cfg(unix)]
+#[test]
+fn runtime_path_rejects_non_utf8_before_registry_serialization() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let path = std::env::temp_dir().join(std::ffi::OsString::from_vec(vec![
+        b's', b'i', b'd', b'e', b'e', b'f', b'f', b'e', b'c', b't', b'-', b'r', b'u', b'n', b't',
+        b'i', b'm', b'e', b'-', 0xff,
+    ]));
+    std::fs::write(&path, b"inert test file").expect("create non-UTF-8 runtime path");
+    let mut registry = ModelRegistry::default();
+    let error = registry
+        .set_runtime(ModelTask::Explanation, &path)
+        .expect_err("non-UTF-8 path cannot be safely persisted in registry JSON");
+    assert!(error.contains("representable as UTF-8"));
+    std::fs::remove_file(path).expect("remove inert test file");
+}

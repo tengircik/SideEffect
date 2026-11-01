@@ -522,6 +522,11 @@ impl ModelRegistry {
         let resolved = path
             .canonicalize()
             .map_err(|_| "runtime path does not identify an existing local file".to_owned())?;
+        if resolved.to_str().is_none() {
+            return Err(
+                "runtime path must be representable as UTF-8 in the model registry".to_owned(),
+            );
+        }
         let runtime = inspect_runtime_file(&resolved)?;
         self.runtime_by_task.insert(task, runtime.clone());
         self.validate()?;
