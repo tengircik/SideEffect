@@ -825,7 +825,10 @@ fn real_strace_capture_inspect_and_diff_observe_file_and_loopback_events() {
         .expect("launch SideEffect diff command");
     assert_success(&output, "diff real captures");
     let diff: Value = serde_json::from_slice(&output.stdout).expect("parse diff JSON");
-    let changes = diff["changes"].as_array().expect("diff changes array");
+    assert_eq!(diff["schema_version"], 4, "diff schema v4");
+    let changes = diff["normalized_changes"]
+        .as_array()
+        .expect("normalized diff changes array");
     let baseline_file_name = baseline_file.file_name().unwrap().to_str().unwrap();
     let candidate_file_name = candidate_file.file_name().unwrap().to_str().unwrap();
     assert!(
