@@ -154,6 +154,39 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         }
         [
             command,
+            trust,
+            operation,
+            public_path,
+            store_flag,
+            store_path,
+            label_flag,
+            label,
+        ] if command == "provenance"
+            && trust == "trust"
+            && operation == "import"
+            && store_flag == "--trust-store"
+            && label_flag == "--label" =>
+        {
+            provenance_trust_import(public_path, store_path, label)
+        }
+        [command, trust, operation, store_flag, store_path]
+            if command == "provenance"
+                && trust == "trust"
+                && operation == "list"
+                && store_flag == "--trust-store" =>
+        {
+            provenance_trust_list(store_path)
+        }
+        [command, trust, operation, key_id, store_flag, store_path]
+            if command == "provenance"
+                && trust == "trust"
+                && operation == "remove"
+                && store_flag == "--trust-store" =>
+        {
+            provenance_trust_remove(key_id, store_path)
+        }
+        [
+            command,
             operation,
             session,
             key_flag,
@@ -181,6 +214,44 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             && key_flag == "--public-key" =>
         {
             provenance_verify_session(session, signature_path, key_path)
+        }
+        [
+            command,
+            operation,
+            session,
+            signature_flag,
+            signature_path,
+            trust_flag,
+            store_path,
+        ] if command == "provenance"
+            && operation == "verify-session"
+            && signature_flag == "--signature"
+            && trust_flag == "--trust-store" =>
+        {
+            provenance_verify_session_with_store(session, signature_path, store_path, None)
+        }
+        [
+            command,
+            operation,
+            session,
+            signature_flag,
+            signature_path,
+            key_flag,
+            key_path,
+            trust_flag,
+            store_path,
+        ] if command == "provenance"
+            && operation == "verify-session"
+            && signature_flag == "--signature"
+            && key_flag == "--public-key"
+            && trust_flag == "--trust-store" =>
+        {
+            provenance_verify_session_with_store(
+                session,
+                signature_path,
+                store_path,
+                Some(key_path),
+            )
         }
         [command] if command == "help" => command_help(&[]),
         [command, topic] if command == "help" => command_help(std::slice::from_ref(topic)),
@@ -1630,7 +1701,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect timeline --trace TRACE [--event-kind KIND] [--process-observation ID]\n       sideeffect timeline --windows-runtime CAPTURE.json [--event-kind KIND] [--process-observation ID] (native Windows)\nBuilds a source-local timeline from bounded Linux strace or strictly validated Windows ETW v3 evidence. Items keep their source ordinal, original timestamp representation, and exact raw-record evidence reference; timestamps do not establish causal order. --event-kind matches an exact event kind. --process-observation selects an emitted source-local ProcessObservation.source_local_id (not a PID or cross-capture ID), retains directly linked items and all their source-native links, and includes the selected observation with its evidence and end_evidence even if no item matches. For Linux task observations, evidence is the first observed row, not proof of task start, and end_evidence is an exact prefixed termination row when available. For Linux returned-child-PID observations, evidence is only the caller's syscall result row; no child-start event is asserted. When both filters are supplied, displayed items must match both. Link roles, statuses and bases remain visible. Filters may appear in either order; duplicates or missing values are errors. An empty result or missing link does not prove absence. Unsupported rows remain in diagnostics. Partial or unknown source status exits with status 2."
         }
         "provenance" => {
-            "Usage: sideeffect provenance keygen PRIVATE_KEY.pk8 PUBLIC_KEY.hex\n       sideeffect provenance sign-session SESSION_DIR --private-key PRIVATE_KEY.pk8 --output SIGNATURE.json\n       sideeffect provenance verify-session SESSION_DIR --signature SIGNATURE.json --public-key PUBLIC_KEY.hex\nCreates Ed25519 keys explicitly, signs the exact validated session.json bytes into a detached envelope, or verifies cryptographic validity offline. Key files and signature output are private, no-clobber files. Verification does not evaluate key trust, signer identity, collector honesty, or capture completeness."
+            "Usage: sideeffect provenance keygen PRIVATE_KEY.pk8 PUBLIC_KEY.hex\n       sideeffect provenance sign-session SESSION_DIR --private-key PRIVATE_KEY.pk8 --output SIGNATURE.json\n       sideeffect provenance verify-session SESSION_DIR --signature SIGNATURE.json --public-key PUBLIC_KEY.hex [--trust-store DIR]\n       sideeffect provenance verify-session SESSION_DIR --signature SIGNATURE.json --trust-store DIR\n       sideeffect provenance trust import PUBLIC_KEY.hex --trust-store DIR --label LABEL\n       sideeffect provenance trust list --trust-store DIR\n       sideeffect provenance trust remove KEY_ID --trust-store DIR\nCreates Ed25519 keys explicitly, signs the exact validated session.json bytes into a detached envelope, or verifies cryptographic validity offline. Trust is an explicit local user decision about a public key; a local label is not verified signer identity. Imports require typing the displayed key fingerprint. Trust stores are selected explicitly and are protected for the current user. Signatures do not establish collector honesty or capture completeness."
         }
         "diff" => {
             "Usage: sideeffect diff [--format json|text] LEFT RIGHT\n       sideeffect diff --format html --output REPORT.html LEFT RIGHT\n       sideeffect diff --bundles [--format json|text] LEFT_DIR RIGHT_DIR\n       sideeffect diff --windows-runtime [--format json|text] BEFORE.json AFTER.json\n       sideeffect diff --format html --output REPORT.html --windows-runtime BEFORE.json AFTER.json (native Windows)\nCompares complete parsed strace observations or validated Windows ETW captures. Windows summary v2 preserves category counts, compares exact normalized record multisets, and labels unique supported changed identities as candidates with source references. One-sided observations are not removals or additions; capture completeness remains unknown, and no causal or system-level absence claims are made. Windows HTML uses the protected current-user publisher and a static offline report. Input and report data may be sensitive."
@@ -1954,6 +2025,176 @@ fn provenance_verify_session(
                 "Key trust was not evaluated. This does not establish signer identity, collector honesty, or capture completeness."
             );
             Ok(ExitCode::SUCCESS)
+        }
+        sideeffect::provenance::Verification::ValidTrusted { .. }
+        | sideeffect::provenance::Verification::ValidUntrusted { .. }
+        | sideeffect::provenance::Verification::UnknownTrustedKey { .. } => {
+            unreachable!("public-key verification does not evaluate trust")
+        }
+    }
+}
+
+fn provenance_trust_import(
+    public_path: &OsString,
+    store_path: &OsString,
+    label: &OsString,
+) -> Result<ExitCode, String> {
+    let label = label
+        .to_str()
+        .ok_or_else(|| "trust label must be valid UTF-8".to_owned())?;
+    sideeffect::provenance::validate_trust_label(label)
+        .map_err(|error| format!("invalid trust label: {error}"))?;
+    let public = sideeffect::provenance::load_public_key(Path::new(public_path))
+        .map_err(|error| format!("could not read public key: {error}"))?;
+    let key_id = sideeffect::provenance::public_key_id(&public)
+        .map_err(|error| format!("could not identify public key: {error}"))?;
+    println!("Public-key fingerprint: {key_id}");
+    println!("Local trust label: {label}");
+    println!("This trusts the key locally; the label does not verify signer identity.");
+    confirm_provenance_action(&format!("trust {key_id}"), "trust import cancelled")?;
+    let trusted =
+        sideeffect::provenance::import_trusted_key_text(Path::new(store_path), &public, label)
+            .map_err(|error| format!("could not import trusted key: {error}"))?;
+    println!(
+        "Imported trusted public key {} as local label '{}'.",
+        trusted.key_id, trusted.label
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn provenance_trust_list(store_path: &OsString) -> Result<ExitCode, String> {
+    let keys = sideeffect::provenance::list_trusted_keys(Path::new(store_path))
+        .map_err(|error| format!("could not read trust store: {error}"))?;
+    if keys.is_empty() {
+        println!("No trusted public keys in this local trust store.");
+    } else {
+        for key in keys {
+            println!("{}  {}", key.key_id, key.label);
+        }
+        println!("Labels are local annotations and do not verify signer identity.");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn provenance_trust_remove(key_id: &OsString, store_path: &OsString) -> Result<ExitCode, String> {
+    let key_id = key_id
+        .to_str()
+        .ok_or_else(|| "key ID must be valid UTF-8".to_owned())?;
+    sideeffect::provenance::validate_trusted_key_id(key_id)
+        .map_err(|error| format!("invalid key ID: {error}"))?;
+    confirm_provenance_action(&format!("remove {key_id}"), "trust removal cancelled")?;
+    sideeffect::provenance::remove_trusted_key(Path::new(store_path), key_id)
+        .map_err(|error| format!("could not remove trusted key: {error}"))?;
+    println!("Removed local trust for key {key_id}.");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn confirm_provenance_action(expected: &str, cancelled: &str) -> Result<(), String> {
+    const MAX_CONFIRMATION_BYTES: usize = 128;
+    print!("Type '{expected}' to continue: ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("could not write confirmation prompt: {error}"))?;
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut bytes = Vec::with_capacity(MAX_CONFIRMATION_BYTES);
+    loop {
+        let (consumed, newline) = {
+            let buffer = input
+                .fill_buf()
+                .map_err(|error| format!("could not read confirmation: {error}"))?;
+            if buffer.is_empty() {
+                return Err("confirmation must end with a newline".to_owned());
+            }
+            let remaining = MAX_CONFIRMATION_BYTES
+                .saturating_add(1)
+                .saturating_sub(bytes.len());
+            let inspected = buffer.len().min(remaining);
+            match buffer[..inspected].iter().position(|byte| *byte == b'\n') {
+                Some(position) => (position + 1, Some(position)),
+                None => (inspected, None),
+            }
+        };
+        if bytes.len().saturating_add(consumed) > MAX_CONFIRMATION_BYTES + 1 {
+            return Err("confirmation line exceeds its size limit".to_owned());
+        }
+        let buffer = input
+            .fill_buf()
+            .map_err(|error| format!("could not read confirmation: {error}"))?;
+        if let Some(position) = newline {
+            if bytes.len().saturating_add(position) > MAX_CONFIRMATION_BYTES {
+                return Err("confirmation line exceeds its size limit".to_owned());
+            }
+            bytes.extend_from_slice(&buffer[..position]);
+            input.consume(consumed);
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..consumed]);
+        input.consume(consumed);
+        if bytes.len() > MAX_CONFIRMATION_BYTES {
+            return Err("confirmation line exceeds its size limit".to_owned());
+        }
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    let confirmation =
+        String::from_utf8(bytes).map_err(|_| "confirmation must be valid UTF-8".to_owned())?;
+    if confirmation != expected {
+        return Err(cancelled.to_owned());
+    }
+    Ok(())
+}
+
+fn provenance_verify_session_with_store(
+    session_path: &OsString,
+    signature_path: &OsString,
+    store_path: &OsString,
+    public_path: Option<&OsString>,
+) -> Result<ExitCode, String> {
+    let session = read_verified_audit_session(Path::new(session_path))?;
+    let envelope = sideeffect::provenance::read_envelope(Path::new(signature_path))
+        .map_err(|error| format!("could not read signature envelope: {error}"))?;
+    let result = if let Some(public_path) = public_path {
+        let public = sideeffect::provenance::load_public_key(Path::new(public_path))
+            .map_err(|error| format!("could not read public key: {error}"))?;
+        sideeffect::provenance::verify_manifest_with_public_key_and_trust_store(
+            session.manifest_bytes(),
+            &envelope,
+            &public,
+            Path::new(store_path),
+        )
+    } else {
+        sideeffect::provenance::verify_manifest_with_trust_store(
+            session.manifest_bytes(),
+            &envelope,
+            Path::new(store_path),
+        )
+    }
+    .map_err(|error| format!("signature verification failed: {error}"))?;
+    match result {
+        sideeffect::provenance::Verification::ValidTrusted { key_id, label } => {
+            println!("Cryptographic signature valid for key {key_id}.");
+            println!(
+                "Matched locally trusted key label '{label}'. The label is not verified signer identity."
+            );
+            println!(
+                "This does not establish collector honesty, host integrity, or capture completeness."
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        sideeffect::provenance::Verification::ValidUntrusted { key_id } => {
+            println!("Cryptographic signature valid for key {key_id}.");
+            println!("This key is not trusted in the selected local trust store.");
+            Ok(ExitCode::from(2))
+        }
+        sideeffect::provenance::Verification::UnknownTrustedKey { key_id } => {
+            println!("Key {key_id} is not in the selected local trust store.");
+            println!("Cryptographic signature validity was not evaluated.");
+            Ok(ExitCode::from(2))
+        }
+        sideeffect::provenance::Verification::Valid { .. } => {
+            unreachable!("trust-aware verification must report trust status")
         }
     }
 }

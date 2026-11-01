@@ -15,6 +15,24 @@ The JSON envelope fields are `schema`, `schema_version`, `algorithm`, `key_id`, 
 
 V1 is exact-byte compatible: do not normalize, parse-and-reserialize, or otherwise rewrite a v1 manifest before hashing. A whitespace-only change therefore invalidates its signature. The CLI validates the session manifest and all declared artifact hashes before signing or verifying. The low-level v1 signing primitive accepts bounded bytes and does not itself parse a session; callers that need the CLI's validation guarantee must use the session reader first. Existing v1 envelopes and the `sideeffect.audit_session` v1-v7 session formats remain unchanged by this design.
 
+## Local public-key trust store
+
+The implemented trust-store commands are explicit and offline:
+
+```text
+sideeffect provenance trust import PUBLIC_KEY.hex --trust-store DIR --label LABEL
+sideeffect provenance trust list --trust-store DIR
+sideeffect provenance trust remove KEY_ID --trust-store DIR
+sideeffect provenance verify-session SESSION_DIR --signature SIGNATURE.json --trust-store DIR
+sideeffect provenance verify-session SESSION_DIR --signature SIGNATURE.json --public-key PUBLIC_KEY.hex --trust-store DIR
+```
+
+There is no default or global trust store. Import reads only the public-key file, computes the key ID as SHA-256 of the decoded raw Ed25519 public key, displays that fingerprint, and requires the user to type `trust <fingerprint>` before changing the store. Labels are local annotations restricted to 1–64 ASCII letters, digits, spaces, periods, underscores, `@`, and hyphens, with no edge spaces. Removal requires typing `remove <fingerprint>`. Import never overwrites an existing fingerprint entry. Listing and verification reject malformed or unexpected store contents.
+
+The store contains a strict `sideeffect.provenance_trust_store` v1 marker and one strict `sideeffect.trusted_provenance_key` v1 record named `key-<key_id>.json` per key. It is capped at 256 key records and 4 KiB per marker or record. Records contain the public key in lowercase hexadecimal, its key ID, and the local label; they contain no private key material. Reads are bounded and reject links/reparse points. Store directories and records must be owned/protected for the current user: Linux uses mode `0700` directories and `0600` files and rejects non-sticky writable parents; Windows requires a protected current-user-only DACL. New record publication is no-overwrite. Confirmation lines are bounded to 128 bytes and must be newline-terminated UTF-8. The user-selected store path is the only store used by these commands.
+
+`verify-session --trust-store DIR` verifies only when the envelope key ID matches a key in that store. It reports a matching key as cryptographically valid and locally trusted. An absent key is reported as unknown without claiming that signature validity was checked. When a public key is also supplied, the command can report a cryptographically valid signature as locally untrusted if the key is absent from the selected store. Unknown and valid-but-untrusted results exit with status 2; malformed inputs and invalid signatures fail. Without `--trust-store`, the existing `--public-key` path remains cryptographic-only and says trust was not evaluated. A local label does not establish signer identity. Removing a key changes only the local trust decision; it is not a published revocation and cannot invalidate previous signatures.
+
 ## Proposed canonical contract for a future v2
 
 V2 is a format proposal, not an implemented or accepted signature version. It must be introduced additively and must never reinterpret a v1 sidecar. The proposed v2 envelope keeps schema `sideeffect.provenance_signature`, uses `schema_version: 2`, and has exactly these fields:

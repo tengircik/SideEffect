@@ -389,7 +389,21 @@ Verify offline by supplying the matching public key:
   --public-key ./sideeffect-public-key.hex
 ```
 
-Verification checks the session artifacts first, then verifies the signature over the exact `session.json` bytes. It reports cryptographic validity only. The current CLI has no local trust store or revocation handling; a valid signature does not identify a person, establish key trust, prove collector honesty, or establish capture completeness. The recorded signing time comes from the local clock and is not a trusted timestamp. Keep the detached signature file with the session when moving or archiving it.
+Verification checks the session artifacts first, then verifies the signature over the exact `session.json` bytes. Using only `--public-key` reports cryptographic validity and leaves key trust unevaluated. The recorded signing time comes from the local clock and is not a trusted timestamp. Keep the detached signature file with the session when moving or archiving it.
+
+To make a local trust decision for a public key, import it into a user-selected trust store. Import shows the computed fingerprint and asks you to type that exact fingerprint; the label is only a local annotation:
+
+```sh
+./target/release/sideeffect provenance trust import ./sideeffect-public-key.hex \
+  --trust-store ./sideeffect-trust-store \
+  --label "review team"
+./target/release/sideeffect provenance trust list --trust-store ./sideeffect-trust-store
+./target/release/sideeffect provenance verify-session ./audit-session \
+  --signature ./audit-session.signature.json \
+  --trust-store ./sideeffect-trust-store
+```
+
+The trust store is explicit; SideEffect has no default/global store or network lookup. A successful trust-aware verification reports cryptographic validity and a matching local key decision separately. Unknown keys are not cryptographically verified unless you also supply `--public-key`; a valid signature from a key absent from the store is reported as valid but untrusted and exits with status 2. Remove a local trust decision with `provenance trust remove KEY_ID --trust-store DIR` and type the requested fingerprint. Removal does not publish revocation. Store permissions and the limits of local labels are described in [PROVENANCE_FORMAT.md](PROVENANCE_FORMAT.md). Trust does not establish signer identity, collector honesty, or capture completeness.
 
 ## Record a command on Linux
 

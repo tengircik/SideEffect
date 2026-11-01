@@ -16,8 +16,14 @@ pub const SIGNATURE_SCHEMA: &str = "sideeffect.provenance_signature";
 pub const SIGNATURE_VERSION: u32 = 1;
 pub const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
 pub const MAX_KEY_FILE_BYTES: usize = 4 * 1024;
+pub const MAX_TRUSTED_KEYS: usize = 256;
+const MAX_TRUST_RECORD_BYTES: usize = 4 * 1024;
+const TRUST_STORE_SCHEMA: &str = "sideeffect.provenance_trust_store";
+const TRUSTED_KEY_SCHEMA: &str = "sideeffect.trusted_provenance_key";
+const TRUST_STORE_VERSION: u32 = 1;
 const SIGNATURE_DOMAIN: &[u8] = b"sideeffect.audit_session.signature.v1\0";
 const ALGORITHM: &str = "ed25519";
+const TRUST_STORE_MARKER: &str = "store.json";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +40,33 @@ pub struct SignatureEnvelope {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Verification {
     Valid { key_id: String },
+    ValidTrusted { key_id: String, label: String },
+    ValidUntrusted { key_id: String },
+    UnknownTrustedKey { key_id: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedKey {
+    pub key_id: String,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TrustStoreMarker {
+    schema: String,
+    schema_version: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TrustedKeyRecord {
+    schema: String,
+    schema_version: u32,
+    key_id: String,
+    public_key: String,
+    label: String,
 }
 
 #[derive(Debug)]
@@ -45,6 +78,8 @@ pub enum ProvenanceError {
     PublicKeyMismatch,
     ManifestDigestMismatch,
     InvalidSignature,
+    UnknownTrustedKey(String),
+    InvalidStore,
 }
 
 impl std::fmt::Display for ProvenanceError {
@@ -59,6 +94,12 @@ impl std::fmt::Display for ProvenanceError {
                 f.write_str("session manifest bytes do not match the signed digest")
             }
             Self::InvalidSignature => f.write_str("Ed25519 signature is invalid"),
+            Self::UnknownTrustedKey(key_id) => {
+                write!(f, "key {key_id} is not in the selected local trust store")
+            }
+            Self::InvalidStore => {
+                f.write_str("local provenance trust store is malformed or unsafe")
+            }
         }
     }
 }
@@ -219,6 +260,190 @@ pub fn load_public_key(path: &Path) -> Result<Vec<u8>, ProvenanceError> {
     Ok(bytes)
 }
 
+/// Add a public key to a user-selected, current-user-private trust store.
+/// `public_key_bytes` must contain the raw 32-byte Ed25519 public key.
+pub fn import_trusted_key(
+    store: &Path,
+    public_key_bytes: &[u8],
+    label: &str,
+) -> Result<TrustedKey, ProvenanceError> {
+    if public_key_bytes.len() != 32 || !valid_trust_label(label) {
+        return Err(ProvenanceError::InvalidInput(
+            "public key or trust label is invalid",
+        ));
+    }
+    ensure_trust_store(store)?;
+    if list_trusted_keys(store)?.len() >= MAX_TRUSTED_KEYS {
+        return Err(ProvenanceError::InvalidInput("trust store is full"));
+    }
+    let key_id = encode_hex(&Sha256::digest(public_key_bytes));
+    let filename = trust_record_filename(&key_id);
+    let path = store.join(filename);
+    let record = TrustedKeyRecord {
+        schema: TRUSTED_KEY_SCHEMA.to_owned(),
+        schema_version: TRUST_STORE_VERSION,
+        key_id: key_id.clone(),
+        public_key: encode_hex(public_key_bytes),
+        label: label.to_owned(),
+    };
+    let mut bytes = serde_json::to_vec(&record).map_err(|_| ProvenanceError::InvalidStore)?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_TRUST_RECORD_BYTES {
+        return Err(ProvenanceError::InvalidStore);
+    }
+    publish_private(&path, &bytes).map_err(|error| match error {
+        ProvenanceError::Io(ref io_error) if io_error.kind() == io::ErrorKind::AlreadyExists => {
+            ProvenanceError::InvalidInput("key is already present in the trust store")
+        }
+        other => other,
+    })?;
+    Ok(TrustedKey {
+        key_id,
+        label: label.to_owned(),
+    })
+}
+
+/// Import a public key from the existing lowercase-hex public-key file format.
+pub fn import_trusted_key_text(
+    store: &Path,
+    public_key_text: &[u8],
+    label: &str,
+) -> Result<TrustedKey, ProvenanceError> {
+    let public_key = decode_hex(public_key_text, 32).ok_or(ProvenanceError::InvalidKey)?;
+    import_trusted_key(store, &public_key, label)
+}
+
+pub fn public_key_id(public_key_text: &[u8]) -> Result<String, ProvenanceError> {
+    let public_key = decode_hex(public_key_text, 32).ok_or(ProvenanceError::InvalidKey)?;
+    Ok(encode_hex(&Sha256::digest(public_key)))
+}
+
+pub fn validate_trust_label(label: &str) -> Result<(), ProvenanceError> {
+    if valid_trust_label(label) {
+        Ok(())
+    } else {
+        Err(ProvenanceError::InvalidInput(
+            "trust label must be 1 to 64 ASCII letters, digits, spaces, periods, underscores, @, or hyphens; edge spaces are not allowed",
+        ))
+    }
+}
+
+pub fn validate_trusted_key_id(key_id: &str) -> Result<(), ProvenanceError> {
+    if decode_hex(key_id.as_bytes(), 32).is_some() {
+        Ok(())
+    } else {
+        Err(ProvenanceError::InvalidInput(
+            "key ID must be lowercase SHA-256 hex",
+        ))
+    }
+}
+
+/// List keys from a strictly validated local trust store.
+pub fn list_trusted_keys(store: &Path) -> Result<Vec<TrustedKey>, ProvenanceError> {
+    validate_trust_store(store)?;
+    let mut keys = Vec::new();
+    let entries = fs::read_dir(store)?;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == TRUST_STORE_MARKER {
+            continue;
+        }
+        if keys.len() == MAX_TRUSTED_KEYS {
+            return Err(ProvenanceError::InvalidStore);
+        }
+        let name = name.to_str().ok_or(ProvenanceError::InvalidStore)?;
+        let key_id = name
+            .strip_prefix("key-")
+            .and_then(|name| name.strip_suffix(".json"))
+            .ok_or(ProvenanceError::InvalidStore)?;
+        if decode_hex(key_id.as_bytes(), 32).is_none() {
+            return Err(ProvenanceError::InvalidStore);
+        }
+        let record = read_trust_record(&entry.path())?;
+        if record.key_id != key_id {
+            return Err(ProvenanceError::InvalidStore);
+        }
+        keys.push(TrustedKey {
+            key_id: record.key_id,
+            label: record.label,
+        });
+    }
+    keys.sort_by(|left, right| left.key_id.cmp(&right.key_id));
+    Ok(keys)
+}
+
+/// Remove a key from a local trust store. The caller should obtain explicit
+/// confirmation before invoking this operation.
+pub fn remove_trusted_key(store: &Path, key_id: &str) -> Result<(), ProvenanceError> {
+    if decode_hex(key_id.as_bytes(), 32).is_none() {
+        return Err(ProvenanceError::InvalidInput(
+            "key ID must be lowercase SHA-256 hex",
+        ));
+    }
+    validate_trust_store(store)?;
+    let _ = list_trusted_keys(store)?;
+    let path = store.join(trust_record_filename(key_id));
+    let record = read_trust_record(&path)?;
+    if record.key_id != key_id {
+        return Err(ProvenanceError::InvalidStore);
+    }
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+/// Verify using a key selected from the trust store. An absent key is reported
+/// as unknown without claiming that its signature was cryptographically checked.
+pub fn verify_manifest_with_trust_store(
+    manifest_bytes: &[u8],
+    envelope_bytes: &[u8],
+    store: &Path,
+) -> Result<Verification, ProvenanceError> {
+    check_manifest_size(manifest_bytes)?;
+    if envelope_bytes.is_empty() || envelope_bytes.len() > MAX_SIGNATURE_BYTES {
+        return Err(ProvenanceError::InvalidEnvelope);
+    }
+    let envelope: SignatureEnvelope =
+        serde_json::from_slice(envelope_bytes).map_err(|_| ProvenanceError::InvalidEnvelope)?;
+    validate_envelope(&envelope)?;
+    let Some(record) = find_trusted_key(store, &envelope.key_id)? else {
+        return Ok(Verification::UnknownTrustedKey {
+            key_id: envelope.key_id,
+        });
+    };
+    match verify_manifest(manifest_bytes, envelope_bytes, record.public_key.as_bytes())? {
+        Verification::Valid { key_id } => Ok(Verification::ValidTrusted {
+            key_id,
+            label: record.label,
+        }),
+        _ => unreachable!("verify_manifest only returns cryptographic validity"),
+    }
+}
+
+/// Verify with an explicitly supplied public key, then report whether that key
+/// is also trusted in the selected store.
+pub fn verify_manifest_with_public_key_and_trust_store(
+    manifest_bytes: &[u8],
+    envelope_bytes: &[u8],
+    public_key_text: &[u8],
+    store: &Path,
+) -> Result<Verification, ProvenanceError> {
+    let valid = verify_manifest(manifest_bytes, envelope_bytes, public_key_text)?;
+    let Verification::Valid { key_id } = valid else {
+        unreachable!("verify_manifest only returns cryptographic validity")
+    };
+    let Some(record) = find_trusted_key(store, &key_id)? else {
+        return Ok(Verification::ValidUntrusted { key_id });
+    };
+    if record.public_key.as_bytes() != public_key_text {
+        return Err(ProvenanceError::InvalidStore);
+    }
+    Ok(Verification::ValidTrusted {
+        key_id,
+        label: record.label,
+    })
+}
+
 pub fn read_manifest(path: &Path) -> Result<Vec<u8>, ProvenanceError> {
     read_limited(
         path,
@@ -229,6 +454,177 @@ pub fn read_manifest(path: &Path) -> Result<Vec<u8>, ProvenanceError> {
 
 pub fn read_envelope(path: &Path) -> Result<Vec<u8>, ProvenanceError> {
     read_limited(path, MAX_SIGNATURE_BYTES, "signature envelope")
+}
+
+fn ensure_trust_store(store: &Path) -> Result<(), ProvenanceError> {
+    match fs::symlink_metadata(store) {
+        Ok(_) => return validate_trust_store(store),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ProvenanceError::Io(error)),
+    }
+    let parent = store
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    validate_trust_store_parent(parent)?;
+    let marker = TrustStoreMarker {
+        schema: TRUST_STORE_SCHEMA.to_owned(),
+        schema_version: TRUST_STORE_VERSION,
+    };
+    let mut bytes = serde_json::to_vec(&marker).map_err(|_| ProvenanceError::InvalidStore)?;
+    bytes.push(b'\n');
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(store) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return validate_trust_store(store);
+            }
+            Err(error) => return Err(ProvenanceError::Io(error)),
+        }
+        validate_trust_store_directory(store)?;
+        publish_private(&store.join(TRUST_STORE_MARKER), &bytes)?;
+    }
+    #[cfg(windows)]
+    {
+        match crate::record::publish_private_windows_directory(
+            store,
+            &[(TRUST_STORE_MARKER, bytes.as_slice())],
+            MAX_TRUST_RECORD_BYTES,
+        ) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return validate_trust_store(store);
+            }
+            Err(error) => return Err(ProvenanceError::Io(error)),
+        }
+    }
+    validate_trust_store(store)
+}
+
+fn validate_trust_store_parent(parent: &Path) -> Result<(), ProvenanceError> {
+    let metadata = fs::metadata(parent)?;
+    if !metadata.is_dir() {
+        return Err(ProvenanceError::InvalidStore);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Permit a sticky shared temporary directory, where other users cannot
+        // remove entries owned by this user. Reject other writable parents.
+        if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
+            return Err(ProvenanceError::InvalidStore);
+        }
+    }
+    // On Windows, the private-directory publisher applies the protected DACL
+    // atomically to the new store; ordinary profile parents may have inherited
+    // read-only ACEs that do not permit tampering with that private child.
+    Ok(())
+}
+
+fn validate_trust_store(store: &Path) -> Result<(), ProvenanceError> {
+    let parent = store
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    validate_trust_store_parent(parent)?;
+    validate_trust_store_directory(store)?;
+    let marker_path = store.join(TRUST_STORE_MARKER);
+    validate_trust_store_file(&marker_path)?;
+    let bytes = read_limited(&marker_path, MAX_TRUST_RECORD_BYTES, "trust-store marker")?;
+    let marker: TrustStoreMarker =
+        serde_json::from_slice(&bytes).map_err(|_| ProvenanceError::InvalidStore)?;
+    if marker.schema != TRUST_STORE_SCHEMA || marker.schema_version != TRUST_STORE_VERSION {
+        return Err(ProvenanceError::InvalidStore);
+    }
+    Ok(())
+}
+
+fn validate_trust_store_directory(store: &Path) -> Result<(), ProvenanceError> {
+    let metadata = fs::symlink_metadata(store)?;
+    if !metadata.file_type().is_dir() {
+        return Err(ProvenanceError::InvalidStore);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and does not mutate memory.
+        let current_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != current_uid || metadata.mode() & 0o077 != 0 {
+            return Err(ProvenanceError::InvalidStore);
+        }
+    }
+    #[cfg(windows)]
+    if !crate::audit_session_reader_windows::owner_only_acl(store)? {
+        return Err(ProvenanceError::InvalidStore);
+    }
+    Ok(())
+}
+
+fn validate_trust_store_file(path: &Path) -> Result<(), ProvenanceError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(ProvenanceError::InvalidStore);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and does not mutate memory.
+        let current_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != current_uid || metadata.mode() & 0o077 != 0 {
+            return Err(ProvenanceError::InvalidStore);
+        }
+    }
+    #[cfg(windows)]
+    if !crate::audit_session_reader_windows::owner_only_acl(path)? {
+        return Err(ProvenanceError::InvalidStore);
+    }
+    Ok(())
+}
+
+fn read_trust_record(path: &Path) -> Result<TrustedKeyRecord, ProvenanceError> {
+    validate_trust_store_file(path)?;
+    let bytes = read_limited(path, MAX_TRUST_RECORD_BYTES, "trusted key record")?;
+    let record: TrustedKeyRecord =
+        serde_json::from_slice(&bytes).map_err(|_| ProvenanceError::InvalidStore)?;
+    let public_key =
+        decode_hex(record.public_key.as_bytes(), 32).ok_or(ProvenanceError::InvalidStore)?;
+    if record.schema != TRUSTED_KEY_SCHEMA
+        || record.schema_version != TRUST_STORE_VERSION
+        || record.key_id != encode_hex(&Sha256::digest(&public_key))
+        || !valid_trust_label(&record.label)
+    {
+        return Err(ProvenanceError::InvalidStore);
+    }
+    Ok(record)
+}
+
+fn find_trusted_key(
+    store: &Path,
+    key_id: &str,
+) -> Result<Option<TrustedKeyRecord>, ProvenanceError> {
+    let keys = list_trusted_keys(store)?;
+    if !keys.iter().any(|key| key.key_id == key_id) {
+        return Ok(None);
+    }
+    let record = read_trust_record(&store.join(trust_record_filename(key_id)))?;
+    Ok(Some(record))
+}
+
+fn trust_record_filename(key_id: &str) -> String {
+    format!("key-{key_id}.json")
+}
+
+fn valid_trust_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 64
+        && label.trim() == label
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b" ._@-".contains(&byte))
 }
 
 fn read_limited(path: &Path, limit: usize, description: &str) -> Result<Vec<u8>, ProvenanceError> {
@@ -363,10 +759,15 @@ fn hex_nibble(value: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Ed25519KeyPair, SignatureEnvelope, SystemRandom, generate_keypair, sign_manifest,
-        verify_manifest,
+        Ed25519KeyPair, SignatureEnvelope, SystemRandom, generate_keypair, import_trusted_key,
+        list_trusted_keys, remove_trusted_key, sign_manifest, verify_manifest,
+        verify_manifest_with_public_key_and_trust_store, verify_manifest_with_trust_store,
     };
     use ring::signature::KeyPair;
+    use sha2::Digest;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(0);
 
     fn test_key() -> (Vec<u8>, Vec<u8>) {
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
@@ -383,6 +784,25 @@ mod tests {
                 ]
             })
             .collect()
+    }
+
+    fn temporary_root() -> std::path::PathBuf {
+        let id = NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "sideeffect-provenance-unit-{}-{id}",
+            std::process::id()
+        ));
+        #[cfg(windows)]
+        crate::record::publish_private_windows_directory(&root, &[("test-root", b"x")], 128)
+            .unwrap();
+        #[cfg(not(windows))]
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        root
     }
 
     #[test]
@@ -450,6 +870,144 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn trust_store_import_verify_and_remove_keep_crypto_and_trust_distinct() {
+        let root = temporary_root();
+        let store = root.join("trusted-keys");
+        let (trusted_private, trusted_public) = test_key();
+        let (untrusted_private, untrusted_public) = test_key();
+        let trusted = import_trusted_key(&store, &trusted_public, "review team").unwrap();
+        assert_eq!(
+            trusted.key_id,
+            super::encode_hex(&sha2::Sha256::digest(&trusted_public))
+        );
+        assert_eq!(list_trusted_keys(&store).unwrap(), vec![trusted.clone()]);
+
+        let manifest = b"validated test manifest bytes";
+        let trusted_envelope = sign_manifest(manifest, &trusted_private, 1234).unwrap();
+        let trusted_envelope = serde_json::to_vec(&trusted_envelope).unwrap();
+        assert_eq!(
+            verify_manifest_with_trust_store(manifest, &trusted_envelope, &store).unwrap(),
+            super::Verification::ValidTrusted {
+                key_id: trusted.key_id.clone(),
+                label: "review team".to_owned(),
+            }
+        );
+        let mut tampered: super::SignatureEnvelope =
+            serde_json::from_slice(&trusted_envelope).unwrap();
+        let replacement = if tampered.signature.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        };
+        tampered.signature.replace_range(0..1, replacement);
+        let tampered = serde_json::to_vec(&tampered).unwrap();
+        assert!(verify_manifest_with_trust_store(manifest, &tampered, &store).is_err());
+
+        let untrusted_envelope = sign_manifest(manifest, &untrusted_private, 1234).unwrap();
+        let untrusted_envelope = serde_json::to_vec(&untrusted_envelope).unwrap();
+        let untrusted_public = public_text(&untrusted_public);
+        let untrusted_id = super::public_key_id(&untrusted_public).unwrap();
+        assert_eq!(
+            verify_manifest_with_trust_store(manifest, &untrusted_envelope, &store).unwrap(),
+            super::Verification::UnknownTrustedKey {
+                key_id: untrusted_id.clone(),
+            }
+        );
+        assert_eq!(
+            verify_manifest_with_public_key_and_trust_store(
+                manifest,
+                &untrusted_envelope,
+                &untrusted_public,
+                &store,
+            )
+            .unwrap(),
+            super::Verification::ValidUntrusted {
+                key_id: untrusted_id,
+            }
+        );
+        #[cfg(windows)]
+        assert!(
+            crate::audit_session_reader_windows::owner_only_acl(
+                &store.join(super::trust_record_filename(&trusted.key_id))
+            )
+            .unwrap()
+        );
+
+        remove_trusted_key(&store, &trusted.key_id).unwrap();
+        assert!(list_trusted_keys(&store).unwrap().is_empty());
+        assert!(remove_trusted_key(&store, &trusted.key_id).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&store).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(store.join(super::TRUST_STORE_MARKER))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        #[cfg(windows)]
+        assert!(crate::audit_session_reader_windows::owner_only_acl(&store).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn trust_store_rejects_duplicate_invalid_label_unknown_record_fields_and_links() {
+        let root = temporary_root();
+        let store = root.join("trusted-keys");
+        let (_, public) = test_key();
+        let trusted = import_trusted_key(&store, &public, "known key").unwrap();
+        assert!(import_trusted_key(&store, &public, "known key").is_err());
+        assert!(import_trusted_key(&store, &public, "bad\nlabel").is_err());
+
+        let record_path = store.join(super::trust_record_filename(&trusted.key_id));
+        let valid_record = std::fs::read(&record_path).unwrap();
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        record["unexpected"] = serde_json::json!(true);
+        std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(list_trusted_keys(&store).is_err());
+
+        let mut record: serde_json::Value = serde_json::from_slice(&valid_record).unwrap();
+        record["key_id"] =
+            serde_json::json!("0000000000000000000000000000000000000000000000000000000000000000");
+        std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(list_trusted_keys(&store).is_err());
+
+        let record: super::TrustedKeyRecord = serde_json::from_slice(&valid_record).unwrap();
+        let duplicate_key_id = format!(
+            "{{\"schema\":\"{}\",\"schema_version\":{},\"key_id\":\"{}\",\"key_id\":\"{}\",\"public_key\":\"{}\",\"label\":\"{}\"}}",
+            record.schema,
+            record.schema_version,
+            record.key_id,
+            record.key_id,
+            record.public_key,
+            record.label,
+        );
+        std::fs::write(&record_path, duplicate_key_id).unwrap();
+        assert!(list_trusted_keys(&store).is_err());
+
+        std::fs::write(&record_path, vec![b' '; super::MAX_TRUST_RECORD_BYTES + 1]).unwrap();
+        assert!(list_trusted_keys(&store).is_err());
+        std::fs::write(&record_path, &valid_record).unwrap();
+
+        #[cfg(unix)]
+        {
+            let link = store
+                .join("key-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json");
+            std::os::unix::fs::symlink(&record_path, &link).unwrap();
+            assert!(list_trusted_keys(&store).is_err());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
