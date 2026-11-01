@@ -211,6 +211,7 @@ For process snapshots, use `sideeffect inventory processes --output ./before.jso
 | Evidence review | Bounded JSON, terminal-safe text, exact source references, and static offline HTML reports where supported |
 | Comparison | Evidence-backed trace and ETW differences, aggregate summaries, and conservative association candidates |
 | Deterministic explanation | Source-aware `explain` summaries without a model dependency |
+| Optional local model tools | Experimental, user-selected model workflows with reviewed previews; no model is release-approved |
 | Agent workflow | A portable skill for using SideEffect through your preferred agent and model |
 
 Inventory collectors expose their source, status, diagnostics, and limits. Comparisons preserve their matching rules and evidence references. A relationship is identified as a candidate when the available records support only a candidate match.
@@ -235,6 +236,7 @@ SideEffect provides a native Rust CLI for Linux x86_64 and Windows x64. The Linu
 - [Build, install, and platform compatibility](docs/INSTALL.md)
 - [Install SideEffect as an agent skill](docs/AGENT_SKILL.md)
 - [Product scope](docs/PRODUCT.md)
+- [Optional local model setup and readiness checks](docs/LOCAL_MODEL_DOCTOR.md)
 - [Windows local explanation model setup](docs/LOCAL_MODEL_WINDOWS_SETUP.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Delivery plan](docs/PLAN.md)
