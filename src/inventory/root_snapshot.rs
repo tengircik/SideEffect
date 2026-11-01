@@ -775,6 +775,66 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inaccessible_selected_root_is_partial_with_access_denied_diagnostic() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Permission checks are bypassed for root, so this fixture is meaningful only
+        // when the test process runs with an ordinary user token.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping permission-denial fixture because the test process is root");
+            return;
+        }
+
+        let root = fixture_dir("denied-root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0)).unwrap();
+        let output = collect_root_snapshot(&root);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(output.status, "partial");
+        assert!(output.root.is_none());
+        assert!(output.entries.is_empty());
+        assert_eq!(output.diagnostics.len(), 1);
+        assert_eq!(output.diagnostics[0].code, "root_open_failed");
+        assert_eq!(
+            output.diagnostics[0].native_error,
+            Some(libc::EACCES as u32)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_metadata_denial_keeps_root_and_reports_partial_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping permission-denial fixture because the test process is root");
+            return;
+        }
+
+        let root = fixture_dir("denied-child-metadata");
+        fs::write(root.join("inaccessible-child"), b"synthetic fixture").unwrap();
+        // Read permission allows readdir; missing search permission makes the
+        // subsequent handle-relative openat for each child fail with EACCES.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o400)).unwrap();
+        let output = collect_root_snapshot(&root);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(output.status, "partial");
+        assert!(output.root.is_some());
+        assert!(output.entries.is_empty());
+        assert_eq!(output.diagnostics.len(), 1);
+        assert_eq!(output.diagnostics[0].code, "entry_metadata_failed");
+        assert_eq!(output.diagnostics[0].entry_ordinal, Some(0));
+        assert_eq!(
+            output.diagnostics[0].native_error,
+            Some(libc::EACCES as u32)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn root_reparse_points_are_rejected_when_symlink_fixtures_are_available() {
