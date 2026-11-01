@@ -127,6 +127,45 @@ sideeffect.exe events --windows-runtime .\runtime.windows.json
 
 The command writes versioned JSON to stdout and never runs represented commands or modifies the input. Events keep their source-local order, timestamps, outcome/status, and evidence links. Envelope v4 adds source-local process observations and event links: Linux process-creation rows link the caller task ID to the returned child PID, while exact prefixed task-termination rows can split trace-task observations into source-local epochs on complete parses. These epochs are not OS process/PID generations or ancestry, and partial parses retain task-ID-only observations. Windows process start/end IDs are decoded from retained raw bytes only for reviewed Kernel-Process v0-v3 layouts and checked against the serialized TDH sidecar; image names remain decoder metadata only. For supported classic TCP/UDP rows, the adapter re-decodes retained raw payload bytes and checks the serialized observation; a mismatch is diagnosed and only the raw payload PID can support a context-candidate link. Unsupported or malformed payloads remain raw with an unresolved link and diagnostic. Windows file/disk header PIDs remain context candidates. These links do not form a merged process graph or causal view. A partial or unknown source exits with status `2`; the envelope does not infer one global clock or process ownership.
 
+### Query runtime evidence
+
+Create an exact-filter query file:
+
+```json
+{
+  "schema": "sideeffect.event_query",
+  "schema_version": 1,
+  "filters": {
+    "event_kind": "connect",
+    "operation_kind": "syscall_attempt",
+    "outcome": "failure"
+  },
+  "limit": 100
+}
+```
+
+Apply it directly to a Linux trace or Windows ETW capture:
+
+```sh
+sideeffect query --query ./query.json --trace ./capture.trace
+```
+
+```powershell
+sideeffect.exe query --query .\query.json --windows-runtime .\runtime.windows.json
+```
+
+Or query the verified runtime artifact in one audit session:
+
+```sh
+sideeffect query --query ./query.json --session ./audit-session --source runtime
+```
+
+```powershell
+sideeffect.exe query --query .\query.json --session .\audit-session --source runtime
+```
+
+Session results keep session status, runtime-source status, capture completeness, and event parse/adaptation status separate. They retain verified artifact hashes and event evidence locators. Linux `run.json` must bind `trace.strace` by exact schema, length, and SHA-256. Windows uses the session reader's verified ETW v3 artifact and validates its capture fingerprint. Missing runtime evidence is an error; partial or unknown evidence exits `2`. Querying one runtime source does not merge or compare sessions.
+
 ### Explore an evidence-linked event graph
 
 ```sh

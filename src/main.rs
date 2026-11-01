@@ -87,6 +87,8 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect model-explain --question <question> --backend auto|cpu|cuda [--runtime <llama-completion>] --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect model-query-preview --question <question> <strace-trace-file>\n\
        sideeffect model-query --question <question> [--runtime <llama-completion>] --confirm-sha256 <preview-digest> <strace-trace-file>\n\
+       sideeffect query --query <query.json> --trace <trace> | --windows-runtime <capture.json>\n\
+       sideeffect query --query <query.json> --session <session-directory> --source runtime\n\
        sideeffect model list | show <id> | install <id> | setup <id> | add | select <task> <id> | remove <id>\n\
        sideeffect model runtime set <task> <existing-file> | show [task] | clear <task>\n\
        sideeffect model doctor --task explanation [--runtime <llama-completion>] [--backend auto|cpu|cuda]\n\
@@ -1652,7 +1654,7 @@ fn print_version() {
 
 fn print_usage() {
     println!(
-        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)\n       sideeffect query --query <query.json> --trace <trace> [--format json|text]\n       sideeffect query --query <query.json> --windows-runtime <capture.json> [--format json|text] (native Windows)\n       sideeffect graph --trace <strace-trace-file> [--event-kind <kind> | --process-observation <id>]\n       sideeffect graph --windows-runtime <capture.json> [--event-kind <kind> | --process-observation <id>] (native Windows)\n       sideeffect timeline --trace <strace-trace-file> [--event-kind <kind>] [--process-observation <id>]\n       sideeffect timeline --windows-runtime <capture.json> [--event-kind <kind>] [--process-observation <id>] (native Windows)\n\nProvenance:\n       sideeffect provenance keygen <private-key.pk8> <public-key.hex>\n       sideeffect provenance sign-session <session-dir> --private-key <private-key.pk8> --output <signature.json>\n       sideeffect provenance verify-session <session-dir> --signature <signature.json> --public-key <public-key.hex>"
+        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)\n       sideeffect query --query <query.json> --trace <trace> [--format json|text]\n       sideeffect query --query <query.json> --windows-runtime <capture.json> [--format json|text] (native Windows)\n       sideeffect query --query <query.json> --session <session-dir> --source runtime [--format json|text]\n       sideeffect graph --trace <strace-trace-file> [--event-kind <kind> | --process-observation <id>]\n       sideeffect graph --windows-runtime <capture.json> [--event-kind <kind> | --process-observation <id>] (native Windows)\n       sideeffect timeline --trace <strace-trace-file> [--event-kind <kind>] [--process-observation <id>]\n       sideeffect timeline --windows-runtime <capture.json> [--event-kind <kind>] [--process-observation <id>] (native Windows)\n\nProvenance:\n       sideeffect provenance keygen <private-key.pk8> <public-key.hex>\n       sideeffect provenance sign-session <session-dir> --private-key <private-key.pk8> --output <signature.json>\n       sideeffect provenance verify-session <session-dir> --signature <signature.json> --public-key <public-key.hex>"
     );
 }
 
@@ -1692,7 +1694,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect events --trace TRACE\n       sideeffect events --windows-runtime CAPTURE.json (native Windows)\nAdapts one local runtime source into a versioned common event envelope and writes JSON only. Source-local order and timestamps are preserved; no cross-platform ordering, parentage, ownership, or causation is inferred. Partial or unknown source status exits with status 2. Windows runtime input is strictly bounded and schema-validated before adaptation."
         }
         "query" => {
-            "Usage: sideeffect query --query QUERY.json --trace TRACE [--format json|text]\n       sideeffect query --query QUERY.json --windows-runtime CAPTURE.json [--format json|text] (native Windows)\nRuns a versioned, read-only exact-filter query over the normalized common event envelope. Query JSON is strictly validated, limited to 16 KiB, 5,000 results, 2 seconds of filtering, and 8 MiB serialized output. Supported filters are exact event_kind, operation_kind, syscall outcome, and source-local process_observation_id. Path, endpoint, and timestamp filtering are not supported by this first schema. Every returned event retains its exact evidence link; full input diagnostics and source completeness remain visible. Partial or unknown input exits with status 2."
+            "Usage: sideeffect query --query QUERY.json --trace TRACE [--format json|text]\n       sideeffect query --query QUERY.json --windows-runtime CAPTURE.json [--format json|text] (native Windows)\n       sideeffect query --query QUERY.json --session SESSION_DIR --source runtime [--format json|text]\nRuns a versioned, read-only exact-filter query over a common event envelope, or over the verified runtime artifact in one private audit session. Query JSON is strictly validated, limited to 16 KiB, 5,000 results, 2 seconds of filtering, and 8 MiB serialized output. Supported filters are exact event_kind, operation_kind, syscall outcome, and source-local process_observation_id. Path, endpoint, timestamp, cross-session, and inventory-artifact queries are not supported. Session output separately preserves session status, runtime source status, capture completeness, event parse/adaptation status, diagnostics, artifact digests, and event evidence references. Missing runtime artifacts are errors, not empty results. Partial or unknown evidence exits with status 2."
         }
         "graph" => {
             "Usage: sideeffect graph --trace TRACE [--event-kind KIND | --process-observation ID]\n       sideeffect graph --windows-runtime CAPTURE.json [--event-kind KIND | --process-observation ID] (native Windows)\nBuilds a bounded source-local graph of event rows, process observations, reported PID context, and evidence-linked relationships. --event-kind selects exact event-kind matches. --process-observation selects a source-local ProcessObservation ID (not a PID or cross-capture ID) and retains events linked to that observation plus its direct process relationships. Retained links preserve their status and basis; diagnostics and source status remain for the full input. An empty event selection is not evidence of absence. PID-only context nodes are kept separate and never merged into process instances. Edges do not establish ownership, causation, or a complete process tree. Partial or unknown source status exits with status 2."
@@ -2233,6 +2235,8 @@ fn events_trace(path: &OsString) -> Result<ExitCode, String> {
 fn query_command(arguments: &[OsString]) -> Result<ExitCode, String> {
     let mut query_path: Option<&OsString> = None;
     let mut source: Option<(&str, &OsString)> = None;
+    let mut session_path: Option<&OsString> = None;
+    let mut session_source: Option<&str> = None;
     let mut output_format = "json";
     let mut format_seen = false;
     let mut index = 0;
@@ -2268,6 +2272,18 @@ fn query_command(arguments: &[OsString]) -> Result<ExitCode, String> {
             {
                 return Err("query accepts exactly one source input".to_owned());
             }
+        } else if flag == "--session" {
+            if session_path.replace(value).is_some() {
+                return Err("duplicate query --session option".to_owned());
+            }
+        } else if flag == "--source" {
+            if session_source.is_some() {
+                return Err("duplicate query --source option".to_owned());
+            }
+            if value != "runtime" {
+                return Err("query --source currently supports only 'runtime'".to_owned());
+            }
+            session_source = Some("runtime");
         } else if flag == "--format" {
             if format_seen {
                 return Err("duplicate query --format option".to_owned());
@@ -2281,21 +2297,44 @@ fn query_command(arguments: &[OsString]) -> Result<ExitCode, String> {
                 .ok_or_else(|| "query format must be UTF-8".to_owned())?;
         } else {
             return Err(format!(
-                "unknown query option {}; use --query, --trace, --windows-runtime, or --format",
+                "unknown query option {}; use --query, --trace, --windows-runtime, --session, --source, or --format",
                 terminal_safe_text(&flag.to_string_lossy())
             ));
         }
         index += 2;
     }
     let query_path = query_path.ok_or_else(|| "query requires --query FILE".to_owned())?;
-    let (source_kind, source_path) =
-        source.ok_or_else(|| "query requires --trace FILE or --windows-runtime FILE".to_owned())?;
     let query_bytes = read_input_file(
         Path::new(query_path),
         sideeffect::query::MAX_QUERY_BYTES,
         "event query",
     )?;
     let query = sideeffect::query::EventQuery::from_json(&query_bytes)?;
+    if let Some(session_path) = session_path {
+        if source.is_some() {
+            return Err(
+                "query cannot combine --session with --trace or --windows-runtime".to_owned(),
+            );
+        }
+        if session_source != Some("runtime") {
+            return Err("session query requires --source runtime".to_owned());
+        }
+        let result = query_verified_session_runtime(session_path, &query)?;
+        let complete = sideeffect::query::session_source_is_complete(&result);
+        write_session_query_result(&result, output_format)?;
+        return Ok(if complete {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(2)
+        });
+    }
+    if session_source.is_some() {
+        return Err("query --source requires --session DIR".to_owned());
+    }
+    let (source_kind, source_path) = source.ok_or_else(|| {
+        "query requires --trace FILE, --windows-runtime FILE, or --session DIR --source runtime"
+            .to_owned()
+    })?;
     let envelope = match source_kind {
         "trace" => {
             let bytes = read_bounded(source_path)?;
@@ -2338,6 +2377,224 @@ fn query_command(arguments: &[OsString]) -> Result<ExitCode, String> {
     )
 }
 
+fn session_runtime_source(
+    manifest: &sideeffect::audit_session::AuditSessionManifest,
+) -> Result<&sideeffect::audit_session::AuditSessionSource, String> {
+    manifest
+        .sources
+        .iter()
+        .find(|source| source.role == sideeffect::audit_session::SourceRole::Runtime)
+        .ok_or_else(|| "runtime_source_missing: session has no selected runtime source".to_owned())
+}
+
+fn session_runtime_artifact_ref(
+    source: &sideeffect::audit_session::AuditSessionSource,
+    kind: sideeffect::audit_session::ArtifactKind,
+) -> Result<&sideeffect::audit_session::SessionArtifactRef, String> {
+    source
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == kind)
+        .ok_or_else(|| {
+            format!(
+                "runtime_artifact_missing: session source has no verified {:?} artifact",
+                kind
+            )
+        })
+}
+
+fn write_session_query_result(
+    result: &sideeffect::query::SessionEventQueryResult,
+    output_format: &str,
+) -> Result<(), String> {
+    if output_format == "json" {
+        let mut output = CappedBuffer::new(sideeffect::query::MAX_QUERY_OUTPUT_BYTES);
+        serde_json::to_writer_pretty(&mut output, result).map_err(|error| {
+            if output.exceeded {
+                format!(
+                    "session event query output exceeds the {}-byte limit",
+                    sideeffect::query::MAX_QUERY_OUTPUT_BYTES
+                )
+            } else {
+                format!("could not serialize session event query result: {error}")
+            }
+        })?;
+        output.write_all(b"\n").map_err(|_| {
+            format!(
+                "session event query output exceeds the {}-byte limit",
+                sideeffect::query::MAX_QUERY_OUTPUT_BYTES
+            )
+        })?;
+        write_buffer(&output, "session event query result")
+    } else {
+        write_session_query_text(result)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn query_verified_session_runtime(
+    session_path: &OsString,
+    query: &sideeffect::query::EventQuery,
+) -> Result<sideeffect::query::SessionEventQueryResult, String> {
+    use sideeffect::audit_session::ArtifactKind;
+
+    let verified = read_verified_audit_session(Path::new(session_path))?;
+    let manifest = verified.manifest();
+    if manifest.platform != "linux" {
+        return Err("session runtime query platform does not match this native reader".to_owned());
+    }
+    let source = session_runtime_source(manifest)?;
+    let run_ref = session_runtime_artifact_ref(source, ArtifactKind::RuntimeManifest)?;
+    let trace_ref = session_runtime_artifact_ref(source, ArtifactKind::RuntimeTrace)?;
+    let run_bytes = verified
+        .artifacts()
+        .iter()
+        .find(|artifact| artifact.kind() == ArtifactKind::RuntimeManifest)
+        .ok_or_else(|| {
+            "runtime_artifact_missing: verified run.json bytes are unavailable".to_owned()
+        })?
+        .bytes();
+    let trace_bytes = verified
+        .artifacts()
+        .iter()
+        .find(|artifact| artifact.kind() == ArtifactKind::RuntimeTrace)
+        .ok_or_else(|| {
+            "runtime_artifact_missing: verified trace.strace bytes are unavailable".to_owned()
+        })?
+        .bytes();
+    if run_ref.schema != "sideeffect.run"
+        || run_ref.schema_version != 2
+        || run_ref.path != "run.json"
+        || trace_ref.schema != "strace_text"
+        || trace_ref.schema_version != 1
+        || trace_ref.path != "trace.strace"
+    {
+        return Err(
+            "runtime_artifact_contract_mismatch: unsupported Linux runtime artifact contract"
+                .to_owned(),
+        );
+    }
+    if run_bytes.len() > sideeffect::limits::MAX_BUNDLE_MANIFEST_BYTES {
+        return Err(format!(
+            "runtime_manifest_limit_exceeded: run.json exceeds the {}-byte limit",
+            sideeffect::limits::MAX_BUNDLE_MANIFEST_BYTES
+        ));
+    }
+    if trace_bytes.len() > sideeffect::limits::MAX_TRACE_BYTES {
+        return Err(format!(
+            "runtime_trace_limit_exceeded: trace.strace exceeds the {}-byte limit",
+            sideeffect::limits::MAX_TRACE_BYTES
+        ));
+    }
+    let run_manifest: RunManifest = serde_json::from_slice(run_bytes).map_err(|_| {
+        "runtime_manifest_invalid: run.json is not a strict supported manifest".to_owned()
+    })?;
+    validate_bundle_manifest(&run_manifest).map_err(|_| {
+        "runtime_manifest_invalid: run.json has invalid or unsupported fields".to_owned()
+    })?;
+    if run_manifest.schema_version != run_ref.schema_version
+        || run_manifest.trace.name != trace_ref.path
+        || run_manifest.trace.format != trace_ref.schema
+        || run_manifest.trace.byte_length != trace_ref.byte_length
+        || run_manifest.trace.byte_length != trace_bytes.len() as u64
+        || run_manifest.trace.sha256 != trace_ref.sha256
+        || format!("{:x}", Sha256::digest(trace_bytes)) != run_manifest.trace.sha256
+    {
+        return Err("runtime_manifest_trace_binding_mismatch: run.json does not bind the verified trace.strace artifact".to_owned());
+    }
+    let trace = parse_trace_bytes(trace_bytes, ParseLimits::default())
+        .map_err(|error| format!("session runtime trace parsing failed: {error}"))?;
+    let envelope = sideeffect::event::from_linux_strace(&trace, trace_bytes, "trace.strace");
+    let events = sideeffect::query::execute_query(&envelope, query)?;
+    Ok(sideeffect::query::session_query_result(
+        manifest,
+        source,
+        sideeffect::query::SessionCaptureStatus {
+            completeness: run_manifest.capture.completeness,
+            collection_status: None,
+            stop_reason: run_manifest.capture.stop_reason,
+        },
+        events,
+    ))
+}
+
+#[cfg(windows)]
+fn query_verified_session_runtime(
+    session_path: &OsString,
+    query: &sideeffect::query::EventQuery,
+) -> Result<sideeffect::query::SessionEventQueryResult, String> {
+    use sideeffect::audit_session::ArtifactKind;
+
+    let verified = read_verified_audit_session(Path::new(session_path))?;
+    let manifest = verified.manifest();
+    if manifest.platform != "windows" {
+        return Err("session runtime query platform does not match this native reader".to_owned());
+    }
+    let source = session_runtime_source(manifest)?;
+    let capture_ref = session_runtime_artifact_ref(source, ArtifactKind::WindowsRuntimeCapture)?;
+    let capture_bytes = verified
+        .artifacts()
+        .iter()
+        .find(|artifact| artifact.kind() == ArtifactKind::WindowsRuntimeCapture)
+        .ok_or_else(|| {
+            "runtime_artifact_missing: verified runtime.windows.json bytes are unavailable"
+                .to_owned()
+        })?
+        .bytes();
+    if capture_ref.schema != sideeffect::windows_runtime::WINDOWS_RUNTIME_CAPTURE_SCHEMA
+        || capture_ref.schema_version
+            != sideeffect::windows_runtime::WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION
+        || capture_ref.path != "runtime.windows.json"
+        || capture_bytes.len() > sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES
+    {
+        return Err(
+            "runtime_artifact_contract_mismatch: unsupported Windows runtime artifact contract"
+                .to_owned(),
+        );
+    }
+    let capture = sideeffect::windows_runtime::inspect_windows_runtime_bytes(capture_bytes)
+        .map_err(|error| format!("Windows session runtime capture validation failed: {error}"))?;
+    let envelope = sideeffect::event::from_windows_runtime_capture(&capture);
+    let events = sideeffect::query::execute_query(&envelope, query)?;
+    let completeness = capture.capture_completeness.clone();
+    let collection_status = Some(match capture.collection_status {
+        sideeffect::windows_runtime::CollectionStatus::Complete => "complete".to_owned(),
+        sideeffect::windows_runtime::CollectionStatus::Partial => "partial".to_owned(),
+    });
+    let stop_reason = Some(
+        match capture.stop_reason {
+            sideeffect::windows_runtime::StopReason::TargetExited => "target_exited",
+            sideeffect::windows_runtime::StopReason::DurationLimitReached => {
+                "duration_limit_reached"
+            }
+            sideeffect::windows_runtime::StopReason::EventLimitReached => "event_limit_reached",
+            sideeffect::windows_runtime::StopReason::EtwLossReported => "etw_loss_reported",
+            sideeffect::windows_runtime::StopReason::EtwStatisticsUnavailable => {
+                "etw_statistics_unavailable"
+            }
+        }
+        .to_owned(),
+    );
+    Ok(sideeffect::query::session_query_result(
+        manifest,
+        source,
+        sideeffect::query::SessionCaptureStatus {
+            completeness,
+            collection_status,
+            stop_reason,
+        },
+        events,
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn query_verified_session_runtime(
+    _session_path: &OsString,
+    _query: &sideeffect::query::EventQuery,
+) -> Result<sideeffect::query::SessionEventQueryResult, String> {
+    Err("session runtime query is supported only on Linux and native Windows".to_owned())
+}
+
 #[cfg(windows)]
 fn read_windows_query_envelope(
     path: &OsString,
@@ -2360,6 +2617,86 @@ fn read_windows_query_envelope(
 }
 
 fn write_event_query_text(result: &sideeffect::query::EventQueryResult) -> Result<(), String> {
+    let text = format_event_query_text(result)?;
+    let mut output = CappedBuffer::new(sideeffect::query::MAX_QUERY_OUTPUT_BYTES);
+    output
+        .write_all(text.as_bytes())
+        .map_err(|_| "event query text output limit exceeded".to_owned())?;
+    write_buffer(&output, "event query text result")
+}
+
+fn write_session_query_text(
+    result: &sideeffect::query::SessionEventQueryResult,
+) -> Result<(), String> {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    writeln!(
+        text,
+        "Session query: {} (manifest v{}, {})",
+        terminal_safe_text(&result.session.session_id),
+        result.session.manifest_schema_version,
+        match result.session.status {
+            sideeffect::audit_session::SessionStatus::Complete => "complete",
+            sideeffect::audit_session::SessionStatus::Partial => "partial",
+        }
+    )
+    .map_err(|_| "could not format session query text".to_owned())?;
+    check_event_query_text_limit(&text)?;
+    writeln!(
+        text,
+        "Runtime source: {} ({}) {}..{}",
+        match result.runtime_source.status {
+            sideeffect::audit_session::SourceStatus::Complete => "complete",
+            sideeffect::audit_session::SourceStatus::Partial => "partial",
+            sideeffect::audit_session::SourceStatus::Unknown => "unknown",
+            sideeffect::audit_session::SourceStatus::NotChecked => "not_checked",
+            sideeffect::audit_session::SourceStatus::Unsupported => "unsupported",
+            sideeffect::audit_session::SourceStatus::NotApplicable => "not_applicable",
+            sideeffect::audit_session::SourceStatus::Unavailable => "unavailable",
+            sideeffect::audit_session::SourceStatus::AccessDenied => "access_denied",
+            sideeffect::audit_session::SourceStatus::Failed => "failed",
+            sideeffect::audit_session::SourceStatus::TimedOut => "timed_out",
+            sideeffect::audit_session::SourceStatus::OutputLimitExceeded => "output_limit_exceeded",
+        },
+        terminal_safe_text(&result.runtime_source.scope),
+        result.runtime_source.started_at_unix_ms,
+        result.runtime_source.ended_at_unix_ms
+    )
+    .map_err(|_| "could not format session query text".to_owned())?;
+    check_event_query_text_limit(&text)?;
+    writeln!(
+        text,
+        "Capture completeness: {}; event parse/adaptation: {:?}",
+        terminal_safe_text(&result.capture.completeness),
+        result.event_query_result.source_state.completeness
+    )
+    .map_err(|_| "could not format session query text".to_owned())?;
+    check_event_query_text_limit(&text)?;
+    for code in &result.runtime_source.diagnostic_codes {
+        writeln!(
+            text,
+            "- session source diagnostic: {}",
+            terminal_safe_text(code)
+        )
+        .map_err(|_| "could not format session query text".to_owned())?;
+        check_event_query_text_limit(&text)?;
+    }
+    let events_text = format_event_query_text(&result.event_query_result)?;
+    if text.len().saturating_add(events_text.len()) > sideeffect::query::MAX_QUERY_OUTPUT_BYTES {
+        return Err(format!(
+            "session event query text exceeds the {}-byte output limit",
+            sideeffect::query::MAX_QUERY_OUTPUT_BYTES
+        ));
+    }
+    text.push_str(&events_text);
+    let mut output = CappedBuffer::new(sideeffect::query::MAX_QUERY_OUTPUT_BYTES);
+    output
+        .write_all(text.as_bytes())
+        .map_err(|_| "session event query text output limit exceeded".to_owned())?;
+    write_buffer(&output, "session event query text result")
+}
+
+fn format_event_query_text(result: &sideeffect::query::EventQueryResult) -> Result<String, String> {
     use std::fmt::Write as _;
     let mut text = String::new();
     let platform = match result.source.platform {
@@ -2416,11 +2753,7 @@ fn write_event_query_text(result: &sideeffect::query::EventQueryResult) -> Resul
         .map_err(|_| "could not format event query text".to_owned())?;
         check_event_query_text_limit(&text)?;
     }
-    let mut output = CappedBuffer::new(sideeffect::query::MAX_QUERY_OUTPUT_BYTES);
-    output
-        .write_all(text.as_bytes())
-        .map_err(|_| "event query text output limit exceeded".to_owned())?;
-    write_buffer(&output, "event query text result")
+    Ok(text)
 }
 
 fn check_event_query_text_limit(text: &str) -> Result<(), String> {

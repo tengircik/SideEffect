@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use crate::audit_session::{
+    AuditSessionManifest, AuditSessionSource, CollectorIdentity, LossMetadata, SessionArtifactRef,
+    SessionStatus, SourceStatus,
+};
 use crate::event::{
     CommonEvent, CommonEventEnvelope, EventDiagnostic, EventProcessLink, OperationSemantics,
     ProcessObservation, ProcessRelationship, SourceCompleteness, SourceDescriptor, SourceState,
@@ -18,6 +22,8 @@ pub const QUERY_SCHEMA: &str = "sideeffect.event_query";
 pub const QUERY_SCHEMA_VERSION: u32 = 1;
 pub const QUERY_RESULT_SCHEMA: &str = "sideeffect.event_query_result";
 pub const QUERY_RESULT_SCHEMA_VERSION: u32 = 1;
+pub const SESSION_QUERY_RESULT_SCHEMA: &str = "sideeffect.session_event_query_result";
+pub const SESSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_QUERY_BYTES: usize = 16 * 1024;
 pub const MAX_QUERY_RESULTS: usize = 5_000;
 pub const MAX_QUERY_ELAPSED: Duration = Duration::from_secs(2);
@@ -165,6 +171,97 @@ pub struct EventQueryResult {
     pub process_relationships: Vec<ProcessRelationship>,
     /// Diagnostics for the full source input, not merely the returned rows.
     pub diagnostics: Vec<EventDiagnostic>,
+}
+
+/// One session-scoped runtime query. Manifest status and event parsing status
+/// remain separate, and the artifact references bind event locators to bytes.
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionEventQueryResult {
+    pub schema: &'static str,
+    pub schema_version: u32,
+    pub session: SessionQueryIdentity,
+    pub runtime_source: SessionRuntimeSource,
+    pub capture: SessionCaptureStatus,
+    pub event_query_result: EventQueryResult,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionQueryIdentity {
+    pub session_id: String,
+    pub manifest_schema_version: u32,
+    pub platform: String,
+    pub status: SessionStatus,
+    pub started_at_unix_ms: u128,
+    pub ended_at_unix_ms: u128,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionRuntimeSource {
+    pub role: crate::audit_session::SourceRole,
+    pub platform: String,
+    pub scope: String,
+    pub started_at_unix_ms: u128,
+    pub ended_at_unix_ms: u128,
+    pub status: SourceStatus,
+    pub collector: Option<CollectorIdentity>,
+    pub loss: Option<LossMetadata>,
+    pub diagnostic_codes: Vec<String>,
+    pub artifacts: Vec<SessionArtifactRef>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionCaptureStatus {
+    /// The producer's bounded completeness statement; runtime sessions usually say unknown.
+    pub completeness: String,
+    /// Windows collection status is distinct from completeness. Linux has no counterpart.
+    pub collection_status: Option<String>,
+    pub stop_reason: Option<String>,
+}
+
+pub fn session_query_result(
+    manifest: &AuditSessionManifest,
+    source: &AuditSessionSource,
+    capture: SessionCaptureStatus,
+    event_query_result: EventQueryResult,
+) -> SessionEventQueryResult {
+    SessionEventQueryResult {
+        schema: SESSION_QUERY_RESULT_SCHEMA,
+        schema_version: SESSION_QUERY_RESULT_SCHEMA_VERSION,
+        session: SessionQueryIdentity {
+            session_id: manifest.session_id.clone(),
+            manifest_schema_version: manifest.schema_version,
+            platform: manifest.platform.clone(),
+            status: manifest.status,
+            started_at_unix_ms: manifest.started_at_unix_ms,
+            ended_at_unix_ms: manifest.ended_at_unix_ms,
+        },
+        runtime_source: SessionRuntimeSource {
+            role: source.role,
+            platform: source.platform.clone(),
+            scope: source.scope.clone(),
+            started_at_unix_ms: source.started_at_unix_ms,
+            ended_at_unix_ms: source.ended_at_unix_ms,
+            status: source.status,
+            collector: source.collector.clone(),
+            loss: source.loss.clone(),
+            diagnostic_codes: source.diagnostic_codes.clone(),
+            artifacts: source.artifacts.clone(),
+        },
+        capture,
+        event_query_result,
+    }
+}
+
+pub fn session_source_is_complete(result: &SessionEventQueryResult) -> bool {
+    result.session.status == SessionStatus::Complete
+        && result.runtime_source.status == SourceStatus::Complete
+        && result.capture.completeness == "complete"
+        && result
+            .capture
+            .collection_status
+            .as_deref()
+            .is_none_or(|status| status == "complete")
+        && source_is_complete(&result.event_query_result.source_state)
 }
 
 pub fn execute_query(
@@ -326,6 +423,63 @@ mod tests {
             filters,
             limit,
         }
+    }
+
+    fn complete_session_query_result(
+        completeness: &str,
+        collection_status: Option<&str>,
+    ) -> SessionEventQueryResult {
+        let envelope = linux_envelope(b"123 1700000000.1 close(1) = 0\n");
+        let event_query_result =
+            execute_query(&envelope, &query(EventQueryFilters::default(), 5)).unwrap();
+        SessionEventQueryResult {
+            schema: SESSION_QUERY_RESULT_SCHEMA,
+            schema_version: SESSION_QUERY_RESULT_SCHEMA_VERSION,
+            session: SessionQueryIdentity {
+                session_id: "synthetic-session".to_owned(),
+                manifest_schema_version: 7,
+                platform: "linux".to_owned(),
+                status: crate::audit_session::SessionStatus::Complete,
+                started_at_unix_ms: 1,
+                ended_at_unix_ms: 2,
+            },
+            runtime_source: SessionRuntimeSource {
+                role: crate::audit_session::SourceRole::Runtime,
+                platform: "linux".to_owned(),
+                scope: "synthetic fixture".to_owned(),
+                started_at_unix_ms: 1,
+                ended_at_unix_ms: 2,
+                status: crate::audit_session::SourceStatus::Complete,
+                collector: None,
+                loss: None,
+                diagnostic_codes: Vec::new(),
+                artifacts: Vec::new(),
+            },
+            capture: SessionCaptureStatus {
+                completeness: completeness.to_owned(),
+                collection_status: collection_status.map(str::to_owned),
+                stop_reason: None,
+            },
+            event_query_result,
+        }
+    }
+
+    #[test]
+    fn session_query_exit_gate_requires_complete_capture_statuses() {
+        assert!(!session_source_is_complete(&complete_session_query_result(
+            "unknown", None
+        )));
+        assert!(!session_source_is_complete(&complete_session_query_result(
+            "complete",
+            Some("partial")
+        )));
+        assert!(session_source_is_complete(&complete_session_query_result(
+            "complete", None
+        )));
+        assert!(session_source_is_complete(&complete_session_query_result(
+            "complete",
+            Some("complete")
+        )));
     }
 
     #[test]
