@@ -281,6 +281,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             inspect_windows_runtime_with_format(&OsString::from("json"), path)
         }
         [command, flag, path] if command == "events" && flag == "--trace" => events_trace(path),
+        [command, arguments @ ..] if command == "query" => query_command(arguments),
         [command, flag, path] if command == "graph" && flag == "--trace" => {
             graph_trace(path, None, None)
         }
@@ -1580,7 +1581,7 @@ fn print_version() {
 
 fn print_usage() {
     println!(
-        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)\n       sideeffect graph --trace <strace-trace-file> [--event-kind <kind> | --process-observation <id>]\n       sideeffect graph --windows-runtime <capture.json> [--event-kind <kind> | --process-observation <id>] (native Windows)\n       sideeffect timeline --trace <strace-trace-file> [--event-kind <kind>] [--process-observation <id>]\n       sideeffect timeline --windows-runtime <capture.json> [--event-kind <kind>] [--process-observation <id>] (native Windows)\n\nProvenance:\n       sideeffect provenance keygen <private-key.pk8> <public-key.hex>\n       sideeffect provenance sign-session <session-dir> --private-key <private-key.pk8> --output <signature.json>\n       sideeffect provenance verify-session <session-dir> --signature <signature.json> --public-key <public-key.hex>"
+        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)\n       sideeffect query --query <query.json> --trace <trace> [--format json|text]\n       sideeffect query --query <query.json> --windows-runtime <capture.json> [--format json|text] (native Windows)\n       sideeffect graph --trace <strace-trace-file> [--event-kind <kind> | --process-observation <id>]\n       sideeffect graph --windows-runtime <capture.json> [--event-kind <kind> | --process-observation <id>] (native Windows)\n       sideeffect timeline --trace <strace-trace-file> [--event-kind <kind>] [--process-observation <id>]\n       sideeffect timeline --windows-runtime <capture.json> [--event-kind <kind>] [--process-observation <id>] (native Windows)\n\nProvenance:\n       sideeffect provenance keygen <private-key.pk8> <public-key.hex>\n       sideeffect provenance sign-session <session-dir> --private-key <private-key.pk8> --output <signature.json>\n       sideeffect provenance verify-session <session-dir> --signature <signature.json> --public-key <public-key.hex>"
     );
 }
 
@@ -1618,6 +1619,9 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         }
         "events" => {
             "Usage: sideeffect events --trace TRACE\n       sideeffect events --windows-runtime CAPTURE.json (native Windows)\nAdapts one local runtime source into a versioned common event envelope and writes JSON only. Source-local order and timestamps are preserved; no cross-platform ordering, parentage, ownership, or causation is inferred. Partial or unknown source status exits with status 2. Windows runtime input is strictly bounded and schema-validated before adaptation."
+        }
+        "query" => {
+            "Usage: sideeffect query --query QUERY.json --trace TRACE [--format json|text]\n       sideeffect query --query QUERY.json --windows-runtime CAPTURE.json [--format json|text] (native Windows)\nRuns a versioned, read-only exact-filter query over the normalized common event envelope. Query JSON is strictly validated, limited to 16 KiB, 5,000 results, 2 seconds of filtering, and 8 MiB serialized output. Supported filters are exact event_kind, operation_kind, syscall outcome, and source-local process_observation_id. Path, endpoint, and timestamp filtering are not supported by this first schema. Every returned event retains its exact evidence link; full input diagnostics and source completeness remain visible. Partial or unknown input exits with status 2."
         }
         "graph" => {
             "Usage: sideeffect graph --trace TRACE [--event-kind KIND | --process-observation ID]\n       sideeffect graph --windows-runtime CAPTURE.json [--event-kind KIND | --process-observation ID] (native Windows)\nBuilds a bounded source-local graph of event rows, process observations, reported PID context, and evidence-linked relationships. --event-kind selects exact event-kind matches. --process-observation selects a source-local ProcessObservation ID (not a PID or cross-capture ID) and retains events linked to that observation plus its direct process relationships. Retained links preserve their status and basis; diagnostics and source status remain for the full input. An empty event selection is not evidence of absence. PID-only context nodes are kept separate and never merged into process instances. Edges do not establish ownership, causation, or a complete process tree. Partial or unknown source status exits with status 2."
@@ -1983,6 +1987,210 @@ fn events_trace(path: &OsString) -> Result<ExitCode, String> {
     } else {
         ExitCode::from(2)
     })
+}
+
+fn query_command(arguments: &[OsString]) -> Result<ExitCode, String> {
+    let mut query_path: Option<&OsString> = None;
+    let mut source: Option<(&str, &OsString)> = None;
+    let mut output_format = "json";
+    let mut format_seen = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        let flag = &arguments[index];
+        let value = arguments.get(index + 1).ok_or_else(|| {
+            format!(
+                "query option {} requires a value",
+                terminal_safe_text(&flag.to_string_lossy())
+            )
+        })?;
+        if value.to_string_lossy().starts_with("--") {
+            return Err(format!(
+                "query option {} requires a value",
+                terminal_safe_text(&flag.to_string_lossy())
+            ));
+        }
+        if flag == "--query" {
+            if query_path.replace(value).is_some() {
+                return Err("duplicate query --query option".to_owned());
+            }
+        } else if flag == "--trace" || flag == "--windows-runtime" {
+            if source
+                .replace((
+                    if flag == "--trace" {
+                        "trace"
+                    } else {
+                        "windows-runtime"
+                    },
+                    value,
+                ))
+                .is_some()
+            {
+                return Err("query accepts exactly one source input".to_owned());
+            }
+        } else if flag == "--format" {
+            if format_seen {
+                return Err("duplicate query --format option".to_owned());
+            }
+            if value != "json" && value != "text" {
+                return Err("query format must be either 'json' or 'text'".to_owned());
+            }
+            format_seen = true;
+            output_format = value
+                .to_str()
+                .ok_or_else(|| "query format must be UTF-8".to_owned())?;
+        } else {
+            return Err(format!(
+                "unknown query option {}; use --query, --trace, --windows-runtime, or --format",
+                terminal_safe_text(&flag.to_string_lossy())
+            ));
+        }
+        index += 2;
+    }
+    let query_path = query_path.ok_or_else(|| "query requires --query FILE".to_owned())?;
+    let (source_kind, source_path) =
+        source.ok_or_else(|| "query requires --trace FILE or --windows-runtime FILE".to_owned())?;
+    let query_bytes = read_input_file(
+        Path::new(query_path),
+        sideeffect::query::MAX_QUERY_BYTES,
+        "event query",
+    )?;
+    let query = sideeffect::query::EventQuery::from_json(&query_bytes)?;
+    let envelope = match source_kind {
+        "trace" => {
+            let bytes = read_bounded(source_path)?;
+            let trace = parse_trace_bytes(&bytes, ParseLimits::default())
+                .map_err(|error| format!("query trace adaptation failed: {error}"))?;
+            sideeffect::event::from_linux_strace(&trace, &bytes, "trace")
+        }
+        "windows-runtime" => read_windows_query_envelope(source_path)?,
+        _ => return Err("invalid internal query source selector".to_owned()),
+    };
+    let result = sideeffect::query::execute_query(&envelope, &query)?;
+    if output_format == "json" {
+        let mut output = CappedBuffer::new(sideeffect::query::MAX_QUERY_OUTPUT_BYTES);
+        serde_json::to_writer_pretty(&mut output, &result).map_err(|error| {
+            if output.exceeded {
+                format!(
+                    "event query output exceeds the {}-byte limit",
+                    sideeffect::query::MAX_QUERY_OUTPUT_BYTES
+                )
+            } else {
+                format!("could not serialize event query result: {error}")
+            }
+        })?;
+        output.write_all(b"\n").map_err(|_| {
+            format!(
+                "event query output exceeds the {}-byte limit",
+                sideeffect::query::MAX_QUERY_OUTPUT_BYTES
+            )
+        })?;
+        write_buffer(&output, "event query result")?;
+    } else {
+        write_event_query_text(&result)?;
+    }
+    Ok(
+        if sideeffect::query::source_is_complete(&result.source_state) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(2)
+        },
+    )
+}
+
+#[cfg(windows)]
+fn read_windows_query_envelope(
+    path: &OsString,
+) -> Result<sideeffect::event::CommonEventEnvelope, String> {
+    let bytes = read_input_file(
+        Path::new(path),
+        sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
+        "Windows runtime capture",
+    )?;
+    let capture = sideeffect::windows_runtime::inspect_windows_runtime_bytes(&bytes)
+        .map_err(|error| format!("Windows runtime query adaptation failed: {error}"))?;
+    Ok(sideeffect::event::from_windows_runtime_capture(&capture))
+}
+
+#[cfg(not(windows))]
+fn read_windows_query_envelope(
+    _path: &OsString,
+) -> Result<sideeffect::event::CommonEventEnvelope, String> {
+    Err("query --windows-runtime is supported only in native Windows builds".to_owned())
+}
+
+fn write_event_query_text(result: &sideeffect::query::EventQueryResult) -> Result<(), String> {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    let platform = match result.source.platform {
+        sideeffect::event::SourcePlatform::Linux => "linux",
+        sideeffect::event::SourcePlatform::Windows => "windows",
+    };
+    let completeness = match result.source_state.completeness {
+        sideeffect::event::SourceCompleteness::Complete => "complete",
+        sideeffect::event::SourceCompleteness::Partial => "partial",
+        sideeffect::event::SourceCompleteness::Unknown => "unknown",
+    };
+    writeln!(
+        text,
+        "Event query: {} ({}), {} result(s)",
+        platform, completeness, result.matched_count
+    )
+    .map_err(|_| "could not format event query text".to_owned())?;
+    check_event_query_text_limit(&text)?;
+    writeln!(text, "Full-input diagnostics: {}", result.diagnostics.len())
+        .map_err(|_| "could not format event query text".to_owned())?;
+    check_event_query_text_limit(&text)?;
+    for diagnostic in &result.source_state.diagnostics {
+        writeln!(text, "- source: {}", terminal_safe_text(diagnostic))
+            .map_err(|_| "could not format event query text".to_owned())?;
+        check_event_query_text_limit(&text)?;
+    }
+    for diagnostic in &result.diagnostics {
+        writeln!(
+            text,
+            "- event {}: {} ({})",
+            diagnostic
+                .source_local_ordinal
+                .map_or_else(|| "?".to_owned(), |ordinal| ordinal.to_string()),
+            terminal_safe_text(&diagnostic.code),
+            terminal_safe_text(&diagnostic.message)
+        )
+        .map_err(|_| "could not format event query text".to_owned())?;
+        check_event_query_text_limit(&text)?;
+    }
+    for event in &result.events {
+        let evidence = serde_json::to_string(&event.evidence)
+            .map_err(|error| format!("could not format event evidence: {error}"))?;
+        writeln!(
+            text,
+            "- #{} {} [{}] evidence={}",
+            event.source_local_ordinal,
+            terminal_safe_text(&event.event_kind),
+            match &event.operation {
+                sideeffect::event::OperationSemantics::SyscallAttempt { .. } => "syscall_attempt",
+                sideeffect::event::OperationSemantics::NativeObservation => "native_observation",
+            },
+            evidence
+        )
+        .map_err(|_| "could not format event query text".to_owned())?;
+        check_event_query_text_limit(&text)?;
+    }
+    let mut output = CappedBuffer::new(sideeffect::query::MAX_QUERY_OUTPUT_BYTES);
+    output
+        .write_all(text.as_bytes())
+        .map_err(|_| "event query text output limit exceeded".to_owned())?;
+    write_buffer(&output, "event query text result")
+}
+
+fn check_event_query_text_limit(text: &str) -> Result<(), String> {
+    if text.len() > sideeffect::query::MAX_QUERY_OUTPUT_BYTES {
+        Err(format!(
+            "event query text exceeds the {}-byte output limit",
+            sideeffect::query::MAX_QUERY_OUTPUT_BYTES
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn graph_trace(
@@ -4985,7 +5193,9 @@ mod tests {
     use super::{
         AnchoredOutput, ParseLimits, compare_traces, parse_trace_bytes, publish_html_report,
     };
-    use super::{CappedBuffer, MAX_REPORT_BYTES, read_limited, read_trace_file};
+    use super::{
+        CappedBuffer, MAX_REPORT_BYTES, read_limited, read_trace_file, write_event_query_text,
+    };
     #[cfg(windows)]
     use sha2::{Digest, Sha256};
     #[cfg(target_os = "linux")]
@@ -5071,6 +5281,47 @@ mod tests {
     fn bounded_reader_rejects_limit_plus_one() {
         let error = read_limited(Cursor::new(b"abcde"), 4).unwrap_err();
         assert!(error.contains("limit"));
+    }
+
+    #[test]
+    fn event_query_text_stops_at_the_output_cap_while_appending_rows() {
+        let result = sideeffect::query::EventQueryResult {
+            schema: sideeffect::query::QUERY_RESULT_SCHEMA,
+            schema_version: sideeffect::query::QUERY_RESULT_SCHEMA_VERSION,
+            source: sideeffect::event::SourceDescriptor {
+                platform: sideeffect::event::SourcePlatform::Linux,
+                schema: "synthetic_fixture".to_owned(),
+                schema_version: 1,
+                artifact: "synthetic-query-fixture".to_owned(),
+                sha256: None,
+            },
+            source_state: sideeffect::event::SourceState {
+                completeness: sideeffect::event::SourceCompleteness::Complete,
+                diagnostics: Vec::new(),
+                loss: None,
+                identity_ambiguity_present: false,
+            },
+            filter: sideeffect::query::EventQueryFilters::default(),
+            matched_count: 1,
+            events: vec![sideeffect::event::CommonEvent {
+                source_local_ordinal: 1,
+                source_timestamp: None,
+                event_kind: "x".repeat(sideeffect::query::MAX_QUERY_OUTPUT_BYTES + 1),
+                operation: sideeffect::event::OperationSemantics::NativeObservation,
+                evidence: sideeffect::event::EvidenceReference::RawTraceRecord {
+                    line_number: 1,
+                    byte_offset: 0,
+                    byte_length: 1,
+                },
+                identity_context: Vec::new(),
+            }],
+            event_process_links: Vec::new(),
+            process_observations: Vec::new(),
+            process_relationships: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let error = write_event_query_text(&result).unwrap_err();
+        assert!(error.contains("event query text exceeds the 8388608-byte output limit"));
     }
 
     #[test]

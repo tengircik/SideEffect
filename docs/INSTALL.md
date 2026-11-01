@@ -426,6 +426,35 @@ On native Windows, adapt a saved ETW v3 capture after the strict bounded schema 
 
 Both commands write JSON only to stdout and read the selected file without modifying it or running represented commands. The envelope preserves source-local row order, timestamps, attempt/result or observation semantics, diagnostics, and evidence references. Its status is `partial` or `unknown` when the source or adapter cannot establish a complete supported result; those outcomes exit `2`. ETW header PID is event context and is not ownership or an actor identity. Neither adapter creates global event order, parentage, or causation. The common envelope is an output format, not a persisted capture or event graph; see [schema compatibility](SCHEMA_COMPATIBILITY.md).
 
+Use a strict, model-independent JSON query against one source at a time. For example, save this as `query.json`:
+
+```json
+{
+  "schema": "sideeffect.event_query",
+  "schema_version": 1,
+  "filters": {
+    "event_kind": "connect",
+    "operation_kind": "syscall_attempt",
+    "outcome": "failure"
+  },
+  "limit": 100
+}
+```
+
+Run it against a Linux trace:
+
+```sh
+./target/release/sideeffect query --query ./query.json --trace ./run.trace
+```
+
+Or, on native Windows, against a validated ETW capture:
+
+```powershell
+sideeffect.exe query --query .\query.json --windows-runtime .\runtime.windows.json
+```
+
+JSON output is the default; add `--format text` for a terminal-safe summary. Version 1 allows exact `event_kind`, `operation_kind` (`syscall_attempt` or `native_observation`), typed syscall `outcome`, and source-local `process_observation_id` filters. Unsupported fields such as path, endpoint, and timestamp filters are rejected rather than approximated. The query JSON is capped at 16 KiB, matching results at 5,000 (overflow is an error, never silent truncation), filtering at two seconds, and serialized output at 8 MiB. The result keeps exact evidence references and diagnostics/status for the entire input even if few or no events match. Partial or unknown sources still exit `2`; an empty result does not establish that activity was absent. This initial query reads one common event envelope and does not yet search audit sessions or combine sources.
+
 To organize the adapted facts into an evidence-linked graph, run:
 
 ```sh
