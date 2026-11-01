@@ -1400,6 +1400,48 @@ mod tests {
     }
 
     #[test]
+    fn etw_start_failures_are_classified_before_target_launch() {
+        use std::cell::Cell;
+
+        let cases = [
+            (
+                ERROR_ACCESS_DENIED,
+                "NT Kernel Logger control was denied; this capture requires administrative privileges. No elevation was requested and the command was not started.",
+            ),
+            (
+                183,
+                "the NT Kernel Logger session is already in use; no session was changed and the command was not started",
+            ),
+            (
+                1234,
+                "could not start or consume the NT Kernel Logger session (Windows error 1234); the command was not started",
+            ),
+        ];
+
+        for (code, expected_message) in cases {
+            let launched = Cell::new(false);
+            let result = setup_before_target_launch::<(), ()>(
+                || Err(etw_start_error(code)),
+                || Ok(()),
+                |_| {
+                    launched.set(true);
+                    Ok(())
+                },
+            );
+
+            assert_eq!(
+                result.unwrap_err(),
+                expected_message,
+                "Windows error {code}"
+            );
+            assert!(
+                !launched.get(),
+                "target launch callback ran for Windows error {code}"
+            );
+        }
+    }
+
+    #[test]
     fn prelaunch_check_failure_returns_before_target_launch_is_invoked() {
         use std::cell::Cell;
         let launched = Cell::new(false);
