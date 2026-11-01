@@ -2,8 +2,8 @@
 
 use serde_json::Value;
 use std::fs;
-use std::io::Read;
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -15,7 +15,8 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 /// Opt-in acceptance test. This needs permission to control the NT Kernel
 /// Logger and is explicitly run on privileged GitHub-hosted Windows CI runners.
 /// Its child fixture creates and reads one temporary file, then connects to a
-/// loopback TCP listener.
+/// loopback TCP listener. The fixture is this test executable itself so the
+/// acceptance run does not depend on PowerShell startup or command parsing.
 #[test]
 #[ignore = "requires administrative access to the NT Kernel Logger; run explicitly"]
 fn captures_process_file_and_loopback_network_observations_and_reports_loss_state() {
@@ -55,21 +56,21 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
             }
         }
     });
-    let escaped_path = fixture_file.to_string_lossy().replace('\'', "''");
-    let script = format!(
-        "$ErrorActionPreference='Stop'; [System.IO.File]::WriteAllText('{escaped_path}','fixture'); [System.IO.File]::ReadAllText('{escaped_path}') | Out-Null; $client=[System.Net.Sockets.TcpClient]::new(); $client.Connect('127.0.0.1',{port}); $client.Close()"
-    );
+    let fixture_executable = std::env::current_exe().unwrap();
     let command = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .args(["record", "--windows-etw", output.to_str().unwrap()])
         .args([
             "--duration-seconds",
             "10",
             "--",
-            "powershell.exe",
-            "-NoProfile",
-            "-Command",
-            &script,
+            fixture_executable.to_str().unwrap(),
+            "--ignored",
+            "--exact",
+            "etw_fixture_child",
+            "--nocapture",
         ])
+        .env("SIDEEFFECT_ETW_FIXTURE_FILE", &fixture_file)
+        .env("SIDEEFFECT_ETW_FIXTURE_PORT", port.to_string())
         .output()
         .unwrap();
     stop_server.store(true, Ordering::Relaxed);
@@ -344,4 +345,27 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
     fs::remove_file(fixture_file).unwrap();
     fs::remove_file(output).unwrap();
     fs::remove_dir(directory).unwrap();
+}
+
+/// Launched only by the live ETW acceptance test above.
+#[test]
+#[ignore = "launched as a child fixture by the live ETW acceptance test"]
+fn etw_fixture_child() {
+    let path = std::env::var_os("SIDEEFFECT_ETW_FIXTURE_FILE")
+        .expect("ETW fixture file path must be supplied by the parent acceptance test");
+    let port = std::env::var("SIDEEFFECT_ETW_FIXTURE_PORT")
+        .expect("ETW fixture port must be supplied by the parent acceptance test")
+        .parse::<u16>()
+        .expect("ETW fixture port must be a valid TCP port");
+
+    fs::write(&path, b"fixture").expect("ETW fixture should write its temporary file");
+    assert_eq!(
+        fs::read(&path).expect("ETW fixture should read its temporary file"),
+        b"fixture"
+    );
+    let mut connection = TcpStream::connect(("127.0.0.1", port))
+        .expect("ETW fixture should connect to its local listener");
+    connection
+        .write_all(b"fixture")
+        .expect("ETW fixture should send bytes to its local listener");
 }

@@ -44,6 +44,9 @@ pub const MAX_WINDOWS_RUNTIME_DURATION_SECONDS: u64 = 60;
 const MAX_EVENT_RECORDS: usize = 50_000;
 const MAX_EVENT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
+// Keep headroom for the enclosing capture metadata, diagnostics, and final
+// SHA-256 field. Event bodies are measured in their exact serialized form.
+const DOCUMENT_METADATA_RESERVE_BYTES: usize = 64 * 1024;
 const MAX_EVENT_PAYLOAD_LENGTH: usize = 64 * 1024;
 const BUFFER_SIZE_KB: u32 = 16;
 const MINIMUM_BUFFERS: u32 = 8;
@@ -170,6 +173,7 @@ pub struct NativeRuntimeEvent {
 struct Collector {
     events: Vec<NativeRuntimeEventBytes>,
     payload_bytes: usize,
+    serialized_event_bytes: usize,
     limit_reached: bool,
     malformed: bool,
     oversized_payload_events: usize,
@@ -281,27 +285,7 @@ pub(crate) fn collect_windows_runtime_capture_before_launch(
     let unsupported_provider_events = collector.unsupported_provider_events;
     let mut events = Vec::with_capacity(collector.events.len());
     for (index, event) in collector.events.iter().enumerate() {
-        let observation_decoding = event
-            .observation_decoding
-            .as_ref()
-            .map(serde_json::to_value)
-            .transpose()
-            .map_err(|error| format!("could not serialize ETW observation decoding: {error}"))?;
-        events.push(NativeRuntimeEvent {
-            record_ordinal: (index + 1) as u64,
-            provider_guid: event.provider_guid.clone(),
-            event_id: event.event_id,
-            event_version: event.event_version,
-            opcode: event.opcode,
-            event_kind: event.event_kind,
-            header_process_id: event.header_process_id,
-            header_thread_id: event.header_thread_id,
-            header_flags: event.header_flags,
-            timestamp_qpc: event.timestamp_qpc,
-            raw_payload_hex: hex(&event.raw_payload),
-            payload_decoding: event.payload_decoding.clone(),
-            observation_decoding,
-        });
+        events.push(native_runtime_event(event, (index + 1) as u64)?);
     }
     drop(collector);
     let status = collection_status(
@@ -775,6 +759,35 @@ fn append_event(state: &mut Collector, event: NativeRuntimeEventBytes) -> bool {
         state.limit_reached = true;
         return false;
     }
+    let projected = match native_runtime_event(&event, (state.events.len() + 1) as u64) {
+        Ok(projected) => projected,
+        Err(_) => {
+            state.malformed = true;
+            return false;
+        }
+    };
+    let projected_bytes = match serde_json::to_vec(&projected) {
+        Ok(serialized) => serialized.len(),
+        Err(_) => {
+            state.malformed = true;
+            return false;
+        }
+    };
+    // The final document contains the event array brackets and one comma for
+    // each previously retained event, followed by bounded capture metadata.
+    // Measure the expanded JSON representation here so decoding and escaping
+    // cannot make a collection pass its independent payload limits but fail
+    // publication later.
+    let projected_document_bytes = state
+        .serialized_event_bytes
+        .saturating_add(projected_bytes)
+        .saturating_add(state.events.len())
+        .saturating_add(2)
+        .saturating_add(DOCUMENT_METADATA_RESERVE_BYTES);
+    if projected_document_bytes > MAX_DOCUMENT_BYTES {
+        state.limit_reached = true;
+        return false;
+    }
     let process_decode_failed = event
         .payload_decoding
         .as_ref()
@@ -791,8 +804,36 @@ fn append_event(state: &mut Collector, event: NativeRuntimeEventBytes) -> bool {
         return false;
     }
     state.payload_bytes += payload_len;
+    state.serialized_event_bytes += projected_bytes;
     state.events.push(event);
     true
+}
+
+fn native_runtime_event(
+    event: &NativeRuntimeEventBytes,
+    record_ordinal: u64,
+) -> Result<NativeRuntimeEvent, String> {
+    let observation_decoding = event
+        .observation_decoding
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|error| format!("could not serialize ETW observation decoding: {error}"))?;
+    Ok(NativeRuntimeEvent {
+        record_ordinal,
+        provider_guid: event.provider_guid.clone(),
+        event_id: event.event_id,
+        event_version: event.event_version,
+        opcode: event.opcode,
+        event_kind: event.event_kind,
+        header_process_id: event.header_process_id,
+        header_thread_id: event.header_thread_id,
+        header_flags: event.header_flags,
+        timestamp_qpc: event.timestamp_qpc,
+        raw_payload_hex: hex(&event.raw_payload),
+        payload_decoding: event.payload_decoding.clone(),
+        observation_decoding,
+    })
 }
 
 fn etw_start_error(code: u32) -> String {
@@ -1107,6 +1148,51 @@ mod tests {
             event(vec![0; MAX_EVENT_PAYLOAD_LENGTH + 1])
         ));
         assert!(state.malformed);
+    }
+
+    #[test]
+    fn serialized_document_budget_accounts_for_decoded_event_expansion() {
+        let expanded_event = || NativeRuntimeEventBytes {
+            provider_guid: "{3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c}".to_owned(),
+            event_id: 1,
+            event_version: 0,
+            opcode: EVENT_TRACE_TYPE_START as u8,
+            event_kind: "process_start",
+            header_process_id: 0,
+            header_thread_id: 0,
+            header_flags: EVENT_HEADER_FLAG_64_BIT_HEADER as u16,
+            timestamp_qpc: 0,
+            raw_payload: vec![7],
+            payload_decoding: Some(DecodedProcessPayload {
+                status: DecodeStatus::Decoded,
+                schema_name: Some("Process_TypeGroup1"),
+                schema_version: Some(3),
+                pointer_size_bytes: Some(8),
+                process_id: Some(42),
+                parent_process_id: Some(1),
+                image_file_name: Some("x".repeat(32 * 1024)),
+                diagnostic: None,
+            }),
+            observation_decoding: None,
+        };
+        let mut state = Collector::default();
+        while append_event(&mut state, expanded_event()) {}
+
+        assert!(state.limit_reached);
+        assert!(!state.events.is_empty());
+        assert!(state.events.len() < MAX_EVENT_RECORDS);
+        assert!(state.payload_bytes < MAX_EVENT_PAYLOAD_BYTES);
+        let serialized_events = state
+            .events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| native_runtime_event(event, (index + 1) as u64).unwrap())
+            .collect::<Vec<_>>();
+        let events_array_bytes = serde_json::to_vec(&serialized_events).unwrap().len();
+        assert!(
+            events_array_bytes + DOCUMENT_METADATA_RESERVE_BYTES <= MAX_DOCUMENT_BYTES,
+            "retained event bytes plus reserved metadata must fit the document cap"
+        );
     }
 
     #[test]
