@@ -788,7 +788,7 @@ mod tests {
         }
 
         let root = fixture_dir("denied-root");
-        fs::set_permissions(&root, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o0)).unwrap();
         let output = collect_root_snapshot(&root);
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
 
