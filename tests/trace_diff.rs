@@ -185,6 +185,85 @@ fn v4_exposes_exact_raw_lines_separately_from_normalized_and_semantic_views() {
 }
 
 #[test]
+fn raw_line_multisets_preserve_duplicate_syscall_and_control_rows_with_evidence() {
+    let syscall = b"1 close(3) = 0\n";
+    let control = b"+++ exited +++\n";
+    let left_bytes = [syscall.as_slice(), syscall, control, control].concat();
+    let right_bytes = [syscall.as_slice(), control].concat();
+    let left = parse(&left_bytes);
+    let right = parse(&right_bytes);
+
+    let diff = compare_traces(&left, &right).unwrap();
+    assert_eq!(diff.left_excluded_control_records, 2);
+    assert_eq!(diff.right_excluded_control_records, 1);
+    assert_eq!(diff.raw_line_deltas.len(), 2);
+    assert!(
+        diff.raw_line_deltas
+            .iter()
+            .all(|delta| delta.kind == DeltaKind::Removed)
+    );
+    assert_eq!(diff.raw_line_deltas[0].evidence, left.records[1].evidence);
+    assert_eq!(diff.raw_line_deltas[0].evidence.line_number, 2);
+    assert_eq!(
+        diff.raw_line_deltas[0].evidence.byte_offset,
+        syscall.len() as u64
+    );
+    assert_eq!(
+        diff.raw_line_deltas[0].evidence.byte_length,
+        (syscall.len() - 1) as u64
+    );
+    assert_eq!(diff.raw_line_deltas[1].evidence, left.records[3].evidence);
+    assert_eq!(diff.raw_line_deltas[1].evidence.line_number, 4);
+    assert_eq!(
+        diff.raw_line_deltas[1].evidence.byte_offset,
+        (syscall.len() * 2 + control.len()) as u64
+    );
+    assert_eq!(
+        diff.raw_line_deltas[1].evidence.byte_length,
+        (control.len() - 1) as u64
+    );
+
+    assert_eq!(diff.normalized_changes.len(), 1);
+    let normalized = &diff.normalized_changes[0];
+    assert_eq!(normalized.kind, DeltaKind::Removed);
+    assert_eq!(normalized.before, vec![left.records[1].evidence.clone()]);
+    assert!(normalized.after.is_empty());
+}
+
+#[test]
+fn raw_line_multisets_retain_crlf_bytes_while_normalized_rows_match() {
+    let left_bytes = b"1 1700000000.000001 close(3) = 0\n";
+    let right_bytes = b"8 1800000000.000002 close(3) = 0\r\n";
+    let left = parse(left_bytes);
+    let right = parse(right_bytes);
+
+    assert_eq!(left.records[0].raw_line, "1 1700000000.000001 close(3) = 0");
+    assert_eq!(
+        right.records[0].raw_line,
+        "8 1800000000.000002 close(3) = 0\r"
+    );
+    let diff = compare_traces(&left, &right).unwrap();
+    assert!(diff.normalized_changes.is_empty());
+    assert_eq!(diff.raw_line_deltas.len(), 2);
+    assert_eq!(diff.raw_line_deltas[0].kind, DeltaKind::Added);
+    assert_eq!(diff.raw_line_deltas[0].evidence, right.records[0].evidence);
+    assert_eq!(diff.raw_line_deltas[0].evidence.line_number, 1);
+    assert_eq!(diff.raw_line_deltas[0].evidence.byte_offset, 0);
+    assert_eq!(
+        diff.raw_line_deltas[0].evidence.byte_length,
+        (right_bytes.len() - 1) as u64
+    );
+    assert_eq!(diff.raw_line_deltas[1].kind, DeltaKind::Removed);
+    assert_eq!(diff.raw_line_deltas[1].evidence, left.records[0].evidence);
+    assert_eq!(diff.raw_line_deltas[1].evidence.line_number, 1);
+    assert_eq!(diff.raw_line_deltas[1].evidence.byte_offset, 0);
+    assert_eq!(
+        diff.raw_line_deltas[1].evidence.byte_length,
+        (left_bytes.len() - 1) as u64
+    );
+}
+
+#[test]
 fn diff_matching_ignores_derived_lexical_hints_and_keeps_raw_arguments_authoritative() {
     let left =
         parse(b"10 1700000000.000001 openat(AT_FDCWD</work>, \"/work/file.txt\", O_RDONLY) = 3\n");
