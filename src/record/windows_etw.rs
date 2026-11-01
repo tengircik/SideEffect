@@ -748,6 +748,9 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
 }
 
 fn append_event(state: &mut Collector, event: NativeRuntimeEventBytes) -> bool {
+    if state.limit_reached {
+        return false;
+    }
     let payload_len = event.raw_payload.len();
     if payload_len > MAX_EVENT_PAYLOAD_LENGTH {
         state.malformed = true;
@@ -1182,6 +1185,9 @@ mod tests {
         assert!(!state.events.is_empty());
         assert!(state.events.len() < MAX_EVENT_RECORDS);
         assert!(state.payload_bytes < MAX_EVENT_PAYLOAD_BYTES);
+        let retained_event_count = state.events.len();
+        assert!(!append_event(&mut state, expanded_event()));
+        assert_eq!(state.events.len(), retained_event_count);
         let serialized_events = state
             .events
             .iter()
