@@ -31,6 +31,7 @@ pub struct AuditOptions {
     pub processes: bool,
     pub startup: bool,
     pub path_executables: bool,
+    pub root_path: Option<PathBuf>,
     pub permission_paths: Vec<PathBuf>,
     pub runtime_program: Option<OsString>,
     pub runtime_arguments: Vec<OsString>,
@@ -58,6 +59,7 @@ pub fn collect_and_publish(
         && !options.processes
         && !options.startup
         && !options.path_executables
+        && options.root_path.is_none()
         && options.permission_paths.is_empty()
         && options.runtime_program.is_none()
     {
@@ -90,12 +92,19 @@ pub fn collect_and_publish(
         );
     }
 
+    let session_start = now_unix_ms()?;
+    // Capture the selected root before creating the sibling staging directory. If the
+    // destination is under the selected root, the session's temporary stage must not
+    // appear as an observed child in its own snapshot.
+    let root_snapshot = options
+        .root_path
+        .as_deref()
+        .map(crate::inventory::collect_root_snapshot);
     let mut output = SessionOutput::prepare(destination)
         .map_err(|error| format!("could not prepare private audit session: {error}"))?;
     let mut artifacts = Vec::new();
     let mut sources = Vec::new();
     let mut runtime_coverage_detail = None;
-    let session_start = now_unix_ms()?;
 
     if options.packages {
         let started = now_unix_ms()?;
@@ -225,6 +234,56 @@ pub fn collect_and_publish(
         };
         sources.push(path_source);
         artifacts.push(artifact("path-executables.json", &document)?);
+    }
+
+    if let Some(document) = root_snapshot.as_ref() {
+        let started = document.captured_started_at_unix_ms;
+        let ended = document.captured_ended_at_unix_ms;
+        let status = match document.status {
+            "complete" => SourceStatus::Complete,
+            "partial" => SourceStatus::Partial,
+            _ => SourceStatus::Unknown,
+        };
+        let limits = vec![
+            limit("max_entries", document.limits.max_entries as u64),
+            limit(
+                "max_root_path_bytes_or_utf16_units",
+                document.limits.max_root_path_bytes_or_utf16_units as u64,
+            ),
+            limit(
+                "max_name_bytes_or_utf16_units",
+                document.limits.max_name_bytes_or_utf16_units as u64,
+            ),
+            limit(
+                "max_aggregate_name_bytes",
+                document.limits.max_aggregate_name_bytes as u64,
+            ),
+            limit("deadline_seconds", document.limits.deadline_seconds),
+        ];
+        let diagnostic_codes = document
+            .diagnostics
+            .iter()
+            .map(|item| item.code.to_owned())
+            .collect();
+        sources.push(AuditSessionSource {
+            role: SourceRole::SelectedRoot,
+            collector: Some(crate::audit_session::collector_identity(
+                "linux",
+                SourceRole::SelectedRoot,
+            )),
+            platform: "linux".to_owned(),
+            scope: "one explicitly selected directory and direct-child metadata only".to_owned(),
+            started_at_unix_ms: started,
+            ended_at_unix_ms: ended,
+            status,
+            applied_limits: limits,
+            requested_settings: Vec::new(),
+            effective_settings: Vec::new(),
+            loss: None,
+            diagnostic_codes,
+            artifacts: Vec::new(),
+        });
+        artifacts.push(artifact("root-snapshot.json", &document)?);
     }
 
     if !options.permission_paths.is_empty() {
@@ -363,6 +422,7 @@ pub fn collect_and_publish(
             ArtifactKind::Permissions => SourceRole::Permissions,
             ArtifactKind::Startup => SourceRole::Startup,
             ArtifactKind::PathExecutables => SourceRole::PathExecutables,
+            ArtifactKind::SelectedRoot => SourceRole::SelectedRoot,
             ArtifactKind::WindowsSoftware
             | ArtifactKind::WindowsProcesses
             | ArtifactKind::WindowsPermissions
@@ -625,6 +685,7 @@ fn artifact_kind(file_name: &str) -> Result<ArtifactKind, String> {
         "startup.json" => Ok(ArtifactKind::Startup),
         "permissions.json" => Ok(ArtifactKind::Permissions),
         "path-executables.json" => Ok(ArtifactKind::PathExecutables),
+        "root-snapshot.json" => Ok(ArtifactKind::SelectedRoot),
         "run.json" => Ok(ArtifactKind::RuntimeManifest),
         "trace.strace" => Ok(ArtifactKind::RuntimeTrace),
         "software.windows.json" => Ok(ArtifactKind::WindowsSoftware),

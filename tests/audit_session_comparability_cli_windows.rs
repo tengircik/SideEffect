@@ -81,7 +81,7 @@ fn assert_code(output: &Output, expected: &str) {
     );
     let value = report(output);
     assert_eq!(value["schema"], "sideeffect.audit_session_diff");
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["schema_version"], 2);
     assert_eq!(value["status"], "incomparable");
     assert!(
         value["reason_codes"]
@@ -150,7 +150,7 @@ fn windows_session_comparability_cli_preserves_metadata_only_and_reader_boundari
     );
     assert_eq!(
         compatible_report["scope"],
-        "metadata_and_item_level_inventory_and_runtime"
+        "metadata_and_item_level_inventory_runtime_and_selected_root_metadata"
     );
     assert!(compatible_report["comparable"].as_bool().unwrap());
     assert_reason(&compatible, "partial_source");

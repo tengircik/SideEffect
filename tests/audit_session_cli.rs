@@ -145,7 +145,7 @@ fn audit_cli_publishes_private_session_with_verified_source_intervals_and_hashes
         if format == "json" {
             let review: serde_json::Value = serde_json::from_slice(&reviewed.stdout).unwrap();
             assert_eq!(review["schema"], "sideeffect.audit_session_review");
-            assert_eq!(review["schema_version"], 6);
+            assert_eq!(review["schema_version"], 7);
             assert!(review["sources"][0]["collector"]["id"].is_string());
             assert_eq!(review["host_context"]["os_name"]["status"], "observed");
             assert!(review["host_context"]["privilege"].is_string());
@@ -189,6 +189,165 @@ fn audit_cli_publishes_private_session_with_verified_source_intervals_and_hashes
     assert!(
         String::from_utf8_lossy(&rejected.stderr).contains("audit session verification failed")
     );
+}
+
+#[test]
+fn audit_sessions_capture_and_compare_one_selected_root_with_verified_evidence() {
+    let directory = TestDirectory::new();
+    let selected_root = directory.0.join("selected-root");
+    fs::create_dir(&selected_root).unwrap();
+    fs::write(selected_root.join("before.txt"), b"fixture").unwrap();
+    let before = directory.0.join("before.session");
+    let first = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["audit", "--output"])
+        .arg(&before)
+        .arg("--root")
+        .arg(&selected_root)
+        .output()
+        .unwrap();
+    assert!(
+        matches!(first.status.code(), Some(0 | 2)),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let before_manifest = parse_manifest(&fs::read(before.join("session.json")).unwrap()).unwrap();
+    assert_eq!(before_manifest.schema_version, 7);
+    let root_source = before_manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::SelectedRoot)
+        .unwrap();
+    assert_eq!(root_source.artifacts[0].path, "root-snapshot.json");
+    let before_snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(before.join("root-snapshot.json")).unwrap()).unwrap();
+    assert_eq!(before_snapshot["entries"].as_array().unwrap().len(), 1);
+    assert!(
+        before_snapshot["root"]["display_path"]
+            .as_str()
+            .unwrap()
+            .contains("selected-root")
+    );
+    let review = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("inspect")
+        .arg("--format")
+        .arg("json")
+        .arg("--session")
+        .arg(&before)
+        .output()
+        .unwrap();
+    assert!(matches!(review.status.code(), Some(0 | 2)));
+    let review: serde_json::Value = serde_json::from_slice(&review.stdout).unwrap();
+    assert_eq!(review["schema"], "sideeffect.audit_session_review");
+    assert_eq!(review["schema_version"], 7);
+    assert!(
+        review["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["role"] == "selected_root")
+    );
+
+    fs::write(selected_root.join("after.txt"), b"second fixture").unwrap();
+    let after = directory.0.join("after.session");
+    let second = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["audit", "--output"])
+        .arg(&after)
+        .arg("--root")
+        .arg(&selected_root)
+        .output()
+        .unwrap();
+    assert!(
+        matches!(second.status.code(), Some(0 | 2)),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let comparison = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("compare-sessions")
+        .arg(&before)
+        .arg(&after)
+        .output()
+        .unwrap();
+    assert!(
+        comparison.status.success(),
+        "{}",
+        String::from_utf8_lossy(&comparison.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&comparison.stdout).unwrap();
+    assert_eq!(
+        report["scope"],
+        "metadata_and_item_level_inventory_runtime_and_selected_root_metadata"
+    );
+    let root_diff = report["source_diffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["role"] == "selected_root")
+        .unwrap();
+    let after_snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(after.join("root-snapshot.json")).unwrap()).unwrap();
+    let after_ordinal = after_snapshot["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["display_name"] == "after.txt")
+        .unwrap()["ordinal"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(root_diff["status"], "compared");
+    assert_eq!(root_diff["comparison"]["counts"]["additions"], 1);
+    assert_eq!(
+        root_diff["comparison"]["deltas"][0]["after"]["entry_ordinal"],
+        after_ordinal
+    );
+
+    let duplicate = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["audit", "--output"])
+        .arg(directory.0.join("duplicate.session"))
+        .arg("--root")
+        .arg(&selected_root)
+        .arg("--root")
+        .arg(&selected_root)
+        .output()
+        .unwrap();
+    assert_eq!(duplicate.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("exactly one --root"));
+}
+
+#[test]
+fn root_snapshot_does_not_capture_its_session_staging_or_final_directory() {
+    let directory = TestDirectory::new();
+    let selected_root = directory.0.join("selected-root");
+    fs::create_dir(&selected_root).unwrap();
+    fs::write(selected_root.join("input.txt"), b"synthetic fixture").unwrap();
+    let output_path = selected_root.join("audit-session");
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["audit", "--output"])
+        .arg(&output_path)
+        .arg("--root")
+        .arg(&selected_root)
+        .output()
+        .unwrap();
+    assert!(
+        matches!(output.status.code(), Some(0 | 2)),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(output_path.join("root-snapshot.json")).unwrap()).unwrap();
+    let names = snapshot["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["display_name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["input.txt"]);
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.starts_with(".sideeffect-capture-"))
+    );
+    assert!(!names.contains(&"audit-session"));
 }
 
 #[test]

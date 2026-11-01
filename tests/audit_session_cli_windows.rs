@@ -52,7 +52,7 @@ fn windows_session_publishes_and_inspects_selected_source_with_private_acl() {
     );
     let value: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
     assert_eq!(value["schema"], "sideeffect.audit_session_review");
-    assert_eq!(value["schema_version"], 6);
+    assert_eq!(value["schema_version"], 7);
     assert_eq!(
         value["sources"][0]["collector"]["id"],
         "windows.software_registry"
@@ -142,6 +142,118 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
         assert_eq!(source["artifacts"].as_array().unwrap().len(), 1);
     }
     assert_eq!(review["sources"].as_array().unwrap().len(), 5);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn windows_audit_session_captures_and_compares_selected_root_metadata() {
+    let root = temp_dir();
+    let selected = root.join("selected-root");
+    fs::create_dir(&selected).unwrap();
+    fs::write(selected.join("before.txt"), b"synthetic fixture").unwrap();
+    let before = root.join("before-session");
+    let first = cli(&[
+        "audit",
+        "--output",
+        before.to_str().unwrap(),
+        "--root",
+        selected.to_str().unwrap(),
+    ]);
+    assert!(
+        published(&first),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(before.join("root-snapshot.json")).unwrap()).unwrap();
+    assert_eq!(snapshot["platform"], "windows");
+    assert_eq!(snapshot["entries"].as_array().unwrap().len(), 1);
+    let review = cli(&[
+        "inspect",
+        "--format",
+        "json",
+        "--session",
+        before.to_str().unwrap(),
+    ]);
+    assert!(
+        published(&review),
+        "{}",
+        String::from_utf8_lossy(&review.stderr)
+    );
+    let review: serde_json::Value = serde_json::from_slice(&review.stdout).unwrap();
+    assert!(
+        review["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["role"] == "selected_root")
+    );
+
+    fs::write(selected.join("after.txt"), b"another fixture").unwrap();
+    let after = root.join("after-session");
+    let second = cli(&[
+        "audit",
+        "--output",
+        after.to_str().unwrap(),
+        "--root",
+        selected.to_str().unwrap(),
+    ]);
+    assert!(
+        published(&second),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let comparison = cli(&[
+        "compare-sessions",
+        before.to_str().unwrap(),
+        after.to_str().unwrap(),
+    ]);
+    assert!(
+        comparison.status.success(),
+        "{}",
+        String::from_utf8_lossy(&comparison.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&comparison.stdout).unwrap();
+    let root_diff = report["source_diffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["role"] == "selected_root")
+        .unwrap();
+    assert_eq!(root_diff["status"], "compared");
+    assert_eq!(root_diff["comparison"]["counts"]["additions"], 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn windows_root_snapshot_does_not_capture_its_session_output_directory() {
+    let root = temp_dir();
+    let selected = root.join("selected-root");
+    fs::create_dir(&selected).unwrap();
+    fs::write(selected.join("input.txt"), b"synthetic fixture").unwrap();
+    let session = selected.join("audit-session");
+    let output = cli(&[
+        "audit",
+        "--output",
+        session.to_str().unwrap(),
+        "--root",
+        selected.to_str().unwrap(),
+    ]);
+    assert!(
+        published(&output),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(session.join("root-snapshot.json")).unwrap()).unwrap();
+    let names = snapshot["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["display_name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["input.txt"]);
+    assert!(!names.contains(&"audit-session"));
     fs::remove_dir_all(root).unwrap();
 }
 

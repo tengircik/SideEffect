@@ -278,7 +278,7 @@ pub fn write_audit_session_json<W: Write>(
         .collect();
     let review = SessionReview {
         schema: "sideeffect.audit_session_review",
-        schema_version: 6,
+        schema_version: 7,
         session_id: &manifest.session_id,
         platform: &manifest.platform,
         architecture: manifest.architecture.clone(),
@@ -473,6 +473,7 @@ fn source_role_name(role: SourceRole) -> &'static str {
         crate::audit_session::SourceRole::Permissions => "permissions",
         crate::audit_session::SourceRole::Startup => "startup",
         crate::audit_session::SourceRole::PathExecutables => "path_executables",
+        crate::audit_session::SourceRole::SelectedRoot => "selected_root",
         crate::audit_session::SourceRole::Runtime => "runtime",
     }
 }
@@ -484,6 +485,7 @@ fn artifact_kind_name(kind: crate::audit_session::ArtifactKind) -> &'static str 
         crate::audit_session::ArtifactKind::Permissions => "permissions",
         crate::audit_session::ArtifactKind::Startup => "startup",
         crate::audit_session::ArtifactKind::PathExecutables => "path_executables",
+        crate::audit_session::ArtifactKind::SelectedRoot => "selected_root",
         crate::audit_session::ArtifactKind::WindowsSoftware => "windows_software",
         crate::audit_session::ArtifactKind::WindowsProcesses => "windows_processes",
         crate::audit_session::ArtifactKind::WindowsPermissions => "windows_permissions",
@@ -594,7 +596,7 @@ mod tests {
         assert!(output.is_ascii());
         let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(value["schema"], "sideeffect.audit_session_review");
-        assert_eq!(value["schema_version"], 6);
+        assert_eq!(value["schema_version"], 7);
         assert_eq!(value["authenticity"], "not_established");
         assert_eq!(
             value["string_encoding"],

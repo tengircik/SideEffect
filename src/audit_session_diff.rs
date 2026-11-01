@@ -8,7 +8,8 @@ use crate::fingerprint::sha256_hex;
 use crate::inventory::{
     compare_package_inventory_json, compare_path_executable_inventory_json,
     compare_permission_inventory_json, compare_process_inventory_json,
-    compare_startup_inventory_json, compare_windows_software_inventory_json,
+    compare_selected_root_inventory_json, compare_startup_inventory_json,
+    compare_windows_software_inventory_json,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -16,6 +17,7 @@ use serde_json::Value;
 /// Existing inventory comparators accept at most this many bytes across a pair.
 pub const MAX_SESSION_DIFF_PAIR_BYTES: usize = 64 * 1024 * 1024;
 pub const AUDIT_SESSION_DIFF_SCHEMA: &str = "sideeffect.audit_session_diff";
+pub const AUDIT_SESSION_DIFF_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug)]
 pub struct VerifiedArtifactBytes<'a> {
@@ -86,6 +88,7 @@ pub fn compare_audit_sessions(
         SourceRole::Startup,
         SourceRole::Runtime,
         SourceRole::PathExecutables,
+        SourceRole::SelectedRoot,
     ];
     let source_diffs: Vec<_> = roles
         .into_iter()
@@ -106,7 +109,7 @@ pub fn compare_audit_sessions(
         };
     AuditSessionDiff {
         schema: AUDIT_SESSION_DIFF_SCHEMA,
-        schema_version: 1,
+        schema_version: AUDIT_SESSION_DIFF_SCHEMA_VERSION,
         status: if context.comparable {
             "comparable"
         } else {
@@ -115,7 +118,7 @@ pub fn compare_audit_sessions(
         comparable: context.comparable,
         reason_codes: context.reasons.iter().map(|reason| reason.code()).collect(),
         metadata_scope: "metadata_readiness_only",
-        scope: "metadata_and_item_level_inventory_and_runtime",
+        scope: "metadata_and_item_level_inventory_runtime_and_selected_root_metadata",
         item_comparison_status,
         native_pair_input_limit_bytes: MAX_SESSION_DIFF_PAIR_BYTES,
         before_session_id: before.session_id.clone(),
@@ -244,6 +247,7 @@ fn compare_source_role(
         Err(NativeCompareError::Malformed) => result.incomparable("invalid_inventory_artifact"),
         Err(NativeCompareError::Unsupported) => result.not_compared("native_schema_not_supported"),
         Err(NativeCompareError::Incompatible) => result.incomparable("native_contract_mismatch"),
+        Err(NativeCompareError::RootMismatch) => result.incomparable("selected_root_mismatch"),
         Err(NativeCompareError::Limit) => result.not_compared("native_comparison_limit_exceeded"),
     }
 }
@@ -287,6 +291,13 @@ fn suppress_session_incomplete_presence(role: SourceRole, comparison: &mut Value
                 "candidates_removed",
                 "candidates_added",
                 "unmatched_candidates_suppressed_for_incomplete_or_changed_context",
+            ),
+            SourceRole::SelectedRoot => (
+                "removed",
+                "added",
+                "removals",
+                "additions",
+                "unmatched_rows_suppressed",
             ),
             SourceRole::Runtime => return,
         };
@@ -426,6 +437,7 @@ fn supported_role_kind(role: SourceRole, kind: ArtifactKind) -> bool {
             SourceRole::Startup,
             ArtifactKind::Startup | ArtifactKind::WindowsStartup
         ) | (SourceRole::PathExecutables, ArtifactKind::PathExecutables)
+            | (SourceRole::SelectedRoot, ArtifactKind::SelectedRoot)
     )
 }
 
@@ -435,6 +447,7 @@ enum NativeCompareError {
     Malformed,
     Unsupported,
     Incompatible,
+    RootMismatch,
     Limit,
 }
 
@@ -445,6 +458,19 @@ fn compare_native(
     right: &[u8],
 ) -> Result<(&'static str, Value), NativeCompareError> {
     let value = match (role, kind) {
+        (SourceRole::SelectedRoot, ArtifactKind::SelectedRoot) => {
+            let result = compare_selected_root_inventory_json(left, right)
+                .map_err(map_root_snapshot_error)?;
+            let status = if result.status == "complete" {
+                "compared"
+            } else {
+                "partial"
+            };
+            (
+                status,
+                serde_json::to_value(result).map_err(|_| NativeCompareError::Malformed)?,
+            )
+        }
         (SourceRole::PathExecutables, ArtifactKind::PathExecutables) => {
             let result = compare_path_executable_inventory_json(left, right)
                 .map_err(map_path_executable_error)?;
@@ -532,6 +558,18 @@ fn compare_native(
         _ => return Err(NativeCompareError::Unsupported),
     };
     Ok(value)
+}
+
+fn map_root_snapshot_error(error: crate::inventory::RootSnapshotDiffError) -> NativeCompareError {
+    use crate::inventory::RootSnapshotDiffError as E;
+    match error {
+        E::MalformedInput => NativeCompareError::Malformed,
+        E::InputTooLarge => NativeCompareError::InputLimit,
+        E::UnsupportedSchema => NativeCompareError::Unsupported,
+        E::PlatformMismatch | E::ScopeMismatch => NativeCompareError::Incompatible,
+        E::RootMismatch => NativeCompareError::RootMismatch,
+        E::LimitExceeded => NativeCompareError::Limit,
+    }
 }
 
 fn map_path_executable_error(
@@ -644,6 +682,7 @@ mod tests {
             SessionSpec {
                 role: SourceRole::Packages,
                 kind: ArtifactKind::Packages,
+                platform: "linux",
                 schema: "sideeffect.inventory",
                 schema_version: 2,
                 scope: "available_package_manager_databases",
@@ -652,9 +691,11 @@ mod tests {
         )
     }
 
+    #[derive(Clone, Copy)]
     struct SessionSpec<'a> {
         role: SourceRole,
         kind: ArtifactKind,
+        platform: &'a str,
         schema: &'a str,
         schema_version: u32,
         scope: &'a str,
@@ -672,6 +713,7 @@ mod tests {
             path: match spec.kind {
                 ArtifactKind::Permissions => "permissions.json",
                 ArtifactKind::PathExecutables => "path-executables.json",
+                ArtifactKind::SelectedRoot => "root-snapshot.json",
                 _ => "packages.json",
             }
             .into(),
@@ -682,8 +724,9 @@ mod tests {
         };
         let source = AuditSessionSource {
             role: spec.role,
-            collector: None,
-            platform: "linux".into(),
+            collector: (spec.role == SourceRole::SelectedRoot)
+                .then(|| crate::audit_session::collector_identity(spec.platform, spec.role)),
+            platform: spec.platform.into(),
             scope: spec.scope.into(),
             started_at_unix_ms: 1000,
             ended_at_unix_ms: 1001,
@@ -698,9 +741,9 @@ mod tests {
         (
             AuditSessionManifest {
                 schema: "sideeffect.audit_session".into(),
-                schema_version: 6,
+                schema_version: crate::audit_session::AUDIT_SESSION_SCHEMA_VERSION,
                 session_id: id.into(),
-                platform: "linux".into(),
+                platform: spec.platform.into(),
                 architecture: "x86_64".into(),
                 started_at_unix_ms: 1000,
                 ended_at_unix_ms: 1002,
@@ -716,6 +759,260 @@ mod tests {
             },
             digest,
         )
+    }
+
+    fn root_snapshot(path_hex: &str, entries: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "sideeffect.selected_root_inventory",
+            "schema_version": 1,
+            "platform": "linux",
+            "scope": "one_explicit_root_and_its_direct_children_metadata_only",
+            "captured_started_at_unix_ms": 1000,
+            "captured_ended_at_unix_ms": 1001,
+            "status": "complete",
+            "root": {
+                "display_path": "/selected",
+                "path_bytes_hex": path_hex,
+                "object_type": "directory",
+                "device_or_volume_serial": 1,
+                "inode_or_file_index": 2
+            },
+            "entries": entries,
+            "diagnostics": [],
+            "limits": {
+                "max_root_path_bytes_or_utf16_units": 4095,
+                "max_entries": 10000,
+                "max_name_bytes_or_utf16_units": 32767,
+                "max_aggregate_name_bytes": 8388608,
+                "deadline_seconds": 5
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn selected_root_sessions_compare_verified_artifacts_and_keep_evidence_links() {
+        let before_bytes = root_snapshot("2f73656c6563746564", serde_json::json!([]));
+        let after_bytes = root_snapshot(
+            "2f73656c6563746564",
+            serde_json::json!([{
+                "ordinal": 0,
+                "display_name": "new.txt",
+                "name_bytes_hex": "6e65772e747874",
+                "object_type": "regular_file",
+                "size_bytes": 12,
+                "modified_at_unix_ms": 1001,
+                "device_or_volume_serial": 1,
+                "inode_or_file_index": 3,
+                "evidence": {"source":"selected_root_directory_entry","entry_ordinal":0}
+            }]),
+        );
+        let spec = SessionSpec {
+            role: SourceRole::SelectedRoot,
+            kind: ArtifactKind::SelectedRoot,
+            platform: "linux",
+            schema: "sideeffect.selected_root_inventory",
+            schema_version: 1,
+            scope: "one explicitly selected directory and direct-child metadata only",
+        };
+        let (before, before_digest) = session_for(
+            &before_bytes,
+            "0123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Complete,
+        );
+        let (after, after_digest) = session_for(
+            &after_bytes,
+            "1123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Complete,
+        );
+        let left = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &before_bytes,
+        }];
+        let right = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &after_bytes,
+        }];
+        let report = compare_audit_sessions(&before, &after, &left, &right);
+        let source = &report.source_diffs[0];
+        assert_eq!(source.role, SourceRole::SelectedRoot);
+        assert_eq!(source.status, "compared");
+        assert_eq!(source.before_artifacts[0].sha256, before_digest);
+        assert_eq!(source.after_artifacts[0].sha256, after_digest);
+        assert_eq!(
+            source.comparison.as_ref().unwrap()["counts"]["additions"],
+            1
+        );
+        assert_eq!(
+            source.comparison.as_ref().unwrap()["deltas"][0]["after"]["entry_ordinal"],
+            0
+        );
+
+        let (partial, _) = session_for(
+            &after_bytes,
+            "2123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Partial,
+        );
+        let partial_report = compare_audit_sessions(&before, &partial, &left, &right);
+        let partial_source = &partial_report.source_diffs[0];
+        assert_eq!(partial_source.status, "partial");
+        assert_eq!(
+            partial_source.comparison.as_ref().unwrap()["counts"]["additions"],
+            0
+        );
+        assert_eq!(
+            partial_source.comparison.as_ref().unwrap()["counts"]["unmatched_rows_suppressed"],
+            1
+        );
+
+        let other_root = root_snapshot("2f6f74686572", serde_json::json!([]));
+        let (different, _) = session_for(
+            &other_root,
+            "3123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Complete,
+        );
+        let other = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &other_root,
+        }];
+        let mismatch = compare_audit_sessions(&before, &different, &left, &other);
+        assert_eq!(mismatch.source_diffs[0].status, "incomparable");
+        assert_eq!(
+            mismatch.source_diffs[0].reason_code,
+            Some("selected_root_mismatch")
+        );
+        assert!(mismatch.source_diffs[0].comparison.is_none());
+    }
+
+    #[test]
+    fn windows_selected_root_sessions_compare_synthetic_utf16_evidence_and_suppress_partial_rows() {
+        fn windows_snapshot(root_hex: &str, entries: serde_json::Value) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "schema":"sideeffect.selected_root_inventory",
+                "schema_version":1,
+                "platform":"windows",
+                "scope":"one_explicit_root_and_its_direct_children_metadata_only",
+                "captured_started_at_unix_ms":1000,
+                "captured_ended_at_unix_ms":1001,
+                "status":"complete",
+                "root":{
+                    "display_path":"C:\\selected",
+                    "path_utf16le_hex":root_hex,
+                    "object_type":"directory",
+                    "device_or_volume_serial":7,
+                    "inode_or_file_index":9
+                },
+                "entries":entries,
+                "diagnostics":[],
+                "limits":{
+                    "max_root_path_bytes_or_utf16_units":32766,
+                    "max_entries":10000,
+                    "max_name_bytes_or_utf16_units":32767,
+                    "max_aggregate_name_bytes":8388608,
+                    "deadline_seconds":5
+                }
+            }))
+            .unwrap()
+        }
+        let before_bytes = windows_snapshot(
+            "43003a005c00730065006c0065006300740065006400",
+            serde_json::json!([]),
+        );
+        let after_bytes = windows_snapshot(
+            "43003a005c00730065006c0065006300740065006400",
+            serde_json::json!([{
+                "ordinal":0,
+                "display_name":"new.txt",
+                "name_utf16le_hex":"6e00650077002e00740078007400",
+                "object_type":"regular_or_other_file",
+                "size_bytes":12,
+                "modified_at_unix_ms":1001,
+                "device_or_volume_serial":7,
+                "inode_or_file_index":10,
+                "evidence":{"source":"selected_root_directory_entry","entry_ordinal":0}
+            }]),
+        );
+        let spec = SessionSpec {
+            role: SourceRole::SelectedRoot,
+            kind: ArtifactKind::SelectedRoot,
+            platform: "windows",
+            schema: "sideeffect.selected_root_inventory",
+            schema_version: 1,
+            scope: "one explicitly selected directory and direct-child metadata only",
+        };
+        let (before, _) = session_for(
+            &before_bytes,
+            "0123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Complete,
+        );
+        let (after, _) = session_for(
+            &after_bytes,
+            "1123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Complete,
+        );
+        let left = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &before_bytes,
+        }];
+        let right = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &after_bytes,
+        }];
+        let report = compare_audit_sessions(&before, &after, &left, &right);
+        assert_eq!(report.source_diffs[0].status, "compared");
+        assert_eq!(
+            report.source_diffs[0].comparison.as_ref().unwrap()["counts"]["additions"],
+            1
+        );
+        assert_eq!(
+            report.source_diffs[0].comparison.as_ref().unwrap()["deltas"][0]["after"]["entry_ordinal"],
+            0
+        );
+
+        let (partial, _) = session_for(
+            &after_bytes,
+            "2123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Partial,
+        );
+        let report = compare_audit_sessions(&before, &partial, &left, &right);
+        let comparison = report.source_diffs[0].comparison.as_ref().unwrap();
+        assert_eq!(report.source_diffs[0].status, "partial");
+        assert_eq!(comparison["counts"]["additions"], 0);
+        assert_eq!(comparison["counts"]["unmatched_rows_suppressed"], 1);
+
+        let other_bytes = windows_snapshot(
+            "44003a005c00730065006c0065006300740065006400",
+            serde_json::json!([]),
+        );
+        let (other, _) = session_for(
+            &other_bytes,
+            "3123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Complete,
+        );
+        let other_artifact = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &other_bytes,
+        }];
+        let report = compare_audit_sessions(&before, &other, &left, &other_artifact);
+        assert_eq!(
+            report.source_diffs[0].reason_code,
+            Some("selected_root_mismatch")
+        );
+        assert!(report.source_diffs[0].comparison.is_none());
     }
 
     #[test]
@@ -1053,6 +1350,7 @@ mod tests {
             SessionSpec {
                 role: SourceRole::Permissions,
                 kind: ArtifactKind::Permissions,
+                platform: "linux",
                 schema: "sideeffect.permission_inventory",
                 schema_version: 1,
                 scope: "selected explicit paths",
@@ -1065,6 +1363,7 @@ mod tests {
             SessionSpec {
                 role: SourceRole::Permissions,
                 kind: ArtifactKind::Permissions,
+                platform: "linux",
                 schema: "sideeffect.permission_inventory",
                 schema_version: 1,
                 scope: "selected explicit paths",
@@ -1173,6 +1472,7 @@ mod tests {
             SessionSpec {
                 role: SourceRole::PathExecutables,
                 kind: ArtifactKind::PathExecutables,
+                platform: "linux",
                 schema: "sideeffect.path_executable_inventory",
                 schema_version: 1,
                 scope: "current process PATH metadata",
@@ -1185,6 +1485,7 @@ mod tests {
             SessionSpec {
                 role: SourceRole::PathExecutables,
                 kind: ArtifactKind::PathExecutables,
+                platform: "linux",
                 schema: "sideeffect.path_executable_inventory",
                 schema_version: 1,
                 scope: "current process PATH metadata",

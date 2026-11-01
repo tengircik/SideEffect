@@ -27,6 +27,7 @@ pub struct WindowsAuditOptions {
     pub processes: bool,
     pub startup: bool,
     pub path_executables: bool,
+    pub root_path: Option<PathBuf>,
     pub permission_paths: Vec<PathBuf>,
     pub include_runtime: bool,
     pub runtime_duration: Option<Duration>,
@@ -56,6 +57,7 @@ pub fn collect_and_publish(
         && !options.processes
         && !options.startup
         && !options.path_executables
+        && options.root_path.is_none()
         && options.permission_paths.is_empty()
         && !options.include_runtime
     {
@@ -229,6 +231,48 @@ pub fn collect_and_publish(
             ArtifactKind::PathExecutables,
             "path-executables.json",
             "sideeffect.path_executable_inventory",
+            1,
+            value,
+        ));
+    }
+    if let Some(root_path) = &options.root_path {
+        let doc = crate::inventory::collect_root_snapshot(root_path);
+        let status = match doc.status {
+            "complete" => SourceStatus::Complete,
+            "partial" => SourceStatus::Partial,
+            _ => SourceStatus::Unknown,
+        };
+        let diagnostics = doc.diagnostics.iter().map(|item| item.code).collect();
+        sources.push(source(
+            SourceRole::SelectedRoot,
+            "one explicitly selected directory and direct-child metadata only",
+            doc.captured_started_at_unix_ms,
+            doc.captured_ended_at_unix_ms,
+            status,
+            diagnostics,
+            vec![
+                ("max_entries", doc.limits.max_entries as u64),
+                (
+                    "max_root_path_bytes_or_utf16_units",
+                    doc.limits.max_root_path_bytes_or_utf16_units as u64,
+                ),
+                (
+                    "max_name_bytes_or_utf16_units",
+                    doc.limits.max_name_bytes_or_utf16_units as u64,
+                ),
+                (
+                    "max_aggregate_name_bytes",
+                    doc.limits.max_aggregate_name_bytes as u64,
+                ),
+                ("deadline_seconds", doc.limits.deadline_seconds),
+            ],
+        ));
+        let value = serde_json::to_vec(&doc)
+            .map_err(|error| format!("could not serialize selected-root inventory: {error}"))?;
+        artifacts.push(artifact(
+            ArtifactKind::SelectedRoot,
+            "root-snapshot.json",
+            "sideeffect.selected_root_inventory",
             1,
             value,
         ));
@@ -685,6 +729,7 @@ fn role_kind(role: SourceRole) -> Option<ArtifactKind> {
         SourceRole::Permissions => Some(ArtifactKind::WindowsPermissions),
         SourceRole::Startup => Some(ArtifactKind::WindowsStartup),
         SourceRole::PathExecutables => Some(ArtifactKind::PathExecutables),
+        SourceRole::SelectedRoot => Some(ArtifactKind::SelectedRoot),
         SourceRole::Runtime => Some(ArtifactKind::WindowsRuntimeCapture),
     }
 }

@@ -405,7 +405,7 @@ fn validate(document: &Document) -> Result<(), RootSnapshotDiffError> {
     let root = document
         .root
         .as_ref()
-        .ok_or(RootSnapshotDiffError::RootMismatch)?;
+        .ok_or(RootSnapshotDiffError::MalformedInput)?;
     if root.object_type != "directory"
         || root.display_path.is_empty()
         || root.display_path.len() > MAX_STRING_BYTES
@@ -1166,6 +1166,17 @@ mod tests {
             )
             .unwrap_err(),
             RootSnapshotDiffError::UnsupportedSchema
+        );
+
+        let mut missing_root: Value = serde_json::from_slice(&valid).unwrap();
+        missing_root["root"] = Value::Null;
+        assert_eq!(
+            compare_selected_root_inventory_json(
+                &valid,
+                &serde_json::to_vec(&missing_root).unwrap()
+            )
+            .unwrap_err(),
+            RootSnapshotDiffError::MalformedInput
         );
 
         let mut malformed: Value = serde_json::from_slice(&valid).unwrap();

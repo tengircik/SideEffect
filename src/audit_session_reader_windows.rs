@@ -16,7 +16,7 @@ use std::path::Path;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-const MAX_ENTRIES: usize = 9;
+const MAX_ENTRIES: usize = 10;
 
 #[derive(Debug)]
 pub struct VerifiedAuditSession {
@@ -358,6 +358,7 @@ fn label(path: &str) -> &'static str {
         "permissions.json" => "permissions.json",
         "startup.json" => "startup.json",
         "path-executables.json" => "path-executables.json",
+        "root-snapshot.json" => "root-snapshot.json",
         "software.windows.json" => "software.windows.json",
         "processes.windows.json" => "processes.windows.json",
         "permissions.windows.json" => "permissions.windows.json",
