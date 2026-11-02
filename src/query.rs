@@ -24,6 +24,12 @@ pub const QUERY_RESULT_SCHEMA: &str = "sideeffect.event_query_result";
 pub const QUERY_RESULT_SCHEMA_VERSION: u32 = 1;
 pub const SESSION_QUERY_RESULT_SCHEMA: &str = "sideeffect.session_event_query_result";
 pub const SESSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 1;
+pub const MULTI_SESSION_QUERY_RESULT_SCHEMA: &str = "sideeffect.multi_session_event_query_result";
+pub const MULTI_SESSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 1;
+pub const MAX_QUERY_SESSIONS: usize = 16;
+pub const MAX_MULTI_SESSION_RESULTS: usize = MAX_QUERY_RESULTS;
+pub const MAX_MULTI_SESSION_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_MULTI_SESSION_ELAPSED: Duration = Duration::from_secs(10);
 pub const MAX_QUERY_BYTES: usize = 16 * 1024;
 pub const MAX_QUERY_RESULTS: usize = 5_000;
 pub const MAX_QUERY_ELAPSED: Duration = Duration::from_secs(2);
@@ -185,6 +191,18 @@ pub struct SessionEventQueryResult {
     pub event_query_result: EventQueryResult,
 }
 
+/// Results for an explicit set of verified sessions. Every event stays nested
+/// under its own session identity because source-local ordinals and IDs reset.
+#[derive(Clone, Debug, Serialize)]
+pub struct MultiSessionEventQueryResult {
+    pub schema: &'static str,
+    pub schema_version: u32,
+    pub session_count: usize,
+    pub matched_count: usize,
+    pub complete: bool,
+    pub sessions: Vec<SessionEventQueryResult>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionQueryIdentity {
     pub session_id: String,
@@ -262,6 +280,42 @@ pub fn session_source_is_complete(result: &SessionEventQueryResult) -> bool {
             .as_deref()
             .is_none_or(|status| status == "complete")
         && source_is_complete(&result.event_query_result.source_state)
+}
+
+pub fn multi_session_query_result(
+    sessions: Vec<SessionEventQueryResult>,
+) -> Result<MultiSessionEventQueryResult, String> {
+    use std::collections::HashSet;
+
+    if !(2..=MAX_QUERY_SESSIONS).contains(&sessions.len()) {
+        return Err(format!(
+            "multi-session query result requires 2..={MAX_QUERY_SESSIONS} sessions"
+        ));
+    }
+    let mut session_ids = HashSet::with_capacity(sessions.len());
+    let mut matched_count = 0usize;
+    for session in &sessions {
+        if !session_ids.insert(session.session.session_id.as_str()) {
+            return Err("multi-session query result contains duplicate session IDs".to_owned());
+        }
+        matched_count = matched_count
+            .checked_add(session.event_query_result.matched_count)
+            .ok_or_else(|| "multi-session query result count overflow".to_owned())?;
+        if matched_count > MAX_MULTI_SESSION_RESULTS {
+            return Err(format!(
+                "multi-session query result exceeds the {MAX_MULTI_SESSION_RESULTS}-row limit"
+            ));
+        }
+    }
+    let complete = sessions.iter().all(session_source_is_complete);
+    Ok(MultiSessionEventQueryResult {
+        schema: MULTI_SESSION_QUERY_RESULT_SCHEMA,
+        schema_version: MULTI_SESSION_QUERY_RESULT_SCHEMA_VERSION,
+        session_count: sessions.len(),
+        matched_count,
+        complete,
+        sessions,
+    })
 }
 
 pub fn execute_query(
@@ -480,6 +534,32 @@ mod tests {
             "complete",
             Some("complete")
         )));
+    }
+
+    #[test]
+    fn multi_session_summary_aggregates_counts_and_never_promotes_partial_evidence() {
+        let complete = complete_session_query_result("complete", None);
+        let mut partial = complete_session_query_result("unknown", None);
+        partial.session.session_id = "other-session".to_owned();
+        partial.event_query_result.matched_count = 2;
+        let result = multi_session_query_result(vec![complete, partial]).unwrap();
+        assert_eq!(result.schema, MULTI_SESSION_QUERY_RESULT_SCHEMA);
+        assert_eq!(result.session_count, 2);
+        assert_eq!(result.matched_count, 3);
+        assert!(!result.complete);
+        assert_eq!(result.sessions[0].session.session_id, "synthetic-session");
+        assert_eq!(result.sessions[1].session.session_id, "other-session");
+    }
+
+    #[test]
+    fn multi_session_summary_rejects_duplicate_ids_and_out_of_range_counts() {
+        let first = complete_session_query_result("complete", None);
+        let second = complete_session_query_result("complete", None);
+        assert!(multi_session_query_result(vec![first.clone()]).is_err());
+        assert!(multi_session_query_result(vec![first.clone(), second]).is_err());
+        let too_many =
+            vec![complete_session_query_result("complete", None); MAX_QUERY_SESSIONS + 1];
+        assert!(multi_session_query_result(too_many).is_err());
     }
 
     #[test]

@@ -479,7 +479,19 @@ The same query can select the runtime artifact from one verified audit session:
 sideeffect.exe query --query .\query.json --session .\audit-session --source runtime
 ```
 
-JSON output is the default; add `--format text` for a terminal-safe summary. Version 1 allows exact `event_kind`, `operation_kind` (`syscall_attempt` or `native_observation`), typed syscall `outcome`, and source-local `process_observation_id` filters. Unsupported fields such as path, endpoint, and timestamp filters are rejected rather than approximated. The query JSON is capped at 16 KiB, matching results at 5,000 (overflow is an error, never silent truncation), filtering at two seconds, and serialized output at 8 MiB. The result keeps exact evidence references and diagnostics/status for the entire input even if few or no events match. Session mode first uses the platform's verified session reader, then queries only its declared runtime artifact: Linux `run.json` must bind the verified `trace.strace` by exact schema, length and SHA-256; Windows requires the declared ETW v3 artifact and validates its capture fingerprint. Session status, runtime-source status, capture completeness and event parse/adaptation status stay separate. Missing runtime artifacts are errors, not empty results. Partial or unknown evidence exits `2`; an empty filtered result does not establish that activity was absent. Session queries currently handle one session and its runtime source only.
+Search multiple sessions from the same native platform by repeating `--session`:
+
+```sh
+./target/release/sideeffect query --query ./query.json \
+  --session ./before-session --session ./after-session --source runtime
+```
+
+```powershell
+sideeffect.exe query --query .\query.json `
+  --session .\before-session --session .\after-session --source runtime
+```
+
+JSON output is the default; add `--format text` for a terminal-safe summary. Version 1 allows exact `event_kind`, `operation_kind` (`syscall_attempt` or `native_observation`), typed syscall `outcome`, and source-local `process_observation_id` filters. Unsupported fields such as path, endpoint, and timestamp filters are rejected rather than approximated. The query JSON is capped at 16 KiB, matching results at 5,000 (overflow is an error, never silent truncation), filtering at two seconds, and serialized output at 8 MiB. A multi-session query accepts 2–16 sessions, caps aggregate runtime-artifact bytes at 256 MiB, aggregate matches at 5,000, a cooperative 10-second total-work budget checked between sessions, and output at 8 MiB. Results remain nested under session IDs with separate source-local evidence; `process_observation_id` is rejected across sessions. The result keeps exact evidence references and diagnostics/status for the entire input even if few or no events match. Session mode first uses the platform's verified session reader, then queries only each selected session's declared runtime artifact: Linux `run.json` must bind the verified `trace.strace` by exact schema, length and SHA-256; Windows requires the declared ETW v3 artifact and validates its capture fingerprint. Session status, runtime-source status, capture completeness and event parse/adaptation status stay separate. Missing or invalid selected sessions are errors, not empty results. Partial or unknown evidence exits `2`; an empty filtered result does not establish that activity was absent.
 
 To organize the adapted facts into an evidence-linked graph, run:
 

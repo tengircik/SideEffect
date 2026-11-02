@@ -175,7 +175,17 @@ sideeffect query --query ./query.json --session ./audit-session --source runtime
 sideeffect.exe query --query .\query.json --session .\audit-session --source runtime
 ```
 
-Session results keep session status, runtime-source status, capture completeness, and event parse/adaptation status separate. They retain verified artifact hashes and event evidence locators. Linux `run.json` must bind `trace.strace` by exact schema, length, and SHA-256. Windows uses the session reader's verified ETW v3 artifact and validates its capture fingerprint. Missing runtime evidence is an error; partial or unknown evidence exits `2`. Querying one runtime source does not merge or compare sessions.
+To search multiple verified sessions from the same native platform, repeat `--session` (2–16 sessions):
+
+```sh
+sideeffect query --query ./query.json --session ./before --session ./after --source runtime
+```
+
+```powershell
+sideeffect.exe query --query .\query.json --session .\before --session .\after --source runtime
+```
+
+Each session's results stay nested under that session ID; event ordinals and evidence remain source-local. Multi-session queries cap aggregate runtime artifacts at 256 MiB, total matching rows at 5,000, a cooperative 10-second total-work budget checked between sessions, and output at 8 MiB. The `process_observation_id` filter is rejected across sessions because those IDs are not portable. Session/source/capture/parse status and diagnostics remain separate. Linux `run.json` must bind `trace.strace` by exact schema, length, and SHA-256. Windows uses the session reader's verified ETW v3 artifact and validates its capture fingerprint. A missing or invalid selected session is an error; partial or unknown evidence exits `2`.
 
 ### Explore an evidence-linked event graph
 

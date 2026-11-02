@@ -8,7 +8,7 @@ use std::io::{self, BufRead, Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use serde::Deserialize;
@@ -1804,7 +1804,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect events --trace TRACE\n       sideeffect events --windows-runtime CAPTURE.json (native Windows)\nAdapts one local runtime source into a versioned common event envelope and writes JSON only. Source-local order and timestamps are preserved; no cross-platform ordering, parentage, ownership, or causation is inferred. Partial or unknown source status exits with status 2. Windows runtime input is strictly bounded and schema-validated before adaptation."
         }
         "query" => {
-            "Usage: sideeffect query --query QUERY.json --trace TRACE [--format json|text]\n       sideeffect query --query QUERY.json --windows-runtime CAPTURE.json [--format json|text] (native Windows)\n       sideeffect query --query QUERY.json --session SESSION_DIR --source runtime [--format json|text]\nRuns a versioned, read-only exact-filter query over a common event envelope, or over the verified runtime artifact in one private audit session. Query JSON is strictly validated, limited to 16 KiB, 5,000 results, 2 seconds of filtering, and 8 MiB serialized output. Supported filters are exact event_kind, operation_kind, syscall outcome, and source-local process_observation_id. Path, endpoint, timestamp, cross-session, and inventory-artifact queries are not supported. Session output separately preserves session status, runtime source status, capture completeness, event parse/adaptation status, diagnostics, artifact digests, and event evidence references. Missing runtime artifacts are errors, not empty results. Partial or unknown evidence exits with status 2."
+            "Usage: sideeffect query --query QUERY.json --trace TRACE [--format json|text]\n       sideeffect query --query QUERY.json --windows-runtime CAPTURE.json [--format json|text] (native Windows)\n       sideeffect query --query QUERY.json --session SESSION_DIR --source runtime [--format json|text]\n       sideeffect query --query QUERY.json --session SESSION_DIR --session SESSION_DIR --source runtime [--format json|text] (2..16 sessions)\nRuns a versioned, read-only exact-filter query over a common event envelope or verified runtime artifacts in explicitly selected private audit sessions. Query JSON is strictly validated, limited to 16 KiB and 5,000 rows; multi-session queries cap aggregate runtime artifacts at 256 MiB, matching rows at 5,000, use a cooperative 10-second total-work budget checked between sessions, and cap output at 8 MiB. Supported filters are exact event_kind, operation_kind, and syscall outcome. The source-local process_observation_id filter is available only for a single session; it is rejected for multi-session queries because IDs are not portable across captures. Path, endpoint, timestamp, and inventory-artifact queries are not supported. Each result remains nested with its own session/source/capture/parse status, diagnostics, artifact digests, and event evidence references. Any invalid or missing selected session is an error, never an empty result. Partial or unknown evidence exits with status 2."
         }
         "graph" => {
             "Usage: sideeffect graph --trace TRACE [--event-kind KIND | --process-observation ID]\n       sideeffect graph --windows-runtime CAPTURE.json [--event-kind KIND | --process-observation ID] (native Windows)\nBuilds a bounded source-local graph of event rows, process observations, reported PID context, and evidence-linked relationships. --event-kind selects exact event-kind matches. --process-observation selects a source-local ProcessObservation ID (not a PID or cross-capture ID) and retains events linked to that observation plus its direct process relationships. Retained links preserve their status and basis; diagnostics and source status remain for the full input. An empty event selection is not evidence of absence. PID-only context nodes are kept separate and never merged into process instances. Edges do not establish ownership, causation, or a complete process tree. Partial or unknown source status exits with status 2."
@@ -2345,7 +2345,7 @@ fn events_trace(path: &OsString) -> Result<ExitCode, String> {
 fn query_command(arguments: &[OsString]) -> Result<ExitCode, String> {
     let mut query_path: Option<&OsString> = None;
     let mut source: Option<(&str, &OsString)> = None;
-    let mut session_path: Option<&OsString> = None;
+    let mut session_paths: Vec<&OsString> = Vec::new();
     let mut session_source: Option<&str> = None;
     let mut output_format = "json";
     let mut format_seen = false;
@@ -2383,9 +2383,13 @@ fn query_command(arguments: &[OsString]) -> Result<ExitCode, String> {
                 return Err("query accepts exactly one source input".to_owned());
             }
         } else if flag == "--session" {
-            if session_path.replace(value).is_some() {
-                return Err("duplicate query --session option".to_owned());
+            if session_paths.len() >= sideeffect::query::MAX_QUERY_SESSIONS {
+                return Err(format!(
+                    "query accepts at most {} --session inputs",
+                    sideeffect::query::MAX_QUERY_SESSIONS
+                ));
             }
+            session_paths.push(value);
         } else if flag == "--source" {
             if session_source.is_some() {
                 return Err("duplicate query --source option".to_owned());
@@ -2420,7 +2424,7 @@ fn query_command(arguments: &[OsString]) -> Result<ExitCode, String> {
         "event query",
     )?;
     let query = sideeffect::query::EventQuery::from_json(&query_bytes)?;
-    if let Some(session_path) = session_path {
+    if !session_paths.is_empty() {
         if source.is_some() {
             return Err(
                 "query cannot combine --session with --trace or --windows-runtime".to_owned(),
@@ -2429,9 +2433,25 @@ fn query_command(arguments: &[OsString]) -> Result<ExitCode, String> {
         if session_source != Some("runtime") {
             return Err("session query requires --source runtime".to_owned());
         }
-        let result = query_verified_session_runtime(session_path, &query)?;
-        let complete = sideeffect::query::session_source_is_complete(&result);
-        write_session_query_result(&result, output_format)?;
+        if session_paths.len() == 1 {
+            let result = query_verified_session_runtime(session_paths[0], &query)?;
+            let complete = sideeffect::query::session_source_is_complete(&result);
+            write_session_query_result(&result, output_format)?;
+            return Ok(if complete {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(2)
+            });
+        }
+        if query.filters.process_observation_id.is_some() {
+            return Err(
+                "query --process-observation-id is source-local and cannot be used across sessions"
+                    .to_owned(),
+            );
+        }
+        let result = query_verified_session_runtimes(&session_paths, &query)?;
+        let complete = result.complete;
+        write_multi_session_query_result(&result, output_format)?;
         return Ok(if complete {
             ExitCode::SUCCESS
         } else {
@@ -2511,6 +2531,116 @@ fn session_runtime_artifact_ref(
                 kind
             )
         })
+}
+
+fn query_verified_session_runtimes(
+    session_paths: &[&OsString],
+    query: &sideeffect::query::EventQuery,
+) -> Result<sideeffect::query::MultiSessionEventQueryResult, String> {
+    use std::collections::HashSet;
+
+    if !(2..=sideeffect::query::MAX_QUERY_SESSIONS).contains(&session_paths.len()) {
+        return Err(format!(
+            "multi-session query requires 2..={} sessions",
+            sideeffect::query::MAX_QUERY_SESSIONS
+        ));
+    }
+    let started = Instant::now();
+    let mut sessions = Vec::with_capacity(session_paths.len());
+    let mut session_ids = HashSet::with_capacity(session_paths.len());
+    let mut aggregate_input_bytes = 0u64;
+    let mut aggregate_results = 0usize;
+    for session_path in session_paths {
+        // Reading and parsing one verified source is bounded but not cancellable;
+        // the total-work deadline is therefore cooperative between sessions.
+        if started.elapsed() > sideeffect::query::MAX_MULTI_SESSION_ELAPSED {
+            return Err(format!(
+                "multi-session query exceeded the {} ms total execution limit",
+                sideeffect::query::MAX_MULTI_SESSION_ELAPSED.as_millis()
+            ));
+        }
+        let result = query_verified_session_runtime(session_path, query)?;
+        if !session_ids.insert(result.session.session_id.clone()) {
+            return Err("multi-session query contains duplicate session IDs".to_owned());
+        }
+        aggregate_input_bytes = result
+            .runtime_source
+            .artifacts
+            .iter()
+            .try_fold(aggregate_input_bytes, |total, artifact| {
+                total.checked_add(artifact.byte_length)
+            })
+            .ok_or_else(|| "multi-session query input byte count overflow".to_owned())?;
+        if aggregate_input_bytes > sideeffect::query::MAX_MULTI_SESSION_INPUT_BYTES {
+            return Err(format!(
+                "multi-session query input exceeds the {}-byte aggregate limit",
+                sideeffect::query::MAX_MULTI_SESSION_INPUT_BYTES
+            ));
+        }
+        aggregate_results = aggregate_results
+            .checked_add(result.event_query_result.matched_count)
+            .ok_or_else(|| "multi-session query result count overflow".to_owned())?;
+        if aggregate_results > sideeffect::query::MAX_MULTI_SESSION_RESULTS {
+            return Err(format!(
+                "multi-session query matched more than its {}-row aggregate limit; narrow the filters",
+                sideeffect::query::MAX_MULTI_SESSION_RESULTS
+            ));
+        }
+        sessions.push(result);
+    }
+    if started.elapsed() > sideeffect::query::MAX_MULTI_SESSION_ELAPSED {
+        return Err(format!(
+            "multi-session query exceeded the {} ms total execution limit",
+            sideeffect::query::MAX_MULTI_SESSION_ELAPSED.as_millis()
+        ));
+    }
+    sideeffect::query::multi_session_query_result(sessions)
+}
+
+fn write_multi_session_query_result(
+    result: &sideeffect::query::MultiSessionEventQueryResult,
+    output_format: &str,
+) -> Result<(), String> {
+    if output_format == "json" {
+        let mut output = CappedBuffer::new(sideeffect::query::MAX_QUERY_OUTPUT_BYTES);
+        serde_json::to_writer_pretty(&mut output, result).map_err(|error| {
+            if output.exceeded {
+                format!(
+                    "multi-session event query output exceeds the {}-byte limit",
+                    sideeffect::query::MAX_QUERY_OUTPUT_BYTES
+                )
+            } else {
+                format!("could not serialize multi-session event query result: {error}")
+            }
+        })?;
+        output.write_all(b"\n").map_err(|_| {
+            format!(
+                "multi-session event query output exceeds the {}-byte limit",
+                sideeffect::query::MAX_QUERY_OUTPUT_BYTES
+            )
+        })?;
+        write_buffer(&output, "multi-session event query result")
+    } else {
+        let mut text = String::new();
+        for session in &result.sessions {
+            let session_text = format_session_query_text(session)?;
+            if text.len().saturating_add(session_text.len())
+                > sideeffect::query::MAX_QUERY_OUTPUT_BYTES
+            {
+                return Err(format!(
+                    "multi-session event query text exceeds the {}-byte limit",
+                    sideeffect::query::MAX_QUERY_OUTPUT_BYTES
+                ));
+            }
+            text.push_str(&session_text);
+            text.push('\n');
+        }
+        let mut output = CappedBuffer::new(sideeffect::query::MAX_QUERY_OUTPUT_BYTES);
+        output
+            .write_all(text.as_bytes())
+            .map_err(|_| "multi-session event query text output limit exceeded".to_owned())?;
+        write_buffer(&output, "multi-session event query text result")
+    }
 }
 
 fn write_session_query_result(
@@ -2738,6 +2868,17 @@ fn write_event_query_text(result: &sideeffect::query::EventQueryResult) -> Resul
 fn write_session_query_text(
     result: &sideeffect::query::SessionEventQueryResult,
 ) -> Result<(), String> {
+    let text = format_session_query_text(result)?;
+    let mut output = CappedBuffer::new(sideeffect::query::MAX_QUERY_OUTPUT_BYTES);
+    output
+        .write_all(text.as_bytes())
+        .map_err(|_| "session event query text output limit exceeded".to_owned())?;
+    write_buffer(&output, "session event query text result")
+}
+
+fn format_session_query_text(
+    result: &sideeffect::query::SessionEventQueryResult,
+) -> Result<String, String> {
     use std::fmt::Write as _;
     let mut text = String::new();
     writeln!(
@@ -2799,11 +2940,7 @@ fn write_session_query_text(
         ));
     }
     text.push_str(&events_text);
-    let mut output = CappedBuffer::new(sideeffect::query::MAX_QUERY_OUTPUT_BYTES);
-    output
-        .write_all(text.as_bytes())
-        .map_err(|_| "session event query text output limit exceeded".to_owned())?;
-    write_buffer(&output, "session event query text result")
+    Ok(text)
 }
 
 fn format_event_query_text(result: &sideeffect::query::EventQueryResult) -> Result<String, String> {

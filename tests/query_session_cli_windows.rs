@@ -119,7 +119,7 @@ fn runtime_capture() -> Vec<u8> {
     serde_json::to_vec(&capture).unwrap()
 }
 
-fn session_manifest(runtime: Option<&[u8]>) -> Vec<u8> {
+fn session_manifest_with_id(runtime: Option<&[u8]>, session_id: &str) -> Vec<u8> {
     let artifacts = runtime
         .map(|bytes| {
             vec![SessionArtifactRef {
@@ -158,7 +158,7 @@ fn session_manifest(runtime: Option<&[u8]>) -> Vec<u8> {
     let mut manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
         schema_version: AUDIT_SESSION_SCHEMA_VERSION,
-        session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        session_id: session_id.to_owned(),
         platform: "windows".to_owned(),
         architecture: "x86_64".to_owned(),
         started_at_unix_ms: 1_000,
@@ -185,7 +185,15 @@ fn session_manifest(runtime: Option<&[u8]>) -> Vec<u8> {
 }
 
 fn publish_session(directory: &std::path::Path, runtime: Option<Vec<u8>>) {
-    let manifest = session_manifest(runtime.as_deref());
+    publish_session_with_id(directory, runtime, "0123456789abcdef0123456789abcdef");
+}
+
+fn publish_session_with_id(
+    directory: &std::path::Path,
+    runtime: Option<Vec<u8>>,
+    session_id: &str,
+) {
+    let manifest = session_manifest_with_id(runtime.as_deref(), session_id);
     let mut files = vec![("session.json", manifest.as_slice())];
     if let Some(runtime) = runtime.as_ref() {
         files.push(("runtime.windows.json", runtime.as_slice()));
@@ -209,6 +217,25 @@ fn query(directory: &TestDirectory, session_path: &PathBuf) -> Output {
         .args(["--source", "runtime"])
         .output()
         .unwrap()
+}
+
+fn multi_query(directory: &TestDirectory, session_paths: &[&PathBuf], text: bool) -> Output {
+    let query_path = directory.0.join("query.json");
+    fs::write(
+        &query_path,
+        br#"{"schema":"sideeffect.event_query","schema_version":1,"filters":{"event_kind":"process_start","operation_kind":"native_observation"}}"#,
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sideeffect"));
+    command.args(["query", "--query"]).arg(query_path);
+    for session in session_paths {
+        command.args(["--session"]).arg(session);
+    }
+    command.args(["--source", "runtime"]);
+    if text {
+        command.args(["--format", "text"]);
+    }
+    command.output().unwrap()
 }
 
 #[test]
@@ -241,6 +268,74 @@ fn session_query_uses_verified_windows_etw_artifact_and_keeps_capture_status_unk
         result["event_query_result"]["events"][0]["evidence"]["kind"],
         "windows_etw_record"
     );
+}
+
+#[test]
+fn multi_session_query_keeps_windows_etw_evidence_under_each_session() {
+    let directory = TestDirectory::new();
+    let first = directory.0.join("first");
+    let second = directory.0.join("second");
+    publish_session_with_id(
+        &first,
+        Some(runtime_capture()),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    publish_session_with_id(
+        &second,
+        Some(runtime_capture()),
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+    let output = multi_query(&directory, &[&first, &second], false);
+    assert_eq!(output.status.code(), Some(2));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result["schema"],
+        "sideeffect.multi_session_event_query_result"
+    );
+    assert_eq!(result["session_count"], 2);
+    assert_eq!(result["matched_count"], 2);
+    assert_eq!(result["complete"], false);
+    assert_eq!(
+        result["sessions"][0]["session"]["session_id"],
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    assert_eq!(
+        result["sessions"][1]["session"]["session_id"],
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    );
+    for session in result["sessions"].as_array().unwrap() {
+        assert_eq!(
+            session["event_query_result"]["events"][0]["event_kind"],
+            "process_start"
+        );
+        assert_eq!(
+            session["event_query_result"]["events"][0]["evidence"]["kind"],
+            "windows_etw_record"
+        );
+    }
+}
+
+#[test]
+fn multi_session_query_text_lists_each_windows_session() {
+    let directory = TestDirectory::new();
+    let first = directory.0.join("first-text");
+    let second = directory.0.join("second-text");
+    publish_session_with_id(
+        &first,
+        Some(runtime_capture()),
+        "cccccccccccccccccccccccccccccccc",
+    );
+    publish_session_with_id(
+        &second,
+        Some(runtime_capture()),
+        "dddddddddddddddddddddddddddddddd",
+    );
+    let output = multi_query(&directory, &[&first, &second], true);
+    assert_eq!(output.status.code(), Some(2));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("cccccccccccccccccccccccccccccccc"));
+    assert!(text.contains("dddddddddddddddddddddddddddddddd"));
+    assert_eq!(text.matches("Event query: windows").count(), 2);
 }
 
 #[test]

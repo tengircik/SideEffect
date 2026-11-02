@@ -94,6 +94,14 @@ fn run_manifest(
 }
 
 fn write_session(path: &Path, runtime: Option<(&[u8], bool, bool, bool)>) {
+    write_session_with_id(path, runtime, "0123456789abcdef0123456789abcdef");
+}
+
+fn write_session_with_id(
+    path: &Path,
+    runtime: Option<(&[u8], bool, bool, bool)>,
+    session_id: &str,
+) {
     fs::create_dir(path).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     let mut artifacts = Vec::new();
@@ -151,7 +159,7 @@ fn write_session(path: &Path, runtime: Option<(&[u8], bool, bool, bool)>) {
     let manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
         schema_version: AUDIT_SESSION_SCHEMA_VERSION,
-        session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        session_id: session_id.to_owned(),
         platform: "linux".to_owned(),
         architecture: "x86_64".to_owned(),
         started_at_unix_ms: 1_000,
@@ -202,6 +210,37 @@ fn query(directory: &TestDirectory, session_name: &str) -> Output {
         .unwrap()
 }
 
+fn multi_query(directory: &TestDirectory, session_names: &[&str], text: bool) -> Output {
+    let query = directory.0.join("query.json");
+    fs::write(&query, QUERY).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sideeffect"));
+    command.args(["query", "--query"]).arg(query);
+    for name in session_names {
+        command.args(["--session"]).arg(directory.0.join(name));
+    }
+    command.args(["--source", "runtime"]);
+    if text {
+        command.args(["--format", "text"]);
+    }
+    command.output().unwrap()
+}
+
+fn multi_query_with_filter(
+    directory: &TestDirectory,
+    session_names: &[&str],
+    query_json: &[u8],
+) -> Output {
+    let query = directory.0.join("query.json");
+    fs::write(&query, query_json).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sideeffect"));
+    command.args(["query", "--query"]).arg(query);
+    for name in session_names {
+        command.args(["--session"]).arg(directory.0.join(name));
+    }
+    command.args(["--source", "runtime"]);
+    command.output().unwrap()
+}
+
 #[test]
 fn session_query_keeps_session_source_capture_and_parse_status_separate() {
     let directory = TestDirectory::new();
@@ -231,6 +270,92 @@ fn session_query_keeps_session_source_capture_and_parse_status_separate() {
         result["runtime_source"]["diagnostic_codes"][0],
         "runtime_capture_completeness_unknown"
     );
+}
+
+#[test]
+fn multi_session_query_keeps_results_and_evidence_scoped_by_session() {
+    let directory = TestDirectory::new();
+    for (name, id) in [
+        ("before", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        ("after", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    ] {
+        write_session_with_id(
+            &directory.0.join(name),
+            Some((TRACE, false, false, false)),
+            id,
+        );
+    }
+    let output = multi_query(&directory, &["before", "after"], false);
+    assert_eq!(output.status.code(), Some(2));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result["schema"],
+        "sideeffect.multi_session_event_query_result"
+    );
+    assert_eq!(result["session_count"], 2);
+    assert_eq!(result["matched_count"], 2);
+    assert_eq!(result["complete"], false);
+    assert_eq!(
+        result["sessions"][0]["session"]["session_id"],
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    assert_eq!(
+        result["sessions"][1]["session"]["session_id"],
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    );
+    for session in result["sessions"].as_array().unwrap() {
+        assert_eq!(
+            session["event_query_result"]["events"][0]["event_kind"],
+            "openat"
+        );
+        assert_eq!(
+            session["event_query_result"]["events"][0]["evidence"]["line_number"],
+            1
+        );
+    }
+}
+
+#[test]
+fn multi_session_query_text_keeps_both_session_headings() {
+    let directory = TestDirectory::new();
+    for (name, id) in [
+        ("one", "cccccccccccccccccccccccccccccccc"),
+        ("two", "dddddddddddddddddddddddddddddddd"),
+    ] {
+        write_session_with_id(
+            &directory.0.join(name),
+            Some((TRACE, false, false, false)),
+            id,
+        );
+    }
+    let output = multi_query(&directory, &["one", "two"], true);
+    assert_eq!(output.status.code(), Some(2));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("cccccccccccccccccccccccccccccccc"));
+    assert!(text.contains("dddddddddddddddddddddddddddddddd"));
+    assert_eq!(text.matches("Event query: linux").count(), 2);
+}
+
+#[test]
+fn multi_session_query_rejects_duplicate_ids_and_source_local_filters() {
+    let directory = TestDirectory::new();
+    write_session(
+        &directory.0.join("same"),
+        Some((TRACE, false, false, false)),
+    );
+    let duplicate = multi_query(&directory, &["same", "same"], false);
+    assert_eq!(duplicate.status.code(), Some(1));
+    assert!(duplicate.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("duplicate session IDs"));
+
+    let local_id = multi_query_with_filter(
+        &directory,
+        &["missing-one", "missing-two"],
+        br#"{"schema":"sideeffect.event_query","schema_version":1,"filters":{"process_observation_id":1}}"#,
+    );
+    assert_eq!(local_id.status.code(), Some(1));
+    assert!(local_id.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&local_id.stderr).contains("source-local"));
 }
 
 #[test]
