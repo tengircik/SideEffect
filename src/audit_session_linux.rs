@@ -32,6 +32,7 @@ pub struct AuditOptions {
     pub startup: bool,
     pub path_executables: bool,
     pub root_path: Option<PathBuf>,
+    pub hash_root_regular_files: bool,
     pub permission_paths: Vec<PathBuf>,
     pub runtime_program: Option<OsString>,
     pub runtime_arguments: Vec<OsString>,
@@ -60,6 +61,7 @@ pub fn collect_and_publish(
         && !options.startup
         && !options.path_executables
         && options.root_path.is_none()
+        && !options.hash_root_regular_files
         && options.permission_paths.is_empty()
         && options.runtime_program.is_none()
     {
@@ -96,10 +98,12 @@ pub fn collect_and_publish(
     // Capture the selected root before creating the sibling staging directory. If the
     // destination is under the selected root, the session's temporary stage must not
     // appear as an observed child in its own snapshot.
-    let root_snapshot = options
-        .root_path
-        .as_deref()
-        .map(crate::inventory::collect_root_snapshot);
+    if options.hash_root_regular_files && options.root_path.is_none() {
+        return Err("audit --hash-regular-files requires --root DIRECTORY".to_owned());
+    }
+    let root_snapshot = options.root_path.as_deref().map(|path| {
+        crate::inventory::collect_root_snapshot_with_hash(path, options.hash_root_regular_files)
+    });
     let mut output = SessionOutput::prepare(destination)
         .map_err(|error| format!("could not prepare private audit session: {error}"))?;
     let mut artifacts = Vec::new();
@@ -244,7 +248,7 @@ pub fn collect_and_publish(
             "partial" => SourceStatus::Partial,
             _ => SourceStatus::Unknown,
         };
-        let limits = vec![
+        let mut limits = vec![
             limit("max_entries", document.limits.max_entries as u64),
             limit(
                 "max_root_path_bytes_or_utf16_units",
@@ -260,6 +264,22 @@ pub fn collect_and_publish(
             ),
             limit("deadline_seconds", document.limits.deadline_seconds),
         ];
+        if options.hash_root_regular_files {
+            limits.extend([
+                limit(
+                    "max_file_hash_bytes",
+                    crate::inventory::MAX_ROOT_FILE_HASH_BYTES,
+                ),
+                limit(
+                    "max_aggregate_hash_bytes",
+                    crate::inventory::MAX_ROOT_AGGREGATE_HASH_BYTES,
+                ),
+                limit(
+                    "hash_deadline_seconds",
+                    crate::inventory::ROOT_HASH_DEADLINE.as_secs(),
+                ),
+            ]);
+        }
         let diagnostic_codes = document
             .diagnostics
             .iter()
@@ -272,12 +292,24 @@ pub fn collect_and_publish(
                 SourceRole::SelectedRoot,
             )),
             platform: "linux".to_owned(),
-            scope: "one explicitly selected directory and direct-child metadata only".to_owned(),
+            scope: if options.hash_root_regular_files {
+                "one explicitly selected directory and direct-child metadata; optional regular-file content fingerprints"
+            } else {
+                "one explicitly selected directory and direct-child metadata only"
+            }
+            .to_owned(),
             started_at_unix_ms: started,
             ended_at_unix_ms: ended,
             status,
             applied_limits: limits,
-            requested_settings: Vec::new(),
+            requested_settings: if options.hash_root_regular_files {
+                vec![crate::audit_session::Setting {
+                    code: "hash_regular_files".to_owned(),
+                    value: 1,
+                }]
+            } else {
+                Vec::new()
+            },
             effective_settings: Vec::new(),
             loss: None,
             diagnostic_codes,

@@ -28,6 +28,7 @@ pub struct WindowsAuditOptions {
     pub startup: bool,
     pub path_executables: bool,
     pub root_path: Option<PathBuf>,
+    pub hash_root_regular_files: bool,
     pub permission_paths: Vec<PathBuf>,
     pub include_runtime: bool,
     pub runtime_duration: Option<Duration>,
@@ -58,10 +59,14 @@ pub fn collect_and_publish(
         && !options.startup
         && !options.path_executables
         && options.root_path.is_none()
+        && !options.hash_root_regular_files
         && options.permission_paths.is_empty()
         && !options.include_runtime
     {
         return Err("select at least one source for the audit session".to_owned());
+    }
+    if options.hash_root_regular_files && options.root_path.is_none() {
+        return Err("audit --hash-regular-files requires --root DIRECTORY".to_owned());
     }
     if options.permission_paths.len() > 256 {
         return Err("permission path count exceeds the 256 path limit".to_owned());
@@ -236,46 +241,81 @@ pub fn collect_and_publish(
         ));
     }
     if let Some(root_path) = &options.root_path {
-        let doc = crate::inventory::collect_root_snapshot(root_path);
+        let doc = crate::inventory::collect_root_snapshot_with_hash(
+            root_path,
+            options.hash_root_regular_files,
+        );
         let status = match doc.status {
             "complete" => SourceStatus::Complete,
             "partial" => SourceStatus::Partial,
             _ => SourceStatus::Unknown,
         };
         let diagnostics = doc.diagnostics.iter().map(|item| item.code).collect();
+        let mut root_limits = vec![
+            ("max_entries", doc.limits.max_entries as u64),
+            (
+                "max_root_path_bytes_or_utf16_units",
+                doc.limits.max_root_path_bytes_or_utf16_units as u64,
+            ),
+            (
+                "max_name_bytes_or_utf16_units",
+                doc.limits.max_name_bytes_or_utf16_units as u64,
+            ),
+            (
+                "max_aggregate_name_bytes",
+                doc.limits.max_aggregate_name_bytes as u64,
+            ),
+            ("deadline_seconds", doc.limits.deadline_seconds),
+        ];
+        if options.hash_root_regular_files {
+            root_limits.extend([
+                (
+                    "max_file_hash_bytes",
+                    crate::inventory::MAX_ROOT_FILE_HASH_BYTES,
+                ),
+                (
+                    "max_aggregate_hash_bytes",
+                    crate::inventory::MAX_ROOT_AGGREGATE_HASH_BYTES,
+                ),
+                (
+                    "hash_deadline_seconds",
+                    crate::inventory::ROOT_HASH_DEADLINE.as_secs(),
+                ),
+            ]);
+        }
         sources.push(source(
             SourceRole::SelectedRoot,
-            "one explicitly selected directory and direct-child metadata only",
+            if options.hash_root_regular_files {
+                "one explicitly selected directory and direct-child metadata; optional regular-file content fingerprints"
+            } else {
+                "one explicitly selected directory and direct-child metadata only"
+            },
             doc.captured_started_at_unix_ms,
             doc.captured_ended_at_unix_ms,
             status,
             diagnostics,
-            vec![
-                ("max_entries", doc.limits.max_entries as u64),
-                (
-                    "max_root_path_bytes_or_utf16_units",
-                    doc.limits.max_root_path_bytes_or_utf16_units as u64,
-                ),
-                (
-                    "max_name_bytes_or_utf16_units",
-                    doc.limits.max_name_bytes_or_utf16_units as u64,
-                ),
-                (
-                    "max_aggregate_name_bytes",
-                    doc.limits.max_aggregate_name_bytes as u64,
-                ),
-                ("deadline_seconds", doc.limits.deadline_seconds),
-            ],
+            root_limits,
         ));
         let value = serde_json::to_vec(&doc)
             .map_err(|error| format!("could not serialize selected-root inventory: {error}"))?;
-        artifacts.push(artifact(
+        let root_artifact = artifact(
             ArtifactKind::SelectedRoot,
             "root-snapshot.json",
             "sideeffect.selected_root_inventory",
-            1,
+            doc.schema_version,
             value,
-        ));
+        );
+        if options.hash_root_regular_files {
+            if let Some(root_source) = sources.last_mut() {
+                root_source
+                    .requested_settings
+                    .push(crate::audit_session::Setting {
+                        code: "hash_regular_files".to_owned(),
+                        value: 1,
+                    });
+            }
+        }
+        artifacts.push(root_artifact);
     }
     if options.include_runtime {
         let duration = options.runtime_duration.ok_or_else(|| {

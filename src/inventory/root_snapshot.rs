@@ -1,6 +1,7 @@
-//! Bounded metadata-only snapshots of one explicitly selected directory level.
+//! Bounded snapshots of one explicitly selected directory level.
 //!
-//! The collector never reads file contents and never descends into child directories.
+//! The default collector reads metadata only. Explicit hashing reads bounded direct-child
+//! regular-file contents. Neither mode descends into child directories.
 
 use serde::Serialize;
 use std::path::Path;

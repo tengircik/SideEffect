@@ -1,8 +1,8 @@
 //! Bounded item-level comparison of verified audit-session inventory artifacts.
 
 use crate::audit_session::{
-    ArtifactKind, AuditSessionManifest, SessionArtifactRef, SourceRole, SourceStatus,
-    compare_sessions,
+    AUDIT_SESSION_SCHEMA_VERSION, AUDIT_SESSION_V7_SCHEMA_VERSION, ArtifactKind,
+    AuditSessionManifest, SessionArtifactRef, SourceRole, SourceStatus, compare_sessions,
 };
 use crate::fingerprint::sha256_hex;
 use crate::inventory::{
@@ -18,6 +18,9 @@ use serde_json::Value;
 pub const MAX_SESSION_DIFF_PAIR_BYTES: usize = 64 * 1024 * 1024;
 pub const AUDIT_SESSION_DIFF_SCHEMA: &str = "sideeffect.audit_session_diff";
 pub const AUDIT_SESSION_DIFF_SCHEMA_VERSION: u32 = 2;
+const SELECTED_ROOT_METADATA_SCOPE: &str =
+    "one explicitly selected directory and direct-child metadata only";
+const SELECTED_ROOT_HASH_SCOPE: &str = "one explicitly selected directory and direct-child metadata; optional regular-file content fingerprints";
 
 #[derive(Clone, Copy, Debug)]
 pub struct VerifiedArtifactBytes<'a> {
@@ -193,7 +196,15 @@ fn compare_source_role(
     if left.platform != right.platform {
         return result.incomparable("source_platform_mismatch");
     }
-    if left.scope != right.scope {
+    if left.scope != right.scope
+        && !selected_root_scope_extension_compatible(
+            role,
+            before.schema_version,
+            after.schema_version,
+            &left.scope,
+            &right.scope,
+        )
+    {
         return result.incomparable("source_scope_mismatch");
     }
     let (Some(left_ref), Some(right_ref)) = (left_reference, right_reference) else {
@@ -203,9 +214,17 @@ fn compare_source_role(
             "artifact_missing_after"
         });
     };
+    let selected_root_versions_compatible = role == SourceRole::SelectedRoot
+        && left_ref.kind == ArtifactKind::SelectedRoot
+        && right_ref.kind == ArtifactKind::SelectedRoot
+        && left_ref.schema == "sideeffect.selected_root_inventory"
+        && right_ref.schema == "sideeffect.selected_root_inventory"
+        && matches!(left_ref.schema_version, 1 | 2)
+        && matches!(right_ref.schema_version, 1 | 2);
     if left_ref.kind != right_ref.kind
         || left_ref.schema != right_ref.schema
-        || left_ref.schema_version != right_ref.schema_version
+        || (left_ref.schema_version != right_ref.schema_version
+            && !selected_root_versions_compatible)
     {
         return result.incomparable("artifact_contract_mismatch");
     }
@@ -250,6 +269,35 @@ fn compare_source_role(
         Err(NativeCompareError::RootMismatch) => result.incomparable("selected_root_mismatch"),
         Err(NativeCompareError::Limit) => result.not_compared("native_comparison_limit_exceeded"),
     }
+}
+
+fn selected_root_scope_extension_compatible(
+    role: SourceRole,
+    before_version: u32,
+    after_version: u32,
+    before_scope: &str,
+    after_scope: &str,
+) -> bool {
+    if role != SourceRole::SelectedRoot {
+        return false;
+    }
+    let valid_scope = |version, scope| match version {
+        AUDIT_SESSION_V7_SCHEMA_VERSION => scope == SELECTED_ROOT_METADATA_SCOPE,
+        AUDIT_SESSION_SCHEMA_VERSION => {
+            matches!(
+                scope,
+                SELECTED_ROOT_METADATA_SCOPE | SELECTED_ROOT_HASH_SCOPE
+            )
+        }
+        _ => false,
+    };
+    valid_scope(before_version, before_scope)
+        && valid_scope(after_version, after_scope)
+        && matches!(
+            (before_scope, after_scope),
+            (SELECTED_ROOT_METADATA_SCOPE, SELECTED_ROOT_HASH_SCOPE)
+                | (SELECTED_ROOT_HASH_SCOPE, SELECTED_ROOT_METADATA_SCOPE)
+        )
 }
 
 /// A source-level session status is authoritative for unmatched-row claims, even if the
@@ -978,6 +1026,163 @@ mod tests {
         assert_eq!(
             report.source_diffs[0].comparison.as_ref().unwrap()["deltas"][0]["after"]["entry_ordinal"],
             0
+        );
+
+        let windows_hashed_snapshot = |digest: &str| {
+            let mut value: serde_json::Value = serde_json::from_slice(&windows_snapshot(
+                "43003a005c00730065006c0065006300740065006400",
+                serde_json::json!([{
+                    "ordinal":0,
+                    "display_name":"same.txt",
+                    "name_utf16le_hex":"730061006d0065002e00740078007400",
+                    "object_type":"regular_or_other_file",
+                    "size_bytes":6,
+                    "modified_at_unix_ms":1001,
+                    "device_or_volume_serial":7,
+                    "inode_or_file_index":10,
+                    "evidence":{"source":"selected_root_directory_entry","entry_ordinal":0}
+                }]),
+            ))
+            .unwrap();
+            value["schema_version"] = serde_json::json!(2);
+            value["scope"] = serde_json::json!(
+                "one_explicit_root_and_its_direct_children_metadata_and_opt_in_sha256"
+            );
+            value["content_hashing"] = serde_json::json!({
+                "requested":true,
+                "algorithm":"sha256",
+                "max_file_bytes":16777216,
+                "max_aggregate_bytes":67108864,
+                "deadline_seconds":5
+            });
+            value["entries"][0]["content_sha256"] = serde_json::json!(digest);
+            value["entries"][0]["content_hash_status"] = serde_json::json!("observed");
+            serde_json::to_vec(&value).unwrap()
+        };
+        let content_before = windows_hashed_snapshot(&"a".repeat(64));
+        let content_after = windows_hashed_snapshot(&"b".repeat(64));
+        let hashed_spec = SessionSpec {
+            schema_version: 2,
+            ..spec
+        };
+        let (hash_before_manifest, _) = session_for(
+            &content_before,
+            "4123456789abcdef0123456789abcdef",
+            hashed_spec,
+            SourceStatus::Complete,
+        );
+        let (hash_after_manifest, _) = session_for(
+            &content_after,
+            "5123456789abcdef0123456789abcdef",
+            hashed_spec,
+            SourceStatus::Complete,
+        );
+        let hash_before_artifact = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &content_before,
+        }];
+        let hash_after_artifact = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &content_after,
+        }];
+        let content_report = compare_audit_sessions(
+            &hash_before_manifest,
+            &hash_after_manifest,
+            &hash_before_artifact,
+            &hash_after_artifact,
+        );
+        assert!(
+            content_report.source_diffs[0].comparison.is_some(),
+            "status={} reason={:?}",
+            content_report.source_diffs[0].status,
+            content_report.source_diffs[0].reason_code
+        );
+        let changed = &content_report.source_diffs[0].comparison.as_ref().unwrap()["deltas"][0];
+        assert!(
+            changed["changed_fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "content_sha256")
+        );
+        assert_eq!(changed["before"]["entry_ordinal"], 0);
+        assert_eq!(
+            changed["after"]["evidence_source"],
+            "selected_root_directory_entry"
+        );
+
+        let metadata_only_bytes = windows_snapshot(
+            "43003a005c00730065006c0065006300740065006400",
+            serde_json::json!([{
+                "ordinal":0,
+                "display_name":"same.txt",
+                "name_utf16le_hex":"730061006d0065002e00740078007400",
+                "object_type":"regular_or_other_file",
+                "size_bytes":6,
+                "modified_at_unix_ms":1001,
+                "device_or_volume_serial":7,
+                "inode_or_file_index":10,
+                "evidence":{"source":"selected_root_directory_entry","entry_ordinal":0}
+            }]),
+        );
+        let (metadata_manifest, _) = session_for(
+            &metadata_only_bytes,
+            "6123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Complete,
+        );
+        let metadata_artifact = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &metadata_only_bytes,
+        }];
+        let metadata_hash_comparison = compare_audit_sessions(
+            &metadata_manifest,
+            &hash_after_manifest,
+            &metadata_artifact,
+            &hash_after_artifact,
+        );
+        assert_eq!(metadata_hash_comparison.source_diffs[0].status, "partial");
+        assert_eq!(
+            metadata_hash_comparison.source_diffs[0]
+                .comparison
+                .as_ref()
+                .unwrap()["deltas"][0]["unknown_fields"][0],
+            "content_sha256"
+        );
+
+        let mut unavailable_value: serde_json::Value =
+            serde_json::from_slice(&content_after).unwrap();
+        unavailable_value["status"] = serde_json::json!("partial");
+        unavailable_value["entries"][0]["content_sha256"] = serde_json::Value::Null;
+        unavailable_value["entries"][0]["content_hash_status"] = serde_json::json!("unavailable");
+        let unavailable_bytes = serde_json::to_vec(&unavailable_value).unwrap();
+        let (unavailable_manifest, _) = session_for(
+            &unavailable_bytes,
+            "7123456789abcdef0123456789abcdef",
+            hashed_spec,
+            SourceStatus::Partial,
+        );
+        let unavailable_artifact = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &unavailable_bytes,
+        }];
+        let unavailable_comparison = compare_audit_sessions(
+            &hash_before_manifest,
+            &unavailable_manifest,
+            &hash_before_artifact,
+            &unavailable_artifact,
+        );
+        assert_eq!(unavailable_comparison.source_diffs[0].status, "partial");
+        assert_eq!(
+            unavailable_comparison.source_diffs[0]
+                .comparison
+                .as_ref()
+                .unwrap()["deltas"][0]["unknown_fields"][0],
+            "content_sha256"
         );
 
         let (partial, _) = session_for(

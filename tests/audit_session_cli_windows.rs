@@ -167,6 +167,8 @@ fn windows_audit_session_captures_and_compares_selected_root_metadata() {
     let snapshot: serde_json::Value =
         serde_json::from_slice(&fs::read(before.join("root-snapshot.json")).unwrap()).unwrap();
     assert_eq!(snapshot["platform"], "windows");
+    assert_eq!(snapshot["schema_version"], 1);
+    assert!(snapshot["content_hashing"].is_null());
     assert_eq!(snapshot["entries"].as_array().unwrap().len(), 1);
     let review = cli(&[
         "inspect",
@@ -222,6 +224,92 @@ fn windows_audit_session_captures_and_compares_selected_root_metadata() {
         .unwrap();
     assert_eq!(root_diff["status"], "compared");
     assert_eq!(root_diff["comparison"]["counts"]["additions"], 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn windows_audit_session_opt_in_hashing_compares_content_changes() {
+    let root = temp_dir();
+    let selected = root.join("selected-root-hashed");
+    fs::create_dir(&selected).unwrap();
+    let file = selected.join("payload.bin");
+    fs::write(&file, b"before").unwrap();
+    let before = root.join("before-session");
+    let first = cli(&[
+        "audit",
+        "--output",
+        before.to_str().unwrap(),
+        "--root",
+        selected.to_str().unwrap(),
+        "--hash-regular-files",
+    ]);
+    assert!(
+        published(&first),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(before.join("session.json")).unwrap()).unwrap();
+    assert_eq!(first_manifest["schema_version"], 8);
+    let first_snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(before.join("root-snapshot.json")).unwrap()).unwrap();
+    assert_eq!(first_snapshot["schema_version"], 2);
+    assert!(
+        first_snapshot["entries"][0]["content_sha256"]
+            .as_str()
+            .is_some()
+    );
+
+    fs::write(&file, b"after!").unwrap();
+    let after = root.join("after-session");
+    let second = cli(&[
+        "audit",
+        "--output",
+        after.to_str().unwrap(),
+        "--root",
+        selected.to_str().unwrap(),
+        "--hash-regular-files",
+    ]);
+    assert!(
+        published(&second),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let comparison = cli(&[
+        "compare-sessions",
+        before.to_str().unwrap(),
+        after.to_str().unwrap(),
+    ]);
+    assert!(
+        comparison.status.success(),
+        "{}",
+        String::from_utf8_lossy(&comparison.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&comparison.stdout).unwrap();
+    let root_diff = report["source_diffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "selected_root")
+        .unwrap();
+    assert_eq!(root_diff["status"], "compared");
+    let changed = root_diff["comparison"]["deltas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|delta| delta["name"] == "payload.bin")
+        .unwrap();
+    assert!(
+        changed["changed_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "content_sha256")
+    );
+    assert_eq!(
+        changed["before"]["evidence_source"],
+        "selected_root_directory_entry"
+    );
     fs::remove_dir_all(root).unwrap();
 }
 

@@ -8,13 +8,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
 pub const AUDIT_SESSION_SCHEMA: &str = "sideeffect.audit_session";
-pub const AUDIT_SESSION_SCHEMA_VERSION: u32 = 7;
+pub const AUDIT_SESSION_SCHEMA_VERSION: u32 = 8;
 pub const AUDIT_SESSION_V1_SCHEMA_VERSION: u32 = 1;
 pub const AUDIT_SESSION_V2_SCHEMA_VERSION: u32 = 2;
 pub const AUDIT_SESSION_V3_SCHEMA_VERSION: u32 = 3;
 pub const AUDIT_SESSION_V4_SCHEMA_VERSION: u32 = 4;
 pub const AUDIT_SESSION_V5_SCHEMA_VERSION: u32 = 5;
 pub const AUDIT_SESSION_V6_SCHEMA_VERSION: u32 = 6;
+pub const AUDIT_SESSION_V7_SCHEMA_VERSION: u32 = 7;
 pub const COVERAGE_MANIFEST_V1_VERSION: u32 = 1;
 pub const COVERAGE_MANIFEST_VERSION: u32 = 2;
 pub const MAX_AUDIT_SESSION_MANIFEST_BYTES: usize = 512 * 1024;
@@ -429,6 +430,7 @@ impl AuditSessionManifest {
                 AUDIT_SESSION_V4_SCHEMA_VERSION
                 | AUDIT_SESSION_V5_SCHEMA_VERSION
                 | AUDIT_SESSION_V6_SCHEMA_VERSION
+                | AUDIT_SESSION_V7_SCHEMA_VERSION
                 | AUDIT_SESSION_SCHEMA_VERSION,
             ) => {
                 for fact in [&context.os_name, &context.os_version] {
@@ -456,6 +458,7 @@ impl AuditSessionManifest {
                 | AUDIT_SESSION_V4_SCHEMA_VERSION
                 | AUDIT_SESSION_V5_SCHEMA_VERSION
                 | AUDIT_SESSION_V6_SCHEMA_VERSION
+                | AUDIT_SESSION_V7_SCHEMA_VERSION
                 | AUDIT_SESSION_SCHEMA_VERSION,
             ) => {
                 if !matches!(
@@ -516,7 +519,7 @@ impl AuditSessionManifest {
             {
                 return Err(ValidationError::InvalidSchema);
             }
-            if self.schema_version < AUDIT_SESSION_SCHEMA_VERSION
+            if self.schema_version < AUDIT_SESSION_V7_SCHEMA_VERSION
                 && source.role == SourceRole::SelectedRoot
             {
                 return Err(ValidationError::InvalidSchema);
@@ -527,6 +530,7 @@ impl AuditSessionManifest {
                     Some(identity),
                     AUDIT_SESSION_V5_SCHEMA_VERSION
                     | AUDIT_SESSION_V6_SCHEMA_VERSION
+                    | AUDIT_SESSION_V7_SCHEMA_VERSION
                     | AUDIT_SESSION_SCHEMA_VERSION,
                 ) => {
                     validate_collector_identity(identity, &source.platform, source.role)?;
@@ -622,7 +626,12 @@ impl AuditSessionManifest {
                     || !source_artifact_kinds.insert(artifact.kind)
                     || artifact.path != path
                     || artifact.schema != schema
-                    || !artifact_version_supported(artifact.kind, artifact.schema_version, version)
+                    || !artifact_version_supported(
+                        artifact.kind,
+                        artifact.schema_version,
+                        version,
+                        self.schema_version,
+                    )
                 {
                     return Err(ValidationError::ArtifactContractMismatch);
                 }
@@ -951,8 +960,16 @@ fn runtime_coverage_detail(manifest: &CoverageManifest) -> Option<&RuntimeCovera
         .and_then(|source| source.runtime_detail.as_ref())
 }
 
-fn artifact_version_supported(kind: ArtifactKind, observed: u32, current: u32) -> bool {
+fn artifact_version_supported(
+    kind: ArtifactKind,
+    observed: u32,
+    current: u32,
+    session_version: u32,
+) -> bool {
     observed == current
+        || (kind == ArtifactKind::SelectedRoot
+            && session_version == AUDIT_SESSION_SCHEMA_VERSION
+            && observed == 2)
         || (matches!(observed, 1..=3)
             && matches!(
                 kind,
@@ -1455,6 +1472,56 @@ mod tests {
                 "v{version} must reject selected root"
             );
         }
+
+        let root_manifest = |session_version: u32, artifact_version: u32| {
+            let mut manifest = valid_manifest();
+            manifest.schema_version = session_version;
+            manifest.sources[0].role = SourceRole::SelectedRoot;
+            manifest.sources[0].collector =
+                Some(super::collector_identity("linux", SourceRole::SelectedRoot));
+            manifest.sources[0].scope = if session_version == super::AUDIT_SESSION_V7_SCHEMA_VERSION {
+                "one explicitly selected directory and direct-child metadata only"
+            } else {
+                "one explicitly selected directory and direct-child metadata; optional regular-file content fingerprints"
+            }.to_owned();
+            manifest.sources[0].artifacts[0] = SessionArtifactRef {
+                kind: ArtifactKind::SelectedRoot,
+                path: "root-snapshot.json".to_owned(),
+                schema: "sideeffect.selected_root_inventory".to_owned(),
+                schema_version: artifact_version,
+                byte_length: 1,
+                sha256: "0".repeat(64),
+            };
+            manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
+            manifest
+        };
+        assert!(
+            root_manifest(super::AUDIT_SESSION_V7_SCHEMA_VERSION, 1)
+                .validate()
+                .is_ok()
+        );
+        assert_eq!(
+            root_manifest(super::AUDIT_SESSION_V7_SCHEMA_VERSION, 2).validate(),
+            Err(ValidationError::ArtifactContractMismatch),
+            "v7 must retain the historical selected-root v1 contract"
+        );
+        assert!(
+            root_manifest(super::AUDIT_SESSION_SCHEMA_VERSION, 1)
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            root_manifest(super::AUDIT_SESSION_SCHEMA_VERSION, 2)
+                .validate()
+                .is_ok()
+        );
+        let mut unsupported_root = root_manifest(super::AUDIT_SESSION_SCHEMA_VERSION, 2);
+        unsupported_root.sources[0].artifacts[0].schema_version = 3;
+        assert_eq!(
+            unsupported_root.validate(),
+            Err(ValidationError::ArtifactContractMismatch),
+            "unknown selected-root schema versions must be rejected"
+        );
     }
 
     #[test]
@@ -2208,19 +2275,31 @@ mod tests {
                 3
             };
             for old in 1..current {
-                assert!(super::artifact_version_supported(kind, old, current));
+                assert!(super::artifact_version_supported(
+                    kind,
+                    old,
+                    current,
+                    super::AUDIT_SESSION_SCHEMA_VERSION,
+                ));
             }
-            assert!(super::artifact_version_supported(kind, current, current));
+            assert!(super::artifact_version_supported(
+                kind,
+                current,
+                current,
+                super::AUDIT_SESSION_SCHEMA_VERSION,
+            ));
             assert!(!super::artifact_version_supported(
                 kind,
                 current + 1,
-                current
+                current,
+                super::AUDIT_SESSION_SCHEMA_VERSION,
             ));
         }
         assert!(!super::artifact_version_supported(
             ArtifactKind::Packages,
             1,
-            2
+            2,
+            super::AUDIT_SESSION_SCHEMA_VERSION,
         ));
     }
 
