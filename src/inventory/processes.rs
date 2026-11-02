@@ -96,6 +96,11 @@ pub struct ProcessBootEpochEvidence {
     pub record_sha256: String,
 }
 
+struct ProcessIdentityContext {
+    boot_epoch: ProcessBootEpoch,
+    pid_namespace: Option<PidNamespaceIdentityEvidence>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ProcessInventorySource {
     pub id: &'static str,
@@ -317,12 +322,14 @@ fn collect_with_limits(root: &Path, limits: Limits) -> ProcessInventoryDocument 
     let mut namespace_bytes = 0usize;
     let mut directories_seen = 0usize;
     let mut partial = false;
-    let boot_epoch = read_boot_epoch(root);
-    let pid_namespace = read_pid_namespace_identity(root);
-    if boot_epoch.status != ProcessBootEpochStatus::Observed {
+    let identity = ProcessIdentityContext {
+        boot_epoch: read_boot_epoch(root),
+        pid_namespace: read_pid_namespace_identity(root),
+    };
+    if identity.boot_epoch.status != ProcessBootEpochStatus::Observed {
         partial = true;
         diagnostics.push(diag(
-            match boot_epoch.status {
+            match identity.boot_epoch.status {
                 ProcessBootEpochStatus::Unavailable => "boot_epoch_unavailable",
                 ProcessBootEpochStatus::Malformed => "boot_epoch_malformed",
                 ProcessBootEpochStatus::OverLimit => "boot_epoch_over_limit",
@@ -333,7 +340,7 @@ fn collect_with_limits(root: &Path, limits: Limits) -> ProcessInventoryDocument 
             "The procfs boot epoch was unavailable, malformed, or over its byte limit.",
         ));
     }
-    if pid_namespace.is_none() {
+    if identity.pid_namespace.is_none() {
         partial = true;
         diagnostics.push(diag(
             "pid_namespace_identity_unavailable",
@@ -351,16 +358,7 @@ fn collect_with_limits(root: &Path, limits: Limits) -> ProcessInventoryDocument 
                 None,
                 "Could not enumerate the procfs root.",
             ));
-            return finish(
-                started,
-                rows,
-                diagnostics,
-                0,
-                0,
-                true,
-                boot_epoch,
-                pid_namespace,
-            );
+            return finish(started, rows, diagnostics, 0, 0, true, identity);
         }
     };
     let mut pids = Vec::new();
@@ -558,8 +556,7 @@ fn collect_with_limits(root: &Path, limits: Limits) -> ProcessInventoryDocument 
         directories_seen,
         total_bytes,
         partial,
-        boot_epoch,
-        pid_namespace,
+        identity,
     )
 }
 
@@ -570,9 +567,12 @@ fn finish(
     directories_seen: usize,
     status_bytes_read: usize,
     partial: bool,
-    boot_epoch: ProcessBootEpoch,
-    pid_namespace: Option<PidNamespaceIdentityEvidence>,
+    identity: ProcessIdentityContext,
 ) -> ProcessInventoryDocument {
+    let ProcessIdentityContext {
+        boot_epoch,
+        pid_namespace,
+    } = identity;
     let status = if partial {
         ProcessInventoryStatus::Partial
     } else {
