@@ -187,6 +187,23 @@ sideeffect.exe query --query .\query.json --session .\before --session .\after -
 
 Each session's results stay nested under that session ID; event ordinals and evidence remain source-local. Multi-session queries cap aggregate runtime artifacts at 256 MiB, total matching rows at 5,000, a cooperative 10-second total-work budget checked between sessions, and output at 8 MiB. The `process_observation_id` filter is rejected across sessions because those IDs are not portable. Session/source/capture/parse status and diagnostics remain separate. Linux `run.json` must bind `trace.strace` by exact schema, length, and SHA-256. Windows uses the session reader's verified ETW v3 artifact and validates its capture fingerprint. A missing or invalid selected session is an error; partial or unknown evidence exits `2`.
 
+Query selected-root snapshots from one or more verified sessions with the separate `sideeffect.inventory_query` v1 contract:
+
+```json
+{
+  "schema": "sideeffect.inventory_query",
+  "schema_version": 1,
+  "filters": {},
+  "limit": 100
+}
+```
+
+```sh
+sideeffect query --query ./inventory-query.json --session ./audit-session --source selected_root
+```
+
+Repeat `--session` to query 2–16 sessions from the same native platform. Optional `root_path_hex` and `entry_name_hex` filters match exact native encodings: Linux path/name bytes or Windows UTF-16LE code units, with no display-name decoding or path normalization. The query accepts verified selected-root v1/v2 artifacts and preserves source status, diagnostics, artifact digest, and entry ordinals. Its bounded results cover only each selected root's one-level snapshot; zero matches do not establish system-wide absence. The install guide documents the PowerShell form and full limits.
+
 ### Explore an evidence-linked event graph
 
 ```sh

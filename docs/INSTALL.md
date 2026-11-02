@@ -493,6 +493,22 @@ sideeffect.exe query --query .\query.json `
 
 JSON output is the default; add `--format text` for a terminal-safe summary. Version 1 allows exact `event_kind`, `operation_kind` (`syscall_attempt` or `native_observation`), typed syscall `outcome`, and source-local `process_observation_id` filters. Unsupported fields such as path, endpoint, and timestamp filters are rejected rather than approximated. The query JSON is capped at 16 KiB, matching results at 5,000 (overflow is an error, never silent truncation), filtering at two seconds, and serialized output at 8 MiB. A multi-session query accepts 2–16 sessions, caps aggregate runtime-artifact bytes at 256 MiB, aggregate matches at 5,000, a cooperative 10-second total-work budget checked between sessions, and output at 8 MiB. Results remain nested under session IDs with separate source-local evidence; `process_observation_id` is rejected across sessions. The result keeps exact evidence references and diagnostics/status for the entire input even if few or no events match. Session mode first uses the platform's verified session reader, then queries only each selected session's declared runtime artifact: Linux `run.json` must bind the verified `trace.strace` by exact schema, length and SHA-256; Windows requires the declared ETW v3 artifact and validates its capture fingerprint. Session status, runtime-source status, capture completeness and event parse/adaptation status stay separate. Missing or invalid selected sessions are errors, not empty results. Partial or unknown evidence exits `2`; an empty filtered result does not establish that activity was absent.
 
+To query selected-root snapshots from one or more verified sessions, use a separate `sideeffect.inventory_query` v1 contract with exact native path/name encodings:
+
+```json
+{
+  "schema": "sideeffect.inventory_query",
+  "schema_version": 1,
+  "filters": {
+    "root_path_hex": "2f746d702f617070",
+    "entry_name_hex": "636f6e6669672e6a736f6e"
+  },
+  "limit": 100
+}
+```
+
+On Linux, the hex values encode exact path/name bytes. On native Windows, they encode exact UTF-16LE code units. No display-name decoding or path normalization is used for matching. Select one session or repeat `--session` for 2–16 sessions, then pass `--source selected_root`; JSON is the default and `--format text` prints a terminal-safe view. The query reads only each session's verified `root-snapshot.json` artifact and accepts selected-root schema v1 or v2. It validates the full document before filtering, caps one document at 64 MiB, each artifact at 10,000 entries and 8 MiB aggregate encoded names, matching rows at 5,000, aggregate selected-root input at 256 MiB, total work at 10 seconds checked between sessions, and output at 8 MiB. Results retain session/source status, source and artifact diagnostics, artifact schema/version/length/SHA-256, native root/name encodings, content-hash metadata when present, and each entry's source ordinal. A partial source stays partial. Zero matches mean only that no matching entry appears in the selected one-level snapshot; they do not establish system-wide absence or prove that entries/changes were absent. The query makes no claim that file IDs or paths establish persistent object identity.
+
 To organize the adapted facts into an evidence-linked graph, run:
 
 ```sh

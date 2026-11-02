@@ -90,7 +90,7 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect model-query-preview --question <question> <strace-trace-file>\n\
        sideeffect model-query --question <question> [--runtime <llama-completion>] --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect query --query <query.json> --trace <trace> | --windows-runtime <capture.json>\n\
-       sideeffect query --query <query.json> --session <session-directory> --source runtime\n\
+       sideeffect query --query <query.json> --session <session-directory> --source runtime|selected_root\n\
        sideeffect model list | show <id> | install <id> | setup <id> | add | select <task> <id> | remove <id>\n\
        sideeffect model runtime set <task> <existing-file> | show [task] | clear <task>\n\
        sideeffect model doctor --task explanation [--runtime <llama-completion>] [--backend auto|cpu|cuda]\n\
@@ -1764,7 +1764,7 @@ fn print_version() {
 
 fn print_usage() {
     println!(
-        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)\n       sideeffect query --query <query.json> --trace <trace> [--format json|text]\n       sideeffect query --query <query.json> --windows-runtime <capture.json> [--format json|text] (native Windows)\n       sideeffect query --query <query.json> --session <session-dir> --source runtime [--format json|text]\n       sideeffect graph --trace <strace-trace-file> [--event-kind <kind> | --process-observation <id>]\n       sideeffect graph --windows-runtime <capture.json> [--event-kind <kind> | --process-observation <id>] (native Windows)\n       sideeffect timeline --trace <strace-trace-file> [--event-kind <kind>] [--process-observation <id>]\n       sideeffect timeline --windows-runtime <capture.json> [--event-kind <kind>] [--process-observation <id>] (native Windows)\n\nProvenance:\n       sideeffect provenance keygen <private-key.pk8> <public-key.hex>\n       sideeffect provenance sign-session <session-dir> --private-key <private-key.pk8> --output <signature.json>\n       sideeffect provenance verify-session <session-dir> --signature <signature.json> --public-key <public-key.hex>"
+        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)\n       sideeffect query --query <query.json> --trace <trace> [--format json|text]\n       sideeffect query --query <query.json> --windows-runtime <capture.json> [--format json|text] (native Windows)\n       sideeffect query --query <query.json> --session <session-dir> --source runtime|selected_root [--format json|text]\n       sideeffect graph --trace <strace-trace-file> [--event-kind <kind> | --process-observation <id>]\n       sideeffect graph --windows-runtime <capture.json> [--event-kind <kind> | --process-observation <id>] (native Windows)\n       sideeffect timeline --trace <strace-trace-file> [--event-kind <kind>] [--process-observation <id>]\n       sideeffect timeline --windows-runtime <capture.json> [--event-kind <kind>] [--process-observation <id>] (native Windows)\n\nProvenance:\n       sideeffect provenance keygen <private-key.pk8> <public-key.hex>\n       sideeffect provenance sign-session <session-dir> --private-key <private-key.pk8> --output <signature.json>\n       sideeffect provenance verify-session <session-dir> --signature <signature.json> --public-key <public-key.hex>"
     );
 }
 
@@ -1804,7 +1804,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect events --trace TRACE\n       sideeffect events --windows-runtime CAPTURE.json (native Windows)\nAdapts one local runtime source into a versioned common event envelope and writes JSON only. Source-local order and timestamps are preserved; no cross-platform ordering, parentage, ownership, or causation is inferred. Partial or unknown source status exits with status 2. Windows runtime input is strictly bounded and schema-validated before adaptation."
         }
         "query" => {
-            "Usage: sideeffect query --query QUERY.json --trace TRACE [--format json|text]\n       sideeffect query --query QUERY.json --windows-runtime CAPTURE.json [--format json|text] (native Windows)\n       sideeffect query --query QUERY.json --session SESSION_DIR --source runtime [--format json|text]\n       sideeffect query --query QUERY.json --session SESSION_DIR --session SESSION_DIR --source runtime [--format json|text] (2..16 sessions)\nRuns a versioned, read-only exact-filter query over a common event envelope or verified runtime artifacts in explicitly selected private audit sessions. Query JSON is strictly validated, limited to 16 KiB and 5,000 rows; multi-session queries cap aggregate runtime artifacts at 256 MiB, matching rows at 5,000, use a cooperative 10-second total-work budget checked between sessions, and cap output at 8 MiB. Supported filters are exact event_kind, operation_kind, and syscall outcome. The source-local process_observation_id filter is available only for a single session; it is rejected for multi-session queries because IDs are not portable across captures. Path, endpoint, timestamp, and inventory-artifact queries are not supported. Each result remains nested with its own session/source/capture/parse status, diagnostics, artifact digests, and event evidence references. Any invalid or missing selected session is an error, never an empty result. Partial or unknown evidence exits with status 2."
+            "Usage: sideeffect query --query QUERY.json --trace TRACE [--format json|text]\n       sideeffect query --query QUERY.json --windows-runtime CAPTURE.json [--format json|text] (native Windows)\n       sideeffect query --query QUERY.json --session SESSION_DIR --source runtime|selected_root [--format json|text]\n       sideeffect query --query QUERY.json --session SESSION_DIR --session SESSION_DIR --source runtime|selected_root [--format json|text] (2..16 sessions)\nRuns a versioned, read-only exact-filter query over runtime evidence or selected-root inventory artifacts in explicitly selected verified sessions. Event query filters are exact event_kind, operation_kind, syscall outcome, and (for a single runtime source) process_observation_id. Inventory query schema v1 accepts exact native-encoding root_path_hex and entry_name_hex filters; Linux values encode bytes and Windows values encode UTF-16LE. Query JSON is capped at 16 KiB, matching rows at 5,000, multi-session verified artifact bytes at 256 MiB, total work at 10 seconds checked between sessions, and serialized output at 8 MiB. Selected-root v1/v2 documents are strictly validated with 10,000-entry and 8 MiB aggregate encoded-name caps. Results retain session/source status, diagnostics, artifact digests, and direct-child entry ordinals. Missing and partial sources remain not checked or partial; zero matches are not evidence of absence. Invalid sessions or malformed documents fail the request. Partial or unknown evidence exits with status 2."
         }
         "graph" => {
             "Usage: sideeffect graph --trace TRACE [--event-kind KIND | --process-observation ID]\n       sideeffect graph --windows-runtime CAPTURE.json [--event-kind KIND | --process-observation ID] (native Windows)\nBuilds a bounded source-local graph of event rows, process observations, reported PID context, and evidence-linked relationships. --event-kind selects exact event-kind matches. --process-observation selects a source-local ProcessObservation ID (not a PID or cross-capture ID) and retains events linked to that observation plus its direct process relationships. Retained links preserve their status and basis; diagnostics and source status remain for the full input. An empty event selection is not evidence of absence. PID-only context nodes are kept separate and never merged into process instances. Edges do not establish ownership, causation, or a complete process tree. Partial or unknown source status exits with status 2."
@@ -2394,10 +2394,14 @@ fn query_command(arguments: &[OsString]) -> Result<ExitCode, String> {
             if session_source.is_some() {
                 return Err("duplicate query --source option".to_owned());
             }
-            if value != "runtime" {
-                return Err("query --source currently supports only 'runtime'".to_owned());
+            if value != "runtime" && value != "selected_root" {
+                return Err("query --source supports only 'runtime' or 'selected_root'".to_owned());
             }
-            session_source = Some("runtime");
+            session_source = Some(if value == "runtime" {
+                "runtime"
+            } else {
+                "selected_root"
+            });
         } else if flag == "--format" {
             if format_seen {
                 return Err("duplicate query --format option".to_owned());
@@ -2421,8 +2425,28 @@ fn query_command(arguments: &[OsString]) -> Result<ExitCode, String> {
     let query_bytes = read_input_file(
         Path::new(query_path),
         sideeffect::query::MAX_QUERY_BYTES,
-        "event query",
+        if session_source == Some("selected_root") {
+            "inventory query"
+        } else {
+            "event query"
+        },
     )?;
+    if session_source == Some("selected_root") {
+        if source.is_some() {
+            return Err(
+                "selected-root inventory queries require verified --session inputs".to_owned(),
+            );
+        }
+        let query = sideeffect::query::InventoryQuery::from_json(&query_bytes)?;
+        let result = query_verified_session_selected_roots(&session_paths, &query)?;
+        let complete = result.complete;
+        write_inventory_query_result(&result, output_format)?;
+        return Ok(if complete {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(2)
+        });
+    }
     let query = sideeffect::query::EventQuery::from_json(&query_bytes)?;
     if !session_paths.is_empty() {
         if source.is_some() {
@@ -2595,6 +2619,264 @@ fn query_verified_session_runtimes(
         ));
     }
     sideeffect::query::multi_session_query_result(sessions)
+}
+
+fn query_verified_session_selected_roots(
+    session_paths: &[&OsString],
+    query: &sideeffect::query::InventoryQuery,
+) -> Result<sideeffect::query::MultiSessionInventoryQueryResult, String> {
+    use std::collections::HashSet;
+
+    if !(1..=sideeffect::query::MAX_QUERY_SESSIONS).contains(&session_paths.len()) {
+        return Err(format!(
+            "selected-root inventory query requires 1..={} sessions",
+            sideeffect::query::MAX_QUERY_SESSIONS
+        ));
+    }
+    let started = Instant::now();
+    let mut sessions = Vec::with_capacity(session_paths.len());
+    let mut session_ids = HashSet::with_capacity(session_paths.len());
+    let mut aggregate_input_bytes = 0u64;
+    let mut aggregate_matches = 0usize;
+    for session_path in session_paths {
+        if started.elapsed() > sideeffect::query::MAX_MULTI_SESSION_ELAPSED {
+            return Err(format!(
+                "selected-root inventory query exceeded the {} ms total execution limit",
+                sideeffect::query::MAX_MULTI_SESSION_ELAPSED.as_millis()
+            ));
+        }
+        let verified = read_verified_audit_session(Path::new(session_path))?;
+        let manifest = verified.manifest();
+        if manifest.platform != native_query_platform() {
+            return Err(
+                "selected-root query platform does not match this native reader".to_owned(),
+            );
+        }
+        if !session_ids.insert(manifest.session_id.clone()) {
+            return Err("inventory query contains duplicate session IDs".to_owned());
+        }
+        let source = manifest
+            .sources
+            .iter()
+            .find(|source| source.role == sideeffect::audit_session::SourceRole::SelectedRoot);
+        let artifact = source.and_then(|source| {
+            source.artifacts.iter().find(|reference| {
+                reference.kind == sideeffect::audit_session::ArtifactKind::SelectedRoot
+            })
+        });
+        let artifact_bytes = artifact.and_then(|reference| {
+            verified
+                .artifacts()
+                .iter()
+                .find(|item| item.kind() == reference.kind)
+                .map(|item| item.bytes())
+        });
+        if let Some(artifact) = artifact {
+            aggregate_input_bytes = aggregate_input_bytes
+                .checked_add(artifact.byte_length)
+                .ok_or_else(|| "inventory query input byte count overflow".to_owned())?;
+        }
+        if aggregate_input_bytes > sideeffect::query::MAX_MULTI_SESSION_INPUT_BYTES {
+            return Err(format!(
+                "inventory query input exceeds the {}-byte aggregate limit",
+                sideeffect::query::MAX_MULTI_SESSION_INPUT_BYTES
+            ));
+        }
+        let selected_root_source = sideeffect::query::query_selected_root_artifact(
+            sideeffect::query::SelectedRootQueryInput {
+                platform: &manifest.platform,
+                source_status: source.map_or(
+                    sideeffect::audit_session::SourceStatus::NotChecked,
+                    |item| item.status,
+                ),
+                scope: source.map(|item| item.scope.clone()),
+                started_at_unix_ms: source.map(|item| item.started_at_unix_ms),
+                ended_at_unix_ms: source.map(|item| item.ended_at_unix_ms),
+                collector: source.and_then(|item| item.collector.clone()),
+                diagnostic_codes: source
+                    .map_or_else(Vec::new, |item| item.diagnostic_codes.clone()),
+                artifact,
+                bytes: artifact_bytes,
+            },
+            query,
+        )?;
+        aggregate_matches = aggregate_matches
+            .checked_add(selected_root_source.matched_count)
+            .ok_or_else(|| "inventory query result count overflow".to_owned())?;
+        if aggregate_matches > sideeffect::query::MAX_MULTI_SESSION_RESULTS {
+            return Err(format!(
+                "inventory query matched more than its {}-row aggregate limit; narrow the filters",
+                sideeffect::query::MAX_MULTI_SESSION_RESULTS
+            ));
+        }
+        sessions.push(sideeffect::query::SessionInventoryQueryResult {
+            session: sideeffect::query::SessionQueryIdentity {
+                session_id: manifest.session_id.clone(),
+                manifest_schema_version: manifest.schema_version,
+                platform: manifest.platform.clone(),
+                status: manifest.status,
+                started_at_unix_ms: manifest.started_at_unix_ms,
+                ended_at_unix_ms: manifest.ended_at_unix_ms,
+            },
+            selected_root_source,
+        });
+    }
+    if started.elapsed() > sideeffect::query::MAX_MULTI_SESSION_ELAPSED {
+        return Err(format!(
+            "selected-root inventory query exceeded the {} ms total execution limit",
+            sideeffect::query::MAX_MULTI_SESSION_ELAPSED.as_millis()
+        ));
+    }
+    sideeffect::query::multi_session_inventory_query_result(sessions, query)
+}
+
+#[cfg(target_os = "linux")]
+fn native_query_platform() -> &'static str {
+    "linux"
+}
+
+#[cfg(windows)]
+fn native_query_platform() -> &'static str {
+    "windows"
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn native_query_platform() -> &'static str {
+    "unsupported"
+}
+
+fn write_inventory_query_result(
+    result: &sideeffect::query::MultiSessionInventoryQueryResult,
+    output_format: &str,
+) -> Result<(), String> {
+    if output_format == "json" {
+        let mut output = CappedBuffer::new(sideeffect::query::MAX_QUERY_OUTPUT_BYTES);
+        serde_json::to_writer_pretty(&mut output, result).map_err(|error| {
+            if output.exceeded {
+                format!(
+                    "inventory query output exceeds the {}-byte limit",
+                    sideeffect::query::MAX_QUERY_OUTPUT_BYTES
+                )
+            } else {
+                format!("could not serialize inventory query result: {error}")
+            }
+        })?;
+        output
+            .write_all(b"\n")
+            .map_err(|_| "inventory query output limit exceeded".to_owned())?;
+        write_buffer(&output, "inventory query result")
+    } else {
+        use std::fmt::Write as _;
+        let mut text = String::new();
+        writeln!(
+            text,
+            "Selected-root inventory query: sessions={} matches={} completeness={}",
+            result.session_count,
+            result.matched_count,
+            if result.complete {
+                "complete"
+            } else {
+                "partial or unknown"
+            }
+        )
+        .map_err(|_| "could not format inventory query text".to_owned())?;
+        writeln!(
+            text,
+            "Filter: root_path_hex={}; entry_name_hex={}; limit={}",
+            result.filter.root_path_hex.as_deref().unwrap_or("*"),
+            result.filter.entry_name_hex.as_deref().unwrap_or("*"),
+            result.limit
+        )
+        .map_err(|_| "could not format inventory query text".to_owned())?;
+        for session in &result.sessions {
+            writeln!(
+                text,
+                "Session {} ({}, {:?})",
+                terminal_safe_text(&session.session.session_id),
+                terminal_safe_text(&session.session.platform),
+                session.session.status
+            )
+            .map_err(|_| "could not format inventory query text".to_owned())?;
+            let source = &session.selected_root_source;
+            writeln!(
+                text,
+                "  selected_root: {:?}; inventory status: {}; scope: {}",
+                source.status,
+                source
+                    .inventory_status
+                    .as_deref()
+                    .unwrap_or("not available"),
+                source
+                    .scope
+                    .as_deref()
+                    .map(terminal_safe_text)
+                    .unwrap_or_else(|| "not checked".to_owned())
+            )
+            .map_err(|_| "could not format inventory query text".to_owned())?;
+            writeln!(
+                text,
+                "  root_path_hex: {}",
+                source.root_path_hex.as_deref().unwrap_or("not recorded")
+            )
+            .map_err(|_| "could not format inventory query text".to_owned())?;
+            writeln!(
+                text,
+                "  root_path_hex: {}",
+                source.root_path_hex.as_deref().unwrap_or("not recorded")
+            )
+            .map_err(|_| "could not format inventory query text".to_owned())?;
+            for code in &source.diagnostic_codes {
+                writeln!(text, "  source diagnostic: {}", terminal_safe_text(code))
+                    .map_err(|_| "could not format inventory query text".to_owned())?;
+            }
+            for diagnostic in &source.inventory_diagnostics {
+                writeln!(
+                    text,
+                    "  inventory diagnostic: {} entry={:?} native_error={:?}",
+                    terminal_safe_text(&diagnostic.code),
+                    diagnostic.entry_ordinal,
+                    diagnostic.native_error
+                )
+                .map_err(|_| "could not format inventory query text".to_owned())?;
+            }
+            if let Some(artifact) = &source.artifact {
+                writeln!(
+                    text,
+                    "  artifact: {} schema={} v{} bytes={} sha256={}",
+                    terminal_safe_text(&artifact.path),
+                    terminal_safe_text(&artifact.schema),
+                    artifact.schema_version,
+                    artifact.byte_length,
+                    artifact.sha256
+                )
+                .map_err(|_| "could not format inventory query text".to_owned())?;
+            }
+            for entry in &source.entries {
+                writeln!(
+                    text,
+                    "  - ordinal={} name={} display={} evidence={}[{}] source={}",
+                    entry.ordinal,
+                    entry.name_hex,
+                    terminal_safe_text(&entry.display_name),
+                    terminal_safe_text(&entry.evidence.artifact_path),
+                    entry.evidence.entry_ordinal,
+                    terminal_safe_text(&entry.evidence.source)
+                )
+                .map_err(|_| "could not format inventory query text".to_owned())?;
+                if text.len() > sideeffect::query::MAX_QUERY_OUTPUT_BYTES {
+                    return Err(format!(
+                        "inventory query text exceeds the {}-byte output limit",
+                        sideeffect::query::MAX_QUERY_OUTPUT_BYTES
+                    ));
+                }
+            }
+        }
+        let mut output = CappedBuffer::new(sideeffect::query::MAX_QUERY_OUTPUT_BYTES);
+        output
+            .write_all(text.as_bytes())
+            .map_err(|_| "inventory query text output limit exceeded".to_owned())?;
+        write_buffer(&output, "inventory query text result")
+    }
 }
 
 fn write_multi_session_query_result(

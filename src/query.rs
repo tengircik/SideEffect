@@ -4,13 +4,16 @@
 //! source-local process links needed to inspect the selected rows. This first
 //! contract intentionally does not claim path, endpoint, or time filtering.
 
-use serde::{Deserialize, Serialize};
+use serde::de::{SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
+use std::fmt;
+use std::marker::PhantomData;
 use std::time::{Duration, Instant};
 
 use crate::audit_session::{
-    AuditSessionManifest, AuditSessionSource, CollectorIdentity, LossMetadata, SessionArtifactRef,
-    SessionStatus, SourceStatus,
+    ArtifactKind, AuditSessionManifest, AuditSessionSource, CollectorIdentity, LossMetadata,
+    SessionArtifactRef, SessionStatus, SourceRole, SourceStatus,
 };
 use crate::event::{
     CommonEvent, CommonEventEnvelope, EventDiagnostic, EventProcessLink, OperationSemantics,
@@ -34,7 +37,755 @@ pub const MAX_QUERY_BYTES: usize = 16 * 1024;
 pub const MAX_QUERY_RESULTS: usize = 5_000;
 pub const MAX_QUERY_ELAPSED: Duration = Duration::from_secs(2);
 pub const MAX_QUERY_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+pub const INVENTORY_QUERY_SCHEMA: &str = "sideeffect.inventory_query";
+pub const INVENTORY_QUERY_SCHEMA_VERSION: u32 = 1;
+pub const INVENTORY_QUERY_RESULT_SCHEMA: &str = "sideeffect.inventory_query_result";
+pub const INVENTORY_QUERY_RESULT_SCHEMA_VERSION: u32 = 1;
+pub const MAX_ROOT_QUERY_ENTRIES: usize = 10_000;
+pub const MAX_ROOT_QUERY_AGGREGATE_NAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FILTER_TEXT_BYTES: usize = 128;
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryQueryFilters {
+    /// Exact selected-root path bytes, lowercase hex in the artifact platform's native encoding.
+    pub root_path_hex: Option<String>,
+    /// Exact direct-child name bytes, lowercase hex in the artifact platform's native encoding.
+    pub entry_name_hex: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryQuery {
+    pub schema: String,
+    pub schema_version: u32,
+    #[serde(default)]
+    pub filters: InventoryQueryFilters,
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+}
+
+impl InventoryQuery {
+    pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_QUERY_BYTES {
+            return Err(format!(
+                "inventory query input exceeds the {MAX_QUERY_BYTES}-byte limit"
+            ));
+        }
+        let query: Self = serde_json::from_slice(bytes)
+            .map_err(|error| format!("invalid inventory query JSON: {error}"))?;
+        query.validate()?;
+        Ok(query)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != INVENTORY_QUERY_SCHEMA
+            || self.schema_version != INVENTORY_QUERY_SCHEMA_VERSION
+        {
+            return Err(format!(
+                "inventory query schema must be {INVENTORY_QUERY_SCHEMA} version {INVENTORY_QUERY_SCHEMA_VERSION}"
+            ));
+        }
+        if self.limit == 0 || self.limit as usize > MAX_QUERY_RESULTS {
+            return Err(format!(
+                "inventory query limit must be between 1 and {MAX_QUERY_RESULTS}"
+            ));
+        }
+        for (label, value) in [
+            ("root_path_hex", self.filters.root_path_hex.as_deref()),
+            ("entry_name_hex", self.filters.entry_name_hex.as_deref()),
+        ] {
+            if let Some(value) = value {
+                if value.is_empty()
+                    || value.len() > 2 * MAX_ROOT_QUERY_AGGREGATE_NAME_BYTES
+                    || value.len() % 2 != 0
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(format!(
+                        "{label} must be non-empty, even-length lowercase hexadecimal within the encoded-name limit"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct InventoryQueryResult {
+    pub schema: &'static str,
+    pub schema_version: u32,
+    pub session_count: usize,
+    pub matched_count: usize,
+    /// True only when every selected session, selected-root source, and artifact document is complete.
+    pub complete: bool,
+    pub sessions: Vec<SessionInventoryQueryResult>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionInventoryQueryResult {
+    pub session: SessionQueryIdentity,
+    pub selected_root_source: SelectedRootQuerySource,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SelectedRootQuerySource {
+    pub role: SourceRole,
+    pub platform: String,
+    pub status: SourceStatus,
+    pub scope: Option<String>,
+    pub started_at_unix_ms: Option<u128>,
+    pub ended_at_unix_ms: Option<u128>,
+    pub collector: Option<CollectorIdentity>,
+    pub diagnostic_codes: Vec<String>,
+    pub inventory_status: Option<String>,
+    pub inventory_diagnostics: Vec<RootQueryDiagnostic>,
+    pub artifact: Option<SelectedRootQueryArtifact>,
+    pub root_path_hex: Option<String>,
+    pub matched_count: usize,
+    pub entries: Vec<RootQueryEntry>,
+}
+
+pub struct SelectedRootQueryInput<'a> {
+    pub platform: &'a str,
+    pub source_status: SourceStatus,
+    pub scope: Option<String>,
+    pub started_at_unix_ms: Option<u128>,
+    pub ended_at_unix_ms: Option<u128>,
+    pub collector: Option<CollectorIdentity>,
+    pub diagnostic_codes: Vec<String>,
+    pub artifact: Option<&'a SessionArtifactRef>,
+    pub bytes: Option<&'a [u8]>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SelectedRootQueryArtifact {
+    pub path: String,
+    pub schema: String,
+    pub schema_version: u32,
+    pub byte_length: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RootQueryDiagnostic {
+    pub code: String,
+    pub entry_ordinal: Option<usize>,
+    pub native_error: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RootQueryEntry {
+    pub ordinal: usize,
+    pub name_hex: String,
+    pub display_name: String,
+    pub object_type: String,
+    pub size_bytes: Option<u64>,
+    pub modified_at_unix_ms: Option<i128>,
+    pub content_sha256: Option<String>,
+    pub content_hash_status: Option<String>,
+    pub evidence: RootQueryEvidence,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RootQueryEvidence {
+    pub artifact_path: String,
+    pub source: String,
+    pub entry_ordinal: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MultiSessionInventoryQueryResult {
+    pub schema: &'static str,
+    pub schema_version: u32,
+    pub session_count: usize,
+    pub matched_count: usize,
+    pub complete: bool,
+    pub filter: InventoryQueryFilters,
+    pub limit: u32,
+    pub sessions: Vec<SessionInventoryQueryResult>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootSnapshotDocument {
+    schema: String,
+    schema_version: u32,
+    platform: String,
+    scope: String,
+    captured_started_at_unix_ms: u128,
+    captured_ended_at_unix_ms: u128,
+    status: String,
+    root: Option<RootSnapshotIdentity>,
+    entries: BoundedSequence<RootSnapshotEntry, MAX_ROOT_QUERY_ENTRIES>,
+    diagnostics: BoundedSequence<RootSnapshotDiagnostic, 256>,
+    limits: RootSnapshotLimits,
+    #[serde(default)]
+    content_hashing: Option<RootSnapshotContentHashing>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootSnapshotContentHashing {
+    requested: bool,
+    algorithm: String,
+    max_file_bytes: u64,
+    max_aggregate_bytes: u64,
+    deadline_seconds: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootSnapshotIdentity {
+    display_path: String,
+    #[serde(default)]
+    path_bytes_hex: Option<String>,
+    #[serde(default)]
+    path_utf16le_hex: Option<String>,
+    object_type: String,
+    device_or_volume_serial: Option<u64>,
+    inode_or_file_index: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootSnapshotEntry {
+    ordinal: usize,
+    display_name: String,
+    #[serde(default)]
+    name_bytes_hex: Option<String>,
+    #[serde(default)]
+    name_utf16le_hex: Option<String>,
+    object_type: String,
+    size_bytes: Option<u64>,
+    modified_at_unix_ms: Option<i128>,
+    device_or_volume_serial: Option<u64>,
+    inode_or_file_index: Option<u64>,
+    #[serde(default)]
+    content_sha256: Option<String>,
+    #[serde(default)]
+    content_hash_status: Option<String>,
+    evidence: RootSnapshotEvidence,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootSnapshotEvidence {
+    source: String,
+    entry_ordinal: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootSnapshotDiagnostic {
+    code: String,
+    entry_ordinal: Option<usize>,
+    native_error: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootSnapshotLimits {
+    max_root_path_bytes_or_utf16_units: usize,
+    max_entries: usize,
+    max_name_bytes_or_utf16_units: usize,
+    max_aggregate_name_bytes: usize,
+    deadline_seconds: u64,
+}
+
+#[derive(Debug)]
+struct BoundedSequence<T, const MAX: usize>(Vec<T>);
+
+impl<'de, T: Deserialize<'de>, const MAX: usize> Deserialize<'de> for BoundedSequence<T, MAX> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BoundedSequenceVisitor<T, const MAX: usize>(PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>, const MAX: usize> Visitor<'de> for BoundedSequenceVisitor<T, MAX> {
+            type Value = BoundedSequence<T, MAX>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, "an array with at most {MAX} items")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                if sequence.size_hint().is_some_and(|size| size > MAX) {
+                    return Err(serde::de::Error::custom("array item limit exceeded"));
+                }
+                let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX));
+                while let Some(value) = sequence.next_element()? {
+                    if values.len() == MAX {
+                        return Err(serde::de::Error::custom("array item limit exceeded"));
+                    }
+                    values.push(value);
+                }
+                Ok(BoundedSequence(values))
+            }
+        }
+
+        deserializer.deserialize_seq(BoundedSequenceVisitor::<T, MAX>(PhantomData))
+    }
+}
+
+/// Validate a selected-root artifact against its exact v1/v2 platform contract and return
+/// only positive matching rows. Session artifact byte length and digest are supplied by the
+/// already-verified reader and retained in the output.
+pub fn query_selected_root_artifact(
+    input: SelectedRootQueryInput<'_>,
+    query: &InventoryQuery,
+) -> Result<SelectedRootQuerySource, String> {
+    let SelectedRootQueryInput {
+        platform,
+        source_status,
+        scope,
+        started_at_unix_ms,
+        ended_at_unix_ms,
+        collector,
+        diagnostic_codes,
+        artifact,
+        bytes,
+    } = input;
+    query.validate()?;
+    validate_inventory_filters(query, platform)?;
+    let Some(artifact) = artifact else {
+        if bytes.is_some() {
+            return Err("selected-root artifact bytes have no manifest reference".to_owned());
+        }
+        return Ok(SelectedRootQuerySource {
+            role: SourceRole::SelectedRoot,
+            platform: platform.to_owned(),
+            status: source_status,
+            scope,
+            started_at_unix_ms,
+            ended_at_unix_ms,
+            collector,
+            diagnostic_codes,
+            inventory_status: None,
+            inventory_diagnostics: Vec::new(),
+            artifact: None,
+            root_path_hex: None,
+            matched_count: 0,
+            entries: Vec::new(),
+        });
+    };
+    let bytes =
+        bytes.ok_or_else(|| "selected-root verified artifact bytes are unavailable".to_owned())?;
+    let expected_version = match artifact.schema_version {
+        1 => 1,
+        2 => 2,
+        _ => return Err("selected-root artifact has an unsupported schema version".to_owned()),
+    };
+    if artifact.kind != ArtifactKind::SelectedRoot
+        || artifact.path != "root-snapshot.json"
+        || artifact.schema != "sideeffect.selected_root_inventory"
+        || artifact.schema_version != expected_version
+        || bytes.len() as u64 != artifact.byte_length
+        || bytes.len() > crate::audit_session::MAX_SESSION_ARTIFACT_BYTES as usize
+        || crate::fingerprint::sha256_hex(bytes) != artifact.sha256
+    {
+        return Err(
+            "selected-root artifact contract or verified bytes do not match the session manifest"
+                .to_owned(),
+        );
+    }
+    let document: RootSnapshotDocument = serde_json::from_slice(bytes).map_err(|_| {
+        "selected-root artifact is malformed or contains unsupported fields".to_owned()
+    })?;
+    let root_path_hex =
+        validate_root_snapshot(&document, platform, artifact.schema_version)?.map(str::to_owned);
+    if query
+        .filters
+        .root_path_hex
+        .as_deref()
+        .is_some_and(|value| root_path_hex.as_deref() != Some(value))
+    {
+        return Ok(SelectedRootQuerySource {
+            role: SourceRole::SelectedRoot,
+            platform: platform.to_owned(),
+            status: source_status,
+            scope,
+            started_at_unix_ms,
+            ended_at_unix_ms,
+            collector,
+            diagnostic_codes,
+            inventory_status: Some(document.status),
+            inventory_diagnostics: document
+                .diagnostics
+                .0
+                .into_iter()
+                .map(|diagnostic| RootQueryDiagnostic {
+                    code: diagnostic.code,
+                    entry_ordinal: diagnostic.entry_ordinal,
+                    native_error: diagnostic.native_error,
+                })
+                .collect(),
+            artifact: Some(SelectedRootQueryArtifact {
+                path: artifact.path.clone(),
+                schema: artifact.schema.clone(),
+                schema_version: artifact.schema_version,
+                byte_length: artifact.byte_length,
+                sha256: artifact.sha256.clone(),
+            }),
+            root_path_hex,
+            matched_count: 0,
+            entries: Vec::new(),
+        });
+    }
+    let mut entries = Vec::new();
+    for entry in document.entries.0 {
+        if root_path_hex.is_none() {
+            return Err("selected-root artifact has entries but no root identity".to_owned());
+        }
+        let name_hex = native_name_hex(&entry, platform)?;
+        if query
+            .filters
+            .entry_name_hex
+            .as_deref()
+            .is_none_or(|filter| filter == name_hex)
+        {
+            if entries.len() >= query.limit as usize {
+                return Err(format!(
+                    "inventory query matched more than its {}-row limit; narrow the filters",
+                    query.limit
+                ));
+            }
+            entries.push(RootQueryEntry {
+                ordinal: entry.ordinal,
+                name_hex: name_hex.to_owned(),
+                display_name: entry.display_name,
+                object_type: entry.object_type,
+                size_bytes: entry.size_bytes,
+                modified_at_unix_ms: entry.modified_at_unix_ms,
+                content_sha256: entry.content_sha256,
+                content_hash_status: entry.content_hash_status,
+                evidence: RootQueryEvidence {
+                    artifact_path: artifact.path.clone(),
+                    source: entry.evidence.source,
+                    entry_ordinal: entry.evidence.entry_ordinal,
+                },
+            });
+        }
+    }
+    let matched_count = entries.len();
+    Ok(SelectedRootQuerySource {
+        role: SourceRole::SelectedRoot,
+        platform: platform.to_owned(),
+        status: source_status,
+        scope,
+        started_at_unix_ms,
+        ended_at_unix_ms,
+        collector,
+        diagnostic_codes,
+        inventory_status: Some(document.status),
+        inventory_diagnostics: document
+            .diagnostics
+            .0
+            .into_iter()
+            .map(|diagnostic| RootQueryDiagnostic {
+                code: diagnostic.code,
+                entry_ordinal: diagnostic.entry_ordinal,
+                native_error: diagnostic.native_error,
+            })
+            .collect(),
+        artifact: Some(SelectedRootQueryArtifact {
+            path: artifact.path.clone(),
+            schema: artifact.schema.clone(),
+            schema_version: artifact.schema_version,
+            byte_length: artifact.byte_length,
+            sha256: artifact.sha256.clone(),
+        }),
+        root_path_hex,
+        matched_count,
+        entries,
+    })
+}
+
+pub fn multi_session_inventory_query_result(
+    sessions: Vec<SessionInventoryQueryResult>,
+    query: &InventoryQuery,
+) -> Result<MultiSessionInventoryQueryResult, String> {
+    query.validate()?;
+    if !(1..=MAX_QUERY_SESSIONS).contains(&sessions.len()) {
+        return Err(format!(
+            "inventory query requires 1..={MAX_QUERY_SESSIONS} sessions"
+        ));
+    }
+    let mut ids = HashSet::with_capacity(sessions.len());
+    let mut matched_count = 0usize;
+    for session in &sessions {
+        if !ids.insert(session.session.session_id.as_str()) {
+            return Err("inventory query contains duplicate session IDs".to_owned());
+        }
+        matched_count = matched_count
+            .checked_add(session.selected_root_source.matched_count)
+            .ok_or_else(|| "inventory query result count overflow".to_owned())?;
+        if matched_count > MAX_MULTI_SESSION_RESULTS {
+            return Err(format!(
+                "inventory query exceeds the {MAX_MULTI_SESSION_RESULTS}-row aggregate limit"
+            ));
+        }
+    }
+    let complete = sessions.iter().all(|session| {
+        session.session.status == SessionStatus::Complete
+            && session.selected_root_source.status == SourceStatus::Complete
+            && session.selected_root_source.inventory_status.as_deref() == Some("complete")
+    });
+    Ok(MultiSessionInventoryQueryResult {
+        schema: INVENTORY_QUERY_RESULT_SCHEMA,
+        schema_version: INVENTORY_QUERY_RESULT_SCHEMA_VERSION,
+        session_count: sessions.len(),
+        matched_count,
+        complete,
+        filter: query.filters.clone(),
+        limit: query.limit,
+        sessions,
+    })
+}
+
+fn validate_root_snapshot<'a>(
+    document: &'a RootSnapshotDocument,
+    platform: &str,
+    artifact_version: u32,
+) -> Result<Option<&'a str>, String> {
+    let expected_scope = match artifact_version {
+        1 => "one_explicit_root_and_its_direct_children_metadata_only",
+        2 => "one_explicit_root_and_its_direct_children_metadata_and_opt_in_sha256",
+        _ => return Err("selected-root artifact version is unsupported".to_owned()),
+    };
+    let (path_limit, name_limit) = match platform {
+        "linux" => (4_095, 32_767),
+        "windows" => (32_766, 32_767),
+        _ => return Err("selected-root session platform is unsupported".to_owned()),
+    };
+    if document.schema != "sideeffect.selected_root_inventory"
+        || document.schema_version != artifact_version
+        || document.platform != platform
+        || document.scope != expected_scope
+        || !matches!(document.status.as_str(), "complete" | "partial")
+        || document.captured_ended_at_unix_ms < document.captured_started_at_unix_ms
+        || document.entries.0.len() > MAX_ROOT_QUERY_ENTRIES
+        || document.diagnostics.0.len() > 256
+        || document.limits.max_root_path_bytes_or_utf16_units != path_limit
+        || document.limits.max_entries != MAX_ROOT_QUERY_ENTRIES
+        || document.limits.max_name_bytes_or_utf16_units != name_limit
+        || document.limits.max_aggregate_name_bytes != MAX_ROOT_QUERY_AGGREGATE_NAME_BYTES
+        || document.limits.deadline_seconds != 5
+        || (document.status == "complete" && !document.diagnostics.0.is_empty())
+    {
+        return Err(
+            "selected-root artifact violates its schema, platform, status, or bounds".to_owned(),
+        );
+    }
+    match (artifact_version, document.content_hashing.as_ref()) {
+        (1, None) => {}
+        (2, Some(h))
+            if h.requested
+                && h.algorithm == "sha256"
+                && h.max_file_bytes == 16 * 1024 * 1024
+                && h.max_aggregate_bytes == 64 * 1024 * 1024
+                && h.deadline_seconds == 5 => {}
+        _ => {
+            return Err(
+                "selected-root content-hashing metadata does not match its schema version"
+                    .to_owned(),
+            );
+        }
+    }
+    for diagnostic in &document.diagnostics.0 {
+        if diagnostic.code.is_empty()
+            || diagnostic.code.len() > 128
+            || diagnostic
+                .entry_ordinal
+                .is_some_and(|ordinal| ordinal > MAX_ROOT_QUERY_ENTRIES)
+        {
+            return Err("selected-root diagnostics exceed the supported contract".to_owned());
+        }
+    }
+    let Some(root) = document.root.as_ref() else {
+        if document.status == "complete" || !document.entries.0.is_empty() {
+            return Err(
+                "selected-root artifact has no root identity despite complete/entry data"
+                    .to_owned(),
+            );
+        }
+        return Ok(None);
+    };
+    let _root_identity_hints = (root.device_or_volume_serial, root.inode_or_file_index);
+    if root.object_type != "directory"
+        || root.display_path.is_empty()
+        || root.display_path.len() > 128 * 1024
+    {
+        return Err("selected-root identity is malformed".to_owned());
+    }
+    let path_hex = match platform {
+        "linux" if root.path_utf16le_hex.is_none() => root.path_bytes_hex.as_deref(),
+        "windows" if root.path_bytes_hex.is_none() => root.path_utf16le_hex.as_deref(),
+        _ => None,
+    }
+    .ok_or_else(|| "selected-root identity encoding does not match its platform".to_owned())?;
+    validate_native_hex(path_hex, platform, path_limit, true, true)?;
+    let mut ordinals = HashSet::with_capacity(document.entries.0.len());
+    let mut aggregate_names = 0usize;
+    for entry in &document.entries.0 {
+        let _entry_identity_hints = (entry.device_or_volume_serial, entry.inode_or_file_index);
+        if entry.ordinal >= MAX_ROOT_QUERY_ENTRIES
+            || entry.evidence.entry_ordinal != entry.ordinal
+            || entry.evidence.source != "selected_root_directory_entry"
+            || entry.display_name.len() > 128 * 1024
+            || !ordinals.insert(entry.ordinal)
+            || !valid_root_object_type(platform, &entry.object_type)
+        {
+            return Err("selected-root entry identity or metadata is malformed".to_owned());
+        }
+        let name_hex = native_name_hex(entry, platform)?;
+        validate_native_hex(name_hex, platform, name_limit, false, false)?;
+        let encoded_bytes = decode_hex(name_hex)?.len();
+        aggregate_names = aggregate_names
+            .checked_add(encoded_bytes)
+            .ok_or_else(|| "selected-root aggregate name length overflow".to_owned())?;
+        if aggregate_names > MAX_ROOT_QUERY_AGGREGATE_NAME_BYTES {
+            return Err("selected-root aggregate names exceed the supported limit".to_owned());
+        }
+        match (
+            entry.content_sha256.as_deref(),
+            entry.content_hash_status.as_deref(),
+        ) {
+            (None, None) if artifact_version == 1 => {}
+            (Some(hash), Some("observed"))
+                if artifact_version == 2
+                    && is_root_regular(&entry.object_type)
+                    && valid_sha256_hex(hash) => {}
+            (None, Some("unavailable"))
+                if artifact_version == 2
+                    && is_root_regular(&entry.object_type)
+                    && document.status == "partial" => {}
+            (None, Some("not_applicable"))
+                if artifact_version == 2 && !is_root_regular(&entry.object_type) => {}
+            _ => return Err("selected-root entry content-hash metadata is malformed".to_owned()),
+        }
+    }
+    Ok(Some(path_hex))
+}
+
+fn native_name_hex<'a>(entry: &'a RootSnapshotEntry, platform: &str) -> Result<&'a str, String> {
+    match platform {
+        "linux" if entry.name_utf16le_hex.is_none() => entry
+            .name_bytes_hex
+            .as_deref()
+            .ok_or_else(|| "selected-root entry has no Linux name encoding".to_owned()),
+        "windows" if entry.name_bytes_hex.is_none() => entry
+            .name_utf16le_hex
+            .as_deref()
+            .ok_or_else(|| "selected-root entry has no Windows name encoding".to_owned()),
+        _ => Err("selected-root entry encoding does not match its platform".to_owned()),
+    }
+}
+
+fn validate_native_hex(
+    value: &str,
+    platform: &str,
+    max_units: usize,
+    path: bool,
+    allow_slash: bool,
+) -> Result<(), String> {
+    let decoded = decode_hex(value)?;
+    let unit_bytes = if platform == "windows" { 2 } else { 1 };
+    if decoded.is_empty()
+        || decoded.len() / unit_bytes > max_units
+        || decoded.len() % unit_bytes != 0
+        || decoded
+            .chunks_exact(unit_bytes)
+            .any(|unit| unit.iter().all(|byte| *byte == 0))
+        || (!path && !allow_slash && platform == "linux" && decoded.contains(&b'/'))
+        || (!path
+            && !allow_slash
+            && platform == "windows"
+            && decoded
+                .chunks_exact(2)
+                .any(|unit| unit == [0x2f, 0] || unit == [0x5c, 0]))
+        || (!path && !allow_slash && platform == "linux" && (value == "2e" || value == "2e2e"))
+        || (!path
+            && !allow_slash
+            && platform == "windows"
+            && (value == "2e00" || value == "2e002e00"))
+    {
+        return Err("selected-root exact path/name encoding is malformed or over limit".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_inventory_filters(query: &InventoryQuery, platform: &str) -> Result<(), String> {
+    let (path_limit, name_limit) = match platform {
+        "linux" => (4_095, 32_767),
+        "windows" => (32_766, 32_767),
+        _ => return Err("selected-root query platform is unsupported".to_owned()),
+    };
+    if let Some(value) = &query.filters.root_path_hex {
+        validate_native_hex(value, platform, path_limit, true, true)?;
+    }
+    if let Some(value) = &query.filters.entry_name_hex {
+        validate_native_hex(value, platform, name_limit, false, false)?;
+    }
+    Ok(())
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
+    if value.is_empty()
+        || value.len() % 2 != 0
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("selected-root encoding must be lowercase even-length hexadecimal".to_owned());
+    }
+    let mut result = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let high = (pair[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| "invalid hexadecimal encoding".to_owned())?;
+        let low = (pair[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| "invalid hexadecimal encoding".to_owned())?;
+        result.push(((high << 4) | low) as u8);
+    }
+    Ok(result)
+}
+
+fn valid_root_object_type(platform: &str, value: &str) -> bool {
+    match platform {
+        "linux" => matches!(
+            value,
+            "regular_file"
+                | "directory"
+                | "symbolic_link"
+                | "fifo"
+                | "socket"
+                | "character_device"
+                | "block_device"
+                | "unknown"
+        ),
+        "windows" => matches!(
+            value,
+            "directory" | "reparse_point" | "regular_or_other_file"
+        ),
+        _ => false,
+    }
+}
+
+fn is_root_regular(value: &str) -> bool {
+    matches!(value, "regular_file" | "regular_or_other_file")
+}
+
+fn valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
 
 #[derive(Hash, Eq, PartialEq)]
 enum EvidenceKey {
