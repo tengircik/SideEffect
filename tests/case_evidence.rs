@@ -720,6 +720,55 @@ fn resolves_synthetic_selected_root_entries_above_general_query_limit() {
 }
 
 #[test]
+fn checks_each_selected_root_locator_digest_after_reusing_the_parsed_artifact() {
+    let platform = if cfg!(windows) { "windows" } else { "linux" };
+    let root = root_fixture(platform);
+    let root_ref = artifact_ref(
+        ArtifactKind::SelectedRoot,
+        "root-snapshot.json",
+        "sideeffect.selected_root_inventory",
+        1,
+        &root,
+    );
+    let source_row = source(platform, SourceRole::SelectedRoot, vec![root_ref.clone()]);
+    let (manifest, manifest_bytes) = manifest(platform, LINUX_ID, source_row);
+    let good_locator = locator_value(
+        "selected_root_entry",
+        json!({"entry_ordinal":0}),
+        LINUX_ID,
+        &manifest_bytes,
+        &root_ref,
+    );
+    let mut bad_locator = good_locator.clone();
+    bad_locator["artifact_sha256"] = json!("f".repeat(64));
+    let mut case_value =
+        serde_json::to_value(make_case(LINUX_ID, platform, &manifest_bytes, good_locator)).unwrap();
+    case_value["entries"][0]["evidence"]
+        .as_array_mut()
+        .unwrap()
+        .push(bad_locator);
+    let case = InvestigationCase::from_json(&serde_json::to_vec(&case_value).unwrap()).unwrap();
+    let artifacts = [VerifiedArtifactView {
+        kind: ArtifactKind::SelectedRoot,
+        path: "root-snapshot.json",
+        bytes: &root,
+    }];
+    let result = resolve_case(
+        &case,
+        &[VerifiedSessionView {
+            manifest: &manifest,
+            manifest_bytes: &manifest_bytes,
+            artifacts: &artifacts,
+        }],
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .contains("artifact digest does not match")
+    );
+}
+
+#[test]
 fn rejects_oversized_case_and_malformed_or_oversized_trace_artifacts() {
     assert!(
         InvestigationCase::from_json(&vec![b' '; sideeffect::case::MAX_CASE_BYTES + 1]).is_err()

@@ -338,7 +338,7 @@ pub fn query_selected_root_artifact(
     input: SelectedRootQueryInput<'_>,
     query: &InventoryQuery,
 ) -> Result<SelectedRootQuerySource, String> {
-    query_selected_root_artifact_inner(input, query, None)
+    query_selected_root_artifact_inner(input, query, None, query.limit as usize, true)
 }
 
 /// Validate the complete selected-root snapshot and retain only the requested entry.
@@ -350,22 +350,57 @@ pub fn query_selected_root_entry_artifact(
     input: SelectedRootQueryInput<'_>,
     entry_ordinal: usize,
 ) -> Result<SelectedRootQuerySource, String> {
-    if entry_ordinal >= MAX_ROOT_QUERY_ENTRIES {
-        return Err("selected-root entry ordinal is outside the supported range".to_owned());
+    query_selected_root_entries_artifact(input, &[entry_ordinal])
+}
+
+/// Validate one selected-root snapshot and retain only the requested bounded ordinal set.
+///
+/// The snapshot is fully validated once, including unrequested entries. The returned result
+/// contains at most one row per distinct requested ordinal.
+pub fn query_selected_root_entries_artifact(
+    input: SelectedRootQueryInput<'_>,
+    entry_ordinals: &[usize],
+) -> Result<SelectedRootQuerySource, String> {
+    query_selected_root_entries_artifact_inner(input, entry_ordinals, true)
+}
+
+/// Case resolution calls this only after `verify_session_view` has checked the exact artifact
+/// length and SHA-256 against the manifest.
+pub(crate) fn query_verified_selected_root_entries_artifact(
+    input: SelectedRootQueryInput<'_>,
+    entry_ordinals: &[usize],
+) -> Result<SelectedRootQuerySource, String> {
+    query_selected_root_entries_artifact_inner(input, entry_ordinals, false)
+}
+
+fn query_selected_root_entries_artifact_inner(
+    input: SelectedRootQueryInput<'_>,
+    entry_ordinals: &[usize],
+    verify_bytes: bool,
+) -> Result<SelectedRootQuerySource, String> {
+    if entry_ordinals.len() > MAX_ROOT_QUERY_ENTRIES
+        || entry_ordinals
+            .iter()
+            .any(|ordinal| *ordinal >= MAX_ROOT_QUERY_ENTRIES)
+    {
+        return Err("selected-root entry ordinal set exceeds the supported range".to_owned());
     }
+    let ordinals: HashSet<usize> = entry_ordinals.iter().copied().collect();
     let query = InventoryQuery {
         schema: INVENTORY_QUERY_SCHEMA.to_owned(),
         schema_version: INVENTORY_QUERY_SCHEMA_VERSION,
         filters: InventoryQueryFilters::default(),
         limit: 1,
     };
-    query_selected_root_artifact_inner(input, &query, Some(entry_ordinal))
+    query_selected_root_artifact_inner(input, &query, Some(&ordinals), ordinals.len(), verify_bytes)
 }
 
 fn query_selected_root_artifact_inner(
     input: SelectedRootQueryInput<'_>,
     query: &InventoryQuery,
-    exact_ordinal: Option<usize>,
+    exact_ordinals: Option<&HashSet<usize>>,
+    result_limit: usize,
+    verify_bytes: bool,
 ) -> Result<SelectedRootQuerySource, String> {
     let SelectedRootQueryInput {
         platform,
@@ -414,7 +449,7 @@ fn query_selected_root_artifact_inner(
         || artifact.schema_version != expected_version
         || bytes.len() as u64 != artifact.byte_length
         || bytes.len() > crate::audit_session::MAX_SESSION_ARTIFACT_BYTES as usize
-        || crate::fingerprint::sha256_hex(bytes) != artifact.sha256
+        || (verify_bytes && crate::fingerprint::sha256_hex(bytes) != artifact.sha256)
     {
         return Err(
             "selected-root artifact contract or verified bytes do not match the session manifest"
@@ -470,14 +505,14 @@ fn query_selected_root_artifact_inner(
             return Err("selected-root artifact has entries but no root identity".to_owned());
         }
         let name_hex = native_name_hex(&entry, platform)?;
-        if exact_ordinal.is_none_or(|ordinal| ordinal == entry.ordinal)
+        if exact_ordinals.is_none_or(|ordinals| ordinals.contains(&entry.ordinal))
             && query
                 .filters
                 .entry_name_hex
                 .as_deref()
                 .is_none_or(|filter| filter == name_hex)
         {
-            if entries.len() >= query.limit as usize {
+            if entries.len() >= result_limit {
                 return Err(format!(
                     "inventory query matched more than its {}-row limit; narrow the filters",
                     query.limit

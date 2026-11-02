@@ -186,11 +186,28 @@ pub fn resolve_case(
         }
     }
 
+    let mut selected_root_ordinals = HashMap::<String, HashSet<usize>>::new();
+    for locator in case.entries.iter().flat_map(|entry| entry.evidence.iter()) {
+        if let CaseEvidenceLocator::SelectedRootEntry {
+            session_id,
+            entry_ordinal,
+            ..
+        } = locator
+        {
+            let ordinal = usize::try_from(*entry_ordinal).map_err(|_| {
+                "selected-root entry ordinal is outside the supported range".to_owned()
+            })?;
+            selected_root_ordinals
+                .entry(session_id.clone())
+                .or_default()
+                .insert(ordinal);
+        }
+    }
+
     let mut facts = Vec::new();
     let mut fact_indexes = HashMap::<CaseEvidenceLocator, usize>::new();
     let mut source_reviews = HashMap::<(String, SourceRole), ArtifactReview>::new();
-    let mut parsed_artifacts =
-        HashMap::<(String, ArtifactKind, Option<u64>), ParsedArtifact>::new();
+    let mut parsed_artifacts = HashMap::<(String, ArtifactKind), ParsedArtifact>::new();
     let mut entries = Vec::with_capacity(case.entries.len());
     let mut resolved_fact_bytes = 0usize;
 
@@ -208,14 +225,19 @@ pub fn resolve_case(
             let source = unique_source(session.manifest, role)?;
             let artifact_ref = unique_artifact_ref(source, artifact_kind)?;
             let artifact = unique_verified_artifact(session, artifact_kind, &artifact_ref.path)?;
-            verify_artifact_bytes(artifact_ref, artifact)?;
-            let cache_key = (
-                session.manifest.session_id.clone(),
-                artifact_kind,
-                locator_cache_ordinal(locator),
-            );
+            if locator_artifact_sha256(locator) != artifact_ref.sha256 {
+                return Err(
+                    "evidence locator artifact digest does not match the manifest".to_owned(),
+                );
+            }
+            let cache_key = (session.manifest.session_id.clone(), artifact_kind);
             if !parsed_artifacts.contains_key(&cache_key) {
-                let parsed = parse_artifact(locator, source, artifact_ref, artifact)?;
+                let root_ordinals = selected_root_ordinals
+                    .get(&session.manifest.session_id)
+                    .map(|ordinals| ordinals.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let parsed =
+                    parse_artifact(locator, source, artifact_ref, artifact, &root_ordinals)?;
                 parsed_artifacts.insert(cache_key.clone(), parsed);
             }
             let parsed = parsed_artifacts
@@ -356,13 +378,6 @@ fn platform_from_manifest(platform: &str) -> Result<CasePlatform, String> {
     }
 }
 
-fn locator_cache_ordinal(locator: &CaseEvidenceLocator) -> Option<u64> {
-    match locator {
-        CaseEvidenceLocator::SelectedRootEntry { entry_ordinal, .. } => Some(*entry_ordinal),
-        _ => None,
-    }
-}
-
 fn locator_session_id(locator: &CaseEvidenceLocator) -> &str {
     match locator {
         CaseEvidenceLocator::LinuxTraceRecord { session_id, .. }
@@ -441,6 +456,7 @@ fn parse_artifact(
     source: &AuditSessionSource,
     artifact_ref: &audit_session::SessionArtifactRef,
     artifact: &VerifiedArtifactView<'_>,
+    selected_root_ordinals: &[usize],
 ) -> Result<ParsedArtifact, String> {
     if locator_artifact_sha256(locator) != artifact_ref.sha256 {
         return Err("evidence locator artifact digest does not match the manifest".to_owned());
@@ -486,17 +502,14 @@ fn parse_artifact(
             );
             Ok(ParsedArtifact::WindowsEtw(capture))
         }
-        CaseEvidenceLocator::SelectedRootEntry { entry_ordinal, .. } => {
+        CaseEvidenceLocator::SelectedRootEntry { .. } => {
             if artifact_ref.path != "root-snapshot.json"
                 || artifact_ref.schema != "sideeffect.selected_root_inventory"
                 || !matches!(artifact_ref.schema_version, 1 | 2)
             {
                 return Err("selected-root locator source contract mismatch".to_owned());
             }
-            let ordinal = usize::try_from(*entry_ordinal).map_err(|_| {
-                "selected-root entry ordinal is outside the supported range".to_owned()
-            })?;
-            let result = crate::query::query_selected_root_entry_artifact(
+            let result = crate::query::query_verified_selected_root_entries_artifact(
                 crate::query::SelectedRootQueryInput {
                     platform: &source.platform,
                     source_status: source.status,
@@ -508,7 +521,7 @@ fn parse_artifact(
                     artifact: Some(artifact_ref),
                     bytes: Some(artifact.bytes),
                 },
-                ordinal,
+                selected_root_ordinals,
             )?;
             Ok(ParsedArtifact::SelectedRoot(result))
         }
