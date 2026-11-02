@@ -511,6 +511,19 @@ impl ModelRegistry {
         self.resolve(id, task)
     }
 
+    /// Resolve the registered identity for a preview or analysis request
+    /// without rereading a potentially multi-gigabyte model. Runtime callers
+    /// must still verify the staged bytes against this recorded digest before
+    /// executing the model. `selected` remains available for diagnostics that
+    /// need to verify the source file immediately.
+    pub fn selected_identity(&self, task: ModelTask) -> Result<ResolvedModel, String> {
+        let id = self
+            .selected_by_task
+            .get(&task)
+            .ok_or_else(|| "no model is selected for this task".to_owned())?;
+        self.resolve_identity(id, task)
+    }
+
     pub fn set_runtime(
         &mut self,
         task: ModelTask,
@@ -581,6 +594,52 @@ impl ModelRegistry {
             path,
             size_bytes,
             sha256,
+            source: ModelSource::UserProvided,
+            license_id: model.license_id.clone(),
+            evaluation: EvaluationStatus::NotAssessed,
+            recommended: false,
+        })
+    }
+
+    fn resolve_identity(&self, id: &str, task: ModelTask) -> Result<ResolvedModel, String> {
+        if let Some(catalog) = catalog_model(id) {
+            if catalog.task != task {
+                return Err("catalog model is not registered for this task".to_owned());
+            }
+            let path = model_store_directory()?
+                .join("models")
+                .join(catalog.filename);
+            return Ok(ResolvedModel {
+                id: catalog.id.to_owned(),
+                name: catalog.name.to_owned(),
+                path,
+                size_bytes: catalog.size_bytes,
+                sha256: catalog.sha256.to_owned(),
+                source: ModelSource::Catalog {
+                    repository: catalog.repository.to_owned(),
+                    revision: catalog.revision.to_owned(),
+                    filename: catalog.filename.to_owned(),
+                },
+                license_id: Some(catalog.license_id.to_owned()),
+                evaluation: catalog.evaluation,
+                recommended: false,
+            });
+        }
+
+        let model = self
+            .custom_models
+            .iter()
+            .find(|model| model.id == id)
+            .ok_or_else(|| "model ID is not known".to_owned())?;
+        if !model.tasks.contains(&task) {
+            return Err("custom model is not registered for this task".to_owned());
+        }
+        Ok(ResolvedModel {
+            id: model.id.clone(),
+            name: model.name.clone(),
+            path: model.path.clone(),
+            size_bytes: model.size_bytes,
+            sha256: model.sha256.clone(),
             source: ModelSource::UserProvided,
             license_id: model.license_id.clone(),
             evaluation: EvaluationStatus::NotAssessed,
@@ -1583,6 +1642,74 @@ fn publish_registry(staged: &Path, destination: &Path) -> std::io::Result<()> {
         Err(std::io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod selected_model_identity_tests {
+    use super::{ModelRegistry, ModelTask};
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDirectory(PathBuf);
+
+    impl TempDirectory {
+        fn new() -> Self {
+            loop {
+                let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "sideeffect-model-identity-{}-{id}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("could not create temporary model directory: {error}"),
+                }
+            }
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn selected_identity_uses_recorded_digest_but_verified_selection_detects_changes() {
+        let directory = TempDirectory::new();
+        let model_path = directory.0.join("fixture.gguf");
+        let original = b"GGUF\x03\0\0\0fixture-original";
+        let changed = b"GGUF\x03\0\0\0fixture-modified";
+        assert_eq!(original.len(), changed.len());
+        fs::write(&model_path, original).unwrap();
+
+        let mut registry = ModelRegistry::default();
+        let id = registry
+            .register_custom(
+                "Synthetic fixture",
+                &model_path,
+                None,
+                vec![ModelTask::Explanation],
+            )
+            .unwrap();
+        registry.select(ModelTask::Explanation, &id).unwrap();
+        fs::write(&model_path, changed).unwrap();
+
+        let identity = registry.selected_identity(ModelTask::Explanation).unwrap();
+        assert_eq!(identity.sha256, format!("{:x}", Sha256::digest(original)));
+        assert_eq!(identity.size_bytes, original.len() as u64);
+        assert!(
+            registry
+                .selected(ModelTask::Explanation)
+                .unwrap_err()
+                .contains("changed since it was added")
+        );
     }
 }
 

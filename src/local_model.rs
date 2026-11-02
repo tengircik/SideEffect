@@ -1157,4 +1157,19 @@ mod tests {
             0o600
         );
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_model_copy_rejects_changed_bytes_and_removes_partial_stage() {
+        use crate::local_model_runtime::{TempDirectory, create_private_temp_dir};
+
+        let directory = create_private_temp_dir().unwrap();
+        let _guard = TempDirectory(directory.clone());
+        let source = directory.join("source.gguf");
+        let staged = directory.join("staged.gguf");
+        std::fs::write(&source, b"changed model bytes").unwrap();
+
+        assert!(copy_verified_model(&source, &staged, &"0".repeat(64), 1024).is_err());
+        assert!(!staged.exists());
+    }
 }

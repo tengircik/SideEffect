@@ -63,7 +63,7 @@ sideeffect.exe model list
 sideeffect.exe model select explanation MODEL_ID
 ```
 
-Use the ID printed by `model add` in place of `MODEL_ID`. SideEffect checks the file's bounded GGUF header, size, and hash, then checks its hash again before use. These checks do not establish model quality or runtime compatibility. Review the model's source and license separately.
+Use the ID printed by `model add` in place of `MODEL_ID`. SideEffect checks the file's bounded GGUF header, size, and hash. Previews use this registered identity without rereading model weights; before inference, SideEffect stages the selected file and verifies the staged bytes against the registered size and hash. If model bytes change after registration, inference fails this check without making large previews reread the weights. These checks do not establish model quality or runtime compatibility. Review the model's source and license separately.
 
 ## Preview, then explicitly run inference
 

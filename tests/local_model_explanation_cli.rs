@@ -297,6 +297,25 @@ fn preview_digest_binds_backend_choice_and_partial_input_is_explicit() {
 }
 
 #[test]
+fn preview_uses_the_registered_model_identity_without_reading_weights() {
+    let model = SelectedTestModel::new("explanation");
+    let mut changed_model = fs::read(model.model_path()).unwrap();
+    changed_model[8] ^= 1;
+    fs::write(model.model_path(), changed_model).unwrap();
+    let trace =
+        TempTrace::with_contents(b"55 execve(\"/usr/bin/example\", [\"example\"], 0x0) = 0\n");
+
+    let output = run_preview(&model, "cpu", &trace);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let preview: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(preview["model_sha256"], model.sha256());
+}
+
+#[test]
 fn rejects_unknown_backend_without_attempting_model_execution() {
     let model = SelectedTestModel::new("explanation");
     let trace =

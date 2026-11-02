@@ -95,6 +95,11 @@ impl SelectedTestModel {
     }
 
     #[allow(dead_code)]
+    pub fn model_path(&self) -> PathBuf {
+        self.data_root.join("synthetic-test-model.gguf")
+    }
+
+    #[allow(dead_code)]
     pub fn data_root(&self) -> &std::path::Path {
         &self.data_root
     }

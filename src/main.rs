@@ -4641,7 +4641,7 @@ fn model_preview_file(question: &OsString, path: &OsString) -> Result<ExitCode, 
         .to_str()
         .ok_or("local model question must be valid UTF-8")?;
     let bytes = read_bounded(path)?;
-    let model = selected_model(ModelTask::EvidenceSelection)?;
+    let model = selected_model_identity(ModelTask::EvidenceSelection)?;
     let preview = sideeffect::local_model::preview_trace_bytes_for_model(&bytes, question, &model)?;
     let partial = preview.evidence_summary["parse_status"] == "partial";
     write_json(&preview, "local model request preview")?;
@@ -4657,7 +4657,7 @@ fn model_query_preview_file(question: &OsString, path: &OsString) -> Result<Exit
         .to_str()
         .ok_or("local query question must be valid UTF-8")?;
     let bytes = read_bounded(path)?;
-    let model = selected_model(ModelTask::QueryPlan)?;
+    let model = selected_model_identity(ModelTask::QueryPlan)?;
     let preview =
         sideeffect::local_query_plan::preview_query_plan_bytes_for_model(&bytes, question, &model)?;
     let partial = preview.evidence_summary["parse_status"] == "partial";
@@ -4684,7 +4684,7 @@ fn model_explanation_preview_file(
         _ => return Err("model explanation backend must be auto, cpu, or cuda".to_owned()),
     };
     let bytes = read_bounded(path)?;
-    let model = selected_model(ModelTask::Explanation)?;
+    let model = selected_model_identity(ModelTask::Explanation)?;
     let preview = sideeffect::local_model_explanation::preview_model_explanation_bytes_for_model(
         &bytes, question, backend, &model,
     )?;
@@ -4710,7 +4710,7 @@ fn model_windows_runtime_explanation_preview_file(
         .ok_or("local model question must be valid UTF-8")?;
     let backend = parse_explanation_backend(backend)?;
     let bytes = read_bounded(path)?;
-    let model = selected_model(ModelTask::Explanation)?;
+    let model = selected_model_identity(ModelTask::Explanation)?;
     let preview =
         sideeffect::local_model_explanation::preview_windows_runtime_explanation_bytes_for_model(
             &bytes, question, backend, &model,
@@ -4755,7 +4755,7 @@ fn model_query_file(
         return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
     }
     let bytes = read_bounded(trace)?;
-    let model = selected_model(ModelTask::QueryPlan)?;
+    let model = selected_model_identity(ModelTask::QueryPlan)?;
     let runtime = resolve_runtime_path(ModelTask::QueryPlan, runtime)?;
     let analysis = sideeffect::local_query_plan::analyze_query_plan_bytes_for_model(
         &bytes, question, &runtime, &model, digest,
@@ -4796,7 +4796,7 @@ fn model_explanation_file(
         return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
     }
     let bytes = read_bounded(trace)?;
-    let model = selected_model(ModelTask::Explanation)?;
+    let model = selected_model_identity(ModelTask::Explanation)?;
     let runtime = resolve_runtime_path(ModelTask::Explanation, runtime)?;
     let analysis =
         sideeffect::local_model_explanation_runtime::analyze_model_explanation_bytes_for_model(
@@ -4834,7 +4834,7 @@ fn model_windows_runtime_explanation_file(
         return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
     }
     let bytes = read_bounded(capture_path)?;
-    let model = selected_model(ModelTask::Explanation)?;
+    let model = selected_model_identity(ModelTask::Explanation)?;
     let runtime = resolve_runtime_path(ModelTask::Explanation, runtime)?;
     let analysis = sideeffect::local_model_explanation_runtime::analyze_windows_runtime_explanation_bytes_for_model(
         &bytes, question, backend, &runtime, &model, digest,
@@ -4869,7 +4869,7 @@ fn model_analyze_file(
         return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
     }
     let bytes = read_bounded(trace)?;
-    let model = selected_model(ModelTask::EvidenceSelection)?;
+    let model = selected_model_identity(ModelTask::EvidenceSelection)?;
     let runtime = resolve_runtime_path(ModelTask::EvidenceSelection, runtime)?;
     let analysis = sideeffect::local_model::analyze_trace_bytes_for_model(
         &bytes, question, &runtime, &model, digest,
@@ -4891,6 +4891,16 @@ fn selected_model(task: ModelTask) -> Result<ResolvedModel, String> {
         ));
     }
     sideeffect::model_manager::load_registry()?.selected(task)
+}
+
+fn selected_model_identity(task: ModelTask) -> Result<ResolvedModel, String> {
+    if !model_task_supported_here(task) {
+        return Err(format!(
+            "local model task '{}' is not supported on this platform",
+            model_task_label(task)
+        ));
+    }
+    sideeffect::model_manager::load_registry()?.selected_identity(task)
 }
 
 fn resolve_runtime_path(task: ModelTask, explicit: Option<&OsString>) -> Result<PathBuf, String> {
