@@ -33,6 +33,60 @@ install -m 0755 "$install_dir/sideeffect" "$HOME/.local/bin/sideeffect"
 
 The commands above extract the archive to a new versioned directory under `~/.local/opt/SideEffect/` and copy its executable to `~/.local/bin/sideeffect` only if that destination does not already exist. Add `~/.local/bin` to the current shell with `export PATH="$HOME/.local/bin:$PATH"`, then run `sideeffect version`. To make it available in future login shells, add that `export` line to the startup file used by your shell (for example, `~/.profile` for a typical login shell) and open a new shell. Do not overwrite an existing CLI without checking its version and location first.
 
+### Update, roll back, or remove a Linux release install
+
+For an update, follow the download, checksum, attestation, and extraction steps above for the new release. Keep each extracted version directory under `~/.local/opt/SideEffect/`; do not extract over an existing version. Check the new executable directly before switching to it:
+
+```sh
+"$install_dir/sideeffect" version
+```
+
+To try or use the new version in the current shell only, put its exact version directory first in that shell's PATH:
+
+```sh
+export PATH="$install_dir:$PATH"
+hash -r
+command -v sideeffect
+sideeffect version
+```
+
+This affects the current shell and programs it starts. It does not change the PATH saved for future login shells. To make the update persistent, add one SideEffect-specific line to the login startup file you use, with the new version directory before `$PATH`:
+
+```sh
+export PATH="$HOME/.local/opt/SideEffect/sideeffect-v0.2.0-linux-x86_64:$PATH"
+```
+
+Replace the example directory with the exact versioned directory you installed. On later updates, edit only this SideEffect-specific line to name the new version; keep the other startup-file lines and the `$PATH` suffix. Do not add a second SideEffect line. Open a new shell and check `command -v sideeffect` and `sideeffect version`. Keep the older version directory so you can roll back: change that same startup line to the older directory, or put the older directory first in the current shell with `export PATH="$old_install_dir:$PATH"` followed by `hash -r`.
+
+Set `old_install_dir` to the exact existing version directory you are keeping, for example:
+
+```sh
+old_install_dir="$HOME/.local/opt/SideEffect/sideeffect-v0.1.0-linux-x86_64"
+```
+
+The original `~/.local/bin/sideeffect` copy remains available if it was created by the initial install. Check `command -v sideeffect` before removing or changing anything; do not replace or remove a CLI there unless you have confirmed it is the SideEffect release copy. To uninstall one release, set `install_dir` to the full path of the version being removed, then verify that the resolved directory is an immediate, non-symlink SideEffect release directory before deleting it:
+
+```sh
+install_root="$HOME/.local/opt/SideEffect"
+printf 'Selected install: %s\n' "$install_dir"
+test ! -L "$install_root" || { echo "Refusing to use a symlink install root" >&2; exit 1; }
+test ! -L "$install_dir" || { echo "Refusing to remove a symlink" >&2; exit 1; }
+resolved_root="$(realpath -e -- "$install_root")" || exit 1
+resolved_install="$(realpath -e -- "$install_dir")" || exit 1
+test "$(dirname -- "$resolved_install")" = "$resolved_root" || {
+  echo "Refusing to remove a directory outside the SideEffect install root" >&2
+  exit 1
+}
+case "$(basename -- "$resolved_install")" in
+  sideeffect-v*-linux-x86_64) ;;
+  *) echo "Refusing to remove an unexpected directory name" >&2; exit 1 ;;
+esac
+test -d "$resolved_install" || exit 1
+rm -r -- "$resolved_install"
+```
+
+This removes one exact version directory; other version directories remain. Remove the SideEffect-specific PATH line from your login startup file if it points to a version you removed. Remove `~/.local/bin/sideeffect` only if you confirmed it is the copy installed by this guide; use `rm -- "$HOME/.local/bin/sideeffect"` for that exact file. Do not remove the shared `~/.local/bin` or `~/.local/opt/SideEffect` parent directories.
+
 Windows x64 PowerShell:
 
 ```powershell
@@ -74,6 +128,76 @@ if (-not ($pathEntries | Where-Object { $_.TrimEnd('\') -ieq $installDir.TrimEnd
 ```
 
 Close and reopen PowerShell and any terminal or agent that should use the updated PATH. Because the directory is versioned, update the PATH entry when you install a newer version. You can always run `sideeffect.exe` directly from the versioned directory.
+
+### Update, roll back, or remove a Windows release install
+
+For an update, repeat the download, checksum, attestation, and extraction steps above. Each release goes into its own versioned directory under `%LOCALAPPDATA%\Programs\SideEffect`; do not extract over an existing version. Check the new executable directly first:
+
+```powershell
+& (Join-Path $installDir "sideeffect.exe") version
+```
+
+To switch versions in this PowerShell window only, prepend the new directory to this process's PATH and verify what runs:
+
+```powershell
+$env:Path = "$installDir;$env:Path"
+Get-Command sideeffect.exe | Select-Object -ExpandProperty Source
+sideeffect.exe version
+```
+
+This change applies to this PowerShell process and child processes; it does not edit the saved user PATH. To persist the update, set `$oldInstallDir` to the exact previous SideEffect version directory, then run the following. It removes only exact matches for the previous and new SideEffect directories (ignoring case and a trailing backslash), puts the new directory first, and preserves all other user PATH entries and their order:
+
+```powershell
+$oldInstallDir = Join-Path $env:LOCALAPPDATA "Programs\SideEffect\sideeffect-v0.1.0-windows-x86_64"
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+$pathEntries = @($userPath -split ';' | Where-Object { $_ })
+$keptEntries = @($pathEntries | Where-Object {
+    $_.Trim().TrimEnd('\') -ine $oldInstallDir.TrimEnd('\') -and
+    $_.Trim().TrimEnd('\') -ine $installDir.TrimEnd('\')
+})
+[Environment]::SetEnvironmentVariable("Path", (@($installDir) + $keptEntries) -join ';', "User")
+```
+
+Replace the example `$oldInstallDir` with the exact older directory that is in your user PATH. The directory is retained for rollback. To roll back persistently, use the older directory as `$installDir` and the currently selected directory as `$oldInstallDir` in the same PATH update; alternatively, prepend the older directory to `$env:Path` for this PowerShell window only. Close and reopen PowerShell and any terminal or agent after a persistent PATH change, then confirm the resolved executable path and `sideeffect.exe version`.
+
+To uninstall one version, remove only its exact directory from the saved user PATH, then remove that version's files. Set `$removeInstallDir` to the exact version directory being uninstalled:
+
+```powershell
+$removeInstallDir = Join-Path $env:LOCALAPPDATA "Programs\SideEffect\sideeffect-v0.1.0-windows-x86_64"
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+$pathEntries = @($userPath -split ';' | Where-Object { $_ })
+$keptEntries = @($pathEntries | Where-Object {
+    $_.Trim().TrimEnd('\') -ine $removeInstallDir.TrimEnd('\')
+})
+[Environment]::SetEnvironmentVariable("Path", ($keptEntries -join ';'), "User")
+```
+
+Replace the example directory with the exact version being removed. Resolve and inspect it, confirm it is an immediate, non-reparse child of the SideEffect install root with the expected versioned archive name, and then remove only that literal directory:
+
+```powershell
+$installRoot = Join-Path $env:LOCALAPPDATA "Programs\SideEffect"
+$rootItem = Get-Item -LiteralPath $installRoot
+if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "Refusing to use a reparse point as the SideEffect install root"
+}
+$resolvedRoot = [System.IO.Path]::GetFullPath($installRoot).TrimEnd('\')
+$resolvedTarget = [System.IO.Path]::GetFullPath($removeInstallDir).TrimEnd('\')
+if ([System.IO.Path]::GetDirectoryName($resolvedTarget) -ine $resolvedRoot) {
+    throw "Refusing to remove a path outside the SideEffect install root"
+}
+if ([System.IO.Path]::GetFileName($resolvedTarget) -notmatch '^sideeffect-v[0-9].*-windows-x86_64$') {
+    throw "Refusing to remove an unexpected directory name"
+}
+$targetItem = Get-Item -LiteralPath $resolvedTarget
+if (($targetItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "Refusing to recursively remove a reparse point"
+}
+$targetItem | Select-Object FullName, Attributes
+Get-ChildItem -LiteralPath $resolvedTarget | Select-Object Name, Length
+Remove-Item -LiteralPath $resolvedTarget -Recurse
+```
+
+`-LiteralPath` prevents wildcard interpretation. Other version directories remain available for rollback. Do not remove the shared `Programs\SideEffect` parent directory while it contains versions. Open a new PowerShell window after changing the saved PATH.
 
 The Linux and Windows binary archives contain the CLI, README, installation and Agent Skill guides, project license, third-party notices, and the version-specific release notes. A separate `sideeffect-<version>-source.tar.gz` archive contains the corresponding tagged source tree. All published archives and notices appear in `SHA256SUMS`; the Linux and Windows binaries and source archive carry GitHub build-provenance attestations. Linux release archives target x86_64 GNU and are built on Ubuntu 22.04; Windows archives target x64 MSVC. The compatibility matrix below lists the exact validation boundaries.
 
@@ -491,7 +615,7 @@ sideeffect.exe query --query .\query.json `
   --session .\before-session --session .\after-session --source runtime
 ```
 
-JSON output is the default; add `--format text` for a terminal-safe summary. Version 1 allows exact `event_kind`, `operation_kind` (`syscall_attempt` or `native_observation`), typed syscall `outcome`, and source-local `process_observation_id` filters. Unsupported fields such as path, endpoint, and timestamp filters are rejected rather than approximated. The query JSON is capped at 16 KiB, matching results at 5,000 (overflow is an error, never silent truncation), filtering at two seconds, and serialized output at 8 MiB. A multi-session query accepts 2–16 sessions, caps aggregate runtime-artifact bytes at 256 MiB, aggregate matches at 5,000, a cooperative 10-second total-work budget checked between sessions, and output at 8 MiB. Results remain nested under session IDs with separate source-local evidence; `process_observation_id` is rejected across sessions. The result keeps exact evidence references and diagnostics/status for the entire input even if few or no events match. Session mode first uses the platform's verified session reader, then queries only each selected session's declared runtime artifact: Linux `run.json` must bind the verified `trace.strace` by exact schema, length and SHA-256; Windows requires the declared ETW v3 artifact and validates its capture fingerprint. Session status, runtime-source status, capture completeness and event parse/adaptation status stay separate. Missing or invalid selected sessions are errors, not empty results. Partial or unknown evidence exits `2`; an empty filtered result does not establish that activity was absent.
+JSON output is the default; add `--format text` for a terminal-safe summary. Version 1 allows exact `event_kind`, `operation_kind` (`syscall_attempt` or `native_observation`), typed syscall `outcome`, source-local `process_observation_id`, and an exact source-native `evidence` locator copied from an event result. Linux locators match the complete `raw_trace_record` tuple (`line_number`, `byte_offset`, `byte_length`). Windows locators match the complete `windows_etw_record` tuple (`record_ordinal`, `json_pointer`, `raw_payload_sha256`). These locators identify one source record; they do not filter or reinterpret path or time values. Unsupported fields such as path, endpoint, and timestamp filters are rejected rather than approximated. The query JSON is capped at 16 KiB, matching results at 5,000 (overflow is an error, never silent truncation), filtering at two seconds, and serialized output at 8 MiB. A multi-session query accepts 2–16 sessions, caps aggregate runtime-artifact bytes at 256 MiB, aggregate matches at 5,000, a cooperative 10-second total-work budget checked between sessions, and output at 8 MiB. Results remain nested under session IDs with separate source-local evidence; `process_observation_id` and `evidence` are rejected across sessions because their identifiers are capture-local. The result keeps exact evidence references and diagnostics/status for the entire input even if few or no events match. Session mode first uses the platform's verified session reader, then queries only each selected session's declared runtime artifact: Linux `run.json` must bind the verified `trace.strace` by exact schema, length and SHA-256; Windows requires the declared ETW v3 artifact and validates its capture fingerprint. Session status, runtime-source status, capture completeness and event parse/adaptation status stay separate. Missing or invalid selected sessions are errors, not empty results. Partial or unknown evidence exits `2`; an empty filtered result does not establish that activity was absent.
 
 To query selected-root snapshots from one or more verified sessions, use a separate `sideeffect.inventory_query` v1 contract with exact native path/name encodings:
 
