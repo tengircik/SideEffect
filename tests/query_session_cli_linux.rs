@@ -488,6 +488,15 @@ fn multi_session_query_rejects_duplicate_ids_and_source_local_filters() {
     assert_eq!(local_id.status.code(), Some(1));
     assert!(local_id.stdout.is_empty());
     assert!(String::from_utf8_lossy(&local_id.stderr).contains("source-local"));
+
+    let local_evidence = multi_query_with_filter(
+        &directory,
+        &["missing-one", "missing-two"],
+        br#"{"schema":"sideeffect.event_query","schema_version":1,"filters":{"evidence":{"kind":"raw_trace_record","line_number":1,"byte_offset":0,"byte_length":1}}}"#,
+    );
+    assert_eq!(local_evidence.status.code(), Some(1));
+    assert!(local_evidence.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&local_evidence.stderr).contains("source-local"));
 }
 
 #[test]

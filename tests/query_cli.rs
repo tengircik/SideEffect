@@ -106,6 +106,54 @@ fn cli_query_preserves_partial_status_and_rejects_unsupported_filter_keys() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("invalid event query JSON"));
 }
 
+#[test]
+fn cli_query_filters_exact_raw_trace_evidence_and_keeps_full_input_status() {
+    let mut files = TempFiles(Vec::new());
+    let trace = files.write("trace", b"123 1700000000.1 close(4) = 0\nmalformed row\n");
+    let broad_query = files.write(
+        "json",
+        br#"{"schema":"sideeffect.event_query","schema_version":1,"filters":{"event_kind":"close"}}"#,
+    );
+    let baseline = run(&trace, &broad_query, "json");
+    assert_eq!(baseline.status.code(), Some(2));
+    let baseline: serde_json::Value = serde_json::from_slice(&baseline.stdout).unwrap();
+    let evidence = baseline["events"][0]["evidence"].clone();
+    let exact_query = files.write(
+        "json",
+        &serde_json::to_vec(&serde_json::json!({
+            "schema": "sideeffect.event_query",
+            "schema_version": 1,
+            "filters": { "evidence": evidence }
+        }))
+        .unwrap(),
+    );
+    let exact = run(&trace, &exact_query, "json");
+    assert_eq!(exact.status.code(), Some(2));
+    let exact: serde_json::Value = serde_json::from_slice(&exact.stdout).unwrap();
+    assert_eq!(exact["matched_count"], 1);
+    assert_eq!(exact["source_state"], baseline["source_state"]);
+    assert_eq!(exact["diagnostics"], baseline["diagnostics"]);
+
+    let mut wrong_evidence = baseline["events"][0]["evidence"].clone();
+    wrong_evidence["byte_offset"] =
+        serde_json::json!(wrong_evidence["byte_offset"].as_u64().unwrap() + 1);
+    let wrong_query = files.write(
+        "json",
+        &serde_json::to_vec(&serde_json::json!({
+            "schema": "sideeffect.event_query",
+            "schema_version": 1,
+            "filters": { "evidence": wrong_evidence }
+        }))
+        .unwrap(),
+    );
+    let wrong = run(&trace, &wrong_query, "json");
+    assert_eq!(wrong.status.code(), Some(2));
+    let wrong: serde_json::Value = serde_json::from_slice(&wrong.stdout).unwrap();
+    assert_eq!(wrong["matched_count"], 0);
+    assert_eq!(wrong["source_state"], baseline["source_state"]);
+    assert_eq!(wrong["diagnostics"], baseline["diagnostics"]);
+}
+
 #[cfg(windows)]
 #[test]
 fn cli_query_uses_native_windows_runtime_fixture_and_preserves_unknown_completeness() {
@@ -200,7 +248,7 @@ fn cli_query_uses_native_windows_runtime_fixture_and_preserves_unknown_completen
         .args(["query", "--query"])
         .arg(query_path)
         .args(["--windows-runtime"])
-        .arg(capture_path)
+        .arg(&capture_path)
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
@@ -213,4 +261,29 @@ fn cli_query_uses_native_windows_runtime_fixture_and_preserves_unknown_completen
         result["events"][0]["evidence"]["kind"],
         "windows_etw_record"
     );
+
+    let evidence = result["events"][0]["evidence"].clone();
+    let exact_query = files.write(
+        "query.json",
+        &serde_json::to_vec(&serde_json::json!({
+            "schema": "sideeffect.event_query",
+            "schema_version": 1,
+            "filters": {
+                "event_kind": "process_start",
+                "evidence": evidence
+            }
+        }))
+        .unwrap(),
+    );
+    let exact = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["query", "--query"])
+        .arg(exact_query)
+        .args(["--windows-runtime"])
+        .arg(&capture_path)
+        .output()
+        .unwrap();
+    assert_eq!(exact.status.code(), Some(2));
+    let exact: serde_json::Value = serde_json::from_slice(&exact.stdout).unwrap();
+    assert_eq!(exact["matched_count"], 1);
+    assert_eq!(exact["source_state"]["completeness"], "unknown");
 }

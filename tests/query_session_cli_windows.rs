@@ -489,6 +489,32 @@ fn multi_session_query_text_lists_each_windows_session() {
 }
 
 #[test]
+fn multi_session_query_rejects_source_local_evidence_filter() {
+    let directory = TestDirectory::new();
+    let query_path = directory.0.join("evidence-query.json");
+    fs::write(
+        &query_path,
+        br#"{"schema":"sideeffect.event_query","schema_version":1,"filters":{"evidence":{"kind":"windows_etw_record","record_ordinal":1,"json_pointer":"/events/0","raw_payload_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}"#,
+    )
+    .unwrap();
+    let first = directory.0.join("missing-first");
+    let second = directory.0.join("missing-second");
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["query", "--query"])
+        .arg(query_path)
+        .args(["--session"])
+        .arg(first)
+        .args(["--session"])
+        .arg(second)
+        .args(["--source", "runtime"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("source-local"));
+}
+
+#[test]
 fn missing_windows_runtime_artifact_is_not_reported_as_an_empty_query() {
     let directory = TestDirectory::new();
     let session = directory.0.join("missing-runtime");

@@ -839,6 +839,23 @@ pub enum OutcomeFilter {
     Unknown,
 }
 
+/// One exact source-local event locator. The `kind` tag and fields mirror
+/// `event::EvidenceReference`; these values are never normalized.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EvidenceFilter {
+    RawTraceRecord {
+        line_number: u64,
+        byte_offset: u64,
+        byte_length: u64,
+    },
+    WindowsEtwRecord {
+        record_ordinal: u64,
+        json_pointer: String,
+        raw_payload_sha256: String,
+    },
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventQueryFilters {
@@ -849,6 +866,9 @@ pub struct EventQueryFilters {
     pub outcome: Option<OutcomeFilter>,
     /// Source-local ProcessObservation ID, not an OS PID or cross-capture ID.
     pub process_observation_id: Option<u64>,
+    /// Exact source-local evidence tuple; not portable across captures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<EvidenceFilter>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -903,6 +923,42 @@ impl EventQuery {
         }
         if self.filters.process_observation_id == Some(0) {
             return Err("process_observation_id must be a positive source-local ID".to_owned());
+        }
+        if let Some(evidence) = &self.filters.evidence {
+            match evidence {
+                EvidenceFilter::RawTraceRecord {
+                    line_number,
+                    byte_offset,
+                    byte_length,
+                } => {
+                    if *line_number == 0
+                        || *line_number > crate::limits::MAX_TRACE_BYTES as u64
+                        || *byte_length == 0
+                        || byte_offset
+                            .checked_add(*byte_length)
+                            .is_none_or(|end| end > crate::limits::MAX_TRACE_BYTES as u64)
+                    {
+                        return Err(
+                            "raw_trace_record evidence locator is outside the supported bounds"
+                                .to_owned(),
+                        );
+                    }
+                }
+                EvidenceFilter::WindowsEtwRecord {
+                    record_ordinal,
+                    json_pointer,
+                    raw_payload_sha256,
+                } => {
+                    if *record_ordinal == 0
+                        || *record_ordinal
+                            > crate::windows_runtime::MAX_WINDOWS_RUNTIME_EVENTS as u64
+                        || !valid_etw_event_pointer(json_pointer)
+                        || !valid_lower_sha256(raw_payload_sha256)
+                    {
+                        return Err("windows_etw_record evidence locator is malformed or outside the supported bounds".to_owned());
+                    }
+                }
+            }
         }
         if self.filters.outcome.is_some()
             && self.filters.operation_kind == Some(OperationKind::NativeObservation)
@@ -1201,7 +1257,79 @@ fn matches_event(
             return false;
         }
     }
+    if filters
+        .evidence
+        .as_ref()
+        .is_some_and(|filter| !evidence_filter_matches(filter, &event.evidence))
+    {
+        return false;
+    }
     process_evidence.is_none_or(|evidence| evidence.contains(&evidence_key(&event.evidence)))
+}
+
+fn evidence_filter_matches(
+    filter: &EvidenceFilter,
+    evidence: &crate::event::EvidenceReference,
+) -> bool {
+    use crate::event::EvidenceReference;
+    match (filter, evidence) {
+        (
+            EvidenceFilter::RawTraceRecord {
+                line_number: filter_line,
+                byte_offset: filter_offset,
+                byte_length: filter_length,
+            },
+            EvidenceReference::RawTraceRecord {
+                line_number,
+                byte_offset,
+                byte_length,
+            },
+        ) => {
+            filter_line == line_number
+                && filter_offset == byte_offset
+                && filter_length == byte_length
+        }
+        (
+            EvidenceFilter::WindowsEtwRecord {
+                record_ordinal: filter_ordinal,
+                json_pointer: filter_pointer,
+                raw_payload_sha256: filter_hash,
+            },
+            EvidenceReference::WindowsEtwRecord {
+                record_ordinal,
+                json_pointer,
+                raw_payload_sha256,
+            },
+        ) => {
+            filter_ordinal == record_ordinal
+                && filter_pointer == json_pointer
+                && filter_hash == raw_payload_sha256
+        }
+        _ => false,
+    }
+}
+
+fn valid_etw_event_pointer(pointer: &str) -> bool {
+    let Some(index) = pointer.strip_prefix("/events/") else {
+        return false;
+    };
+    if index.is_empty()
+        || index.len() > 5
+        || (index.len() > 1 && index.starts_with('0'))
+        || !index.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    index
+        .parse::<usize>()
+        .is_ok_and(|value| value < crate::windows_runtime::MAX_WINDOWS_RUNTIME_EVENTS)
+}
+
+fn valid_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Helps callers retain the source's partial/unknown exit status.
@@ -1326,6 +1454,40 @@ mod tests {
             .is_err()
         );
         assert!(EventQuery::from_json(&vec![b' '; MAX_QUERY_BYTES + 1]).is_err());
+        for invalid_locator in [
+            br#"{"kind":"raw_trace_record","line_number":0,"byte_offset":0,"byte_length":1}"#.as_slice(),
+            br#"{"kind":"raw_trace_record","line_number":1,"byte_offset":0,"byte_length":0}"#.as_slice(),
+            br#"{"kind":"windows_etw_record","record_ordinal":1,"json_pointer":"/events/00","raw_payload_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#.as_slice(),
+            br#"{"kind":"windows_etw_record","record_ordinal":1,"json_pointer":"/events/0","raw_payload_sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#.as_slice(),
+        ] {
+            let query = serde_json::json!({
+                "schema": QUERY_SCHEMA,
+                "schema_version": QUERY_SCHEMA_VERSION,
+                "filters": { "evidence": serde_json::from_slice::<serde_json::Value>(invalid_locator).unwrap() }
+            });
+            assert!(EventQuery::from_json(&serde_json::to_vec(&query).unwrap()).is_err());
+        }
+        assert!(EventQuery::from_json(
+            br#"{"schema":"sideeffect.event_query","schema_version":1,"filters":{"evidence":{"kind":"raw_trace_record","line_number":1,"line_number":2,"byte_offset":0,"byte_length":1}}}"#
+        )
+        .is_err());
+        let high_physical_line = serde_json::json!({
+            "schema": QUERY_SCHEMA,
+            "schema_version": QUERY_SCHEMA_VERSION,
+            "filters": {
+                "evidence": {
+                    "kind": "raw_trace_record",
+                    "line_number": crate::limits::MAX_TRACE_BYTES,
+                    "byte_offset": 0,
+                    "byte_length": 1
+                }
+            }
+        });
+        assert!(EventQuery::from_json(&serde_json::to_vec(&high_physical_line).unwrap()).is_ok());
+        assert!(EventQuery::from_json(
+            br#"{"schema":"sideeffect.event_query","schema_version":1,"filters":{"evidence":{"kind":"raw_trace_record","line_number":1,"byte_offset":0,"byte_length":1,"extra":true}}}"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -1340,6 +1502,7 @@ mod tests {
                     operation_kind: Some(OperationKind::SyscallAttempt),
                     outcome: Some(OutcomeFilter::Failure),
                     process_observation_id: None,
+                    evidence: None,
                 },
                 10,
             ),
