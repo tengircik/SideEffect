@@ -970,7 +970,7 @@ fn artifact_version_supported(
         || (kind == ArtifactKind::SelectedRoot
             && session_version == AUDIT_SESSION_SCHEMA_VERSION
             && observed == 2)
-        || (matches!(observed, 1..=3)
+        || (matches!(observed, 1..=4)
             && matches!(
                 kind,
                 ArtifactKind::Processes | ArtifactKind::WindowsProcesses
@@ -1009,7 +1009,7 @@ fn artifact_contract(
 ) -> Result<(&'static str, &'static str, u32), ValidationError> {
     Ok(match kind {
         ArtifactKind::Packages => ("packages.json", "sideeffect.inventory", 2),
-        ArtifactKind::Processes => ("processes.json", "sideeffect.process_inventory", 4),
+        ArtifactKind::Processes => ("processes.json", "sideeffect.process_inventory", 5),
         ArtifactKind::Permissions => ("permissions.json", "sideeffect.permission_inventory", 1),
         ArtifactKind::Startup => ("startup.json", "sideeffect.startup_inventory", 2),
         ArtifactKind::PathExecutables => (
@@ -1030,7 +1030,7 @@ fn artifact_contract(
         ArtifactKind::WindowsProcesses => (
             "processes.windows.json",
             "sideeffect.windows_process_inventory",
-            3,
+            4,
         ),
         ArtifactKind::WindowsPermissions => (
             "permissions.windows.json",
@@ -2270,9 +2270,9 @@ mod tests {
     fn process_artifact_contracts_accept_legacy_versions_and_platform_current_versions() {
         for kind in [ArtifactKind::Processes, ArtifactKind::WindowsProcesses] {
             let current = if kind == ArtifactKind::Processes {
-                4
+                5
             } else {
-                3
+                4
             };
             for old in 1..current {
                 assert!(super::artifact_version_supported(

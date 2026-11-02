@@ -233,13 +233,15 @@ fn explain_inventory_diff_routes_linux_process_snapshots_by_generation() {
         .output()
         .unwrap();
     assert!(
-        output.status.success(),
+        output.status.success() || output.status.code() == Some(2),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["schema"], "sideeffect.process_inventory_diff");
-    assert_eq!(json["counts"]["changes"], 1);
+    assert_eq!(json["schema_version"], 3);
+    assert_eq!(json["counts"]["candidate_changes"], 1);
+    assert_eq!(json["deltas"][0]["kind"], "candidate_changed");
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(!text.contains("private raw"));
     assert!(!text.contains("private-row-hash"));

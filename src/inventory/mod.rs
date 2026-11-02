@@ -113,8 +113,9 @@ pub use permissions_windows::{
 pub use processes::{
     MAX_AGGREGATE_NAMESPACE_LINK_BYTES, MAX_AGGREGATE_STATUS_BYTES, MAX_NAMESPACE_LINK_BYTES,
     MAX_PROCESS_DIRECTORIES, MAX_PROCESS_STAT_BYTES, NamespacePidEvidence, NamespacePidStatus,
-    PROCESS_NAMESPACES, ProcessDiagnostic, ProcessEvidence, ProcessExecutableEvidence,
-    ProcessExecutableLink, ProcessExecutableLinkStatus, ProcessInventoryDocument,
+    PROCESS_NAMESPACES, PidNamespaceIdentityEvidence, ProcessDiagnostic, ProcessEvidence,
+    ProcessExecutableEvidence, ProcessExecutableLink, ProcessExecutableLinkStatus,
+    ProcessIdentityDomain, ProcessIdentityDomainStatus, ProcessInventoryDocument,
     ProcessInventorySource, ProcessInventoryStatus, ProcessNamespace, ProcessNamespaceEvidence,
     ProcessNamespaceStatus, ProcessRow, ProcessStartTime, ProcessStartTimeEvidence,
     ProcessStartTimeStatus, collect_processes, collect_processes_from,

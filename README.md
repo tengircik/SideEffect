@@ -276,19 +276,19 @@ sideeffect.exe inventory startup --output .\startup-after.json
 sideeffect.exe explain --inventory-diff .\startup-before.json .\startup-after.json
 ```
 
-On Windows, use `sideeffect.exe inventory packages --output .\before.json` and `sideeffect.exe explain --inventory-diff .\before.json .\after.json`. The offline comparison accepts same-platform pairs of Linux package v2, Windows software-registration v1, Linux process v3-v4, Windows process v3, Linux/Windows selected-path permission v1, Linux startup v2, or Windows startup v4 inventories. Permission rows match only by exact selected path bytes (Linux) or UTF-16LE path bytes (Windows); paths are not normalized. It compares bounded metadata and native ACL/capability or descriptor/ACE facts, keeps evidence references, and omits raw xattr/security descriptor bytes. Duplicate identities and incomplete inputs do not produce confident unmatched presence changes. It does not calculate effective access or establish that inode/file-index values identify a persistent object. Process rows match only by PID plus observed generation (Linux proc start ticks or Windows creation FILETIME), never PID alone. Selected process facts are compared with evidence references on both sides. Unmatched process rows become additions/removals only when both snapshots and sources are complete and identity is certain. Startup rows use native source-specific identities; task action rows are compared as an ordered sequence, and duplicate task triggers or lossy XDG display paths remain ambiguous. Startup output contains only hashed identities, changed-field labels, and before/after source references; raw commands/configuration values stay in the input files. A startup comparison does not establish that a configured entry was installed, removed, effective, or executed. These bounded outputs compare two snapshots, not start/exit or execution history, exhaustive inventory, causation, or proof of absence. PIDs, generation values, paths, and source references can be sensitive. Hashed identities are not anonymization and may be guessable for common paths or names. Incomplete sources or ambiguous identities suppress uncertain presence changes and produce exit status `2`.
+On Windows, use `sideeffect.exe inventory packages --output .\before.json` and `sideeffect.exe explain --inventory-diff .\before.json .\after.json`. The offline comparison accepts same-platform pairs of Linux package v2, Windows software-registration v1, Linux process v3-v5, Windows process v3-v4, Linux/Windows selected-path permission v1, Linux startup v2, or Windows startup v4 inventories. Permission rows match only by exact selected path bytes (Linux) or UTF-16LE path bytes (Windows); paths are not normalized. It compares bounded metadata and native ACL/capability or descriptor/ACE facts, keeps evidence references, and omits raw xattr/security descriptor bytes. Duplicate identities and incomplete inputs do not produce confident unmatched presence changes. It does not calculate effective access or establish that inode/file-index values identify a persistent object. Process rows are matched only by PID plus observed generation (Linux proc start ticks or Windows creation FILETIME), never PID alone. Linux v5 requires matching boot-ID and PID-namespace inode hints; Linux v4 has no PID-namespace identity, and Windows v3-v4 have no reviewed reusable host boot identity. Exact matches in those candidate domains can produce only `candidate_changed` field comparisons; unmatched additions/removals are suppressed. Linux v3 snapshots suppress all cross-snapshot deltas. These are bounded evidence hints, not host authentication or process history. Selected process facts preserve evidence references on both sides. Startup rows use native source-specific identities; task action rows are compared as an ordered sequence, and duplicate task triggers or lossy XDG display paths remain ambiguous. Startup output contains only hashed identities, changed-field labels, and before/after source references; raw commands/configuration values stay in the input files. A startup comparison does not establish that a configured entry was installed, removed, effective, or executed. These bounded outputs compare two snapshots, not start/exit or execution history, exhaustive inventory, causation, or proof of absence. PIDs, generation values, paths, and source references can be sensitive. Hashed identities are not anonymization and may be guessable for common paths or names. Incomplete sources or ambiguous identities suppress uncertain presence changes and produce exit status `2`.
 
-For process snapshots, use `sideeffect inventory processes --output ./before.json` and `sideeffect inventory processes --output ./after.json` (or `sideeffect.exe` on Windows), then run the same `explain --inventory-diff` command. Linux cross-snapshot deltas require matching observed boot IDs; legacy snapshots or unavailable identity context suppress all deltas. This comparison key is evidence from procfs, not host authentication, and cloned VM state can preserve it. Process output includes local PIDs, generation values, and selected paths; review it before sharing.
+For process snapshots, use `sideeffect inventory processes --output ./before.json` and `sideeffect inventory processes --output ./after.json` (or `sideeffect.exe` on Windows), then run the same `explain --inventory-diff` command. Linux v5 records a boot-ID and caller PID-namespace inode hint; Linux v4 has no namespace identity, and Linux v3 has no identity domain. Linux v4-v5 and Windows v3-v4 comparisons emit candidate field changes only for exact PID/generation matches and suppress unmatched presence; missing or mismatched Linux v5 domains and Linux v3 comparisons suppress all deltas. The hints are procfs evidence, not host authentication or durable process identity; cloned VM state may preserve boot IDs and namespace inodes can be reused. Process output includes local PIDs, generation values, and selected paths; review it before sharing.
 
 ### Keep evidence in a local investigation case
 
-Create a private case draft from one or more verified sessions on the same native platform:
+Create a private schema-v2 draft from one or more verified sessions on the same native platform:
 
 ```sh
 sideeffect case init --output ./review.case.json --title "Review selected behavior" --session ./audit-session
 ```
 
-On Windows, use `sideeffect.exe` and PowerShell paths. Repeat `--session` for additional sessions (up to 16). The draft stores each session ID and the SHA-256 of its exact manifest bytes. Add one note or assertion by preparing a bounded entry JSON file and writing a new case file:
+On Windows, use `sideeffect.exe` and PowerShell paths. Repeat `--session` for additional sessions (up to 16). The case stores each session ID and SHA-256 of its exact manifest bytes. Add one note or assertion by preparing a bounded entry JSON file and writing a new case revision:
 
 ```json
 {
@@ -301,10 +301,22 @@ On Windows, use `sideeffect.exe` and PowerShell paths. Repeat `--session` for ad
 ```
 
 ```sh
-sideeffect case add-entry --case ./review.case.json --entry ./note.json --output ./review-with-note.case.json
+sideeffect case add-entry --case ./review.case.json --entry ./note.json --output ./review-with-note.case.json --session ./audit-session
 ```
 
-For assertions, include exact evidence locators copied from the relevant session artifact. Assertions remain analyst-supplied and unverified. The command validates the entry and case, preserves the source case, and writes a private output without overwriting an existing file. Repeat it with a new output path for each entry.
+For assertions, include exact evidence locators copied from the relevant session artifact. Assertions remain analyst-supplied and unverified. The command verifies the supplied sessions and locators, preserves the source case, increments the branch-local revision, and writes a private output without overwriting an existing file. Repeat it with a new output path for each entry. Entries can be added only while the case is `draft` or `open`.
+
+Move a case through its review states by writing new files. `draft` can become `open` or `cancelled`; `open` can become `in_review`, `closed`, or `cancelled`; `in_review` can return to `open` or become `closed` or `cancelled`. `closed` and `cancelled` are terminal. Status describes the analyst workflow and does not assess evidence quality or completeness:
+
+```sh
+sideeffect case set-status --case ./review-with-note.case.json --status in_review --output ./review-in-review.case.json --session ./audit-session
+```
+
+V1 case files remain readable and resolvable, but have no stored status. Migrate one explicitly by choosing its initial status; the migration preserves all entries and evidence locators, hashes the exact source bytes as the parent, and leaves the source file unchanged:
+
+```sh
+sideeffect case migrate --case ./legacy.case.json --status open --output ./review-v2.case.json --session ./audit-session
+```
 
 Resolve the locators against the same verified sessions:
 
@@ -318,7 +330,7 @@ For a private, static HTML review report with links from each entry to its resol
 sideeffect case resolve --format html --output ./review.html --case ./review.case.json --session ./audit-session
 ```
 
-The default command writes bounded JSON; HTML is static, offline, size-bounded, private, and never overwrites an existing file. Both formats retain source/session status. Exit status `2` means some source or capture remains partial or unknown. Hash checks establish consistency with the supplied session manifest; they do not authenticate who produced it or prove an assertion. Entry authoring is one JSON entry at a time; there is no interactive editor or role-specific report set yet. Reports can contain sensitive paths, arguments, and event payloads; keep them local and review before sharing.
+The default command writes bounded JSON; HTML is static, offline, size-bounded, private, and never overwrites an existing file. Both formats retain case status/revision and source/session status. Exit status `2` means some source or capture remains partial or unknown. Manifest, artifact, and parent-case hashes establish byte consistency; they do not authenticate who produced the evidence or prove an assertion, and the parent hash does not prevent forks or rewrites. Entry authoring is one JSON entry at a time; there is no interactive editor or role-specific report set yet. Reports can contain sensitive paths, arguments, and event payloads; keep them local and review before sharing.
 
 ## What you can do
 
@@ -331,7 +343,7 @@ The default command writes bounded JSON; HTML is static, offline, size-bounded, 
 | Startup discovery | Source-linked startup configuration, retained as inert values and scripts |
 | Runtime capture | Linux `strace` records for a selected command and traced children; native Windows ETW events for a bounded capture window |
 | Evidence review | Bounded JSON, terminal-safe text, exact source references, and static offline HTML reports where supported |
-| Investigation case | Private JSON drafts, validated one-entry append to a new case file, exact evidence-locator resolution, and linked static offline HTML review; interactive editing, lifecycle, and role-specific reports remain open |
+| Investigation case | Private v2 drafts, explicit v1 migration, status transitions, immutable no-clobber revisions, exact evidence-locator resolution, and linked static offline HTML review; interactive editing and role-specific reports remain open |
 | Comparison | Evidence-backed trace and ETW differences, aggregate summaries, and conservative association candidates |
 | Deterministic explanation | Source-aware `explain` summaries without a model dependency |
 | Optional local model tools | Experimental, user-selected model workflows with reviewed previews; no model is release-approved |

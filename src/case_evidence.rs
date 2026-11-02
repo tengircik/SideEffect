@@ -42,6 +42,9 @@ pub struct ResolvedCase {
     pub disclosure_note: &'static str,
     pub case_id: String,
     pub title: String,
+    /// Absent for legacy schema-v1 cases, which did not track workflow status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<crate::case::CaseLifecycle>,
     /// Unique resolved facts; entry references point here by index to avoid duplicating raw data.
     pub facts: Vec<ResolvedEvidenceFact>,
     pub entries: Vec<ResolvedCaseEntry>,
@@ -307,10 +310,11 @@ pub fn resolve_case(
 
     Ok(ResolvedCase {
         schema: "sideeffect.resolved_investigation_case",
-        schema_version: 1,
+        schema_version: 2,
         disclosure_note: "Evidence values may be sensitive and untrusted. Hash checks establish consistency with the supplied manifest, not producer authenticity or capture completeness. Escape values when rendering and review before sharing.",
         case_id: case.case_id.clone(),
         title: case.title.clone(),
+        lifecycle: case.lifecycle.clone(),
         facts,
         entries,
         sessions: resolved_sessions,

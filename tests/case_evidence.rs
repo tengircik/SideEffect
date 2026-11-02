@@ -118,6 +118,7 @@ fn make_case(
     let value = json!({
         "schema": CASE_SCHEMA,
         "schema_version": CASE_SCHEMA_VERSION,
+        "lifecycle": {"status":"open", "revision":1, "previous_case_sha256":null},
         "case_id": "synthetic-case",
         "title": "Synthetic evidence review",
         "sessions": [{
@@ -674,6 +675,7 @@ fn resolves_synthetic_selected_root_entries_above_general_query_limit() {
     let case_value = json!({
         "schema": CASE_SCHEMA,
         "schema_version": CASE_SCHEMA_VERSION,
+        "lifecycle": {"status":"open", "revision":1, "previous_case_sha256":null},
         "case_id":"synthetic-large-root-case",
         "title":"Synthetic selected-root ordinal boundary",
         "sessions":[{

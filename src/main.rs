@@ -82,7 +82,9 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect explain --inventory-diff <before.json> <after.json>\n\
        sideeffect compare-sessions <before-session-directory> <after-session-directory>\n\
        sideeffect case init --output <new-case.json> --title <title> --session <session-directory>...\n\
-       sideeffect case add-entry --case <case.json> --entry <entry.json> --output <new-case.json>\n\
+       sideeffect case migrate --case <v1.json> --status draft|open --output <v2.json> --session <session-directory>...\n\
+       sideeffect case set-status --case <v2.json> --status <status> --output <new-v2.json> --session <session-directory>...\n\
+       sideeffect case add-entry --case <v2.json> --entry <entry.json> --output <new-v2.json> --session <session-directory>...\n\
        sideeffect case resolve [--format json|html] [--output <new-report.html>] --case <case.json> --session <session-directory>...\n\
        sideeffect model-preview --question <question> <strace-trace-file>\n\
        sideeffect model-analyze --question <question> [--runtime <llama-cli>] --confirm-sha256 <preview-digest> <strace-trace-file>\n\
@@ -1831,13 +1833,19 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect compare-sessions BEFORE_SESSION_DIR AFTER_SESSION_DIR\nVerifies both local audit sessions, reports metadata comparability, and compares bounded item-level inventory and runtime evidence from verified artifacts. Per-source status and evidence references remain visible; missing, partial, unsupported, or incompatible sources do not become empty results. This is not an exhaustive history or coverage claim, and it does not establish causation or event absence. Incomparable or partial results exit with status 2 and include stable reason codes."
         }
         "case" => {
-            "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-entry --case CASE.json --entry ENTRY.json --output NEW_CASE.json\n       sideeffect case resolve [--format json|html] [--output NEW_REPORT.html] --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nCreates a private case draft, validates and appends one analyst-authored entry into a new private case file, or resolves all case evidence locators against supplied verified sessions. Existing files are never overwritten. Case-authored assertions remain unverified. Hash checks establish byte consistency, not producer authenticity or capture completeness. JSON output may contain sensitive local evidence. Incomplete, partial, or unknown source status exits with status 2."
+            "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case migrate --case V1_CASE.json --status draft|open --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case set-status --case V2_CASE.json --status draft|open|in_review|closed|cancelled --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-entry --case V2_CASE.json --entry ENTRY.json --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case resolve [--format json|html] [--output NEW_REPORT.html] --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nCreates a private schema-v2 draft, explicitly migrates a schema-v1 case with a user-selected initial status, applies validated lifecycle transitions, appends one analyst-authored entry to a draft/open v2 case, or resolves evidence against supplied verified sessions. Each update writes a new private file and never replaces an existing file. Closed and cancelled cases are terminal. Case-authored assertions remain unverified; lifecycle status is an analyst workflow label. Hash checks establish byte consistency, not producer authenticity or capture completeness. JSON output may contain sensitive local evidence. Incomplete, partial, or unknown source status remains visible and exits with status 2."
         }
         "case init" => {
-            "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\nCreates an empty, bounded case file bound to the exact manifests of the supplied verified sessions. It does not add findings or evidence locators. The output is private and never overwrites an existing file."
+            "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\nCreates an empty schema-v2 draft bound to the exact manifests of supplied verified sessions. It does not add findings or evidence locators. Revision 1 has no parent digest. The output is private and never overwrites an existing file."
+        }
+        "case migrate" => {
+            "Usage: sideeffect case migrate --case V1_CASE.json --status draft|open --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nExplicitly converts one schema-v1 case to schema v2, preserving its case ID, entries, session identities, and evidence locators. The initial status is required because v1 did not record one. Revision 2 links the exact input bytes with previous_case_sha256; the source is unchanged and the output never overwrites an existing file."
+        }
+        "case set-status" => {
+            "Usage: sideeffect case set-status --case V2_CASE.json --status draft|open|in_review|closed|cancelled --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nApplies one allowed status transition after strict verification of all bound sessions and evidence locators. Each output increments the branch-local revision and hashes the exact input case bytes. Closed and cancelled are terminal. The output is private and no-clobber; status is an analyst workflow label, not evidence quality or completeness."
         }
         "case add-entry" => {
-            "Usage: sideeffect case add-entry --case CASE.json --entry ENTRY.json --output NEW_CASE.json\nValidates one bounded note/assertion JSON object, appends it to a validated case, and writes a new private case file. The source case is unchanged and output never overwrites an existing file. Assertions require evidence locators and remain analyst_supplied_unverified."
+            "Usage: sideeffect case add-entry --case V2_CASE.json --entry ENTRY.json --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nValidates one bounded note/assertion JSON object and appends it only to a draft/open schema-v2 case after strict verification of all bound sessions and evidence locators. The source case is unchanged; output increments the branch-local revision and never overwrites an existing file. Schema-v1 cases require explicit migration first. Assertions require evidence locators and remain analyst_supplied_unverified."
         }
         "case resolve" => {
             "Usage: sideeffect case resolve [--format json|html] [--output NEW_REPORT.html] --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nVerifies supplied sessions and resolves each case locator to its exact source record or selected-root entry. HTML is static, offline, bounded, private, and no-clobber. Session and artifact hashes establish consistency with the supplied manifest, not authenticity. Author-written assertions remain unverified; runtime completeness may remain unknown. Reports can contain sensitive paths, arguments, and raw payloads. Review before sharing."
@@ -2353,9 +2361,14 @@ type CaseVerifiedSession = sideeffect::audit_session_reader_windows::VerifiedAud
 fn case_command(operation: &OsString, arguments: &[OsString]) -> Result<ExitCode, String> {
     match operation.to_str() {
         Some("init") => case_init_command(arguments),
+        Some("migrate") => case_migrate_command(arguments),
+        Some("set-status") => case_set_status_command(arguments),
         Some("add-entry") => case_add_entry_command(arguments),
         Some("resolve") => case_resolve_command(arguments),
-        _ => Err("case command must be 'init', 'add-entry', or 'resolve'".to_owned()),
+        _ => Err(
+            "case command must be 'init', 'migrate', 'set-status', 'add-entry', or 'resolve'"
+                .to_owned(),
+        ),
     }
 }
 
@@ -2363,6 +2376,7 @@ fn case_add_entry_command(arguments: &[OsString]) -> Result<ExitCode, String> {
     let mut case_path: Option<&OsString> = None;
     let mut entry_path: Option<&OsString> = None;
     let mut output: Option<&OsString> = None;
+    let mut session_paths: Vec<&OsString> = Vec::new();
     let mut index = 0;
     while index < arguments.len() {
         let flag = &arguments[index];
@@ -2376,6 +2390,7 @@ fn case_add_entry_command(arguments: &[OsString]) -> Result<ExitCode, String> {
             Some("--case") if case_path.replace(value).is_none() => {}
             Some("--entry") if entry_path.replace(value).is_none() => {}
             Some("--output") if output.replace(value).is_none() => {}
+            Some("--session") => session_paths.push(value),
             Some("--case") => return Err("duplicate case add-entry --case option".to_owned()),
             Some("--entry") => return Err("duplicate case add-entry --entry option".to_owned()),
             Some("--output") => return Err("duplicate case add-entry --output option".to_owned()),
@@ -2392,6 +2407,12 @@ fn case_add_entry_command(arguments: &[OsString]) -> Result<ExitCode, String> {
     let case_path = case_path.ok_or("case add-entry requires --case CASE.json")?;
     let entry_path = entry_path.ok_or("case add-entry requires --entry ENTRY.json")?;
     let output = output.ok_or("case add-entry requires --output NEW_CASE.json")?;
+    if session_paths.is_empty() || session_paths.len() > sideeffect::case::MAX_CASE_SESSIONS {
+        return Err(format!(
+            "case add-entry requires 1..={} --session directories",
+            sideeffect::case::MAX_CASE_SESSIONS
+        ));
+    }
     let case_bytes = read_input_file(
         Path::new(case_path),
         sideeffect::case::MAX_CASE_BYTES,
@@ -2403,10 +2424,24 @@ fn case_add_entry_command(arguments: &[OsString]) -> Result<ExitCode, String> {
         "case entry",
     )?;
     let mut case = sideeffect::case::InvestigationCase::from_json(&case_bytes)?;
+    if case.schema_version != sideeffect::case::CASE_SCHEMA_VERSION {
+        return Err("case add-entry requires schema version 2; migrate the version 1 case with an explicit initial status first".to_owned());
+    }
+    let lifecycle = case.lifecycle.as_ref().expect("validated v2 lifecycle");
+    if !lifecycle.permits_entry() {
+        return Err(format!(
+            "case status {} does not permit entry changes; transition to open first if allowed",
+            lifecycle.status.as_str()
+        ));
+    }
     let entry: sideeffect::case::CaseEntry = serde_json::from_slice(&entry_bytes)
         .map_err(|_| "case entry JSON is malformed or has unsupported fields".to_owned())?;
     case.entries.push(entry);
+    advance_case_revision(&mut case, &case_bytes)?;
     case.validate()?;
+    let session_paths: Vec<OsString> = session_paths.iter().map(|path| (*path).clone()).collect();
+    let resolved_case = verify_case_against_sessions(&case, &session_paths)?;
+    let incomplete = resolved_case_is_incomplete(&resolved_case);
 
     let mut encoded = CappedBuffer::new(sideeffect::case::MAX_CASE_BYTES);
     serde_json::to_writer_pretty(&mut encoded, &case).map_err(|error| {
@@ -2439,10 +2474,21 @@ fn case_add_entry_command(arguments: &[OsString]) -> Result<ExitCode, String> {
         return Err("case workflows are not supported on this platform".to_owned());
     };
     eprintln!(
-        "Saved case with one validated analyst entry to {}. Assertions remain unverified; review sensitive content before sharing.",
+        "Saved case revision {} with one validated analyst entry to {}. Assertions remain unverified; review sensitive content before sharing.",
+        case.lifecycle
+            .as_ref()
+            .map(|value| value.revision)
+            .unwrap_or_default(),
         terminal_safe_path(&published)
     );
-    Ok(ExitCode::SUCCESS)
+    if incomplete {
+        eprintln!(
+            "Supplied sessions or referenced sources remain partial or unknown; that state was preserved."
+        );
+        Ok(ExitCode::from(2))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
 }
 
 fn case_init_command(arguments: &[OsString]) -> Result<ExitCode, String> {
@@ -2515,6 +2561,11 @@ fn case_init_command(arguments: &[OsString]) -> Result<ExitCode, String> {
             title: title.to_owned(),
             sessions: identities,
             entries: Vec::new(),
+            lifecycle: Some(sideeffect::case::CaseLifecycle {
+                status: sideeffect::case::CaseStatus::Draft,
+                revision: 1,
+                previous_case_sha256: None,
+            }),
         };
         case.validate()?;
         let mut encoded = CappedBuffer::new(sideeffect::case::MAX_CASE_BYTES);
@@ -2553,6 +2604,289 @@ fn case_init_command(arguments: &[OsString]) -> Result<ExitCode, String> {
         let _ = (output, title, session_paths);
         Err("case workflows are not supported on this platform".to_owned())
     }
+}
+
+fn case_migrate_command(arguments: &[OsString]) -> Result<ExitCode, String> {
+    let mut case_path: Option<&OsString> = None;
+    let mut output: Option<&OsString> = None;
+    let mut status: Option<sideeffect::case::CaseStatus> = None;
+    let mut session_paths: Vec<OsString> = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let flag = &arguments[index];
+        let value = arguments.get(index + 1).ok_or_else(|| {
+            format!(
+                "case migrate option {} requires a value",
+                terminal_safe_text(&flag.to_string_lossy())
+            )
+        })?;
+        match flag.to_str() {
+            Some("--case") if case_path.replace(value).is_none() => {}
+            Some("--output") if output.replace(value).is_none() => {}
+            Some("--status") if status.is_none() => status = Some(parse_case_status(value)?),
+            Some("--session") => session_paths.push(value.clone()),
+            Some("--case") => return Err("duplicate case migrate --case option".to_owned()),
+            Some("--output") => return Err("duplicate case migrate --output option".to_owned()),
+            Some("--status") => return Err("duplicate case migrate --status option".to_owned()),
+            _ => {
+                return Err(format!(
+                    "unknown case migrate option {}",
+                    terminal_safe_text(&flag.to_string_lossy())
+                ));
+            }
+        }
+        index += 2;
+    }
+    let case_path = case_path.ok_or("case migrate requires --case CASE.json")?;
+    let output = output.ok_or("case migrate requires --output NEW_CASE.json")?;
+    let status = status.ok_or("case migrate requires an explicit --status draft|open")?;
+    if !matches!(
+        status,
+        sideeffect::case::CaseStatus::Draft | sideeffect::case::CaseStatus::Open
+    ) {
+        return Err("case migrate initial status must be draft or open".to_owned());
+    }
+    validate_case_session_count("case migrate", session_paths.len())?;
+    let case_bytes = read_input_file(
+        Path::new(case_path),
+        sideeffect::case::MAX_CASE_BYTES,
+        "case",
+    )?;
+    let mut case = sideeffect::case::InvestigationCase::from_json(&case_bytes)?;
+    if case.schema_version != sideeffect::case::CASE_SCHEMA_V1 {
+        return Err("case migrate accepts only schema version 1".to_owned());
+    }
+    case.schema_version = sideeffect::case::CASE_SCHEMA_VERSION;
+    case.lifecycle = Some(sideeffect::case::CaseLifecycle {
+        status,
+        // V1 has no revision counter. Treat it as the parent revision and record its exact bytes.
+        revision: 2,
+        previous_case_sha256: Some(format!("{:x}", Sha256::digest(&case_bytes))),
+    });
+    case.validate()?;
+    let resolved_case = verify_case_against_sessions(&case, &session_paths)?;
+    let incomplete = resolved_case_is_incomplete(&resolved_case);
+    let published = publish_case_file(Path::new(output), &case)?;
+    eprintln!(
+        "Migrated schema v1 case to schema v2 at {} (revision 2, status {}). The source file remains unchanged.",
+        terminal_safe_path(&published),
+        status.as_str()
+    );
+    if incomplete {
+        eprintln!(
+            "Supplied sessions or referenced sources remain partial or unknown; that state was preserved."
+        );
+        Ok(ExitCode::from(2))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+fn case_set_status_command(arguments: &[OsString]) -> Result<ExitCode, String> {
+    let mut case_path: Option<&OsString> = None;
+    let mut output: Option<&OsString> = None;
+    let mut status: Option<sideeffect::case::CaseStatus> = None;
+    let mut session_paths: Vec<OsString> = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let flag = &arguments[index];
+        let value = arguments.get(index + 1).ok_or_else(|| {
+            format!(
+                "case set-status option {} requires a value",
+                terminal_safe_text(&flag.to_string_lossy())
+            )
+        })?;
+        match flag.to_str() {
+            Some("--case") if case_path.replace(value).is_none() => {}
+            Some("--output") if output.replace(value).is_none() => {}
+            Some("--status") if status.is_none() => status = Some(parse_case_status(value)?),
+            Some("--session") => session_paths.push(value.clone()),
+            Some("--case") => return Err("duplicate case set-status --case option".to_owned()),
+            Some("--output") => return Err("duplicate case set-status --output option".to_owned()),
+            Some("--status") => return Err("duplicate case set-status --status option".to_owned()),
+            _ => {
+                return Err(format!(
+                    "unknown case set-status option {}",
+                    terminal_safe_text(&flag.to_string_lossy())
+                ));
+            }
+        }
+        index += 2;
+    }
+    let case_path = case_path.ok_or("case set-status requires --case CASE.json")?;
+    let output = output.ok_or("case set-status requires --output NEW_CASE.json")?;
+    let next_status = status.ok_or("case set-status requires --status STATUS")?;
+    validate_case_session_count("case set-status", session_paths.len())?;
+    let case_bytes = read_input_file(
+        Path::new(case_path),
+        sideeffect::case::MAX_CASE_BYTES,
+        "case",
+    )?;
+    let mut case = sideeffect::case::InvestigationCase::from_json(&case_bytes)?;
+    let lifecycle = case.lifecycle.as_mut().ok_or("case set-status requires schema version 2; migrate the version 1 case with an explicit initial status first")?;
+    if !lifecycle.permits_transition(next_status) {
+        return Err(format!(
+            "case status transition from {} to {} is not allowed",
+            lifecycle.status.as_str(),
+            next_status.as_str()
+        ));
+    }
+    lifecycle.status = next_status;
+    advance_case_revision(&mut case, &case_bytes)?;
+    case.validate()?;
+    let resolved_case = verify_case_against_sessions(&case, &session_paths)?;
+    let incomplete = resolved_case_is_incomplete(&resolved_case);
+    let published = publish_case_file(Path::new(output), &case)?;
+    eprintln!(
+        "Saved case revision {} with status {} to {}. This is an analyst workflow label, not an evidence-quality or completeness claim.",
+        case.lifecycle.as_ref().unwrap().revision,
+        next_status.as_str(),
+        terminal_safe_path(&published)
+    );
+    if incomplete {
+        eprintln!(
+            "Supplied sessions or referenced sources remain partial or unknown; that state was preserved."
+        );
+        Ok(ExitCode::from(2))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+fn parse_case_status(value: &OsString) -> Result<sideeffect::case::CaseStatus, String> {
+    match value.to_str() {
+        Some("draft") => Ok(sideeffect::case::CaseStatus::Draft),
+        Some("open") => Ok(sideeffect::case::CaseStatus::Open),
+        Some("in_review") => Ok(sideeffect::case::CaseStatus::InReview),
+        Some("closed") => Ok(sideeffect::case::CaseStatus::Closed),
+        Some("cancelled") => Ok(sideeffect::case::CaseStatus::Cancelled),
+        _ => Err("case status must be draft, open, in_review, closed, or cancelled".to_owned()),
+    }
+}
+
+fn validate_case_session_count(command: &str, count: usize) -> Result<(), String> {
+    if count == 0 || count > sideeffect::case::MAX_CASE_SESSIONS {
+        return Err(format!(
+            "{command} requires 1..={} --session directories",
+            sideeffect::case::MAX_CASE_SESSIONS
+        ));
+    }
+    Ok(())
+}
+
+fn advance_case_revision(
+    case: &mut sideeffect::case::InvestigationCase,
+    previous_bytes: &[u8],
+) -> Result<(), String> {
+    let lifecycle = case
+        .lifecycle
+        .as_mut()
+        .ok_or("case lifecycle requires schema version 2")?;
+    lifecycle.revision = lifecycle
+        .revision
+        .checked_add(1)
+        .ok_or("case revision overflow")?;
+    lifecycle.previous_case_sha256 = Some(format!("{:x}", Sha256::digest(previous_bytes)));
+    Ok(())
+}
+
+fn publish_case_file(
+    output: &Path,
+    case: &sideeffect::case::InvestigationCase,
+) -> Result<PathBuf, String> {
+    case.validate()?;
+    let mut encoded = CappedBuffer::new(sideeffect::case::MAX_CASE_BYTES);
+    serde_json::to_writer_pretty(&mut encoded, case).map_err(|error| {
+        if encoded.exceeded {
+            "case file exceeds its byte limit".to_owned()
+        } else {
+            format!("could not serialize case file: {error}")
+        }
+    })?;
+    encoded
+        .write_all(b"\n")
+        .map_err(|_| "case file exceeds its byte limit".to_owned())?;
+    #[cfg(target_os = "linux")]
+    let published = publish_private_file(output, &encoded.bytes, sideeffect::case::MAX_CASE_BYTES)
+        .map_err(|error| format!("could not publish private case file: {error}"))?;
+    #[cfg(windows)]
+    let published =
+        publish_private_windows_file(output, &encoded.bytes, sideeffect::case::MAX_CASE_BYTES)
+            .map_err(|error| format!("could not publish private case file: {error}"))?;
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let published = return Err("case workflows are not supported on this platform".to_owned());
+    Ok(published)
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn verify_case_against_sessions(
+    case: &sideeffect::case::InvestigationCase,
+    session_paths: &[OsString],
+) -> Result<sideeffect::case_evidence::ResolvedCase, String> {
+    validate_case_session_count("case operation", session_paths.len())?;
+    let mut verified_sessions: Vec<CaseVerifiedSession> = Vec::with_capacity(session_paths.len());
+    for path in session_paths {
+        verified_sessions.push(read_verified_audit_session(Path::new(path))?);
+    }
+    let artifact_views = verified_sessions
+        .iter()
+        .map(|session| {
+            session
+                .artifacts()
+                .iter()
+                .map(|artifact| sideeffect::case_evidence::VerifiedArtifactView {
+                    kind: artifact.kind(),
+                    path: artifact.path(),
+                    bytes: artifact.bytes(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let session_views = verified_sessions
+        .iter()
+        .zip(&artifact_views)
+        .map(
+            |(session, artifacts)| sideeffect::case_evidence::VerifiedSessionView {
+                manifest: session.manifest(),
+                manifest_bytes: session.manifest_bytes(),
+                artifacts,
+            },
+        )
+        .collect::<Vec<_>>();
+    sideeffect::case_evidence::resolve_case(case, &session_views)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn verify_case_against_sessions(
+    _case: &sideeffect::case::InvestigationCase,
+    _session_paths: &[OsString],
+) -> Result<sideeffect::case_evidence::ResolvedCase, String> {
+    Err("case workflows are not supported on this platform".to_owned())
+}
+
+fn resolved_case_is_incomplete(case: &sideeffect::case_evidence::ResolvedCase) -> bool {
+    case.sessions.iter().any(|session| {
+        session.status != sideeffect::audit_session::SessionStatus::Complete
+            || session
+                .sources
+                .iter()
+                .any(|source| source.status != sideeffect::audit_session::SourceStatus::Complete)
+    }) || case.facts.iter().any(|fact| match &fact.fact {
+        sideeffect::case_evidence::ResolvedEvidence::LinuxTraceRecord { parse_status, .. } => {
+            *parse_status == sideeffect::model::ParseCompleteness::Partial
+        }
+        sideeffect::case_evidence::ResolvedEvidence::WindowsEtwRecord {
+            collection_status,
+            capture_completeness,
+            ..
+        } => {
+            *collection_status == sideeffect::windows_runtime::CollectionStatus::Partial
+                || capture_completeness != "complete"
+        }
+        sideeffect::case_evidence::ResolvedEvidence::SelectedRootEntry {
+            inventory_status, ..
+        } => inventory_status != "complete",
+    })
 }
 
 fn case_resolve_command(arguments: &[OsString]) -> Result<ExitCode, String> {

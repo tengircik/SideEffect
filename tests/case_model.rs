@@ -12,6 +12,7 @@ fn valid_case() -> Value {
     json!({
         "schema": CASE_SCHEMA,
         "schema_version": CASE_SCHEMA_VERSION,
+        "lifecycle": {"status":"open", "revision":1, "previous_case_sha256":null},
         "case_id": "case-1",
         "title": "Review selected runtime evidence",
         "sessions": [{
@@ -40,6 +41,13 @@ fn valid_case() -> Value {
     })
 }
 
+fn valid_v1_case() -> Value {
+    let mut value = valid_case();
+    value["schema_version"] = json!(sideeffect::case::CASE_SCHEMA_V1);
+    value.as_object_mut().unwrap().remove("lifecycle");
+    value
+}
+
 fn parse(value: &Value) -> Result<InvestigationCase, String> {
     InvestigationCase::from_json(&serde_json::to_vec(value).unwrap())
 }
@@ -66,6 +74,116 @@ fn case_model_rejects_unknown_fields_and_wrong_schema() {
     let mut value = valid_case();
     value["schema_version"] = json!(99);
     assert!(parse(&value).unwrap_err().contains("case schema must be"));
+}
+
+#[test]
+fn case_model_keeps_v1_read_compatible_and_requires_strict_v2_lifecycle() {
+    let legacy =
+        InvestigationCase::from_json(&serde_json::to_vec(&valid_v1_case()).unwrap()).unwrap();
+    assert_eq!(legacy.schema_version, sideeffect::case::CASE_SCHEMA_V1);
+    assert!(legacy.lifecycle.is_none());
+
+    let mut missing_lifecycle = valid_case();
+    missing_lifecycle
+        .as_object_mut()
+        .unwrap()
+        .remove("lifecycle");
+    assert!(
+        InvestigationCase::from_json(&serde_json::to_vec(&missing_lifecycle).unwrap())
+            .unwrap_err()
+            .contains("requires lifecycle")
+    );
+
+    let mut v1_with_lifecycle = valid_v1_case();
+    v1_with_lifecycle["lifecycle"] =
+        json!({"status":"open","revision":1,"previous_case_sha256":null});
+    assert!(
+        InvestigationCase::from_json(&serde_json::to_vec(&v1_with_lifecycle).unwrap())
+            .unwrap_err()
+            .contains("must not contain lifecycle")
+    );
+
+    for invalid in [
+        json!({"status":"unknown","revision":1,"previous_case_sha256":null}),
+        json!({"status":"open","revision":0,"previous_case_sha256":null}),
+        json!({"status":"open","revision":2,"previous_case_sha256":null}),
+        json!({"status":"open","revision":1,"previous_case_sha256":"bad"}),
+        json!({"status":"open","revision":1}),
+        json!({"status":"open","revision":1,"previous_case_sha256":null,"extra":true}),
+    ] {
+        let mut value = valid_case();
+        value["lifecycle"] = invalid;
+        assert!(InvestigationCase::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+}
+
+#[test]
+fn case_lifecycle_transition_graph_has_terminal_states_and_entry_locking() {
+    use sideeffect::case::CaseStatus as S;
+    let allowed = [
+        (S::Draft, S::Open),
+        (S::Draft, S::Cancelled),
+        (S::Open, S::InReview),
+        (S::Open, S::Closed),
+        (S::Open, S::Cancelled),
+        (S::InReview, S::Open),
+        (S::InReview, S::Closed),
+        (S::InReview, S::Cancelled),
+    ];
+    for from in [S::Draft, S::Open, S::InReview, S::Closed, S::Cancelled] {
+        for to in [S::Draft, S::Open, S::InReview, S::Closed, S::Cancelled] {
+            let lifecycle = sideeffect::case::CaseLifecycle {
+                status: from,
+                revision: 1,
+                previous_case_sha256: None,
+            };
+            assert_eq!(
+                lifecycle.permits_transition(to),
+                allowed.contains(&(from, to)),
+                "{from:?} -> {to:?}"
+            );
+        }
+    }
+    assert!(
+        sideeffect::case::CaseLifecycle {
+            status: S::Draft,
+            revision: 1,
+            previous_case_sha256: None
+        }
+        .permits_entry()
+    );
+    assert!(
+        sideeffect::case::CaseLifecycle {
+            status: S::Open,
+            revision: 1,
+            previous_case_sha256: None
+        }
+        .permits_entry()
+    );
+    assert!(
+        !sideeffect::case::CaseLifecycle {
+            status: S::InReview,
+            revision: 1,
+            previous_case_sha256: None
+        }
+        .permits_entry()
+    );
+    assert!(
+        !sideeffect::case::CaseLifecycle {
+            status: S::Closed,
+            revision: 1,
+            previous_case_sha256: None
+        }
+        .permits_entry()
+    );
+    assert!(
+        !sideeffect::case::CaseLifecycle {
+            status: S::Cancelled,
+            revision: 1,
+            previous_case_sha256: None
+        }
+        .permits_entry()
+    );
 }
 
 #[test]

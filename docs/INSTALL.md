@@ -228,7 +228,7 @@ The minimums below describe declared support requirements, while the validation 
 | Lexical path hints | Narrow `openat`/`openat2` argument subset only; display-only | Deterministic parser fixtures | Filesystem resolution, symlink behavior, descriptor identity, or canonical paths |
 | Linux permission inventory | Explicit paths; metadata, supported POSIX ACL xattrs, and Linux VFS file-capability revisions 1–3 | Deterministic ACL/capability byte fixtures, metadata/path handling, and xattr-backed filesystem tests when supported | Recursive or complete inventory, effective access decisions, and other ACL/permission sources |
 | Linux package inventory | dpkg, RPM, pacman, APK, and optional Flatpak refs at fixed system paths; XBPS, Nix, Guix, and Snap are unsupported | Adapter/parser fixtures and live dpkg CLI inventory in Linux CI; Flatpak live smoke runs only when already installed | Complete software inventory, custom/user manager paths, and all distributions or package formats |
-| Linux process inventory | Visible `/proc` status fields, bounded `/proc/PID/exe` link text, start ticks, namespaces, and `/proc/sys/kernel/random/boot_id` evidence | Synthetic procfs fixtures and Linux CLI tests | Atomic or exhaustive process coverage; command lines or executable contents; host identity authenticated by boot ID |
+| Linux process inventory | Visible `/proc` status fields, bounded `/proc/PID/exe` link text, start ticks, namespace links, boot-ID evidence, and caller PID-namespace inode hint | Synthetic procfs fixtures and Linux CLI tests | Atomic or exhaustive process coverage; command lines or executable contents; host or durable namespace identity authenticated by boot ID/inode |
 | Linux startup configuration | Aggregate schema v2: curated XDG, systemd, SysV, and cron source snapshots with inert evidence | CLI tests and deterministic source/parser fixtures | Effective applicability, manager runtime state, all distribution-specific paths, or exhaustive startup coverage |
 | Diff | Exact multiset comparison of parsed syscall rows; PID/timestamp prefixes alone are ignored | Synthetic pairs plus real integration trace pair | Root cause, causal links, normalized paths/FDs, or complete OS observation |
 | Windows native x64 | Bounded inventory and experimental ETW v3 capture, inspection, event-level diff summary v3, evidence lookup, attribution candidate view, and audit-session integration | Local Windows x64 `cargo test --locked --all-targets`, Clippy and format checks; hosted Windows Server 2022/2025 build/test and live process/file/loopback acceptance at exact commit [`797ba86`](https://github.com/tengircik/SideEffect/commit/797ba86dc41d024129da35b2fc4be7ad5eca6756) ([CI run](https://github.com/tengircik/SideEffect/actions/runs/40867530573)) | Windows 11 x64 privileged live ETW validation, ETL import, exhaustive inventory/event coverage, all provider/version combinations, and general Windows compatibility |
@@ -261,7 +261,7 @@ The model manager and catalog can be inspected on Windows. Catalog query-plan in
 
 ## Create and resolve an investigation case
 
-Create a private JSON draft bound to one or more verified audit sessions from the same platform:
+Create a private schema-v2 JSON draft bound to one or more verified audit sessions from the same platform:
 
 ```sh
 sideeffect case init --output ./review.case.json --title "Review selected behavior" --session ./audit-session
@@ -273,17 +273,29 @@ On Windows PowerShell:
 sideeffect.exe case init --output .\review.case.json --title "Review selected behavior" --session .\audit-session
 ```
 
-Repeat `--session` to bind up to 16 sessions. To add one note or assertion without editing the case file directly, provide a bounded entry JSON object and write a new private case file:
+Repeat `--session` to bind up to 16 sessions. To add one note or assertion without editing the case file directly, provide a bounded entry JSON object, pass every bound session for strict verification, and write a new private revision:
 
 ```json
 {"id":"N001","kind":"note","authorship":"analyst_supplied_unverified","text":"Review this observation","evidence":[]}
 ```
 
 ```sh
-sideeffect case add-entry --case ./review.case.json --entry ./note.json --output ./review-with-note.case.json
+sideeffect case add-entry --case ./review.case.json --entry ./note.json --output ./review-with-note.case.json --session ./audit-session
 ```
 
-For assertions, include exact evidence locators copied from the session artifacts. Assertions require evidence references and stay labeled analyst-supplied and unverified. The source case remains unchanged; each output path must be new. This is a one-entry JSON workflow, not an interactive case editor.
+For assertions, include exact evidence locators copied from the session artifacts. Assertions require evidence references and stay labeled analyst-supplied and unverified. Entries can be added only in `draft` or `open` status. The command checks the supplied sessions and referenced artifacts, increments the branch-local revision, and writes a new private file without replacing the source.
+
+Use `case set-status` to move between workflow states. Allowed transitions are `draft` to `open` or `cancelled`, `open` to `in_review`, `closed`, or `cancelled`, and `in_review` to `open`, `closed`, or `cancelled`. `closed` and `cancelled` are terminal. Status is an analyst workflow label; it does not indicate evidence quality or completeness. Every transition rechecks the bound sessions and evidence locators and writes a new no-clobber file:
+
+```powershell
+sideeffect.exe case set-status --case .\review-with-note.case.json --status in_review --output .\review-in-review.case.json --session .\audit-session
+```
+
+Schema-v1 cases remain readable and resolvable, but v1 did not record a status. Convert one with an explicit initial `draft` or `open` status. Migration preserves the case ID, session identities, entries, and evidence locators, hashes the exact v1 bytes as its parent, and leaves the v1 source unchanged:
+
+```powershell
+sideeffect.exe case migrate --case .\legacy.case.json --status open --output .\review-v2.case.json --session .\audit-session
+```
 
 Resolve the case against those same session directories:
 
@@ -301,7 +313,7 @@ For a private static HTML report that links each analyst entry to its resolved e
 sideeffect.exe case resolve --format html --output .\review.html --case .\review.case.json --session .\audit-session
 ```
 
-The default bounded JSON result includes exact matched source rows; the optional HTML report is static, offline, size-bounded, private, and no-clobber. Both preserve session/source/parser/loss status. Exit status `2` means a source remains partial or unknown. Manifest and artifact hashes establish byte consistency, not producer authenticity or assertion truth. Resolved output may contain raw trace rows, paths, arguments, analyst text, or ETW payloads represented as hex. Keep it local and review it before sharing. This early workflow does not provide case lifecycle/status management, an interactive editor, role-specific reports, or a general investigation query engine.
+The default bounded JSON result includes exact matched source rows; the optional HTML report is static, offline, size-bounded, private, and no-clobber. Both include v2 case status/revision and preserve session/source/parser/loss status. V1 cases show that status is not tracked. Exit status `2` means a source remains partial or unknown. Manifest, artifact, and parent-case hashes establish byte consistency, not producer authenticity, a tamper-proof history, or assertion truth. Resolved output may contain raw trace rows, paths, arguments, analyst text, or ETW payloads represented as hex. Keep it local and review it before sharing. The workflow still has no interactive editor, role-specific reports, or general investigation query engine.
 
 ## Build from source
 
@@ -377,7 +389,7 @@ This does not require `strace`. The fixture is illustrative data, not a capture 
 .\target\release\sideeffect.exe inventory processes --output .\processes.json
 ```
 
-This native Windows inventory writes `sideeffect.windows_process_inventory` v3 using one Tool Help process snapshot and queries image paths, creation FILETIME, and token user SID/integrity RID/session ID only where `PROCESS_QUERY_LIMITED_INFORMATION` and token query access are available. Creation FILETIME is PID-generation evidence; the token query's generation is checked against it and values are cleared when identity cannot be verified or changed. Inaccessible, vanished, malformed, or failed queries remain unknown and make the result partial. SID strings are retained as identifiers; SideEffect does not resolve account names. It does not read command lines, inspect memory, start processes, or request elevation. The snapshot and subsequent queries happen at different times, so processes can exit or identifiers can be reused between them. The scan is limited to 8,192 process entries, 10 seconds, 32,768 UTF-16 code units per path, 4 Mi aggregate path code units, 256 UTF-16 code units per SID, 2 Mi aggregate SID code units, and 64 MiB of JSON. The output is staged under an explicit current-user-only Windows DACL and is published without replacing an existing destination. Process names, image paths, and SIDs can be sensitive; review before sharing.
+This native Windows inventory writes `sideeffect.windows_process_inventory` v4 from one Tool Help process snapshot and queries image paths, creation FILETIME, and token facts through one process handle per PID. Handle-bound facts are internally generation-consistent, but the snapshot PID-only row cannot be bound to that later handle and stays candidate context. Windows host boot identity is unknown. Inaccessible, vanished, malformed, or failed queries remain unknown and make the result partial. SID strings are retained as identifiers; SideEffect does not resolve account names. It does not read command lines, inspect memory, start processes, or request elevation. The snapshot and handle queries happen at different times, so processes can exit or identifiers can be reused between them. The scan is limited to 8,192 process entries, 10 seconds, 32,768 UTF-16 code units per path, 4 Mi aggregate path code units, 256 UTF-16 code units per SID, 2 Mi aggregate SID code units, and 64 MiB of JSON. The output is staged under an explicit current-user-only Windows DACL and is published without replacing an existing destination. Process names, image paths, and SIDs can be sensitive; review before sharing.
 
 ## Find executable candidates on the current PATH
 

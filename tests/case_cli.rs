@@ -1,4 +1,5 @@
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -50,6 +51,8 @@ fn case_help_describes_the_partial_workflow_and_integrity_boundary() {
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(help.contains("sideeffect case init"));
+    assert!(help.contains("sideeffect case migrate"));
+    assert!(help.contains("sideeffect case set-status"));
     assert!(help.contains("sideeffect case add-entry"));
     assert!(help.contains("sideeffect case resolve"));
     assert!(help.contains("not producer authenticity"));
@@ -93,7 +96,10 @@ fn case_cli_initializes_and_resolves_against_a_verified_session_without_overwrit
     let case_bytes = fs::read(&case_path).unwrap();
     let case: Value = serde_json::from_slice(&case_bytes).unwrap();
     assert_eq!(case["schema"], "sideeffect.investigation_case");
-    assert_eq!(case["schema_version"], 1);
+    assert_eq!(case["schema_version"], 2);
+    assert_eq!(case["lifecycle"]["status"], "draft");
+    assert_eq!(case["lifecycle"]["revision"], 1);
+    assert!(case["lifecycle"]["previous_case_sha256"].is_null());
     assert_eq!(case["title"], "CLI case workflow integration");
     assert_eq!(case["sessions"].as_array().unwrap().len(), 1);
     assert_eq!(case["entries"].as_array().unwrap().len(), 0);
@@ -121,7 +127,175 @@ fn case_cli_initializes_and_resolves_against_a_verified_session_without_overwrit
     assert!(!second_init.status.success());
     assert_eq!(fs::read(&case_path).unwrap(), case_bytes);
 
+    let mut legacy_value = case.clone();
+    legacy_value["schema_version"] = serde_json::json!(1);
+    legacy_value.as_object_mut().unwrap().remove("lifecycle");
+    let legacy_bytes = serde_json::to_vec(&legacy_value).unwrap();
+    let legacy_path = directory.0.join("legacy-v1.case.json");
+    fs::write(&legacy_path, &legacy_bytes).unwrap();
+    let legacy_resolve = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("resolve")
+        .arg("--case")
+        .arg(&legacy_path)
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(legacy_resolve.status.success() || legacy_resolve.status.code() == Some(2));
+    let legacy_report: Value = serde_json::from_slice(&legacy_resolve.stdout).unwrap();
+    assert_eq!(legacy_report["schema_version"], 2);
+    assert!(legacy_report.get("lifecycle").is_none());
+    let migrated_path = directory.0.join("migrated.case.json");
+    let migrated = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("migrate")
+        .arg("--case")
+        .arg(&legacy_path)
+        .arg("--status")
+        .arg("open")
+        .arg("--output")
+        .arg(&migrated_path)
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(
+        migrated.status.success() || migrated.status.code() == Some(2),
+        "migration failed: {}",
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+    let migrated_bytes = fs::read(&migrated_path).unwrap();
+    let migrated_value: Value = serde_json::from_slice(&migrated_bytes).unwrap();
+    assert_eq!(migrated_value["schema_version"], 2);
+    assert_eq!(migrated_value["lifecycle"]["status"], "open");
+    assert_eq!(migrated_value["lifecycle"]["revision"], 2);
+    assert_eq!(
+        migrated_value["lifecycle"]["previous_case_sha256"],
+        format!("{:x}", Sha256::digest(&legacy_bytes))
+    );
+    assert_eq!(fs::read(&legacy_path).unwrap(), legacy_bytes);
+
+    let review_path = directory.0.join("in-review.case.json");
+    let to_review = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("set-status")
+        .arg("--case")
+        .arg(&migrated_path)
+        .arg("--status")
+        .arg("in_review")
+        .arg("--output")
+        .arg(&review_path)
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(
+        to_review.status.success() || to_review.status.code() == Some(2),
+        "status transition failed: {}",
+        String::from_utf8_lossy(&to_review.stderr)
+    );
+    let review_bytes = fs::read(&review_path).unwrap();
+    let review_value: Value = serde_json::from_slice(&review_bytes).unwrap();
+    assert_eq!(review_value["lifecycle"]["revision"], 3);
+    assert_eq!(
+        review_value["lifecycle"]["previous_case_sha256"],
+        format!("{:x}", Sha256::digest(&migrated_bytes))
+    );
+    assert_eq!(fs::read(&migrated_path).unwrap(), migrated_bytes);
+
+    let repeated_transition = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("set-status")
+        .arg("--case")
+        .arg(&migrated_path)
+        .arg("--status")
+        .arg("in_review")
+        .arg("--output")
+        .arg(&review_path)
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(!repeated_transition.status.success());
+    assert_eq!(fs::read(&review_path).unwrap(), review_bytes);
+
     let entry_path = directory.0.join("note.json");
+    fs::write(&entry_path, br#"{"id":"N001","kind":"note","authorship":"analyst_supplied_unverified","text":"bounded note"}"#).unwrap();
+    let blocked_entry = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("add-entry")
+        .arg("--case")
+        .arg(&review_path)
+        .arg("--entry")
+        .arg(directory.0.join("note.json"))
+        .arg("--output")
+        .arg(directory.0.join("blocked-entry.case.json"))
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(!blocked_entry.status.success());
+
+    let reopened_path = directory.0.join("reopened.case.json");
+    let reopen = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("set-status")
+        .arg("--case")
+        .arg(&review_path)
+        .arg("--status")
+        .arg("open")
+        .arg("--output")
+        .arg(&reopened_path)
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(reopen.status.success() || reopen.status.code() == Some(2));
+    let closed_path = directory.0.join("closed.case.json");
+    let close = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("set-status")
+        .arg("--case")
+        .arg(&reopened_path)
+        .arg("--status")
+        .arg("closed")
+        .arg("--output")
+        .arg(&closed_path)
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(close.status.success() || close.status.code() == Some(2));
+    let closed_entry = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("add-entry")
+        .arg("--case")
+        .arg(&closed_path)
+        .arg("--entry")
+        .arg(&entry_path)
+        .arg("--output")
+        .arg(directory.0.join("closed-entry.case.json"))
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(!closed_entry.status.success());
+    let terminal = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("set-status")
+        .arg("--case")
+        .arg(&closed_path)
+        .arg("--status")
+        .arg("open")
+        .arg("--output")
+        .arg(directory.0.join("reopened-terminal.case.json"))
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(!terminal.status.success());
+
     fs::write(
         &entry_path,
         br#"{"id":"N001","kind":"note","authorship":"analyst_supplied_unverified","text":"<script>alert(1)</script>\u202e"}"#,
@@ -135,12 +309,14 @@ fn case_cli_initializes_and_resolves_against_a_verified_session_without_overwrit
         .arg(&case_path)
         .arg("--entry")
         .arg(&entry_path)
+        .arg("--session")
+        .arg(&session)
         .arg("--output")
         .arg(&updated_case_path)
         .output()
         .unwrap();
     assert!(
-        add_entry.status.success(),
+        add_entry.status.success() || add_entry.status.code() == Some(2),
         "case add-entry failed: {}",
         String::from_utf8_lossy(&add_entry.stderr)
     );
@@ -157,6 +333,8 @@ fn case_cli_initializes_and_resolves_against_a_verified_session_without_overwrit
         .arg(&case_path)
         .arg("--entry")
         .arg(&entry_path)
+        .arg("--session")
+        .arg(&session)
         .arg("--output")
         .arg(&updated_case_path)
         .output()
@@ -171,6 +349,8 @@ fn case_cli_initializes_and_resolves_against_a_verified_session_without_overwrit
         .arg(&updated_case_path)
         .arg("--entry")
         .arg(&entry_path)
+        .arg("--session")
+        .arg(&session)
         .arg("--output")
         .arg(directory.0.join("duplicate-id.case.json"))
         .output()
@@ -203,6 +383,8 @@ fn case_cli_initializes_and_resolves_against_a_verified_session_without_overwrit
         .arg(&case_path)
         .arg("--entry")
         .arg(&invalid_assertion_path)
+        .arg("--session")
+        .arg(&session)
         .arg("--output")
         .arg(directory.0.join("invalid.case.json"))
         .output()

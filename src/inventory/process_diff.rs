@@ -44,6 +44,7 @@ pub struct ProcessDiffCounts {
     pub additions: usize,
     pub removals: usize,
     pub changes: usize,
+    pub candidate_changes: usize,
     pub unmatched_rows_suppressed_for_partial_source: usize,
     pub rows_with_missing_or_unobserved_generation: usize,
     pub ambiguous_pid_groups: usize,
@@ -338,8 +339,8 @@ fn validate(v: &Value, kind: Kind) -> Result<(), ProcessDiffError> {
     };
     let version = u64v(v, "schema_version")?;
     let supported_version = match kind {
-        Kind::Linux => matches!(version, 3 | 4),
-        Kind::Windows => version == 3,
+        Kind::Linux => matches!(version, 3 | 4 | 5),
+        Kind::Windows => matches!(version, 3 | 4),
     };
     if strv(v, "schema")? != schema || !supported_version {
         return Err(ProcessDiffError::UnsupportedSchema);
@@ -347,12 +348,31 @@ fn validate(v: &Value, kind: Kind) -> Result<(), ProcessDiffError> {
     if strv(v, "platform")? != platform {
         return Err(ProcessDiffError::PlatformMismatch);
     }
-    if strv(v, "scope")? != scope {
+    let expected_scope = if kind == Kind::Linux && u64v(v, "schema_version")? == 5 {
+        "visible_numeric_proc_status_stat_executable_and_namespace_entries_and_self_pid_namespace"
+    } else {
+        scope
+    };
+    if strv(v, "scope")? != expected_scope {
         return Err(ProcessDiffError::MalformedInput);
     }
     let (top, source_keys) = match kind {
         Kind::Linux => (
-            if u64v(v, "schema_version")? == 4 {
+            if u64v(v, "schema_version")? == 5 {
+                &[
+                    "schema",
+                    "schema_version",
+                    "platform",
+                    "scope",
+                    "capture_started_at_unix_ms",
+                    "capture_ended_at_unix_ms",
+                    "status",
+                    "boot_epoch",
+                    "identity_domain",
+                    "source",
+                    "processes",
+                ][..]
+            } else if u64v(v, "schema_version")? == 4 {
                 &[
                     "schema",
                     "schema_version",
@@ -387,17 +407,32 @@ fn validate(v: &Value, kind: Kind) -> Result<(), ProcessDiffError> {
             ][..],
         ),
         Kind::Windows => (
-            &[
-                "schema",
-                "schema_version",
-                "platform",
-                "scope",
-                "capture_started_at_unix_ms",
-                "capture_ended_at_unix_ms",
-                "status",
-                "source",
-                "processes",
-            ][..],
+            if u64v(v, "schema_version")? == 4 {
+                &[
+                    "schema",
+                    "schema_version",
+                    "platform",
+                    "scope",
+                    "capture_started_at_unix_ms",
+                    "capture_ended_at_unix_ms",
+                    "status",
+                    "identity_domain",
+                    "source",
+                    "processes",
+                ][..]
+            } else {
+                &[
+                    "schema",
+                    "schema_version",
+                    "platform",
+                    "scope",
+                    "capture_started_at_unix_ms",
+                    "capture_ended_at_unix_ms",
+                    "status",
+                    "source",
+                    "processes",
+                ][..]
+            },
             &[
                 "id",
                 "status",
@@ -409,7 +444,7 @@ fn validate(v: &Value, kind: Kind) -> Result<(), ProcessDiffError> {
         ),
     };
     only_keys(v, top)?;
-    if kind == Kind::Linux && u64v(v, "schema_version")? == 4 {
+    if kind == Kind::Linux && u64v(v, "schema_version")? >= 4 {
         validate_boot_epoch(
             v.get("boot_epoch")
                 .ok_or(ProcessDiffError::MalformedInput)?,
@@ -419,13 +454,23 @@ fn validate(v: &Value, kind: Kind) -> Result<(), ProcessDiffError> {
         return Err(ProcessDiffError::MalformedInput);
     }
     if kind == Kind::Linux
-        && u64v(v, "schema_version")? == 4
+        && u64v(v, "schema_version")? >= 4
         && v.pointer("/boot_epoch/status")
             .and_then(Value::as_str)
             .is_some_and(|status| status != "observed")
         && strv(v, "status")? != "partial"
     {
         return Err(ProcessDiffError::MalformedInput);
+    }
+    if (kind == Kind::Linux && u64v(v, "schema_version")? == 5)
+        || (kind == Kind::Windows && u64v(v, "schema_version")? == 4)
+    {
+        validate_identity_domain(
+            v.get("identity_domain")
+                .ok_or(ProcessDiffError::MalformedInput)?,
+            kind,
+            v,
+        )?;
     }
     let source = v.get("source").ok_or(ProcessDiffError::MalformedInput)?;
     only_keys(source, source_keys)?;
@@ -482,7 +527,7 @@ fn validate(v: &Value, kind: Kind) -> Result<(), ProcessDiffError> {
     for row in arr(v, "processes")? {
         match kind {
             Kind::Linux => validate_linux_row(row)?,
-            Kind::Windows => validate_windows_row(row)?,
+            Kind::Windows => validate_windows_row(row, u64v(v, "schema_version")?)?,
         }
     }
     Ok(())
@@ -537,6 +582,86 @@ fn validate_boot_epoch(epoch: &Value) -> Result<(), ProcessDiffError> {
         }
     } else if epoch.get("normalized_id").is_some_and(|v| !v.is_null()) {
         return Err(ProcessDiffError::MalformedInput);
+    }
+    Ok(())
+}
+
+fn validate_identity_domain(
+    domain: &Value,
+    kind: Kind,
+    document: &Value,
+) -> Result<(), ProcessDiffError> {
+    let keys: &[&str] = if kind == Kind::Linux {
+        &[
+            "status",
+            "kind",
+            "value",
+            "reason",
+            "boot_epoch_evidence",
+            "pid_namespace_evidence",
+        ]
+    } else {
+        &["status", "kind", "reason"]
+    };
+    only_keys(domain, keys)?;
+    let status = strv(domain, "status")?;
+    let expected_kind = if kind == Kind::Linux {
+        "linux_boot_pid_namespace"
+    } else {
+        "windows_host_boot_epoch"
+    };
+    if strv(domain, "kind")? != expected_kind
+        || !matches!(status, "observed" | "observed_hint" | "unknown")
+    {
+        return Err(ProcessDiffError::MalformedInput);
+    }
+    optional_string(domain, "reason")?;
+    optional_string(domain, "value")?;
+    if let Some(evidence) = domain.get("boot_epoch_evidence") {
+        let wrapped = serde_json::json!({"status":"observed","normalized_id":"00000000-0000-0000-0000-000000000000","evidence":evidence});
+        validate_boot_epoch(&wrapped)?;
+    }
+    if let Some(evidence) = domain.get("pid_namespace_evidence") {
+        only_keys(
+            evidence,
+            &["source", "byte_length", "record_sha256", "namespace_inode"],
+        )?;
+        if strv(evidence, "source")? != "/proc/self/ns/pid"
+            || u64v(evidence, "byte_length")? == 0
+            || u64v(evidence, "byte_length")? > 128
+            || u64v(evidence, "namespace_inode")? == 0
+        {
+            return Err(ProcessDiffError::MalformedInput);
+        }
+        let digest = strv(evidence, "record_sha256")?;
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ProcessDiffError::MalformedInput);
+        }
+    }
+    match status {
+        "observed_hint"
+            if domain.get("value").and_then(Value::as_str).is_some()
+                && domain.get("boot_epoch_evidence").is_some()
+                && domain.get("pid_namespace_evidence").is_some() =>
+        {
+            let boot_id = document
+                .pointer("/boot_epoch/normalized_id")
+                .and_then(Value::as_str)
+                .ok_or(ProcessDiffError::MalformedInput)?;
+            let namespace_inode = u64v(
+                domain
+                    .get("pid_namespace_evidence")
+                    .ok_or(ProcessDiffError::MalformedInput)?,
+                "namespace_inode",
+            )?;
+            if domain.get("value").and_then(Value::as_str)
+                != Some(format!("{boot_id}:{namespace_inode}").as_str())
+            {
+                return Err(ProcessDiffError::MalformedInput);
+            }
+        }
+        "unknown" if domain.get("value").is_none_or(Value::is_null) => {}
+        _ => return Err(ProcessDiffError::MalformedInput),
     }
     Ok(())
 }
@@ -793,9 +918,20 @@ fn validate_process_evidence(evidence: &Value) -> Result<(), ProcessDiffError> {
     Ok(())
 }
 
-fn validate_windows_row(row: &Value) -> Result<(), ProcessDiffError> {
-    only_keys(
-        row,
+fn validate_windows_row(row: &Value, version: u64) -> Result<(), ProcessDiffError> {
+    let allowed: &[&str] = if version >= 4 {
+        &[
+            "process_id",
+            "parent_process_id",
+            "thread_count",
+            "executable_name",
+            "creation_time",
+            "image",
+            "token_context",
+            "snapshot_binding_status",
+            "evidence",
+        ]
+    } else {
         &[
             "process_id",
             "parent_process_id",
@@ -805,8 +941,12 @@ fn validate_windows_row(row: &Value) -> Result<(), ProcessDiffError> {
             "image",
             "token_context",
             "evidence",
-        ],
-    )?;
+        ]
+    };
+    only_keys(row, allowed)?;
+    if version >= 4 && strv(row, "snapshot_binding_status")? != "candidate_pid_only" {
+        return Err(ProcessDiffError::MalformedInput);
+    }
     let _ = u64v(row, "process_id")?;
     if u64v(row, "process_id")? > u32::MAX as u64
         || u64v(row, "parent_process_id")? > u32::MAX as u64
@@ -1126,12 +1266,24 @@ fn evidence(row: &Value, index: usize, kind: Kind) -> ProcessEvidenceRef {
 
 fn compare(left: &Value, right: &Value, kind: Kind) -> Result<ProcessDiff, ProcessDiffError> {
     if kind == Kind::Linux {
-        let before = observed_boot_epoch(left);
-        let after = observed_boot_epoch(right);
-        let reason = match (before, after) {
-            (Some(a), Some(b)) if a != b => Some("boot_epoch_mismatch"),
-            (Some(_), Some(_)) => None,
-            _ => Some("identity_context_unknown"),
+        let before_version = u64v(left, "schema_version")?;
+        let after_version = u64v(right, "schema_version")?;
+        let reason = if before_version == 4 && after_version == 4 {
+            match (observed_boot_epoch(left), observed_boot_epoch(right)) {
+                (Some(a), Some(b)) if a != b => Some("boot_epoch_mismatch"),
+                (Some(_), Some(_)) => None,
+                _ => Some("identity_context_unknown"),
+            }
+        } else if before_version == 5 && after_version == 5 {
+            let before = observed_identity_domain(left);
+            let after = observed_identity_domain(right);
+            match (before, after) {
+                (Some(a), Some(b)) if a != b => Some("identity_domain_mismatch"),
+                (Some(_), Some(_)) => None,
+                _ => Some("identity_context_unknown"),
+            }
+        } else {
+            Some("identity_context_unknown")
         };
         if let Some(reason) = reason {
             let mut diagnostics = vec![reason];
@@ -1144,7 +1296,7 @@ fn compare(left: &Value, right: &Value, kind: Kind) -> Result<ProcessDiff, Proce
             }
             return Ok(ProcessDiff {
                 schema: "sideeffect.process_inventory_diff",
-                schema_version: 2,
+                schema_version: 3,
                 platform: "linux",
                 before_captured_at_unix_ms: left
                     .get("capture_ended_at_unix_ms")
@@ -1199,6 +1351,11 @@ fn compare(left: &Value, right: &Value, kind: Kind) -> Result<ProcessDiff, Proce
         && right.pointer("/source/status").and_then(Value::as_str) == Some("complete");
     let mut deltas = Vec::new();
     let mut diagnostics = BTreeSet::new();
+    let candidate_mode =
+        kind == Kind::Windows || (kind == Kind::Linux && u64v(left, "schema_version")? >= 4);
+    if candidate_mode {
+        diagnostics.insert("identity_context_candidate");
+    }
     if !full {
         diagnostics.insert("source_incomplete");
     }
@@ -1251,7 +1408,11 @@ fn compare(left: &Value, right: &Value, kind: Kind) -> Result<ProcessDiff, Proce
                         .into_iter()
                         .collect();
                     deltas.push(ProcessDelta {
-                        kind: "changed",
+                        kind: if candidate_mode {
+                            "candidate_changed"
+                        } else {
+                            "changed"
+                        },
                         process_id: *p,
                         generation: Some(*g),
                         changed_fields: changed,
@@ -1264,11 +1425,19 @@ fn compare(left: &Value, right: &Value, kind: Kind) -> Result<ProcessDiff, Proce
                             facts: b,
                         }),
                     });
-                    counts.changes += 1;
+                    if candidate_mode {
+                        counts.candidate_changes += 1;
+                    } else {
+                        counts.changes += 1;
+                    }
                 }
             }
             (Some((i, row)), None) | (None, Some((i, row))) => {
                 if unknown_pids.contains(p) || duplicate_pids.contains(p) {
+                    continue;
+                }
+                if candidate_mode {
+                    counts.unmatched_rows_suppressed_for_partial_source += 1;
                     continue;
                 }
                 if !full {
@@ -1318,7 +1487,7 @@ fn compare(left: &Value, right: &Value, kind: Kind) -> Result<ProcessDiff, Proce
     delta.sort_by_key(|d| (d.process_id, d.generation, d.kind));
     let result = ProcessDiff {
         schema: "sideeffect.process_inventory_diff",
-        schema_version: 2,
+        schema_version: 3,
         platform: if kind == Kind::Linux {
             "linux"
         } else {
@@ -1353,11 +1522,29 @@ fn observed_boot_epoch(document: &Value) -> Option<&str> {
     (epoch.get("status")?.as_str()? == "observed").then(|| epoch.get("normalized_id")?.as_str())?
 }
 
+fn observed_identity_domain(document: &Value) -> Option<&str> {
+    let domain = document.get("identity_domain")?;
+    (domain.get("status")?.as_str()? == "observed_hint").then(|| domain.get("value")?.as_str())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn linux(status: &str, rows: Value) -> Value {
         serde_json::json!({"schema":LINUX,"schema_version":4,"platform":"linux","scope":"visible_numeric_proc_status_stat_executable_and_namespace_entries","capture_started_at_unix_ms":1,"capture_ended_at_unix_ms":2,"status":status,"boot_epoch":{"status":"observed","normalized_id":"01234567-89ab-cdef-0123-456789abcdef","evidence":{"source":"/proc/sys/kernel/random/boot_id","byte_length":37,"record_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}},"source":{"id":"procfs_status","status":status,"directories_seen":rows.as_array().map_or(0,Vec::len),"status_bytes_read":0,"diagnostics":[]},"processes":rows})
+    }
+    fn linux_v5(status: &str, rows: Value, namespace_inode: Option<u64>) -> Value {
+        let mut value = linux(status, rows);
+        value["schema_version"] = serde_json::json!(5);
+        value["scope"] = serde_json::json!(
+            "visible_numeric_proc_status_stat_executable_and_namespace_entries_and_self_pid_namespace"
+        );
+        value["identity_domain"] = if let Some(inode) = namespace_inode {
+            serde_json::json!({"status":"observed_hint","kind":"linux_boot_pid_namespace","reason":"PID namespace inode is a local reusable hint","value":format!("01234567-89ab-cdef-0123-456789abcdef:{inode}"),"boot_epoch_evidence":{"source":"/proc/sys/kernel/random/boot_id","byte_length":37,"record_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"pid_namespace_evidence":{"source":"/proc/self/ns/pid","byte_length":18,"record_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","namespace_inode":inode}})
+        } else {
+            serde_json::json!({"status":"unknown","kind":"linux_boot_pid_namespace","reason":"PID namespace identity was unavailable"})
+        };
+        value
     }
     fn lrow(pid: u32, generation: Option<u64>, name: &str) -> Value {
         let start = if let Some(g) = generation {
@@ -1380,7 +1567,7 @@ mod tests {
             after.to_string().as_bytes(),
         )
         .unwrap();
-        assert_eq!(mismatch.schema_version, 2);
+        assert_eq!(mismatch.schema_version, 3);
         assert_eq!(mismatch.status, ProcessDiffStatus::Partial);
         assert_eq!(mismatch.diagnostics, ["boot_epoch_mismatch"]);
         assert!(mismatch.deltas.is_empty());
@@ -1444,7 +1631,65 @@ mod tests {
     }
 
     #[test]
-    fn matching_linux_boot_epoch_preserves_existing_duplicate_and_partial_rules() {
+    fn linux_v5_scopes_candidate_changes_to_matching_boot_and_pid_namespace() {
+        let before = linux_v5(
+            "complete",
+            serde_json::json!([lrow(7, Some(10), "old")]),
+            Some(4026531836),
+        );
+        let after = linux_v5(
+            "complete",
+            serde_json::json!([lrow(7, Some(10), "new")]),
+            Some(4026531836),
+        );
+        let diff = compare_process_inventory_json(
+            before.to_string().as_bytes(),
+            after.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(diff.schema_version, 3);
+        assert_eq!(diff.counts.candidate_changes, 1);
+        assert_eq!(diff.counts.changes, 0);
+        assert_eq!(diff.deltas[0].kind, "candidate_changed");
+        assert_eq!(diff.status, ProcessDiffStatus::Partial);
+
+        let other_namespace = linux_v5(
+            "complete",
+            serde_json::json!([lrow(7, Some(10), "new")]),
+            Some(4026532500),
+        );
+        let diff = compare_process_inventory_json(
+            before.to_string().as_bytes(),
+            other_namespace.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert!(diff.deltas.is_empty());
+        assert_eq!(diff.diagnostics, ["identity_domain_mismatch"]);
+    }
+
+    #[test]
+    fn linux_v5_unknown_domain_suppresses_cross_snapshot_claims() {
+        let before = linux_v5(
+            "partial",
+            serde_json::json!([lrow(7, Some(10), "old")]),
+            None,
+        );
+        let after = linux_v5(
+            "partial",
+            serde_json::json!([lrow(7, Some(10), "new")]),
+            None,
+        );
+        let diff = compare_process_inventory_json(
+            before.to_string().as_bytes(),
+            after.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert!(diff.deltas.is_empty());
+        assert!(diff.diagnostics.contains(&"identity_context_unknown"));
+    }
+
+    #[test]
+    fn matching_linux_boot_epoch_only_supports_candidate_changes_without_pid_namespace() {
         let before = linux("complete", serde_json::json!([lrow(7, Some(10), "old")]));
         let after = linux("complete", serde_json::json!([lrow(7, Some(10), "new")]));
         let diff = compare_process_inventory_json(
@@ -1453,7 +1698,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(diff.deltas.len(), 1);
-        assert_eq!(diff.deltas[0].kind, "changed");
+        assert_eq!(diff.deltas[0].kind, "candidate_changed");
+        assert_eq!(diff.counts.candidate_changes, 1);
+        assert_eq!(diff.counts.changes, 0);
 
         let duplicate = linux(
             "complete",
@@ -1465,10 +1712,67 @@ mod tests {
         )
         .unwrap();
         assert!(ambiguous.deltas.is_empty());
-        assert_eq!(ambiguous.diagnostics, ["ambiguous_pid_identity"]);
+        assert!(ambiguous.diagnostics.contains(&"ambiguous_pid_identity"));
+    }
+
+    #[test]
+    fn linux_v4_same_boot_without_pid_namespace_cannot_claim_presence() {
+        let before = linux("complete", serde_json::json!([lrow(7, Some(10), "old")]));
+        let after = linux("complete", serde_json::json!([lrow(8, Some(11), "new")]));
+        let diff = compare_process_inventory_json(
+            before.to_string().as_bytes(),
+            after.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(diff.counts.additions, 0);
+        assert_eq!(diff.counts.removals, 0);
+        assert_eq!(diff.counts.candidate_changes, 0);
+        assert!(diff.deltas.is_empty());
+        assert!(diff.counts.unmatched_rows_suppressed_for_partial_source > 0);
     }
     fn windows() -> Value {
         serde_json::json!({"schema":WINDOWS,"schema_version":3,"platform":"windows","scope":"toolhelp_process_snapshot_image_paths_and_token_context","capture_started_at_unix_ms":1,"capture_ended_at_unix_ms":2,"status":"complete","source":{"id":"toolhelp_process_snapshot","status":"complete","entries_seen":1,"image_path_utf16_code_units":10,"token_sid_utf16_code_units":10,"diagnostics":[]},"processes":[{"process_id":10,"parent_process_id":1,"thread_count":2,"executable_name":"demo.exe","creation_time":{"status":"observed","filetime_100ns":123,"source":"GetProcessTimes"},"image":{"status":"observed","path":"C:\\demo.exe","utf16_code_units":10},"token_context":{"identity_status":"observed","process_creation_time_filetime_100ns":123,"user_sid":{"status":"observed","value":"S-1-5-18","source":"TokenUser"},"integrity_level_rid":{"status":"observed","value":8192,"source":"TokenIntegrityLevel"},"session_id":{"status":"observed","value":0,"source":"TokenSessionId"}},"evidence":{"snapshot_source":"Toolhelp32Snapshot","snapshot_index":0,"process_id":10,"parent_process_id":1,"thread_count":2,"executable_name":"demo.exe","image_source":"QueryFullProcessImageNameW"}}]})
+    }
+
+    #[test]
+    fn windows_v4_unknown_domain_allows_only_exact_generation_candidates() {
+        let mut before = windows();
+        let mut after = windows();
+        for value in [&mut before, &mut after] {
+            value["schema_version"] = serde_json::json!(4);
+            value["identity_domain"] = serde_json::json!({"status":"unknown","kind":"windows_host_boot_epoch","reason":"no reviewed host boot identifier"});
+            value["processes"][0]["snapshot_binding_status"] =
+                serde_json::json!("candidate_pid_only");
+        }
+        after["processes"][0]["token_context"]["session_id"]["value"] = serde_json::json!(2);
+        let diff = compare_process_inventory_json(
+            before.to_string().as_bytes(),
+            after.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(diff.counts.candidate_changes, 1);
+        assert_eq!(diff.deltas[0].kind, "candidate_changed");
+        assert_eq!(diff.counts.additions, 0);
+        assert_eq!(diff.counts.removals, 0);
+
+        before["processes"][0]["creation_time"]["filetime_100ns"] = serde_json::json!(124);
+        before["processes"][0]["token_context"]["identity_status"] =
+            serde_json::json!("changed_during_read");
+        for field in ["user_sid", "integrity_level_rid", "session_id"] {
+            before["processes"][0]["token_context"][field]["status"] =
+                serde_json::json!("identity_unverified");
+            before["processes"][0]["token_context"][field]
+                .as_object_mut()
+                .unwrap()
+                .remove("value");
+        }
+        let diff = compare_process_inventory_json(
+            before.to_string().as_bytes(),
+            after.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(diff.counts.additions, 0);
+        assert_eq!(diff.counts.removals, 0);
     }
 
     #[test]
@@ -1482,7 +1786,8 @@ mod tests {
             after.to_string().as_bytes(),
         )
         .unwrap();
-        assert_eq!(output.counts.changes, 1);
+        assert_eq!(output.counts.candidate_changes, 1);
+        assert_eq!(output.deltas[0].kind, "candidate_changed");
         let text = serde_json::to_string(&output).unwrap();
         assert!(!text.contains("private raw"));
         assert!(!text.contains("private-line-hash"));
@@ -1506,7 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn only_complete_sources_report_presence_and_partial_sources_suppress_it() {
+    fn legacy_linux_sources_never_report_presence_without_pid_namespace_scope() {
         let before = linux("complete", serde_json::json!([]));
         let after = linux("complete", serde_json::json!([lrow(7, Some(8), "new")]));
         assert_eq!(
@@ -1517,7 +1822,7 @@ mod tests {
             .unwrap()
             .counts
             .additions,
-            1
+            0
         );
         let partial = linux("partial", serde_json::json!([lrow(7, Some(8), "new")]));
         let diff = compare_process_inventory_json(
@@ -1565,7 +1870,8 @@ mod tests {
             after.to_string().as_bytes(),
         )
         .unwrap();
-        assert_eq!(diff.counts.changes, 1);
+        assert_eq!(diff.counts.candidate_changes, 1);
+        assert_eq!(diff.deltas[0].kind, "candidate_changed");
         assert!(diff.deltas[0].changed_fields.contains(&"token_context"));
         assert_eq!(diff.before_captured_at_unix_ms, 2);
         assert_eq!(diff.after_captured_at_unix_ms, 3);
@@ -1585,8 +1891,10 @@ mod tests {
             after.to_string().as_bytes(),
         )
         .unwrap();
-        assert_eq!(diff.counts.additions, 1);
-        assert_eq!(diff.counts.removals, 1);
+        assert_eq!(diff.counts.additions, 0);
+        assert_eq!(diff.counts.removals, 0);
+        assert!(diff.deltas.is_empty());
+        assert!(diff.counts.unmatched_rows_suppressed_for_partial_source > 0);
     }
 
     #[test]

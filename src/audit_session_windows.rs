@@ -156,7 +156,7 @@ pub fn collect_and_publish(
             ArtifactKind::WindowsProcesses,
             "processes.windows.json",
             "sideeffect.windows_process_inventory",
-            3,
+            4,
             value,
         ));
     }

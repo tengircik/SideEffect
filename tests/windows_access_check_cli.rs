@@ -86,7 +86,8 @@ fn access_check_uses_process_snapshot_identity_and_reports_conditional_dacl_resu
     )
     .expect("process inventory output is JSON");
     assert_eq!(inventory["schema"], "sideeffect.windows_process_inventory");
-    assert_eq!(inventory["schema_version"], 3);
+    assert_eq!(inventory["schema_version"], 4);
+    assert_eq!(inventory["identity_domain"]["status"], "unknown");
     let current_pid = std::process::id();
     let current_process = inventory["processes"]
         .as_array()

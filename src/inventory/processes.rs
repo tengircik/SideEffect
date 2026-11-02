@@ -2,6 +2,7 @@ use crate::fingerprint::sha256_hex;
 use serde::Serialize;
 use std::fs;
 use std::io::{self, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -34,8 +35,40 @@ pub struct ProcessInventoryDocument {
     pub capture_ended_at_unix_ms: u128,
     pub status: ProcessInventoryStatus,
     pub boot_epoch: ProcessBootEpoch,
+    /// Reusable only inside the observed boot epoch and declared procfs scope.
+    /// It does not authenticate a host or distinguish cloned VM state.
+    pub identity_domain: ProcessIdentityDomain,
     pub source: ProcessInventorySource,
     pub processes: Vec<ProcessRow>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProcessIdentityDomain {
+    pub status: ProcessIdentityDomainStatus,
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_epoch_evidence: Option<ProcessBootEpochEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid_namespace_evidence: Option<PidNamespaceIdentityEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessIdentityDomainStatus {
+    ObservedHint,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PidNamespaceIdentityEvidence {
+    pub source: &'static str,
+    pub byte_length: usize,
+    pub record_sha256: String,
+    pub namespace_inode: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -285,6 +318,7 @@ fn collect_with_limits(root: &Path, limits: Limits) -> ProcessInventoryDocument 
     let mut directories_seen = 0usize;
     let mut partial = false;
     let boot_epoch = read_boot_epoch(root);
+    let pid_namespace = read_pid_namespace_identity(root);
     if boot_epoch.status != ProcessBootEpochStatus::Observed {
         partial = true;
         diagnostics.push(diag(
@@ -299,6 +333,15 @@ fn collect_with_limits(root: &Path, limits: Limits) -> ProcessInventoryDocument 
             "The procfs boot epoch was unavailable, malformed, or over its byte limit.",
         ));
     }
+    if pid_namespace.is_none() {
+        partial = true;
+        diagnostics.push(diag(
+            "pid_namespace_identity_unavailable",
+            None,
+            None,
+            "The procfs PID namespace identity was unavailable or malformed; cross-snapshot identity is unknown.",
+        ));
+    }
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(_) => {
@@ -308,7 +351,16 @@ fn collect_with_limits(root: &Path, limits: Limits) -> ProcessInventoryDocument 
                 None,
                 "Could not enumerate the procfs root.",
             ));
-            return finish(started, rows, diagnostics, 0, 0, true, boot_epoch);
+            return finish(
+                started,
+                rows,
+                diagnostics,
+                0,
+                0,
+                true,
+                boot_epoch,
+                pid_namespace,
+            );
         }
     };
     let mut pids = Vec::new();
@@ -507,6 +559,7 @@ fn collect_with_limits(root: &Path, limits: Limits) -> ProcessInventoryDocument 
         total_bytes,
         partial,
         boot_epoch,
+        pid_namespace,
     )
 }
 
@@ -518,6 +571,7 @@ fn finish(
     status_bytes_read: usize,
     partial: bool,
     boot_epoch: ProcessBootEpoch,
+    pid_namespace: Option<PidNamespaceIdentityEvidence>,
 ) -> ProcessInventoryDocument {
     let status = if partial {
         ProcessInventoryStatus::Partial
@@ -526,12 +580,36 @@ fn finish(
     };
     ProcessInventoryDocument {
         schema: "sideeffect.process_inventory",
-        schema_version: 4,
+        schema_version: 5,
         platform: "linux",
-        scope: "visible_numeric_proc_status_stat_executable_and_namespace_entries",
+        scope: "visible_numeric_proc_status_stat_executable_and_namespace_entries_and_self_pid_namespace",
         capture_started_at_unix_ms: started,
         capture_ended_at_unix_ms: now_ms(),
         status,
+        identity_domain: match (&boot_epoch.normalized_id, &pid_namespace) {
+            (Some(boot_id), Some(namespace))
+                if boot_epoch.status == ProcessBootEpochStatus::Observed =>
+            {
+                ProcessIdentityDomain {
+                    status: ProcessIdentityDomainStatus::ObservedHint,
+                    kind: "linux_boot_pid_namespace",
+                    reason: Some(
+                        "PID namespace inode is a local reusable hint, not host authentication or a durable identifier",
+                    ),
+                    value: Some(format!("{boot_id}:{}", namespace.namespace_inode)),
+                    boot_epoch_evidence: boot_epoch.evidence.clone(),
+                    pid_namespace_evidence: pid_namespace.clone(),
+                }
+            }
+            _ => ProcessIdentityDomain {
+                status: ProcessIdentityDomainStatus::Unknown,
+                kind: "linux_boot_pid_namespace",
+                reason: Some("boot epoch or procfs PID namespace identity was not observed"),
+                value: None,
+                boot_epoch_evidence: boot_epoch.evidence.clone(),
+                pid_namespace_evidence: pid_namespace.clone(),
+            },
+        },
         boot_epoch,
         source: ProcessInventorySource {
             id: "procfs_status",
@@ -599,6 +677,30 @@ fn boot_epoch_evidence(bytes: &[u8]) -> ProcessBootEpochEvidence {
         byte_length: bytes.len(),
         record_sha256: sha256_hex(bytes),
     }
+}
+
+fn read_pid_namespace_identity(root: &Path) -> Option<PidNamespaceIdentityEvidence> {
+    let path = root.join("self/ns/pid");
+    let target = fs::read_link(&path).ok()?;
+    let bytes = target.as_os_str().as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_NAMESPACE_LINK_BYTES || !bytes.is_ascii() {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let inode = text
+        .strip_prefix("pid:[")?
+        .strip_suffix(']')?
+        .parse::<u64>()
+        .ok()?;
+    if inode == 0 {
+        return None;
+    }
+    Some(PidNamespaceIdentityEvidence {
+        source: "/proc/self/ns/pid",
+        byte_length: bytes.len(),
+        record_sha256: sha256_hex(bytes),
+        namespace_inode: inode,
+    })
 }
 
 enum ReadStatusError {
@@ -1297,6 +1399,9 @@ mod tests {
                 b"01234567-89AB-CDEF-0123-456789ABCDEF\n",
             )
             .unwrap();
+            let self_ns = p.join("self/ns");
+            fs::create_dir_all(&self_ns).unwrap();
+            symlink("pid:[4026531836]", self_ns.join("pid")).unwrap();
             Self(p)
         }
         fn status(&self, pid: u32, bytes: &[u8]) {
@@ -1342,6 +1447,21 @@ mod tests {
             evidence.record_sha256,
             sha256_hex(b"01234567-89AB-CDEF-0123-456789ABCDEF\n")
         );
+    }
+
+    #[test]
+    fn pid_namespace_identity_is_bounded_observed_hint_and_unknown_on_malformed_input() {
+        let root = Temp::new();
+        let identity = read_pid_namespace_identity(&root.0).unwrap();
+        assert_eq!(identity.source, "/proc/self/ns/pid");
+        assert_eq!(identity.namespace_inode, 4026531836);
+        assert_eq!(identity.byte_length, b"pid:[4026531836]".len());
+        assert_eq!(identity.record_sha256, sha256_hex(b"pid:[4026531836]"));
+
+        let link = root.0.join("self/ns/pid");
+        fs::remove_file(&link).unwrap();
+        symlink("pid:[not-an-inode]", &link).unwrap();
+        assert!(read_pid_namespace_identity(&root.0).is_none());
     }
 
     #[test]

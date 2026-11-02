@@ -15,9 +15,18 @@ pub fn write_case_html<W: Write>(case: &ResolvedCase, writer: &mut W) -> io::Res
     write_text(writer, &case.title)?;
     writer.write_all(b"</h1><p class=\"notice\">This report contains local audit evidence and analyst-supplied text. It may expose sensitive paths, arguments, process data, or payloads. Review before sharing. It does not authenticate session producers or verify analyst assertions.</p></header>\n<section class=\"card\"><h2>Case context</h2><dl><dt>Case ID</dt><dd>")?;
     write_text(writer, &case.case_id)?;
+    let lifecycle_html = if let Some(lifecycle) = &case.lifecycle {
+        format!(
+            "</dd><dt>Case status</dt><dd>{}</dd><dt>Case revision</dt><dd>{}",
+            lifecycle.status.as_str(),
+            lifecycle.revision
+        )
+    } else {
+        "</dd><dt>Case status</dt><dd>not tracked in schema v1".to_owned()
+    };
     writeln!(
         writer,
-        "</dd><dt>Schema</dt><dd>{} v{}</dd><dt>Sessions</dt><dd>{}</dd><dt>Entries</dt><dd>{}</dd><dt>Resolved evidence facts</dt><dd>{}</dd></dl></section>",
+        "{lifecycle_html}</dd><dt>Schema</dt><dd>{} v{}</dd><dt>Sessions</dt><dd>{}</dd><dt>Entries</dt><dd>{}</dd><dt>Resolved evidence facts</dt><dd>{}</dd></dl></section>",
         case.schema,
         case.schema_version,
         case.sessions.len(),
@@ -206,10 +215,15 @@ mod tests {
     fn report_is_offline_escapes_hostile_text_and_links_entry_to_evidence() {
         let case = ResolvedCase {
             schema: "sideeffect.resolved_investigation_case",
-            schema_version: 1,
+            schema_version: 2,
             disclosure_note: "not producer authenticity",
             case_id: "case-test".to_owned(),
             title: "Review <script>alert(1)</script>".to_owned(),
+            lifecycle: Some(crate::case::CaseLifecycle {
+                status: crate::case::CaseStatus::InReview,
+                revision: 3,
+                previous_case_sha256: Some("a".repeat(64)),
+            }),
             facts: vec![ResolvedEvidenceFact {
                 locator: CaseEvidenceLocator::SelectedRootEntry {
                     session_id: "0123456789abcdef0123456789abcdef".to_owned(),
@@ -262,6 +276,8 @@ mod tests {
         assert!(html.contains("script-src 'none'"));
         assert!(html.contains("<a href=\"#fact-0\">Fact 1</a>"));
         assert!(html.contains("id=\"fact-0\""));
+        assert!(html.contains("<dt>Case status</dt><dd>in_review</dd>"));
+        assert!(html.contains("<dt>Case revision</dt><dd>3</dd>"));
         assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;&amp;#x202E;"));
         assert!(!html.contains("<script"));
         assert!(!html.contains("<img"));

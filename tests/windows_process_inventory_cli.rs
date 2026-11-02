@@ -39,7 +39,8 @@ fn windows_process_command_includes_current_test_process_and_refuses_overwrite()
     let bytes = fs::read(&output).unwrap();
     let document: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(document["schema"], "sideeffect.windows_process_inventory");
-    assert_eq!(document["schema_version"], 3);
+    assert_eq!(document["schema_version"], 4);
+    assert_eq!(document["identity_domain"]["status"], "unknown");
     assert_eq!(document["platform"], "windows");
     assert_eq!(
         document["scope"],
@@ -56,6 +57,7 @@ fn windows_process_command_includes_current_test_process_and_refuses_overwrite()
         .iter()
         .find(|row| row["process_id"] == std::process::id())
         .unwrap();
+    assert_eq!(current["snapshot_binding_status"], "candidate_pid_only");
     assert!(matches!(
         current["creation_time"]["status"].as_str(),
         Some("observed" | "inaccessible" | "vanished" | "error")

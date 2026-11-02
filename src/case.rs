@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 pub const CASE_SCHEMA: &str = "sideeffect.investigation_case";
-pub const CASE_SCHEMA_VERSION: u32 = 1;
+pub const CASE_SCHEMA_V1: u32 = 1;
+pub const CASE_SCHEMA_VERSION: u32 = 2;
 
 pub const MAX_CASE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CASE_SESSIONS: usize = 16;
@@ -44,6 +45,81 @@ pub enum CasePlatform {
 pub enum CaseEntryKind {
     Note,
     Assertion,
+}
+
+/// User-managed case workflow status. This does not describe evidence quality or truth.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaseStatus {
+    Draft,
+    Open,
+    InReview,
+    Closed,
+    Cancelled,
+}
+
+impl CaseStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Open => "open",
+            Self::InReview => "in_review",
+            Self::Closed => "closed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Branch-local immutable revision metadata. The digest identifies exact prior file bytes; it
+/// does not authenticate their author or prevent a case history from being forked or rewritten.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaseLifecycle {
+    pub status: CaseStatus,
+    pub revision: u64,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub previous_case_sha256: Option<String>,
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+impl CaseLifecycle {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.revision == 0 {
+            return Err("case lifecycle revision must be positive".to_owned());
+        }
+        match (self.revision, self.previous_case_sha256.as_deref()) {
+            (1, None) => Ok(()),
+            (1, Some(_)) => Err("revision 1 must not have a previous case digest".to_owned()),
+            (_, None) => Err("case revision after 1 requires previous_case_sha256".to_owned()),
+            (_, Some(digest)) => validate_sha256("previous_case_sha256", digest),
+        }
+    }
+
+    pub fn permits_transition(&self, next: CaseStatus) -> bool {
+        matches!(
+            (self.status, next),
+            (CaseStatus::Draft, CaseStatus::Open | CaseStatus::Cancelled)
+                | (
+                    CaseStatus::Open,
+                    CaseStatus::InReview | CaseStatus::Closed | CaseStatus::Cancelled
+                )
+                | (
+                    CaseStatus::InReview,
+                    CaseStatus::Open | CaseStatus::Closed | CaseStatus::Cancelled
+                )
+        )
+    }
+
+    pub fn permits_entry(&self) -> bool {
+        matches!(self.status, CaseStatus::Draft | CaseStatus::Open)
+    }
 }
 
 /// This is an author's severity assessment, not a system-derived risk rating.
@@ -216,6 +292,9 @@ pub struct InvestigationCase {
     pub title: String,
     pub sessions: Vec<CaseSessionIdentity>,
     pub entries: Vec<CaseEntry>,
+    /// Absent only in schema v1. V2 requires this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<CaseLifecycle>,
 }
 
 impl InvestigationCase {
@@ -234,10 +313,23 @@ impl InvestigationCase {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema != CASE_SCHEMA || self.schema_version != CASE_SCHEMA_VERSION {
+        if self.schema != CASE_SCHEMA
+            || !matches!(self.schema_version, CASE_SCHEMA_V1 | CASE_SCHEMA_VERSION)
+        {
             return Err(format!(
-                "case schema must be {CASE_SCHEMA} version {CASE_SCHEMA_VERSION}"
+                "case schema must be {CASE_SCHEMA} version {CASE_SCHEMA_V1} or {CASE_SCHEMA_VERSION}"
             ));
+        }
+        match (self.schema_version, &self.lifecycle) {
+            (CASE_SCHEMA_V1, None) => {}
+            (CASE_SCHEMA_V1, Some(_)) => {
+                return Err("case schema version 1 must not contain lifecycle".to_owned());
+            }
+            (CASE_SCHEMA_VERSION, Some(lifecycle)) => lifecycle.validate()?,
+            (CASE_SCHEMA_VERSION, None) => {
+                return Err("case schema version 2 requires lifecycle".to_owned());
+            }
+            _ => unreachable!("schema version was checked above"),
         }
         validate_identifier("case_id", &self.case_id, MAX_CASE_ID_BYTES)?;
         validate_text("title", &self.title, MAX_TITLE_BYTES)?;
