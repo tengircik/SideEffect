@@ -830,6 +830,12 @@ def _validate_results_v3(
         reviewer_reports.append({
             "reviewer_id": reviewer_id,
             "reviewed_case_count": len(review_rows),
+            "review_completion_status": (
+                "self_attested_full_completion_not_independently_verified"
+                if full_completion else
+                "self_attested_review_incomplete_or_unverified"
+            ),
+            "review_blinding_or_independence_verified_automatically": False,
             "fully_completed_blinded_independent_review": full_completion,
             "required_evidence_label_coverage": (covered_count / required_count) if required_count else None,
             "covered_required_evidence_label_count": covered_count,
@@ -883,7 +889,10 @@ def _validate_results_v3(
         if len(complete_reviewers) >= 2
         else "not_independently_reviewed"
     )
+    report["human_review_gate_status_scope"] = "reviewer_completion_only_not_independent_verification_or_model_quality"
+    report["human_review_status_is_self_attested_diagnostic_only"] = True
     report["human_review_gate_reviewer_id_count"] = len(complete_reviewers)
+    report["self_attested_full_review_completion_reviewer_id_count"] = len(complete_reviewers)
     report["human_review_identity_or_independence_verified_automatically"] = False
     report["human_review_is_model_quality_gate"] = False
     report["selector_answerability_agreement_is_diagnostic"] = True

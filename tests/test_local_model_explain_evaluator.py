@@ -281,8 +281,17 @@ class ExplainEvaluatorV3HumanReviewTests(unittest.TestCase):
 
         report = self._validate(results)
         self.assertEqual(report["schema_version"], 3)
-        self.assertEqual(report["human_review_gate_status"], "reviewer_threshold_met_self_attested")
+        self.assertEqual(
+            report["human_review_gate_status"],
+            "reviewer_threshold_met_self_attested",
+        )
+        self.assertEqual(
+            report["human_review_gate_status_scope"],
+            "reviewer_completion_only_not_independent_verification_or_model_quality",
+        )
+        self.assertTrue(report["human_review_status_is_self_attested_diagnostic_only"])
         self.assertEqual(report["human_review_gate_reviewer_id_count"], 2)
+        self.assertEqual(report["self_attested_full_review_completion_reviewer_id_count"], 2)
         self.assertFalse(report["human_review_identity_or_independence_verified_automatically"])
         self.assertFalse(report["human_review_is_model_quality_gate"])
         self.assertTrue(report["selector_answerability_agreement_is_diagnostic"])
@@ -290,6 +299,11 @@ class ExplainEvaluatorV3HumanReviewTests(unittest.TestCase):
         self.assertFalse(report["semantic_truth_inferred_from_selector_structure"])
         reviewers = {row["reviewer_id"]: row for row in report["human_reviewers"]}
         self.assertTrue(reviewers["reviewer-a"]["fully_completed_blinded_independent_review"])
+        self.assertEqual(
+            reviewers["reviewer-a"]["review_completion_status"],
+            "self_attested_full_completion_not_independently_verified",
+        )
+        self.assertFalse(reviewers["reviewer-a"]["review_blinding_or_independence_verified_automatically"])
         self.assertEqual(reviewers["reviewer-a"]["required_evidence_label_coverage"], 17 / 26)
         self.assertLess(reviewers["reviewer-a"]["peer_answerability_agreement_rate"], 1.0)
         self.assertEqual(reviewers["reviewer-a"]["selector_answerability_denominator"], 26)
@@ -315,14 +329,33 @@ class ExplainEvaluatorV3HumanReviewTests(unittest.TestCase):
         for row in results["cases"]:
             row["human_reviews"] = row["human_reviews"][:1]
         report = self._validate(results)
-        self.assertEqual(report["human_review_gate_status"], "not_independently_reviewed")
+        self.assertEqual(
+            report["human_review_gate_status"],
+            "not_independently_reviewed",
+        )
+        self.assertTrue(report["human_review_status_is_self_attested_diagnostic_only"])
+        self.assertEqual(
+            report["human_review_gate_status_scope"],
+            "reviewer_completion_only_not_independent_verification_or_model_quality",
+        )
+        self.assertFalse(report["human_review_identity_or_independence_verified_automatically"])
+        self.assertFalse(report["human_review_is_model_quality_gate"])
         self.assertEqual(report["human_review_gate_reviewer_id_count"], 1)
 
         results = _result(self.corpus, self.digest, version=3)
         row = results["cases"][0]
         row["human_reviews"][1]["blind_to_model_identity"] = False
         report = self._validate(results)
-        self.assertEqual(report["human_review_gate_status"], "not_independently_reviewed")
+        self.assertEqual(
+            report["human_review_gate_status"],
+            "not_independently_reviewed",
+        )
+        self.assertTrue(report["human_review_status_is_self_attested_diagnostic_only"])
+        self.assertEqual(
+            report["human_review_gate_status_scope"],
+            "reviewer_completion_only_not_independent_verification_or_model_quality",
+        )
+        self.assertFalse(report["human_review_is_model_quality_gate"])
 
     def test_v3_rejects_incomplete_or_mismatched_case_reviews(self) -> None:
         mutations = [
@@ -423,7 +456,10 @@ class ExplainEvaluatorV3HumanReviewTests(unittest.TestCase):
             "error": "Synthetic test failure.",
         }]
         report = self._validate(results)
-        self.assertEqual(report["human_review_gate_status"], "not_independently_reviewed")
+        self.assertEqual(
+            report["human_review_gate_status"],
+            "not_independently_reviewed",
+        )
         self.assertTrue(all(not reviewer["fully_completed_blinded_independent_review"] for reviewer in report["human_reviewers"]))
 
 
