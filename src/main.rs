@@ -1,5 +1,5 @@
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 #[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
@@ -84,7 +84,9 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect model-preview --question <question> <strace-trace-file>\n\
        sideeffect model-analyze --question <question> [--runtime <llama-cli>] --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect model-explain-preview --question <question> --backend auto|cpu|cuda <strace-trace-file>\n\
+       sideeffect model-explain-preview --question <question> --backend auto|cpu|cuda --windows-runtime <capture.json>\n\
        sideeffect model-explain --question <question> --backend auto|cpu|cuda [--runtime <llama-completion>] --confirm-sha256 <preview-digest> <strace-trace-file>\n\
+       sideeffect model-explain --question <question> --backend auto|cpu|cuda [--runtime <llama-completion>] --confirm-sha256 <preview-digest> --windows-runtime <capture.json>\n\
        sideeffect model-query-preview --question <question> <strace-trace-file>\n\
        sideeffect model-query --question <question> [--runtime <llama-completion>] --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect query --query <query.json> --trace <trace> | --windows-runtime <capture.json>\n\
@@ -458,6 +460,21 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             question,
             backend_flag,
             backend,
+            windows_flag,
+            path,
+        ] if command == "model-explain-preview"
+            && question_flag == "--question"
+            && backend_flag == "--backend"
+            && windows_flag == "--windows-runtime" =>
+        {
+            model_windows_runtime_explanation_preview_file(question, backend, path)
+        }
+        [
+            command,
+            question_flag,
+            question,
+            backend_flag,
+            backend,
             runtime_flag,
             runtime,
             confirm_flag,
@@ -470,6 +487,51 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             && confirm_flag == "--confirm-sha256" =>
         {
             model_explanation_file(question, backend, Some(runtime), digest, trace)
+        }
+        [
+            command,
+            question_flag,
+            question,
+            backend_flag,
+            backend,
+            confirm_flag,
+            digest,
+            windows_flag,
+            capture,
+        ] if command == "model-explain"
+            && question_flag == "--question"
+            && backend_flag == "--backend"
+            && confirm_flag == "--confirm-sha256"
+            && windows_flag == "--windows-runtime" =>
+        {
+            model_windows_runtime_explanation_file(question, backend, None, digest, capture)
+        }
+        [
+            command,
+            question_flag,
+            question,
+            backend_flag,
+            backend,
+            runtime_flag,
+            runtime,
+            confirm_flag,
+            digest,
+            windows_flag,
+            capture,
+        ] if command == "model-explain"
+            && question_flag == "--question"
+            && backend_flag == "--backend"
+            && runtime_flag == "--runtime"
+            && confirm_flag == "--confirm-sha256"
+            && windows_flag == "--windows-runtime" =>
+        {
+            model_windows_runtime_explanation_file(
+                question,
+                backend,
+                Some(runtime),
+                digest,
+                capture,
+            )
         }
         [
             command,
@@ -1897,10 +1959,10 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect model-analyze --question QUESTION [--runtime LLAMA_CLI] --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the selected local evidence model on Linux x86_64 after explicit digest confirmation, using --runtime when supplied or the configured evidence runtime. The model may select at most one source evidence ID as an unverified hint; it can be wrong and is not a finding. SideEffect does not upload evidence. See docs/LOCAL_MODEL_EVALUATION.md."
         }
         "model-explain-preview" => {
-            "Usage: sideeffect model-explain-preview --question QUESTION --backend auto|cpu|cuda TRACE\nPreviews the bounded typed evidence, coverage, and selected explanation model identity. Review the exact prompt and digest before inference. 'auto' prefers a supported GPU and otherwise reports CPU use; it does not silently fall back after a GPU failure. This command does not run a model."
+            "Usage: sideeffect model-explain-preview --question QUESTION --backend auto|cpu|cuda TRACE | --windows-runtime CAPTURE.json\nPreviews bounded Linux syscall evidence or, with --windows-runtime, validated Windows ETW v3 events under a separate source-specific schema. ETW decoded observations appear only when bounded raw-payload re-decoding exactly matches the serialized sidecar; process payload fields remain unknown when live TDH metadata is required. Review the exact prompt and digest before inference. 'auto' prefers a supported GPU and otherwise reports CPU use; it does not silently fall back after a GPU failure. This command does not run a model."
         }
         "model-explain" => {
-            "Usage: sideeffect model-explain --question QUESTION --backend auto|cpu|cuda [--runtime LLAMA_COMPLETION] --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the selected local model after confirmation of the exact evidence preview, using --runtime when supplied or the configured explanation runtime. The model may select up to five syscall-result evidence IDs; SideEffect returns only the exact matching preview rows. This is an unverified evidence-selection aid, not an answer or finding. 'auto' prefers CUDA when the pinned runtime reports a device; CUDA errors do not silently fall back to CPU. SideEffect does not upload data or auto-download a model during analysis. The selected runtime is executable code that must be trusted separately; see docs/LOCAL_MODEL_EXPLANATION_EVALUATION.md."
+            "Usage: sideeffect model-explain --question QUESTION --backend auto|cpu|cuda [--runtime LLAMA_COMPLETION] --confirm-sha256 REQUEST_SHA256 TRACE | --windows-runtime CAPTURE.json\nRuns the selected local model after confirmation of the exact evidence preview. The Linux selector can select up to five syscall-result evidence IDs; --windows-runtime selects IDs from a source-specific Windows ETW v3 preview, with decoded payload observations included only after raw-payload/sidecar agreement. SideEffect returns only the exact matching preview rows. Unsupported event-kind labels remain marked as unverified capture metadata; the representation fingerprint does not authenticate the capture. This is an unverified evidence-selection aid, not an answer or finding. ETW event-header PID/TID values are context only. 'auto' prefers CUDA when the pinned runtime reports a device; CUDA errors do not silently fall back to CPU. SideEffect does not upload data or auto-download a model during analysis. The selected runtime is executable code that must be trusted separately; see docs/LOCAL_MODEL_EXPLANATION_EVALUATION.md."
         }
         "model-query-preview" => {
             "Usage: sideeffect model-query-preview --question QUESTION TRACE\nPreviews the bounded local query request, selected model identity, and typed evidence facts. Queryable facts are shown for review but are not sent to the model. Review this exact question, scope, and digest before optional local inference. Partial input exits with status 2."
@@ -4219,6 +4281,41 @@ fn model_explanation_preview_file(
     })
 }
 
+fn model_windows_runtime_explanation_preview_file(
+    question: &OsString,
+    backend: &OsString,
+    path: &OsString,
+) -> Result<ExitCode, String> {
+    let question = question
+        .to_str()
+        .ok_or("local model question must be valid UTF-8")?;
+    let backend = parse_explanation_backend(backend)?;
+    let bytes = read_bounded(path)?;
+    let model = selected_model(ModelTask::Explanation)?;
+    let preview =
+        sideeffect::local_model_explanation::preview_windows_runtime_explanation_bytes_for_model(
+            &bytes, question, backend, &model,
+        )?;
+    let partial = preview.evidence_summary["parse_status"] == "partial";
+    write_json(&preview, "local Windows ETW evidence explanation preview")?;
+    Ok(if partial {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn parse_explanation_backend(
+    backend: &OsStr,
+) -> Result<sideeffect::local_model_explanation::ExplanationBackendPreference, String> {
+    match backend.to_str() {
+        Some("auto") => Ok(sideeffect::local_model_explanation::ExplanationBackendPreference::Auto),
+        Some("cpu") => Ok(sideeffect::local_model_explanation::ExplanationBackendPreference::Cpu),
+        Some("cuda") => Ok(sideeffect::local_model_explanation::ExplanationBackendPreference::Cuda),
+        _ => Err("model explanation backend must be auto, cpu, or cuda".to_owned()),
+    }
+}
+
 fn model_query_file(
     question: &OsString,
     runtime: Option<&OsString>,
@@ -4289,6 +4386,43 @@ fn model_explanation_file(
     let selected = analysis.interpretation.selection_status
         == sideeffect::local_model_explanation::ExplanationSelectionStatus::Selected;
     write_json(&analysis, "local model evidence selection")?;
+    Ok(if selected {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
+fn model_windows_runtime_explanation_file(
+    question: &OsString,
+    backend: &OsString,
+    runtime: Option<&OsString>,
+    digest: &OsString,
+    capture_path: &OsString,
+) -> Result<ExitCode, String> {
+    let question = question
+        .to_str()
+        .ok_or("local model question must be valid UTF-8")?;
+    let backend = parse_explanation_backend(backend)?;
+    let digest = digest
+        .to_str()
+        .ok_or("preview digest must be 64 lowercase hexadecimal characters")?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
+    }
+    let bytes = read_bounded(capture_path)?;
+    let model = selected_model(ModelTask::Explanation)?;
+    let runtime = resolve_runtime_path(ModelTask::Explanation, runtime)?;
+    let analysis = sideeffect::local_model_explanation_runtime::analyze_windows_runtime_explanation_bytes_for_model(
+        &bytes, question, backend, &runtime, &model, digest,
+    )?;
+    let selected = analysis.interpretation.selection_status
+        == sideeffect::local_model_explanation::ExplanationSelectionStatus::Selected;
+    write_json(&analysis, "local Windows ETW evidence selection")?;
     Ok(if selected {
         ExitCode::SUCCESS
     } else {

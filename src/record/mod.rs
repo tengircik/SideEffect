@@ -5,7 +5,7 @@ mod paths;
 mod windows;
 #[cfg(windows)]
 mod windows_etw;
-mod windows_io_decode;
+pub(crate) mod windows_io_decode;
 
 #[cfg(target_os = "linux")]
 mod linux;

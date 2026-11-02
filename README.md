@@ -113,6 +113,15 @@ sideeffect.exe inspect --format text --session .\session
 
 The bounded ETW window records selected process, file, and network event families. Controlling the Windows Kernel Logger requires an already-administrative token; SideEffect never elevates automatically.
 
+An existing validated ETW v3 capture can be reviewed with the experimental local evidence selector:
+
+```powershell
+$preview = sideeffect.exe model-explain-preview --question "Which network observation is recorded?" --backend cpu --windows-runtime .\runtime.windows.json | ConvertFrom-Json
+sideeffect.exe model-explain --question "Which network observation is recorded?" --backend cpu --confirm-sha256 $preview.request_sha256 --windows-runtime .\runtime.windows.json
+```
+
+The ETW preview and result use their own schema versions. The selector can choose only exact preview event IDs. File, network, and disk payload observations appear only when SideEffect re-decodes retained bytes and matches the serialized sidecar; process payload fields are unknown when live TDH metadata is needed. Unsupported event-kind labels are marked as unverified capture metadata: the capture fingerprint detects representation changes but does not authenticate the capture. Event-header PID/TID values are context only. ETW capture completeness remains unknown, and this feature does not pass the local-model quality gate.
+
 ### Adapt runtime evidence into a common event envelope
 
 ```sh

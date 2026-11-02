@@ -252,6 +252,43 @@ fn analyze_model_explanation_bytes_with_model(
         backend_preference,
         model,
     )?;
+    analyze_model_explanation_preview_for_model(
+        preview,
+        runtime_path,
+        model_path,
+        confirmed_request_sha256,
+    )
+}
+
+pub fn analyze_windows_runtime_explanation_bytes_for_model(
+    capture_bytes: &[u8],
+    question: &str,
+    backend_preference: ExplanationBackendPreference,
+    runtime_path: &Path,
+    model: &crate::model_manager::ResolvedModel,
+    confirmed_request_sha256: &str,
+) -> Result<LocalModelExplanation, String> {
+    let preview =
+        crate::local_model_explanation::preview_windows_runtime_explanation_bytes_for_model(
+            capture_bytes,
+            question,
+            backend_preference,
+            model,
+        )?;
+    analyze_model_explanation_preview_for_model(
+        preview,
+        runtime_path,
+        &model.path,
+        confirmed_request_sha256,
+    )
+}
+
+fn analyze_model_explanation_preview_for_model(
+    preview: LocalModelExplanationPreview,
+    runtime_path: &Path,
+    model_path: &Path,
+    confirmed_request_sha256: &str,
+) -> Result<LocalModelExplanation, String> {
     if confirmed_request_sha256 != preview.request_sha256 {
         return Err(format!(
             "preview digest mismatch; review model-explain-preview and confirm its request_sha256 ({})",
@@ -267,8 +304,20 @@ fn analyze_model_explanation_bytes_with_model(
             Some(reason),
         )?;
         return Ok(LocalModelExplanation {
-            schema: "sideeffect.local_model_explanation",
-            schema_version: crate::local_model_explanation::LOCAL_MODEL_EXPLANATION_SCHEMA_VERSION,
+            schema: if preview.schema
+                == "sideeffect.local_model_windows_runtime_explanation_preview"
+            {
+                "sideeffect.local_model_windows_runtime_explanation"
+            } else {
+                "sideeffect.local_model_explanation"
+            },
+            schema_version: if preview.schema
+                == "sideeffect.local_model_windows_runtime_explanation_preview"
+            {
+                crate::local_model_explanation::LOCAL_MODEL_WINDOWS_RUNTIME_EXPLANATION_SCHEMA_VERSION
+            } else {
+                crate::local_model_explanation::LOCAL_MODEL_EXPLANATION_SCHEMA_VERSION
+            },
             interpretation_label: "local_model_selection_abstained",
             request_sha256: preview.request_sha256,
             backend_used: "not_run",
@@ -653,8 +702,18 @@ fn finish_inference<O: RuntimeOutputView>(
         None,
     )?;
     Ok(LocalModelExplanation {
-        schema: "sideeffect.local_model_explanation",
-        schema_version: crate::local_model_explanation::LOCAL_MODEL_EXPLANATION_SCHEMA_VERSION,
+        schema: if preview.schema == "sideeffect.local_model_windows_runtime_explanation_preview" {
+            "sideeffect.local_model_windows_runtime_explanation"
+        } else {
+            "sideeffect.local_model_explanation"
+        },
+        schema_version: if preview.schema
+            == "sideeffect.local_model_windows_runtime_explanation_preview"
+        {
+            crate::local_model_explanation::LOCAL_MODEL_WINDOWS_RUNTIME_EXPLANATION_SCHEMA_VERSION
+        } else {
+            crate::local_model_explanation::LOCAL_MODEL_EXPLANATION_SCHEMA_VERSION
+        },
         interpretation_label: match interpretation.selection_status {
             crate::local_model_explanation::ExplanationSelectionStatus::Selected => {
                 "local_model_selected_preview_evidence"

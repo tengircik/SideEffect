@@ -26,14 +26,14 @@ const MAX_EVENT_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_PATH_UTF16_UNITS: usize = 32 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum PointerWidth {
+pub(crate) enum PointerWidth {
     Bits32,
     Bits64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum DecodeStatus {
+pub(crate) enum DecodeStatus {
     Decoded,
     UnsupportedProvider,
     UnsupportedEvent,
@@ -44,7 +44,7 @@ pub(super) enum DecodeStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) struct DecodeResult {
+pub(crate) struct DecodeResult {
     pub status: DecodeStatus,
     pub diagnostic: Option<&'static str>,
     pub observation: Option<DecodedObservation>,
@@ -52,7 +52,7 @@ pub(super) struct DecodeResult {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) struct DecodedObservation {
+pub(crate) struct DecodedObservation {
     pub schema: &'static str,
     pub schema_version: u8,
     pub activity: Activity,
@@ -60,7 +60,7 @@ pub(super) struct DecodedObservation {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "observation")]
-pub(super) enum Activity {
+pub(crate) enum Activity {
     File(FileObservation),
     Network(NetworkObservation),
     Disk(DiskObservation),
@@ -68,7 +68,7 @@ pub(super) enum Activity {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum FileOperation {
+pub(crate) enum FileOperation {
     Name,
     CreateName,
     DeleteName,
@@ -88,7 +88,7 @@ pub(super) enum FileOperation {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) struct FileObservation {
+pub(crate) struct FileObservation {
     pub operation: FileOperation,
     pub thread_id: Option<u64>,
     pub file_object: u64,
@@ -105,14 +105,14 @@ pub(super) struct FileObservation {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Transport {
+pub(crate) enum Transport {
     Tcp,
     Udp,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum NetworkOperation {
+pub(crate) enum NetworkOperation {
     Connect,
     Accept,
     Disconnect,
@@ -125,14 +125,14 @@ pub(super) enum NetworkOperation {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum IpAddress {
+pub(crate) enum IpAddress {
     V4([u8; 4]),
     V6([u8; 16]),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) struct NetworkObservation {
+pub(crate) struct NetworkObservation {
     pub transport: Transport,
     pub operation: NetworkOperation,
     /// The `PID` field from the documented provider payload, not header PID.
@@ -148,7 +148,7 @@ pub(super) struct NetworkObservation {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum DiskOperation {
+pub(crate) enum DiskOperation {
     Read,
     Write,
     FlushBuffers,
@@ -156,7 +156,7 @@ pub(super) enum DiskOperation {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) struct DiskObservation {
+pub(crate) struct DiskObservation {
     pub operation: DiskOperation,
     pub disk_number: u32,
     pub irp_flags: u32,
@@ -173,7 +173,7 @@ pub(super) struct DiskObservation {
 /// Decode a classic event payload after the ETW callback has copied its bytes.
 /// `provider_guid` may be formatted with or without braces and in either hex
 /// case. `event_id`, version, and opcode are the EVENT_DESCRIPTOR fields.
-pub(super) fn decode_classic_event(
+pub(crate) fn decode_classic_event(
     provider_guid: &str,
     event_id: u16,
     version: u8,
