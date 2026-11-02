@@ -961,6 +961,67 @@ mod tests {
     }
 
     #[test]
+    fn key_rotation_keeps_old_signatures_verifiable_and_moves_local_trust() {
+        let root = temporary_root();
+        let store = root.join("trusted-keys");
+        let (old_private, old_public) = test_key();
+        let (new_private, new_public) = test_key();
+        let old_trust = import_trusted_key(&store, &old_public, "old signing key").unwrap();
+        let manifest = b"validated rotation fixture manifest";
+        let old_signature =
+            serde_json::to_vec(&sign_manifest(manifest, &old_private, 100).unwrap()).unwrap();
+        assert!(matches!(
+            verify_manifest_with_trust_store(manifest, &old_signature, &store).unwrap(),
+            super::Verification::ValidTrusted { .. }
+        ));
+
+        // Add the replacement before retiring the old local trust decision.
+        let new_trust = import_trusted_key(&store, &new_public, "new signing key").unwrap();
+        let new_signature =
+            serde_json::to_vec(&sign_manifest(manifest, &new_private, 200).unwrap()).unwrap();
+        assert!(matches!(
+            verify_manifest_with_trust_store(manifest, &new_signature, &store).unwrap(),
+            super::Verification::ValidTrusted { .. }
+        ));
+        assert!(matches!(
+            verify_manifest_with_trust_store(manifest, &old_signature, &store).unwrap(),
+            super::Verification::ValidTrusted { .. }
+        ));
+
+        remove_trusted_key(&store, &old_trust.key_id).unwrap();
+        assert_eq!(
+            verify_manifest_with_trust_store(manifest, &old_signature, &store).unwrap(),
+            super::Verification::UnknownTrustedKey {
+                key_id: old_trust.key_id.clone(),
+            }
+        );
+        assert_eq!(
+            verify_manifest_with_public_key_and_trust_store(
+                manifest,
+                &old_signature,
+                &public_text(&old_public),
+                &store,
+            )
+            .unwrap(),
+            super::Verification::ValidUntrusted {
+                key_id: old_trust.key_id,
+            }
+        );
+        assert_eq!(
+            verify_manifest_with_trust_store(manifest, &new_signature, &store).unwrap(),
+            super::Verification::ValidTrusted {
+                key_id: new_trust.key_id,
+                label: "new signing key".to_owned(),
+            }
+        );
+
+        // Retiring the old trust entry does not revoke signatures, while losing
+        // the old private key cannot be repaired from its public key or envelope.
+        assert!(sign_manifest(manifest, &old_public, 300).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn trust_store_rejects_duplicate_invalid_label_unknown_record_fields_and_links() {
         let root = temporary_root();
         let store = root.join("trusted-keys");
