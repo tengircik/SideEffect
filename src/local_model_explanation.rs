@@ -982,6 +982,7 @@ mod tests {
     fn tcp_capture(sidecar_matches: bool) -> Vec<u8> {
         use crate::record::windows_io_decode::{PointerWidth, decode_classic_event};
         use crate::windows_runtime::NativeRuntimeEvent;
+        use std::fmt::Write as _;
         let mut payload = Vec::new();
         payload.extend_from_slice(&4242_u32.to_le_bytes());
         payload.extend_from_slice(&12_u32.to_le_bytes());
@@ -996,10 +997,10 @@ mod tests {
         payload.extend_from_slice(&2_i16.to_le_bytes());
         payload.extend_from_slice(&99_u32.to_le_bytes());
         payload.extend_from_slice(&0x7788_u64.to_le_bytes());
-        let raw_hex = payload
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let mut raw_hex = String::with_capacity(payload.len() * 2);
+        for byte in &payload {
+            write!(&mut raw_hex, "{byte:02x}").unwrap();
+        }
         let raw_sidecar = serde_json::to_value(decode_classic_event(
             "9a280ac0-c8e0-11d1-84e2-00c04fb998a2",
             0,

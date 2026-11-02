@@ -666,7 +666,7 @@ mod platform {
         }
         let id = (u64::from(before.nFileIndexHigh) << 32) | u64::from(before.nFileIndexLow);
         let listed_write = listed.LastWriteTime as u64;
-        let before_write = (before.ftLastWriteTime.dwHighDateTime as u64) << 32
+        let before_write = ((before.ftLastWriteTime.dwHighDateTime as u64) << 32)
             | before.ftLastWriteTime.dwLowDateTime as u64;
         let before_size = (u64::from(before.nFileSizeHigh) << 32) | u64::from(before.nFileSizeLow);
         if before.dwFileAttributes
@@ -756,7 +756,7 @@ mod platform {
             return context.unavailable("content_hash_metadata_failed");
         }
         let after_id = (u64::from(after.nFileIndexHigh) << 32) | u64::from(after.nFileIndexLow);
-        let after_write = (after.ftLastWriteTime.dwHighDateTime as u64) << 32
+        let after_write = ((after.ftLastWriteTime.dwHighDateTime as u64) << 32)
             | after.ftLastWriteTime.dwLowDateTime as u64;
         let after_size = (u64::from(after.nFileSizeHigh) << 32) | u64::from(after.nFileSizeLow);
         if after_id != id
