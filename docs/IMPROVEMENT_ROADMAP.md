@@ -332,7 +332,7 @@ Status describes the coverage in current repository documentation as reviewed fo
 | 10.5 system change intelligence | Before/after files, registrations, services, startup, task, firewall/env and scoped install diff | Partial; selected-root and broad session item comparisons plus Linux/Windows startup comparisons exist; integrated controlled install/update workflows, additional source adapters, cross-source attribution, and install inference remain open | R5 |
 | 10.5 persistence attribution | Direct observed creator vs temporal/path candidate; configured vs execution | Partial exact-path startup candidate support; causal attribution intentionally not claimed | R2, R3, R5 |
 | 10.6 query engine | Read-only structured/SQL-like search over events and relationships | Missing as a general investigation query engine | R7 |
-| 10.6 cases | Saved scope, evidence, findings and investigation status | Missing | R7 |
+| 10.6 cases | Saved scope, evidence, findings and investigation status | Partial; a strict bounded case schema foundation exists, but verified session binding, locator resolution, authoring/report CLI, and end-to-end acceptance remain missing | R7 |
 | 10.6 reports | Technical, security/analyst and executive views from evidence-linked facts | Partial static HTML and deterministic summaries exist; role-specific report set missing | R7 |
 | 10.7 AI assistant | Natural language query, explanation and report only after deterministic engine | Experimental task-specific plumbing exists; no general approved assistant | R9 deferred/queued, gated by R3–R7 |
 | 11 | Priority order and acceptance before expanding analysis | Partial; existing milestones are gated, comprehensive future gates are now proposed | R0–R9 |
@@ -358,7 +358,7 @@ Status describes the coverage in current repository documentation as reviewed fo
 | Anomaly Detection | Missing as deterministic qualified findings | R4 |
 | System Change Intelligence | Partial source inventories, no scoped cross-source install diff | R5 |
 | Effective Access Analyzer | Missing beyond selected-path facts | R6 |
-| Investigation Engine | Missing general query/case/report engine | R7 |
+| Investigation Engine | Partial; strict case schema foundation exists, but general query, evidence resolution, authoring workflow, and integrated reports remain missing | R7 |
 | AI Investigation Assistant | Deferred/queued evaluation; experimental and incomplete, no model release-approved | R9 |
 | Top three: baseline, semantic diff, system change intelligence | Not integrated; prioritized after reliability and event/identity foundations | R1 → R3 → R4/R5 |
 

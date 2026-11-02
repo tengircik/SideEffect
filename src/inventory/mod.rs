@@ -128,7 +128,7 @@ pub use processes_windows::{
     WindowsProcessTokenField, WindowsProcessTokenFieldStatus, collect_windows_processes,
 };
 pub use root_snapshot::{
-    MAX_ROOT_AGGREGATE_HASH_BYTES, MAX_ROOT_FILE_HASH_BYTES, ROOT_HASH_DEADLINE,
+    MAX_ROOT_AGGREGATE_HASH_BYTES, MAX_ROOT_ENTRIES, MAX_ROOT_FILE_HASH_BYTES, ROOT_HASH_DEADLINE,
     ROOT_SNAPSHOT_HASH_SCHEMA_VERSION, ROOT_SNAPSHOT_SCHEMA, ROOT_SNAPSHOT_SCHEMA_VERSION,
     RootContentHashing, RootDiagnostic, RootEntry, RootEntryEvidence, RootIdentity, RootSnapshot,
     RootSnapshotLimits, collect_root_snapshot, collect_root_snapshot_with_hash,
