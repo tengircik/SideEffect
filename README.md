@@ -373,6 +373,7 @@ SideEffect provides a native Rust CLI for Linux x86_64 and Windows x64. The Linu
 - [Product scope](docs/PRODUCT.md)
 - [Optional local model setup and readiness checks](docs/LOCAL_MODEL_DOCTOR.md)
 - [Windows local explanation model setup](docs/LOCAL_MODEL_WINDOWS_SETUP.md)
+- [Bounded Windows GPU memory sampling for local models](docs/WINDOWS_LOCAL_MODEL_GPU_MEMORY_MEASUREMENT.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Delivery plan](docs/PLAN.md)
 - [Linux real-trace benchmark methodology](docs/TRACE_BENCHMARKING.md)
