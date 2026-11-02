@@ -10,7 +10,24 @@
 
 The prompt contains one selectable row per ETW capture record, with capture-reported event identity and timestamp, event-header PID/TID explicitly labeled context only, and exact evidence links (capture fingerprint, record ordinal, JSON pointer, and raw-payload SHA-256). A representation fingerprint detects accidental edits but does not authenticate capture metadata. The event identity therefore carries an explicit verification status: supported FileIo, DiskIo, TcpIp, and UdpIp event kinds are corroborated by bounded raw-payload re-decoding plus an exact sidecar match; other event-kind labels remain unverified capture-reported metadata. SideEffect includes a structured supported observation only when it exactly matches the serialized sidecar. Mismatch, unsupported, malformed, or unknown decodes remain null and make the preview partial. Process payload facts remain unknown because the current process decoder requires live Windows TDH schema metadata that an imported capture does not retain. No ETW syscall facts, operation success, event ownership, causation, or process lineage are inferred. Collection status, loss counters/availability, source diagnostics, and unknown capture completeness remain in coverage.
 
-This source path has synthetic adapter tests only; it does not establish live ETW compatibility or model selection quality. The existing M8 explanation quality gate remains explicitly unpassed. Adding ETW input does not qualify a model or alter its recommendation status.
+The ETW model-explanation adapter has synthetic contract tests; separate capture tests exercise live ETW on Windows Server 2022/2025, but do not validate live ETW model-preview quality. Neither test class establishes model selection quality. The existing M8 explanation quality gate remains explicitly unpassed. Adding ETW input does not qualify a model or alter its recommendation status.
+
+For a local preview, inspect the exact ETW rows and coverage before confirming inference:
+
+```powershell
+$preview = sideeffect.exe model-explain-preview `
+  --question "Which decoded network observation is present?" `
+  --backend cuda `
+  --windows-runtime .\runtime.windows.json | ConvertFrom-Json
+$preview | ConvertTo-Json -Depth 32
+sideeffect.exe model-explain `
+  --question "Which decoded network observation is present?" `
+  --backend cuda `
+  --confirm-sha256 $preview.request_sha256 `
+  --windows-runtime .\runtime.windows.json
+```
+
+Use a locally registered model and runtime that you have chosen and trust. Review the preview first; a non-null deterministic abstention does not launch inference. This example demonstrates the command contract only, not model quality or live ETW explanation acceptance.
 
 The catalog includes `explanation-qwen3.5-4b-q4-k-m` for Linux x86_64 and native Windows. Use `sideeffect model list` and `sideeffect model show explanation-qwen3.5-4b-q4-k-m` to inspect its source, revision, 2,783,446,368-byte size, Apache-2.0 license, and evaluation status. Install it with `sideeffect model install explanation-qwen3.5-4b-q4-k-m`, review the terms, and type the exact `ACCEPT Apache-2.0` confirmation; then run `sideeffect model select explanation explanation-qwen3.5-4b-q4-k-m`. It failed its development check, answering only 4 of 26 synthetic questions, and is not recommended for decisions. There is no positive quality recommendation. An alternative existing local GGUF can be registered with `sideeffect model add --name NAME --path FILE --for explanation [--license ID]`; the file is bounded to 3 GiB, and any supplied license ID is unverified. The runtime is separately obtained and installed by the user.
 
@@ -43,7 +60,7 @@ Review the preview's complete JSON and sensitive fields before confirming. Repla
 
 ### Blinded human review for selector results
 
-Results schema v3 adds `preview_request_sha256` and `review_target_sha256` to each selector result row, plus a `human_reviews` array. Each reviewer annotation repeats both digests. `preview_request_sha256` is the exact `request_sha256` from the SideEffect `model-explain-preview` output. The evaluator checks its format and equality between the result row and each review, but cannot recompute or authenticate the preview digest, verify the redaction, or prove the blind packet came from that preview. The packet preparer—not the reviewer—must inspect the original preview to confirm this value and prepare the blind packet below. Reviewers must see only that packet, never the identity-bearing original preview or model output.
+Results schema v3 adds `preview_request_sha256` and `review_target_sha256` to each selector result row, plus a `human_reviews` array. Each reviewer annotation repeats both digests. `preview_request_sha256` is the exact `request_sha256` from the SideEffect `model-explain-preview` output. The evaluator checks its format and equality between the result row and each review, but cannot recompute or authenticate the preview digest, verify reviewer blinding, or prove a packet came from that preview. The packet preparer checks the exact preview/analysis/result linkage and emits an allowlisted packet, but cannot authenticate the files’ origin; reviewers must not receive the identity-bearing originals. Reviewers must see only that packet, never the identity-bearing original preview or model output.
 
 `review_target_sha256` binds the review to a canonical target object containing schema/version, pinned corpus digest, case ID, the case question, `preview_request_sha256`, selector response, source parse status, and the complete bounded `available_evidence` array. Canonical bytes are UTF-8 JSON emitted with lexicographically sorted object keys, `ensure_ascii=false`, separators `,` and `:` with no spaces, and `allow_nan=false`; there is no trailing newline. SHA-256 is computed over those bytes. The validator reconstructs the target digest from the unchanged pinned case question and result row, then rejects an invalid, stale, or reviewer-mismatched digest. Do not include expected corpus semantic labels in the reviewer packet.
 
@@ -117,7 +134,7 @@ The prior prompt run used the same model blob, runtime revision, backend prefere
 
 The nine cases labeled unanswerable in this development corpus produced no selected evidence IDs. Three of the four source-order permutations selected rows labeled `connect_failed` and `errno_econnrefused`; one abstained. Their evidence IDs differ by source order, so the evaluator's literal ID consistency check reports the group inconsistent. This is not a permutation pass. The model-backed selection latency p95 was 9,996 ms as measured by the temporary harness; the validator only reports supplied latency, and peak process-isolated VRAM was not measured.
 
-The explanation selector's bounded output schema now allows a process-creation relation's root evidence row alongside syscall-result rows. Unit tests verify exact-row mapping, combined relation-plus-exec selection, ID collisions, unknown and duplicate selections, the five-row limit, and injection-resistant closed output. A subsequent targeted CUDA run still abstained on `What child PID did clone3 return?`; the same model selected the `execve` row for `Which executable does the execve row show?`. The schema can now express that relation evidence, but this run does not show that the model can use it reliably. Native Windows ETW evidence is still not accepted by `model-explain`. The current model remains **unqualified and not approved for user decisions**; an independently reviewed quality gate and demonstrated native Windows evidence workflow remain open.
+The explanation selector's bounded output schema now allows a process-creation relation's root evidence row alongside syscall-result rows. Unit tests verify exact-row mapping, combined relation-plus-exec selection, ID collisions, unknown and duplicate selections, the five-row limit, and injection-resistant closed output. A subsequent targeted CUDA run still abstained on `What child PID did clone3 return?`; the same model selected the `execve` row for `Which executable does the execve row show?`. The schema can now express that relation evidence, but this run does not show that the model can use it reliably. Native Windows ETW input is accepted through its separate preview/analysis schema, but it has only synthetic adapter contract coverage and no reviewed model-quality corpus or live model-preview acceptance. The current model remains **unqualified and not approved for user decisions**; an independently reviewed quality gate remains open.
 
 ### Compact candidate triage — 2026-10-28
 

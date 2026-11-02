@@ -122,6 +122,8 @@ sideeffect.exe model-explain --question "Which network observation is recorded?"
 
 The ETW preview and result use their own schema versions. The selector can choose only exact preview event IDs. File, network, and disk payload observations appear only when SideEffect re-decodes retained bytes and matches the serialized sidecar; process payload fields are unknown when live TDH metadata is needed. Unsupported event-kind labels are marked as unverified capture metadata: the capture fingerprint detects representation changes but does not authenticate the capture. Event-header PID/TID values are context only. ETW capture completeness remains unknown, and this feature does not pass the local-model quality gate.
 
+Local-model selection remains experimental; no model is approved for decisions. The [evaluation record](docs/LOCAL_MODEL_EXPLANATION_EVALUATION.md) describes the current quality limits and the identity-allowlisted review-packet tool for the Linux synthetic corpus. Native Windows ETW does not yet have a reviewed model-quality corpus.
+
 ### Adapt runtime evidence into a common event envelope
 
 ```sh
