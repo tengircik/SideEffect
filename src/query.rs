@@ -338,6 +338,35 @@ pub fn query_selected_root_artifact(
     input: SelectedRootQueryInput<'_>,
     query: &InventoryQuery,
 ) -> Result<SelectedRootQuerySource, String> {
+    query_selected_root_artifact_inner(input, query, None)
+}
+
+/// Validate the complete selected-root snapshot and retain only the requested entry.
+///
+/// Snapshot validation still examines every bounded entry for duplicate ordinals, native-name
+/// encoding, and aggregate-name limits. The returned query result contains at most one row, so
+/// callers resolving a locator do not need to materialize a multi-thousand-row query result.
+pub fn query_selected_root_entry_artifact(
+    input: SelectedRootQueryInput<'_>,
+    entry_ordinal: usize,
+) -> Result<SelectedRootQuerySource, String> {
+    if entry_ordinal >= MAX_ROOT_QUERY_ENTRIES {
+        return Err("selected-root entry ordinal is outside the supported range".to_owned());
+    }
+    let query = InventoryQuery {
+        schema: INVENTORY_QUERY_SCHEMA.to_owned(),
+        schema_version: INVENTORY_QUERY_SCHEMA_VERSION,
+        filters: InventoryQueryFilters::default(),
+        limit: 1,
+    };
+    query_selected_root_artifact_inner(input, &query, Some(entry_ordinal))
+}
+
+fn query_selected_root_artifact_inner(
+    input: SelectedRootQueryInput<'_>,
+    query: &InventoryQuery,
+    exact_ordinal: Option<usize>,
+) -> Result<SelectedRootQuerySource, String> {
     let SelectedRootQueryInput {
         platform,
         source_status,
@@ -441,11 +470,12 @@ pub fn query_selected_root_artifact(
             return Err("selected-root artifact has entries but no root identity".to_owned());
         }
         let name_hex = native_name_hex(&entry, platform)?;
-        if query
-            .filters
-            .entry_name_hex
-            .as_deref()
-            .is_none_or(|filter| filter == name_hex)
+        if exact_ordinal.is_none_or(|ordinal| ordinal == entry.ordinal)
+            && query
+                .filters
+                .entry_name_hex
+                .as_deref()
+                .is_none_or(|filter| filter == name_hex)
         {
             if entries.len() >= query.limit as usize {
                 return Err(format!(

@@ -280,6 +280,24 @@ On Windows, use `sideeffect.exe inventory packages --output .\before.json` and `
 
 For process snapshots, use `sideeffect inventory processes --output ./before.json` and `sideeffect inventory processes --output ./after.json` (or `sideeffect.exe` on Windows), then run the same `explain --inventory-diff` command. Linux cross-snapshot deltas require matching observed boot IDs; legacy snapshots or unavailable identity context suppress all deltas. This comparison key is evidence from procfs, not host authentication, and cloned VM state can preserve it. Process output includes local PIDs, generation values, and selected paths; review it before sharing.
 
+### Keep evidence in a local investigation case
+
+Create a private case draft from one or more verified sessions on the same native platform:
+
+```sh
+sideeffect case init --output ./review.case.json --title "Review selected behavior" --session ./audit-session
+```
+
+On Windows, use `sideeffect.exe` and PowerShell paths. Repeat `--session` for additional sessions (up to 16). The draft stores each session ID and the SHA-256 of its exact manifest bytes. Add analyst notes or assertions to the JSON `entries` array and copy exact evidence locators from the session evidence output. Assertions are always labeled analyst-supplied and unverified.
+
+Resolve the locators against the same verified sessions:
+
+```sh
+sideeffect case resolve --case ./review.case.json --session ./audit-session
+```
+
+The command writes bounded JSON with each resolved source row and the original session/source status. Exit status `2` means some source or capture remains partial or unknown. Hash checks establish consistency with the supplied session manifest; they do not authenticate who produced it or prove an assertion. The CLI does not yet edit case entries or generate role-specific HTML reports. Resolved JSON can contain sensitive paths, arguments, and event payloads; keep it local and review before sharing.
+
 ## What you can do
 
 | Workflow | Evidence and output |
@@ -291,6 +309,7 @@ For process snapshots, use `sideeffect inventory processes --output ./before.jso
 | Startup discovery | Source-linked startup configuration, retained as inert values and scripts |
 | Runtime capture | Linux `strace` records for a selected command and traced children; native Windows ETW events for a bounded capture window |
 | Evidence review | Bounded JSON, terminal-safe text, exact source references, and static offline HTML reports where supported |
+| Investigation case | Private JSON drafts and exact evidence-locator resolution against verified sessions; entry editing and role-specific reports remain open |
 | Comparison | Evidence-backed trace and ETW differences, aggregate summaries, and conservative association candidates |
 | Deterministic explanation | Source-aware `explain` summaries without a model dependency |
 | Optional local model tools | Experimental, user-selected model workflows with reviewed previews; no model is release-approved |

@@ -259,6 +259,34 @@ After installation, select the model for its task. An existing local GGUF can in
 
 The model manager and catalog can be inspected on Windows. Catalog query-plan inference and the evidence-selection command are Linux x86_64 only; the catalog explanation model and explanation command support Linux x86_64 and native Windows. Windows explanation supports `auto`, `cpu`, or `cuda`. A local custom GGUF can be registered only for a task supported on that platform. Runtime setup remains user-managed: SideEffect does not download or install llama.cpp or another runtime. The analysis commands accept a saved per-task path or an explicit `--runtime PATH`; configured runtime files are re-hashed before use and rejected if missing or changed. Model/runtime compatibility does not imply model quality, and no candidate has passed its applicable semantic gate. For the Windows/NVIDIA explanation setup and its CUDA, runtime, and resource limitations, see [Windows local explanation model setup](LOCAL_MODEL_WINDOWS_SETUP.md). Also see the task-specific setup and limitations in [evidence selection](LOCAL_MODEL_EVALUATION.md), [query plans](LOCAL_QUERY_PLAN_EVALUATION.md), and [explanations](LOCAL_MODEL_EXPLANATION_EVALUATION.md).
 
+## Create and resolve an investigation case
+
+Create a private JSON draft bound to one or more verified audit sessions from the same platform:
+
+```sh
+sideeffect case init --output ./review.case.json --title "Review selected behavior" --session ./audit-session
+```
+
+On Windows PowerShell:
+
+```powershell
+sideeffect.exe case init --output .\review.case.json --title "Review selected behavior" --session .\audit-session
+```
+
+Repeat `--session` to bind up to 16 sessions. Add analyst notes or assertions in the draft's `entries` array, using exact evidence locators from the session artifacts. The CLI currently creates an empty draft; it does not edit entries. Assertions require evidence references and stay labeled analyst-supplied and unverified.
+
+Resolve the case against those same session directories:
+
+```sh
+sideeffect case resolve --case ./review.case.json --session ./audit-session
+```
+
+```powershell
+sideeffect.exe case resolve --case .\review.case.json --session .\audit-session
+```
+
+The bounded JSON result includes exact matched source rows and preserves session/source/parser/loss status. Exit status `2` means a source remains partial or unknown. Manifest and artifact hashes establish byte consistency, not producer authenticity or assertion truth. Resolved output may contain raw trace rows, paths, arguments, analyst text, or ETW payloads represented as hex. Keep it local and review it before sharing. This early workflow does not provide HTML reports, case lifecycle/status management, or a general investigation query engine.
+
 ## Build from source
 
 The source repository is public and can be cloned over HTTPS or SSH:

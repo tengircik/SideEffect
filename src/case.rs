@@ -228,7 +228,7 @@ impl InvestigationCase {
             ));
         }
         let case: Self =
-            serde_json::from_slice(bytes).map_err(|error| format!("invalid case JSON: {error}"))?;
+            serde_json::from_slice(bytes).map_err(|_| "invalid case JSON".to_owned())?;
         case.validate()?;
         Ok(case)
     }
