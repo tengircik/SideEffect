@@ -124,7 +124,7 @@ fn case_cli_initializes_and_resolves_against_a_verified_session_without_overwrit
     let entry_path = directory.0.join("note.json");
     fs::write(
         &entry_path,
-        br#"{"id":"N001","kind":"note","authorship":"analyst_supplied_unverified","text":"Reviewed locally"}"#,
+        br#"{"id":"N001","kind":"note","authorship":"analyst_supplied_unverified","text":"<script>alert(1)</script>\u202e"}"#,
     )
     .unwrap();
     let updated_case_path = directory.0.join("review-with-note.case.json");
@@ -228,7 +228,10 @@ fn case_cli_initializes_and_resolves_against_a_verified_session_without_overwrit
     assert_eq!(report["case_id"], case["case_id"]);
     assert_eq!(report["facts"].as_array().unwrap().len(), 0);
     assert_eq!(report["entries"].as_array().unwrap().len(), 1);
-    assert_eq!(report["entries"][0]["text"], "Reviewed locally");
+    assert_eq!(
+        report["entries"][0]["text"],
+        "<script>alert(1)</script>\u{202e}"
+    );
     assert_eq!(report["sessions"].as_array().unwrap().len(), 1);
     assert!(
         report["disclosure_note"]
@@ -236,6 +239,59 @@ fn case_cli_initializes_and_resolves_against_a_verified_session_without_overwrit
             .unwrap()
             .contains("not producer authenticity")
     );
+
+    let html_path = directory.0.join("review.html");
+    let html = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("resolve")
+        .arg("--format")
+        .arg("html")
+        .arg("--output")
+        .arg(&html_path)
+        .arg("--case")
+        .arg(&updated_case_path)
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(
+        html.status.success() || html.status.code() == Some(2),
+        "case HTML resolve failed: {}",
+        String::from_utf8_lossy(&html.stderr)
+    );
+    let html_bytes = fs::read(&html_path).unwrap();
+    let html = String::from_utf8(html_bytes.clone()).unwrap();
+    assert!(html.contains("Content-Security-Policy"));
+    assert!(html.contains("default-src 'none'"));
+    assert!(html.contains("script-src 'none'"));
+    assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;&amp;#x202E;"));
+    assert!(!html.contains("<script>alert(1)</script>"));
+    assert!(!html.contains("https://"));
+
+    let html_overwrite = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("resolve")
+        .arg("--format")
+        .arg("html")
+        .arg("--output")
+        .arg(&html_path)
+        .arg("--case")
+        .arg(&updated_case_path)
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(!html_overwrite.status.success());
+    assert_eq!(fs::read(&html_path).unwrap(), html_bytes);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&html_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }
 
 #[test]

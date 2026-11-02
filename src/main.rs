@@ -83,7 +83,7 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect compare-sessions <before-session-directory> <after-session-directory>\n\
        sideeffect case init --output <new-case.json> --title <title> --session <session-directory>...\n\
        sideeffect case add-entry --case <case.json> --entry <entry.json> --output <new-case.json>\n\
-       sideeffect case resolve --case <case.json> --session <session-directory>...\n\
+       sideeffect case resolve [--format json|html] [--output <new-report.html>] --case <case.json> --session <session-directory>...\n\
        sideeffect model-preview --question <question> <strace-trace-file>\n\
        sideeffect model-analyze --question <question> [--runtime <llama-cli>] --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect model-explain-preview --question <question> --backend auto|cpu|cuda <strace-trace-file>\n\
@@ -1831,7 +1831,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect compare-sessions BEFORE_SESSION_DIR AFTER_SESSION_DIR\nVerifies both local audit sessions, reports metadata comparability, and compares bounded item-level inventory and runtime evidence from verified artifacts. Per-source status and evidence references remain visible; missing, partial, unsupported, or incompatible sources do not become empty results. This is not an exhaustive history or coverage claim, and it does not establish causation or event absence. Incomparable or partial results exit with status 2 and include stable reason codes."
         }
         "case" => {
-            "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-entry --case CASE.json --entry ENTRY.json --output NEW_CASE.json\n       sideeffect case resolve --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nCreates a private case draft, validates and appends one analyst-authored entry into a new private case file, or resolves all case evidence locators against supplied verified sessions. Existing files are never overwritten. Case-authored assertions remain unverified. Hash checks establish byte consistency, not producer authenticity or capture completeness. JSON output may contain sensitive local evidence. Incomplete, partial, or unknown source status exits with status 2."
+            "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-entry --case CASE.json --entry ENTRY.json --output NEW_CASE.json\n       sideeffect case resolve [--format json|html] [--output NEW_REPORT.html] --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nCreates a private case draft, validates and appends one analyst-authored entry into a new private case file, or resolves all case evidence locators against supplied verified sessions. Existing files are never overwritten. Case-authored assertions remain unverified. Hash checks establish byte consistency, not producer authenticity or capture completeness. JSON output may contain sensitive local evidence. Incomplete, partial, or unknown source status exits with status 2."
         }
         "case init" => {
             "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\nCreates an empty, bounded case file bound to the exact manifests of the supplied verified sessions. It does not add findings or evidence locators. The output is private and never overwrites an existing file."
@@ -1840,7 +1840,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect case add-entry --case CASE.json --entry ENTRY.json --output NEW_CASE.json\nValidates one bounded note/assertion JSON object, appends it to a validated case, and writes a new private case file. The source case is unchanged and output never overwrites an existing file. Assertions require evidence locators and remain analyst_supplied_unverified."
         }
         "case resolve" => {
-            "Usage: sideeffect case resolve --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nVerifies supplied sessions and resolves each case locator to its exact source record or selected-root entry. Session and artifact hashes establish consistency with the supplied manifest, not authenticity. Author-written assertions remain unverified; runtime completeness may remain unknown. JSON can contain sensitive paths, arguments, and raw payloads. Review before sharing."
+            "Usage: sideeffect case resolve [--format json|html] [--output NEW_REPORT.html] --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nVerifies supplied sessions and resolves each case locator to its exact source record or selected-root entry. HTML is static, offline, bounded, private, and no-clobber. Session and artifact hashes establish consistency with the supplied manifest, not authenticity. Author-written assertions remain unverified; runtime completeness may remain unknown. Reports can contain sensitive paths, arguments, and raw payloads. Review before sharing."
         }
         "explain" => {
             "Usage: sideeffect explain TRACE\n       sideeffect explain --diff LEFT RIGHT\n       sideeffect explain --inventory-diff BEFORE.json AFTER.json\nCreates bounded deterministic summaries. It does not use a language model."
@@ -2558,6 +2558,9 @@ fn case_init_command(arguments: &[OsString]) -> Result<ExitCode, String> {
 fn case_resolve_command(arguments: &[OsString]) -> Result<ExitCode, String> {
     let mut case_path: Option<&OsString> = None;
     let mut session_paths = Vec::new();
+    let mut output_path: Option<&OsString> = None;
+    let mut output_format = "json";
+    let mut format_seen = false;
     let mut index = 0;
     while index < arguments.len() {
         let flag = &arguments[index];
@@ -2570,6 +2573,18 @@ fn case_resolve_command(arguments: &[OsString]) -> Result<ExitCode, String> {
         match flag.to_str() {
             Some("--case") if case_path.replace(value).is_none() => {}
             Some("--session") => session_paths.push(value),
+            Some("--format") if !format_seen => {
+                output_format = value
+                    .to_str()
+                    .ok_or("case resolve format must be json or html")?;
+                if !matches!(output_format, "json" | "html") {
+                    return Err("case resolve format must be json or html".to_owned());
+                }
+                format_seen = true;
+            }
+            Some("--format") => return Err("duplicate case resolve --format option".to_owned()),
+            Some("--output") if output_path.replace(value).is_none() => {}
+            Some("--output") => return Err("duplicate case resolve --output option".to_owned()),
             Some("--case") => return Err("duplicate case resolve --case option".to_owned()),
             _ => {
                 return Err(format!(
@@ -2581,6 +2596,12 @@ fn case_resolve_command(arguments: &[OsString]) -> Result<ExitCode, String> {
         index += 2;
     }
     let case_path = case_path.ok_or("case resolve requires --case CASE.json")?;
+    if output_format == "html" && output_path.is_none() {
+        return Err("case resolve --format html requires --output NEW_REPORT.html".to_owned());
+    }
+    if output_format == "json" && output_path.is_some() {
+        return Err("case resolve --output is supported only with --format html".to_owned());
+    }
     if session_paths.is_empty() || session_paths.len() > sideeffect::case::MAX_CASE_SESSIONS {
         return Err(format!(
             "case resolve requires 1..={} --session directories",
@@ -2670,7 +2691,37 @@ fn case_resolve_command(arguments: &[OsString]) -> Result<ExitCode, String> {
             } => inventory_status != "complete",
             _ => false,
         });
-        write_json(&resolved, "resolved investigation case")?;
+        if output_format == "json" {
+            write_json(&resolved, "resolved investigation case")?;
+        } else {
+            let mut html = CappedBuffer::new(MAX_REPORT_BYTES);
+            sideeffect::format::write_case_html(&resolved, &mut html).map_err(|error| {
+                if html.exceeded {
+                    format!("case HTML report exceeds the {MAX_REPORT_BYTES} byte output limit")
+                } else {
+                    format!("could not render case HTML report: {error}")
+                }
+            })?;
+            let output = output_path.expect("HTML output path was validated above");
+            #[cfg(target_os = "linux")]
+            let published = publish_private_file(Path::new(output), &html.bytes, MAX_REPORT_BYTES)
+                .map_err(|error| format!("could not publish private case HTML report: {error}"))?;
+            #[cfg(windows)]
+            let published =
+                publish_private_windows_file(Path::new(output), &html.bytes, MAX_REPORT_BYTES)
+                    .map_err(|error| {
+                        format!("could not publish private case HTML report: {error}")
+                    })?;
+            #[cfg(not(any(target_os = "linux", windows)))]
+            let published = {
+                let _ = output;
+                return Err("case workflows are not supported on this platform".to_owned());
+            };
+            eprintln!(
+                "Offline case HTML report written to {}. It contains sensitive local evidence; review before sharing.",
+                terminal_safe_path(&published)
+            );
+        }
         Ok(if incomplete {
             ExitCode::from(2)
         } else {

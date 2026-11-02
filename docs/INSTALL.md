@@ -295,7 +295,13 @@ sideeffect case resolve --case ./review.case.json --session ./audit-session
 sideeffect.exe case resolve --case .\review.case.json --session .\audit-session
 ```
 
-The bounded JSON result includes exact matched source rows and preserves session/source/parser/loss status. Exit status `2` means a source remains partial or unknown. Manifest and artifact hashes establish byte consistency, not producer authenticity or assertion truth. Resolved output may contain raw trace rows, paths, arguments, analyst text, or ETW payloads represented as hex. Keep it local and review it before sharing. This early workflow does not provide HTML reports, case lifecycle/status management, an interactive editor, or a general investigation query engine.
+For a private static HTML report that links each analyst entry to its resolved evidence facts:
+
+```powershell
+sideeffect.exe case resolve --format html --output .\review.html --case .\review.case.json --session .\audit-session
+```
+
+The default bounded JSON result includes exact matched source rows; the optional HTML report is static, offline, size-bounded, private, and no-clobber. Both preserve session/source/parser/loss status. Exit status `2` means a source remains partial or unknown. Manifest and artifact hashes establish byte consistency, not producer authenticity or assertion truth. Resolved output may contain raw trace rows, paths, arguments, analyst text, or ETW payloads represented as hex. Keep it local and review it before sharing. This early workflow does not provide case lifecycle/status management, an interactive editor, role-specific reports, or a general investigation query engine.
 
 ## Build from source
 

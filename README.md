@@ -312,7 +312,13 @@ Resolve the locators against the same verified sessions:
 sideeffect case resolve --case ./review.case.json --session ./audit-session
 ```
 
-The command writes bounded JSON with each resolved source row and the original session/source status. Exit status `2` means some source or capture remains partial or unknown. Hash checks establish consistency with the supplied session manifest; they do not authenticate who produced it or prove an assertion. Entry authoring is one JSON entry at a time; there is no interactive editor or role-specific HTML report yet. Resolved JSON can contain sensitive paths, arguments, and event payloads; keep it local and review before sharing.
+For a private, static HTML review report with links from each entry to its resolved evidence facts, use:
+
+```sh
+sideeffect case resolve --format html --output ./review.html --case ./review.case.json --session ./audit-session
+```
+
+The default command writes bounded JSON; HTML is static, offline, size-bounded, private, and never overwrites an existing file. Both formats retain source/session status. Exit status `2` means some source or capture remains partial or unknown. Hash checks establish consistency with the supplied session manifest; they do not authenticate who produced it or prove an assertion. Entry authoring is one JSON entry at a time; there is no interactive editor or role-specific report set yet. Reports can contain sensitive paths, arguments, and event payloads; keep them local and review before sharing.
 
 ## What you can do
 
@@ -325,7 +331,7 @@ The command writes bounded JSON with each resolved source row and the original s
 | Startup discovery | Source-linked startup configuration, retained as inert values and scripts |
 | Runtime capture | Linux `strace` records for a selected command and traced children; native Windows ETW events for a bounded capture window |
 | Evidence review | Bounded JSON, terminal-safe text, exact source references, and static offline HTML reports where supported |
-| Investigation case | Private JSON drafts, validated one-entry append to a new case file, and exact evidence-locator resolution against verified sessions; interactive editing, lifecycle, and role-specific reports remain open |
+| Investigation case | Private JSON drafts, validated one-entry append to a new case file, exact evidence-locator resolution, and linked static offline HTML review; interactive editing, lifecycle, and role-specific reports remain open |
 | Comparison | Evidence-backed trace and ETW differences, aggregate summaries, and conservative association candidates |
 | Deterministic explanation | Source-aware `explain` summaries without a model dependency |
 | Optional local model tools | Experimental, user-selected model workflows with reviewed previews; no model is release-approved |
