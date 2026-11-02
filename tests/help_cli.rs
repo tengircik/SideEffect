@@ -60,6 +60,13 @@ fn focused_help_covers_command_and_nested_inventory_topics() {
     assert!(diff_help.contains("Windows summary v2"));
     assert!(diff_help.contains("unique supported changed identities as candidates"));
 
+    let compare_sessions = run(&["help", "compare-sessions"]);
+    assert!(compare_sessions.status.success());
+    let compare_sessions_help = String::from_utf8_lossy(&compare_sessions.stdout);
+    assert!(compare_sessions_help.contains("bounded item-level inventory and runtime evidence"));
+    assert!(compare_sessions_help.contains("does not establish causation or event absence"));
+    assert!(!compare_sessions_help.contains("only their declared collection metadata"));
+
     let associated = run(&["help", "associated-behavior"]);
     assert!(associated.status.success());
     let associated_help = String::from_utf8_lossy(&associated.stdout);

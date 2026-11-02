@@ -1822,7 +1822,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect diff-summary [--format json] LEFT RIGHT\n       sideeffect diff-summary --format html --output REPORT.html LEFT RIGHT\nWrites aggregate change counts without event strings or evidence references. Counts may still be sensitive; the output is not a safe-to-share verdict."
         }
         "compare-sessions" => {
-            "Usage: sideeffect compare-sessions BEFORE_SESSION_DIR AFTER_SESSION_DIR\nVerifies both local audit sessions and compares only their declared collection metadata. This is a readiness/context check, not an inventory or event diff; comparable sessions do not establish equal observations, exhaustive coverage, or event absence. Incomparable results exit with status 2 and include stable reason codes."
+            "Usage: sideeffect compare-sessions BEFORE_SESSION_DIR AFTER_SESSION_DIR\nVerifies both local audit sessions, reports metadata comparability, and compares bounded item-level inventory and runtime evidence from verified artifacts. Per-source status and evidence references remain visible; missing, partial, unsupported, or incompatible sources do not become empty results. This is not an exhaustive history or coverage claim, and it does not establish causation or event absence. Incomparable or partial results exit with status 2 and include stable reason codes."
         }
         "explain" => {
             "Usage: sideeffect explain TRACE\n       sideeffect explain --diff LEFT RIGHT\n       sideeffect explain --inventory-diff BEFORE.json AFTER.json\nCreates bounded deterministic summaries. It does not use a language model."
