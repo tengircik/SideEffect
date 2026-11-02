@@ -1,4 +1,4 @@
-//! Bounded comparison of exact, metadata-only selected-root snapshots.
+//! Bounded comparison of exact selected-root snapshots, including opt-in content hashes.
 
 use serde::Serialize;
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
@@ -7,10 +7,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 const INPUT_SCHEMA: &str = "sideeffect.selected_root_inventory";
-const INPUT_SCHEMA_VERSION: u32 = 1;
 const OUTPUT_SCHEMA: &str = "sideeffect.selected_root_inventory_diff";
 const OUTPUT_SCHEMA_VERSION: u32 = 1;
-const SCOPE: &str = "one_explicit_root_and_its_direct_children_metadata_only";
+const SCOPE_V1: &str = "one_explicit_root_and_its_direct_children_metadata_only";
+const SCOPE_V2: &str = "one_explicit_root_and_its_direct_children_metadata_and_opt_in_sha256";
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DEPTH: usize = 16;
 const MAX_COLLECTION: usize = 20_000;
@@ -100,6 +100,18 @@ struct Document {
     entries: Vec<Entry>,
     diagnostics: Vec<Diagnostic>,
     limits: Limits,
+    #[serde(default)]
+    content_hashing: Option<ContentHashing>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContentHashing {
+    requested: bool,
+    algorithm: String,
+    max_file_bytes: u64,
+    max_aggregate_bytes: u64,
+    deadline_seconds: u64,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -130,6 +142,10 @@ struct Entry {
     device_or_volume_serial: Option<u64>,
     inode_or_file_index: Option<u64>,
     evidence: Evidence,
+    #[serde(default)]
+    content_sha256: Option<String>,
+    #[serde(default)]
+    content_hash_status: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -355,8 +371,8 @@ pub fn compare_selected_root_inventory_json(
     let right = parse_document(after)?;
     if left.schema != INPUT_SCHEMA
         || right.schema != INPUT_SCHEMA
-        || left.schema_version != INPUT_SCHEMA_VERSION
-        || right.schema_version != INPUT_SCHEMA_VERSION
+        || !matches!(left.schema_version, 1 | 2)
+        || !matches!(right.schema_version, 1 | 2)
     {
         return Err(RootSnapshotDiffError::UnsupportedSchema);
     }
@@ -374,7 +390,12 @@ fn parse_document(bytes: &[u8]) -> Result<Document, RootSnapshotDiffError> {
 }
 
 fn validate(document: &Document) -> Result<(), RootSnapshotDiffError> {
-    if document.scope != SCOPE {
+    let expected_scope = match document.schema_version {
+        1 => SCOPE_V1,
+        2 => SCOPE_V2,
+        _ => return Err(RootSnapshotDiffError::UnsupportedSchema),
+    };
+    if document.scope != expected_scope {
         return Err(RootSnapshotDiffError::ScopeMismatch);
     }
     if !matches!(document.status.as_str(), "complete" | "partial")
@@ -402,6 +423,16 @@ fn validate(document: &Document) -> Result<(), RootSnapshotDiffError> {
     if document.captured_ended_at_unix_ms < document.captured_started_at_unix_ms {
         return Err(RootSnapshotDiffError::MalformedInput);
     }
+    match (document.schema_version, document.content_hashing.as_ref()) {
+        (1, None) => {}
+        (2, Some(h))
+            if h.requested
+                && h.algorithm == "sha256"
+                && h.max_file_bytes == 16 * 1024 * 1024
+                && h.max_aggregate_bytes == 64 * 1024 * 1024
+                && h.deadline_seconds == 5 => {}
+        _ => return Err(RootSnapshotDiffError::MalformedInput),
+    }
     let root = document
         .root
         .as_ref()
@@ -421,6 +452,26 @@ fn validate(document: &Document) -> Result<(), RootSnapshotDiffError> {
             || !valid_object_type(&document.platform, &entry.object_type)
             || entry.evidence.source != "selected_root_directory_entry"
             || !ordinals.insert(entry.ordinal)
+        {
+            return Err(RootSnapshotDiffError::MalformedInput);
+        }
+        match (
+            entry.content_sha256.as_deref(),
+            entry.content_hash_status.as_deref(),
+        ) {
+            (None, None) if document.schema_version == 1 => {}
+            (Some(hash), Some("observed"))
+                if document.schema_version == 2
+                    && is_regular(&entry.object_type)
+                    && valid_sha256(hash) => {}
+            (None, Some("unavailable"))
+                if document.schema_version == 2 && is_regular(&entry.object_type) => {}
+            (None, Some("not_applicable"))
+                if document.schema_version == 2 && !is_regular(&entry.object_type) => {}
+            _ => return Err(RootSnapshotDiffError::MalformedInput),
+        }
+        if document.status == "complete"
+            && entry.content_hash_status.as_deref() == Some("unavailable")
         {
             return Err(RootSnapshotDiffError::MalformedInput);
         }
@@ -455,6 +506,13 @@ fn validate(document: &Document) -> Result<(), RootSnapshotDiffError> {
         let _ = diagnostic.native_error;
     }
     Ok(())
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn valid_object_type(platform: &str, kind: &str) -> bool {
@@ -603,9 +661,6 @@ fn compare(left: &Document, right: &Document) -> Result<RootSnapshotDiff, RootSn
             .ok_or(RootSnapshotDiffError::RootMismatch)?,
         &right.platform,
     )?;
-    if left.scope != right.scope {
-        return Err(RootSnapshotDiffError::ScopeMismatch);
-    }
     if left_root != right_root {
         return Err(RootSnapshotDiffError::RootMismatch);
     }
@@ -650,7 +705,11 @@ fn compare(left: &Document, right: &Document) -> Result<RootSnapshotDiff, RootSn
         match (before_rows.first(), after_rows.first()) {
             (Some(before), Some(after)) => {
                 counts.matched = counts.matched.saturating_add(1);
-                let (changed_fields, unknown_fields) = changed_fields(before.entry, after.entry);
+                let (changed_fields, unknown_fields) = changed_fields(
+                    before.entry,
+                    after.entry,
+                    left.content_hashing.is_some() || right.content_hashing.is_some(),
+                );
                 if !unknown_fields.is_empty() {
                     counts.uncertain_matches = counts.uncertain_matches.saturating_add(1);
                 }
@@ -748,7 +807,7 @@ fn compare(left: &Document, right: &Document) -> Result<RootSnapshotDiff, RootSn
             "utf16le_code_units_hex"
         },
         root_identity_hint_conflict,
-        coverage_note: "Compares metadata for direct children of one exact selected-root path. Complete same-scope snapshots permit candidate addition/removal labels unless known local root identity hints conflict. Such hints are not durable identities, and a conflict does not prove that a different root object was observed; it only suppresses unmatched presence claims. This does not prove installation, deletion cause, or filesystem history.",
+        coverage_note: "Compares metadata for direct children of one exact selected-root path and compares opt-in SHA-256 content fingerprints only when both sides observed a digest. Schema v1 metadata-only and v2 hash-requested snapshots can be compared together; a missing or unavailable requested hash remains unknown and makes the result partial. Complete snapshots of the supported direct-child scopes permit candidate addition/removal labels unless known local root identity hints conflict. Such hints are not durable identities, and a conflict does not prove that a different root object was observed; it only suppresses unmatched presence claims. This does not prove installation, deletion cause, content authenticity, or filesystem history.",
         counts,
         diagnostics,
         deltas,
@@ -779,7 +838,11 @@ fn index<'a>(
     Ok(result)
 }
 
-fn changed_fields(before: &Entry, after: &Entry) -> (Vec<&'static str>, Vec<&'static str>) {
+fn changed_fields(
+    before: &Entry,
+    after: &Entry,
+    compare_content: bool,
+) -> (Vec<&'static str>, Vec<&'static str>) {
     let mut changed = Vec::new();
     let mut unknown = Vec::new();
     if before.object_type == "unknown" || after.object_type == "unknown" {
@@ -815,7 +878,21 @@ fn changed_fields(before: &Entry, after: &Entry) -> (Vec<&'static str>, Vec<&'st
         &mut changed,
         &mut unknown,
     );
+    if compare_content && (is_regular(&before.object_type) || is_regular(&after.object_type)) {
+        match (
+            before.content_sha256.as_deref(),
+            after.content_sha256.as_deref(),
+        ) {
+            (Some(left), Some(right)) if left != right => changed.push("content_sha256"),
+            (Some(_), Some(_)) => {}
+            _ => unknown.push("content_sha256"),
+        }
+    }
     (changed, unknown)
+}
+
+fn is_regular(kind: &str) -> bool {
+    matches!(kind, "regular_file" | "regular_or_other_file")
 }
 
 fn compare_optional<T: Eq>(
@@ -1158,7 +1235,7 @@ mod tests {
         );
 
         let mut unsupported: Value = serde_json::from_slice(&valid).unwrap();
-        unsupported["schema_version"] = json!(2);
+        unsupported["schema_version"] = json!(3);
         assert_eq!(
             compare_selected_root_inventory_json(
                 &valid,

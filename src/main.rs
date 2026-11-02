@@ -47,7 +47,7 @@ use sideeffect::inventory::{PathExecutableInventory, collect_path_executables};
 use sideeffect::inventory::{PermissionInventoryStatus, collect_permissions};
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{ProcessInventoryStatus, collect_processes};
-use sideeffect::inventory::{RootSnapshot, collect_root_snapshot};
+use sideeffect::inventory::{RootSnapshot, collect_root_snapshot, collect_root_snapshot_with_hash};
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{StartupInventoryStatus, collect_startup};
 #[cfg(windows)]
@@ -584,7 +584,23 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         [command, subcommand, option, output, root]
             if command == "inventory" && subcommand == "root" && option == "--output" =>
         {
-            inventory_root(output, root)
+            inventory_root(output, root, false)
+        }
+        [command, subcommand, option, output, hash_flag, root]
+            if command == "inventory"
+                && subcommand == "root"
+                && option == "--output"
+                && hash_flag == "--hash-regular-files" =>
+        {
+            inventory_root(output, root, true)
+        }
+        [command, subcommand, hash_flag, option, output, root]
+            if command == "inventory"
+                && subcommand == "root"
+                && hash_flag == "--hash-regular-files"
+                && option == "--output" =>
+        {
+            inventory_root(output, root, true)
         }
         [command, subcommand, option, output, paths @ ..]
             if command == "inventory"
@@ -1292,8 +1308,16 @@ fn inventory_path_executables(output: &OsString) -> Result<ExitCode, String> {
     })
 }
 
-fn inventory_root(output: &OsString, root: &OsString) -> Result<ExitCode, String> {
-    let document: RootSnapshot = collect_root_snapshot(Path::new(root));
+fn inventory_root(
+    output: &OsString,
+    root: &OsString,
+    hash_regular_files: bool,
+) -> Result<ExitCode, String> {
+    let document: RootSnapshot = if hash_regular_files {
+        collect_root_snapshot_with_hash(Path::new(root), true)
+    } else {
+        collect_root_snapshot(Path::new(root))
+    };
     let complete = document.status == "complete";
     let mut json = CappedBuffer::new(MAX_REPORT_BYTES);
     serde_json::to_writer(&mut json, &document).map_err(|error| {
@@ -1306,8 +1330,13 @@ fn inventory_root(output: &OsString, root: &OsString) -> Result<ExitCode, String
     let published = publish_private_windows_file(Path::new(output), &json.bytes, MAX_REPORT_BYTES)
         .map_err(|error| format!("could not publish private selected-root inventory: {error}"))?;
     eprintln!(
-        "Saved a {} metadata-only snapshot of the selected directory and its direct children to {}. It does not recurse or read file contents; enumeration is non-atomic and file identities are local hints.",
+        "Saved a {} {} snapshot of the selected directory and its direct children to {}. It does not recurse; enumeration is non-atomic and file identities are local hints. Content hashes are sensitive equality fingerprints, not authenticity evidence.",
         if complete { "complete" } else { "partial" },
+        if hash_regular_files {
+            "SHA-256"
+        } else {
+            "metadata-only"
+        },
         terminal_safe_path(&published)
     );
     Ok(if complete {
@@ -1779,7 +1808,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect inventory path-executables --output FILE\nSnapshots the current process PATH and checks one directory level using platform metadata heuristics. It never executes candidates; symlinks/reparse points and limits make results partial."
         }
         "inventory root" => {
-            "Usage: sideeffect inventory root --output NEW_FILE SELECTED_DIRECTORY\nOpens one explicitly selected directory and inventories only its direct children using metadata. It does not read contents, recurse, follow child symlinks/reparse points, request elevation, or claim an atomic snapshot. Paths and metadata may be sensitive; partial results exit with status 2."
+            "Usage: sideeffect inventory root [--hash-regular-files] --output NEW_FILE SELECTED_DIRECTORY\nOpens one explicitly selected directory and inventories only its direct children. By default it reads metadata only. --hash-regular-files opts into bounded SHA-256 reads of direct-child regular files; symlinks/reparse points and nonregular files are not followed or hashed. Hashes can reveal file equality and are sensitive; they do not authenticate content. The snapshot does not recurse or claim atomicity. Partial results exit with status 2."
         }
         "inventory permissions" => {
             #[cfg(target_os = "linux")]
