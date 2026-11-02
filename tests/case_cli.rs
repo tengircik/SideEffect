@@ -50,6 +50,7 @@ fn case_help_describes_the_partial_workflow_and_integrity_boundary() {
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(help.contains("sideeffect case init"));
+    assert!(help.contains("sideeffect case add-entry"));
     assert!(help.contains("sideeffect case resolve"));
     assert!(help.contains("not producer authenticity"));
     assert!(help.contains("sensitive local evidence"));
@@ -120,11 +121,99 @@ fn case_cli_initializes_and_resolves_against_a_verified_session_without_overwrit
     assert!(!second_init.status.success());
     assert_eq!(fs::read(&case_path).unwrap(), case_bytes);
 
+    let entry_path = directory.0.join("note.json");
+    fs::write(
+        &entry_path,
+        br#"{"id":"N001","kind":"note","authorship":"analyst_supplied_unverified","text":"Reviewed locally"}"#,
+    )
+    .unwrap();
+    let updated_case_path = directory.0.join("review-with-note.case.json");
+    let add_entry = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("add-entry")
+        .arg("--case")
+        .arg(&case_path)
+        .arg("--entry")
+        .arg(&entry_path)
+        .arg("--output")
+        .arg(&updated_case_path)
+        .output()
+        .unwrap();
+    assert!(
+        add_entry.status.success(),
+        "case add-entry failed: {}",
+        String::from_utf8_lossy(&add_entry.stderr)
+    );
+    assert_eq!(fs::read(&case_path).unwrap(), case_bytes);
+    let updated_case_bytes = fs::read(&updated_case_path).unwrap();
+    let updated_case: Value = serde_json::from_slice(&updated_case_bytes).unwrap();
+    assert_eq!(updated_case["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(updated_case["entries"][0]["id"], "N001");
+
+    let duplicate_output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("add-entry")
+        .arg("--case")
+        .arg(&case_path)
+        .arg("--entry")
+        .arg(&entry_path)
+        .arg("--output")
+        .arg(&updated_case_path)
+        .output()
+        .unwrap();
+    assert!(!duplicate_output.status.success());
+    assert_eq!(fs::read(&updated_case_path).unwrap(), updated_case_bytes);
+
+    let duplicate_id_output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("add-entry")
+        .arg("--case")
+        .arg(&updated_case_path)
+        .arg("--entry")
+        .arg(&entry_path)
+        .arg("--output")
+        .arg(directory.0.join("duplicate-id.case.json"))
+        .output()
+        .unwrap();
+    assert!(!duplicate_id_output.status.success());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&updated_case_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    let invalid_assertion_path = directory.0.join("assertion-without-evidence.json");
+    fs::write(
+        &invalid_assertion_path,
+        br#"{"id":"A001","kind":"assertion","authorship":"analyst_supplied_unverified","text":"Unsupported assertion"}"#,
+    )
+    .unwrap();
+    let invalid_assertion = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("add-entry")
+        .arg("--case")
+        .arg(&case_path)
+        .arg("--entry")
+        .arg(&invalid_assertion_path)
+        .arg("--output")
+        .arg(directory.0.join("invalid.case.json"))
+        .output()
+        .unwrap();
+    assert!(!invalid_assertion.status.success());
+
     let resolved = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .arg("case")
         .arg("resolve")
         .arg("--case")
-        .arg(&case_path)
+        .arg(&updated_case_path)
         .arg("--session")
         .arg(&session)
         .output()
@@ -138,7 +227,8 @@ fn case_cli_initializes_and_resolves_against_a_verified_session_without_overwrit
     assert_eq!(report["schema"], "sideeffect.resolved_investigation_case");
     assert_eq!(report["case_id"], case["case_id"]);
     assert_eq!(report["facts"].as_array().unwrap().len(), 0);
-    assert_eq!(report["entries"].as_array().unwrap().len(), 0);
+    assert_eq!(report["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(report["entries"][0]["text"], "Reviewed locally");
     assert_eq!(report["sessions"].as_array().unwrap().len(), 1);
     assert!(
         report["disclosure_note"]

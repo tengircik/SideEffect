@@ -288,7 +288,23 @@ Create a private case draft from one or more verified sessions on the same nativ
 sideeffect case init --output ./review.case.json --title "Review selected behavior" --session ./audit-session
 ```
 
-On Windows, use `sideeffect.exe` and PowerShell paths. Repeat `--session` for additional sessions (up to 16). The draft stores each session ID and the SHA-256 of its exact manifest bytes. Add analyst notes or assertions to the JSON `entries` array and copy exact evidence locators from the session evidence output. Assertions are always labeled analyst-supplied and unverified.
+On Windows, use `sideeffect.exe` and PowerShell paths. Repeat `--session` for additional sessions (up to 16). The draft stores each session ID and the SHA-256 of its exact manifest bytes. Add one note or assertion by preparing a bounded entry JSON file and writing a new case file:
+
+```json
+{
+  "id": "N001",
+  "kind": "note",
+  "authorship": "analyst_supplied_unverified",
+  "text": "Review this observation",
+  "evidence": []
+}
+```
+
+```sh
+sideeffect case add-entry --case ./review.case.json --entry ./note.json --output ./review-with-note.case.json
+```
+
+For assertions, include exact evidence locators copied from the relevant session artifact. Assertions remain analyst-supplied and unverified. The command validates the entry and case, preserves the source case, and writes a private output without overwriting an existing file. Repeat it with a new output path for each entry.
 
 Resolve the locators against the same verified sessions:
 
@@ -296,7 +312,7 @@ Resolve the locators against the same verified sessions:
 sideeffect case resolve --case ./review.case.json --session ./audit-session
 ```
 
-The command writes bounded JSON with each resolved source row and the original session/source status. Exit status `2` means some source or capture remains partial or unknown. Hash checks establish consistency with the supplied session manifest; they do not authenticate who produced it or prove an assertion. The CLI does not yet edit case entries or generate role-specific HTML reports. Resolved JSON can contain sensitive paths, arguments, and event payloads; keep it local and review before sharing.
+The command writes bounded JSON with each resolved source row and the original session/source status. Exit status `2` means some source or capture remains partial or unknown. Hash checks establish consistency with the supplied session manifest; they do not authenticate who produced it or prove an assertion. Entry authoring is one JSON entry at a time; there is no interactive editor or role-specific HTML report yet. Resolved JSON can contain sensitive paths, arguments, and event payloads; keep it local and review before sharing.
 
 ## What you can do
 
@@ -309,7 +325,7 @@ The command writes bounded JSON with each resolved source row and the original s
 | Startup discovery | Source-linked startup configuration, retained as inert values and scripts |
 | Runtime capture | Linux `strace` records for a selected command and traced children; native Windows ETW events for a bounded capture window |
 | Evidence review | Bounded JSON, terminal-safe text, exact source references, and static offline HTML reports where supported |
-| Investigation case | Private JSON drafts and exact evidence-locator resolution against verified sessions; entry editing and role-specific reports remain open |
+| Investigation case | Private JSON drafts, validated one-entry append to a new case file, and exact evidence-locator resolution against verified sessions; interactive editing, lifecycle, and role-specific reports remain open |
 | Comparison | Evidence-backed trace and ETW differences, aggregate summaries, and conservative association candidates |
 | Deterministic explanation | Source-aware `explain` summaries without a model dependency |
 | Optional local model tools | Experimental, user-selected model workflows with reviewed previews; no model is release-approved |

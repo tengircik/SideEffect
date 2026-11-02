@@ -273,7 +273,17 @@ On Windows PowerShell:
 sideeffect.exe case init --output .\review.case.json --title "Review selected behavior" --session .\audit-session
 ```
 
-Repeat `--session` to bind up to 16 sessions. Add analyst notes or assertions in the draft's `entries` array, using exact evidence locators from the session artifacts. The CLI currently creates an empty draft; it does not edit entries. Assertions require evidence references and stay labeled analyst-supplied and unverified.
+Repeat `--session` to bind up to 16 sessions. To add one note or assertion without editing the case file directly, provide a bounded entry JSON object and write a new private case file:
+
+```json
+{"id":"N001","kind":"note","authorship":"analyst_supplied_unverified","text":"Review this observation","evidence":[]}
+```
+
+```sh
+sideeffect case add-entry --case ./review.case.json --entry ./note.json --output ./review-with-note.case.json
+```
+
+For assertions, include exact evidence locators copied from the session artifacts. Assertions require evidence references and stay labeled analyst-supplied and unverified. The source case remains unchanged; each output path must be new. This is a one-entry JSON workflow, not an interactive case editor.
 
 Resolve the case against those same session directories:
 
@@ -285,7 +295,7 @@ sideeffect case resolve --case ./review.case.json --session ./audit-session
 sideeffect.exe case resolve --case .\review.case.json --session .\audit-session
 ```
 
-The bounded JSON result includes exact matched source rows and preserves session/source/parser/loss status. Exit status `2` means a source remains partial or unknown. Manifest and artifact hashes establish byte consistency, not producer authenticity or assertion truth. Resolved output may contain raw trace rows, paths, arguments, analyst text, or ETW payloads represented as hex. Keep it local and review it before sharing. This early workflow does not provide HTML reports, case lifecycle/status management, or a general investigation query engine.
+The bounded JSON result includes exact matched source rows and preserves session/source/parser/loss status. Exit status `2` means a source remains partial or unknown. Manifest and artifact hashes establish byte consistency, not producer authenticity or assertion truth. Resolved output may contain raw trace rows, paths, arguments, analyst text, or ETW payloads represented as hex. Keep it local and review it before sharing. This early workflow does not provide HTML reports, case lifecycle/status management, an interactive editor, or a general investigation query engine.
 
 ## Build from source
 

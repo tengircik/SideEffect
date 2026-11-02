@@ -82,6 +82,7 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect explain --inventory-diff <before.json> <after.json>\n\
        sideeffect compare-sessions <before-session-directory> <after-session-directory>\n\
        sideeffect case init --output <new-case.json> --title <title> --session <session-directory>...\n\
+       sideeffect case add-entry --case <case.json> --entry <entry.json> --output <new-case.json>\n\
        sideeffect case resolve --case <case.json> --session <session-directory>...\n\
        sideeffect model-preview --question <question> <strace-trace-file>\n\
        sideeffect model-analyze --question <question> [--runtime <llama-cli>] --confirm-sha256 <preview-digest> <strace-trace-file>\n\
@@ -1830,10 +1831,13 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect compare-sessions BEFORE_SESSION_DIR AFTER_SESSION_DIR\nVerifies both local audit sessions, reports metadata comparability, and compares bounded item-level inventory and runtime evidence from verified artifacts. Per-source status and evidence references remain visible; missing, partial, unsupported, or incompatible sources do not become empty results. This is not an exhaustive history or coverage claim, and it does not establish causation or event absence. Incomparable or partial results exit with status 2 and include stable reason codes."
         }
         "case" => {
-            "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case resolve --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nCreates a private case draft bound to exact supplied audit-session manifests, or resolves all case evidence locators against supplied verified sessions. Case-authored assertions remain unverified. Hash checks establish byte consistency, not producer authenticity or capture completeness. JSON output may contain sensitive local evidence. Incomplete, partial, or unknown source status exits with status 2."
+            "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-entry --case CASE.json --entry ENTRY.json --output NEW_CASE.json\n       sideeffect case resolve --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nCreates a private case draft, validates and appends one analyst-authored entry into a new private case file, or resolves all case evidence locators against supplied verified sessions. Existing files are never overwritten. Case-authored assertions remain unverified. Hash checks establish byte consistency, not producer authenticity or capture completeness. JSON output may contain sensitive local evidence. Incomplete, partial, or unknown source status exits with status 2."
         }
         "case init" => {
             "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\nCreates an empty, bounded case file bound to the exact manifests of the supplied verified sessions. It does not add findings or evidence locators. The output is private and never overwrites an existing file."
+        }
+        "case add-entry" => {
+            "Usage: sideeffect case add-entry --case CASE.json --entry ENTRY.json --output NEW_CASE.json\nValidates one bounded note/assertion JSON object, appends it to a validated case, and writes a new private case file. The source case is unchanged and output never overwrites an existing file. Assertions require evidence locators and remain analyst_supplied_unverified."
         }
         "case resolve" => {
             "Usage: sideeffect case resolve --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nVerifies supplied sessions and resolves each case locator to its exact source record or selected-root entry. Session and artifact hashes establish consistency with the supplied manifest, not authenticity. Author-written assertions remain unverified; runtime completeness may remain unknown. JSON can contain sensitive paths, arguments, and raw payloads. Review before sharing."
@@ -2349,9 +2353,96 @@ type CaseVerifiedSession = sideeffect::audit_session_reader_windows::VerifiedAud
 fn case_command(operation: &OsString, arguments: &[OsString]) -> Result<ExitCode, String> {
     match operation.to_str() {
         Some("init") => case_init_command(arguments),
+        Some("add-entry") => case_add_entry_command(arguments),
         Some("resolve") => case_resolve_command(arguments),
-        _ => Err("case command must be 'init' or 'resolve'".to_owned()),
+        _ => Err("case command must be 'init', 'add-entry', or 'resolve'".to_owned()),
     }
+}
+
+fn case_add_entry_command(arguments: &[OsString]) -> Result<ExitCode, String> {
+    let mut case_path: Option<&OsString> = None;
+    let mut entry_path: Option<&OsString> = None;
+    let mut output: Option<&OsString> = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let flag = &arguments[index];
+        let value = arguments.get(index + 1).ok_or_else(|| {
+            format!(
+                "case add-entry option {} requires a value",
+                terminal_safe_text(&flag.to_string_lossy())
+            )
+        })?;
+        match flag.to_str() {
+            Some("--case") if case_path.replace(value).is_none() => {}
+            Some("--entry") if entry_path.replace(value).is_none() => {}
+            Some("--output") if output.replace(value).is_none() => {}
+            Some("--case") => return Err("duplicate case add-entry --case option".to_owned()),
+            Some("--entry") => return Err("duplicate case add-entry --entry option".to_owned()),
+            Some("--output") => return Err("duplicate case add-entry --output option".to_owned()),
+            _ => {
+                return Err(format!(
+                    "unknown case add-entry option {}",
+                    terminal_safe_text(&flag.to_string_lossy())
+                ));
+            }
+        }
+        index += 2;
+    }
+
+    let case_path = case_path.ok_or("case add-entry requires --case CASE.json")?;
+    let entry_path = entry_path.ok_or("case add-entry requires --entry ENTRY.json")?;
+    let output = output.ok_or("case add-entry requires --output NEW_CASE.json")?;
+    let case_bytes = read_input_file(
+        Path::new(case_path),
+        sideeffect::case::MAX_CASE_BYTES,
+        "case",
+    )?;
+    let entry_bytes = read_input_file(
+        Path::new(entry_path),
+        sideeffect::case::MAX_CASE_BYTES,
+        "case entry",
+    )?;
+    let mut case = sideeffect::case::InvestigationCase::from_json(&case_bytes)?;
+    let entry: sideeffect::case::CaseEntry = serde_json::from_slice(&entry_bytes)
+        .map_err(|_| "case entry JSON is malformed or has unsupported fields".to_owned())?;
+    case.entries.push(entry);
+    case.validate()?;
+
+    let mut encoded = CappedBuffer::new(sideeffect::case::MAX_CASE_BYTES);
+    serde_json::to_writer_pretty(&mut encoded, &case).map_err(|error| {
+        if encoded.exceeded {
+            "updated case file exceeds its byte limit".to_owned()
+        } else {
+            format!("could not serialize updated case file: {error}")
+        }
+    })?;
+    encoded
+        .write_all(b"\n")
+        .map_err(|_| "updated case file exceeds its byte limit".to_owned())?;
+    #[cfg(target_os = "linux")]
+    let published = publish_private_file(
+        Path::new(output),
+        &encoded.bytes,
+        sideeffect::case::MAX_CASE_BYTES,
+    )
+    .map_err(|error| format!("could not publish updated private case: {error}"))?;
+    #[cfg(windows)]
+    let published = publish_private_windows_file(
+        Path::new(output),
+        &encoded.bytes,
+        sideeffect::case::MAX_CASE_BYTES,
+    )
+    .map_err(|error| format!("could not publish updated private case: {error}"))?;
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let published = {
+        let _ = output;
+        return Err("case workflows are not supported on this platform".to_owned());
+    };
+    eprintln!(
+        "Saved case with one validated analyst entry to {}. Assertions remain unverified; review sensitive content before sharing.",
+        terminal_safe_path(&published)
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 fn case_init_command(arguments: &[OsString]) -> Result<ExitCode, String> {
