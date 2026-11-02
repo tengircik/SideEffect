@@ -339,7 +339,7 @@ fn validate(v: &Value, kind: Kind) -> Result<(), ProcessDiffError> {
     };
     let version = u64v(v, "schema_version")?;
     let supported_version = match kind {
-        Kind::Linux => matches!(version, 3 | 4 | 5),
+        Kind::Linux => matches!(version, 3..=5),
         Kind::Windows => matches!(version, 3 | 4),
     };
     if strv(v, "schema")? != schema || !supported_version {
