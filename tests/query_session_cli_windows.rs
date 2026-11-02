@@ -239,11 +239,13 @@ fn multi_query(directory: &TestDirectory, session_paths: &[&PathBuf], text: bool
 }
 
 fn utf16_hex(value: &str) -> String {
-    value
-        .encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    use std::fmt::Write as _;
+
+    let mut encoded = String::new();
+    for byte in value.encode_utf16().flat_map(u16::to_le_bytes) {
+        write!(&mut encoded, "{byte:02x}").unwrap();
+    }
+    encoded
 }
 
 fn selected_root_document(version: u32, status: &str, display_name: &str) -> Vec<u8> {

@@ -23,6 +23,16 @@ fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn bytes_to_hex(bytes: impl IntoIterator<Item = u8>) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::new();
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").unwrap();
+    }
+    encoded
+}
+
 fn source(
     platform: &str,
     role: SourceRole,
@@ -628,15 +638,9 @@ fn resolves_synthetic_selected_root_entries_above_general_query_limit() {
         .map(|ordinal| {
             let name = format!("entry{ordinal}");
             let name_hex = if platform == "linux" {
-                name.as_bytes()
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
+                bytes_to_hex(name.bytes())
             } else {
-                name.encode_utf16()
-                    .flat_map(u16::to_le_bytes)
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
+                bytes_to_hex(name.encode_utf16().flat_map(u16::to_le_bytes))
             };
             let mut entry = json!({
                 "ordinal":ordinal,
