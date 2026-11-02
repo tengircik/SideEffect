@@ -187,8 +187,9 @@ def _preview_evidence(preview: dict[str, Any], question: str) -> tuple[str, list
     selectable: list[dict[str, Any]] = []
 
     syscall_rows = prompt.get("observed_syscall_results")
-    relation_rows = prompt.get("process_relations")
-    evaluator._require(isinstance(syscall_rows, list) and isinstance(relation_rows, list), "preview evidence sections are missing")
+    relation_rows = prompt.get("process_relations", [])
+    evaluator._require(isinstance(syscall_rows, list), "preview syscall evidence section is missing")
+    evaluator._require(isinstance(relation_rows, list), "preview process-relation evidence section is invalid")
     for row in syscall_rows:
         evaluator._require(isinstance(row, dict), "invalid syscall evidence row")
         evidence_id = row.get("evidence_id")
@@ -366,15 +367,15 @@ def run_corpus(
             errors.append({"case_id": case["id"], "phase": "analysis", "error": _error_message("analysis", "timeout", preview_completed=True)})
             continue
 
-        analysis_argv = [*sideeffect_command, "model-explain"]
-        if runtime is not None:
-            analysis_argv.extend(["--runtime", runtime])
-        analysis_argv.extend([
+        analysis_argv = [
+            *sideeffect_command,
+            "model-explain",
             "--question", case["question"],
             "--backend", backend,
-            "--confirm-sha256", preview["request_sha256"],
-            trace_path,
-        ])
+        ]
+        if runtime is not None:
+            analysis_argv.extend(["--runtime", runtime])
+        analysis_argv.extend(["--confirm-sha256", preview["request_sha256"], trace_path])
         analysis_started = time.monotonic()
         analysis_code, analysis_raw, failure = invoke(
             analysis_argv, timeout_seconds=remaining, output_limit=MAX_COMMAND_OUTPUT_BYTES

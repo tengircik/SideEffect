@@ -65,15 +65,32 @@ class CorpusRunnerTests(unittest.TestCase):
         self.fake_cli = Path(self.temp.name) / "fake_cli.py"
         self.fake_cli.write_text(FAKE_CLI, encoding="utf-8")
 
-    def _run(self, *, version: int = 3, invoke=runner._invoke):
+    def _run(self, *, version: int = 3, runtime: str | None = None, invoke=runner._invoke):
         return runner.run_corpus(
             sideeffect_command=[sys.executable, str(self.fake_cli)],
             backend="auto",
-            runtime=None,
+            runtime=runtime,
             timeout_seconds=5,
             results_version=version,
             invoke=invoke,
         )
+
+    def test_preview_without_empty_process_relations_section_is_valid(self) -> None:
+        row = {"evidence_id": "E001", "kind": "syscall_result", "result": "success"}
+        preview = {
+            "schema": "sideeffect.local_model_explanation_preview",
+            "schema_version": 3,
+            "question": "Which executable started?",
+            "request_sha256": "a" * 64,
+            "evidence_summary": {"parse_status": "complete"},
+            "prompt": json.dumps({"observed_syscall_results": [row]}),
+        }
+
+        parse_status, available, allowed = runner._preview_evidence(preview, preview["question"])
+
+        self.assertEqual(parse_status, "complete")
+        self.assertEqual(available, [{"evidence_id": "E001", "semantic_labels": []}])
+        self.assertEqual(allowed, {"E001": row})
 
     def test_runs_full_corpus_and_emits_valid_v3_without_labels_or_paths(self) -> None:
         results = self._run()
@@ -95,6 +112,33 @@ class CorpusRunnerTests(unittest.TestCase):
         self.assertEqual(results["schema_version"], 2)
         runner.evaluator._validate_results_v2(results, corpus, digest)
         self.assertNotIn("preview_request_sha256", results["cases"][0])
+
+    def test_configured_runtime_uses_cli_option_order(self) -> None:
+        analysis_argv: list[str] = []
+
+        def capture_analysis(argv, **kwargs):
+            if len(argv) > 2 and argv[2] == "model-explain" and not analysis_argv:
+                analysis_argv.extend(argv)
+            return runner._invoke(argv, **kwargs)
+
+        results = self._run(runtime="C:/tools/llama-completion.exe", invoke=capture_analysis)
+
+        self.assertEqual(len(results["cases"]), 26)
+        self.assertNotIn("errors", results)
+        corpus, _digest = runner.evaluator.load_corpus()
+        self.assertEqual(
+            analysis_argv[2:8],
+            [
+                "model-explain",
+                "--question",
+                corpus["cases"][0]["question"],
+                "--backend",
+                "auto",
+                "--runtime",
+            ],
+        )
+        self.assertEqual(analysis_argv[8], "C:/tools/llama-completion.exe")
+        self.assertEqual(analysis_argv[9], "--confirm-sha256")
 
     def test_records_partial_analysis_timeout_without_losing_other_cases(self) -> None:
         calls = 0
