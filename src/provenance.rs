@@ -75,6 +75,7 @@ pub enum ProvenanceError {
     InvalidInput(&'static str),
     InvalidEnvelope,
     InvalidKey,
+    KeyPairMismatch,
     PublicKeyMismatch,
     ManifestDigestMismatch,
     InvalidSignature,
@@ -89,6 +90,7 @@ impl std::fmt::Display for ProvenanceError {
             Self::InvalidInput(message) => f.write_str(message),
             Self::InvalidEnvelope => f.write_str("signature envelope is malformed or unsupported"),
             Self::InvalidKey => f.write_str("signing key is malformed or unsupported"),
+            Self::KeyPairMismatch => f.write_str("private and public key do not form a pair"),
             Self::PublicKeyMismatch => f.write_str("public key does not match the envelope key ID"),
             Self::ManifestDigestMismatch => {
                 f.write_str("session manifest bytes do not match the signed digest")
@@ -258,6 +260,24 @@ pub fn load_public_key(path: &Path) -> Result<Vec<u8>, ProvenanceError> {
     let bytes = read_limited(path, 64, "public key")?;
     decode_hex(&bytes, 32).ok_or(ProvenanceError::InvalidKey)?;
     Ok(bytes)
+}
+
+/// Check a protected private key against a bounded public-key file.
+///
+/// Returns only the matching public key fingerprint. This validates that the
+/// two supplied files form a pair; it does not validate a backup or recover a
+/// lost private key.
+pub fn check_keypair(private_path: &Path, public_path: &Path) -> Result<String, ProvenanceError> {
+    let private_bytes = load_private_key(private_path)?;
+    let public_text = load_public_key(public_path)?;
+    let public_bytes = decode_hex(&public_text, 32).ok_or(ProvenanceError::InvalidKey)?;
+    let private_key =
+        Ed25519KeyPair::from_pkcs8(&private_bytes).map_err(|_| ProvenanceError::InvalidKey)?;
+    let derived_public = private_key.public_key().as_ref();
+    if derived_public != public_bytes {
+        return Err(ProvenanceError::KeyPairMismatch);
+    }
+    Ok(encode_hex(&Sha256::digest(derived_public)))
 }
 
 /// Add a public key to a user-selected, current-user-private trust store.
@@ -759,8 +779,9 @@ fn hex_nibble(value: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Ed25519KeyPair, SignatureEnvelope, SystemRandom, generate_keypair, import_trusted_key,
-        list_trusted_keys, remove_trusted_key, sign_manifest, verify_manifest,
+        Ed25519KeyPair, ProvenanceError, SignatureEnvelope, SystemRandom, check_keypair,
+        generate_keypair, import_trusted_key, import_trusted_key_text, list_trusted_keys,
+        public_key_id, remove_trusted_key, sign_manifest, verify_manifest,
         verify_manifest_with_public_key_and_trust_store, verify_manifest_with_trust_store,
     };
     use ring::signature::KeyPair;
@@ -1100,6 +1121,50 @@ mod tests {
                 "generated public key must have a protected current-user-only DACL"
             );
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn keypair_check_returns_only_the_fingerprint_and_does_not_mutate_inputs_or_trust() {
+        let root = temporary_root();
+        let private = root.join("private.pk8");
+        let public = root.join("public.hex");
+        let store = root.join("trusted-keys");
+        generate_keypair(&private, &public).unwrap();
+        let trusted =
+            import_trusted_key_text(&store, &std::fs::read(&public).unwrap(), "signer").unwrap();
+        let before_private = std::fs::read(&private).unwrap();
+        let before_public = std::fs::read(&public).unwrap();
+        let before_trust = list_trusted_keys(&store).unwrap();
+
+        let fingerprint = check_keypair(&private, &public).unwrap();
+
+        assert_eq!(fingerprint, trusted.key_id);
+        assert_eq!(fingerprint, public_key_id(&before_public).unwrap());
+        assert!(!fingerprint.as_bytes().contains(&b'\n'));
+        assert_eq!(std::fs::read(&private).unwrap(), before_private);
+        assert_eq!(std::fs::read(&public).unwrap(), before_public);
+        assert_eq!(list_trusted_keys(&store).unwrap(), before_trust);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn keypair_check_rejects_mismatched_public_key_without_exposing_key_bytes() {
+        let root = temporary_root();
+        let private = root.join("private.pk8");
+        let public = root.join("public.hex");
+        let other_private = root.join("other-private.pk8");
+        let other_public = root.join("other-public.hex");
+        generate_keypair(&private, &public).unwrap();
+        generate_keypair(&other_private, &other_public).unwrap();
+        let expected_message = "private and public key do not form a pair";
+
+        let error = check_keypair(&private, &other_public).unwrap_err();
+
+        assert!(matches!(&error, ProvenanceError::KeyPairMismatch));
+        assert_eq!(error.to_string(), expected_message);
+        let public_text = std::fs::read_to_string(&other_public).unwrap();
+        assert!(!error.to_string().contains(public_text.as_str()));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

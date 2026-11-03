@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -46,6 +46,143 @@ impl Drop for TestDirectory {
     fn drop(&mut self) {
         fs::remove_dir_all(&self.0).unwrap();
     }
+}
+
+fn generate_pair(directory: &std::path::Path, name: &str) -> (PathBuf, PathBuf) {
+    let private = directory.join(format!("{name}.pk8"));
+    let public = directory.join(format!("{name}.hex"));
+    sideeffect::provenance::generate_keypair(&private, &public).unwrap();
+    (private, public)
+}
+
+fn key_check(private: &std::path::Path, public: &std::path::Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("provenance")
+        .arg("key-check")
+        .arg(private)
+        .arg(public)
+        .output()
+        .unwrap()
+}
+
+fn output_contains_bytes(output: &Output, needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && [output.stdout.as_slice(), output.stderr.as_slice()]
+            .into_iter()
+            .any(|stream| stream.windows(needle.len()).any(|window| window == needle))
+}
+
+#[test]
+fn provenance_key_check_cli_is_read_only_and_does_not_disclose_private_material() {
+    let temp = TestDirectory::new();
+    let (private, public) = generate_pair(&temp.0, "current");
+    let (other_private, other_public) = generate_pair(&temp.0, "other");
+    let original_private = fs::read(&private).unwrap();
+    let original_public = fs::read(&public).unwrap();
+    let trust_store = temp.0.join("explicit-trust-store");
+    sideeffect::provenance::import_trusted_key_text(
+        &trust_store,
+        &original_public,
+        "key check fixture",
+    )
+    .unwrap();
+    let original_trusted_keys = sideeffect::provenance::list_trusted_keys(&trust_store).unwrap();
+    let expected_fingerprint = sideeffect::provenance::public_key_id(&original_public).unwrap();
+
+    let matched = key_check(&private, &public);
+    assert!(
+        matched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&matched.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&matched.stdout).trim(),
+        expected_fingerprint
+    );
+    assert!(matched.stderr.is_empty());
+    assert!(!output_contains_bytes(&matched, &original_private));
+
+    let help = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["help", "provenance", "key-check"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(
+        String::from_utf8_lossy(&help.stdout)
+            .contains("Usage: sideeffect provenance key-check PRIVATE_KEY.pk8 PUBLIC_KEY.hex")
+    );
+    assert!(String::from_utf8_lossy(&help.stdout).contains("pair consistency only"));
+
+    let mismatch = key_check(&private, &other_public);
+    assert_eq!(mismatch.status.code(), Some(1));
+    assert!(mismatch.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&mismatch.stderr)
+            .contains("private and public key do not form a pair")
+    );
+    assert!(!output_contains_bytes(&mismatch, &original_private));
+    assert!(!output_contains_bytes(
+        &mismatch,
+        &fs::read(&other_private).unwrap()
+    ));
+    assert_eq!(fs::read(&private).unwrap(), original_private);
+    assert_eq!(fs::read(&public).unwrap(), original_public);
+    assert_eq!(
+        sideeffect::provenance::list_trusted_keys(&trust_store).unwrap(),
+        original_trusted_keys
+    );
+
+    let malformed_secret = b"PRIVATE_SECRET_MARKER_DO_NOT_ECHO";
+    fs::write(&private, malformed_secret).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let malformed_bytes = fs::read(&private).unwrap();
+    let malformed = key_check(&private, &public);
+    assert_eq!(malformed.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&malformed.stderr)
+            .contains("signing key is malformed or unsupported")
+    );
+    assert!(!output_contains_bytes(&malformed, malformed_secret));
+    assert_eq!(fs::read(&private).unwrap(), malformed_bytes);
+    fs::write(&private, &original_private).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o644)).unwrap();
+        let insecure = key_check(&private, &public);
+        assert_eq!(insecure.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&insecure.stderr).contains(
+            "private key must be owned by the current user with no group or other access"
+        ));
+        assert!(!output_contains_bytes(&insecure, &original_private));
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let invalid_path = temp.0.join("not-a-key-file");
+    fs::create_dir(&invalid_path).unwrap();
+    let invalid_path_result = key_check(&invalid_path, &public);
+    assert_eq!(invalid_path_result.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&invalid_path_result.stderr)
+            .contains("private key must be a regular file, not a link or special file")
+    );
+    assert!(
+        !String::from_utf8_lossy(&invalid_path_result.stderr)
+            .contains(invalid_path.file_name().unwrap().to_string_lossy().as_ref())
+    );
+
+    assert_eq!(fs::read(&private).unwrap(), original_private);
+    assert_eq!(fs::read(&public).unwrap(), original_public);
+    assert_eq!(
+        sideeffect::provenance::list_trusted_keys(&trust_store).unwrap(),
+        original_trusted_keys
+    );
 }
 
 #[test]
