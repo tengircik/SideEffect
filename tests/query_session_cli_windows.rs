@@ -512,6 +512,34 @@ fn verified_windows_session_query_v2_matches_only_raw_payload_validated_file_nam
         "windows_etw_validated_file_name"
     );
 
+    let prefix_query = directory.0.join("path-prefix-query.json");
+    fs::write(
+        &prefix_query,
+        serde_json::to_vec(&json!({
+            "schema": "sideeffect.event_query",
+            "schema_version": 3,
+            "filters": { "path_prefix": r"C:\Windows\Temp" },
+            "limit": 5
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["query", "--query"])
+        .arg(prefix_query)
+        .args(["--session"])
+        .arg(directory.0.join("path-session"))
+        .args(["--source", "runtime"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["event_query_result"]["matched_count"], 1);
+    assert_eq!(
+        result["event_query_result"]["source_state"]["completeness"],
+        "unknown"
+    );
+
     let no_path_query = directory.0.join("no-path-query.json");
     fs::write(
         &no_path_query,

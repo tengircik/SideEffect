@@ -99,7 +99,7 @@ fn cli_query_v2_filters_exact_lexical_paths_and_displays_them_as_terminal_safe_t
         String::from_utf8_lossy(&output.stderr)
     );
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["schema_version"], 2);
+    assert_eq!(result["schema_version"], 3);
     assert_eq!(result["matched_count"], 1);
     assert_eq!(
         result["events"][0]["path_observation"]["path"],
@@ -116,6 +116,20 @@ fn cli_query_v2_filters_exact_lexical_paths_and_displays_them_as_terminal_safe_t
     assert!(text.contains("path=/tmp/<script>alert(1)</script>"));
     assert!(!text.contains(".bak"));
     assert!(!text.contains("\u{1b}"));
+
+    let prefix_query = files.write(
+        "json",
+        br#"{"schema":"sideeffect.event_query","schema_version":3,"filters":{"path_prefix":"/tmp/<script>alert(1)</script>"},"limit":5}"#,
+    );
+    let output = run(&trace, &prefix_query, "json");
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["schema_version"], 3);
+    assert_eq!(result["matched_count"], 2);
+    assert_eq!(
+        result["events"][1]["path_observation"]["path"],
+        "/tmp/<script>alert(1)</script>.bak"
+    );
 }
 
 #[test]

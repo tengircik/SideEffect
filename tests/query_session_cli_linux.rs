@@ -462,7 +462,7 @@ fn verified_linux_session_query_v2_filters_exact_lexical_path() {
         .args(["query", "--query"])
         .arg(query_path)
         .args(["--session"])
-        .arg(session)
+        .arg(&session)
         .args(["--source", "runtime"])
         .output()
         .unwrap();
@@ -476,6 +476,28 @@ fn verified_linux_session_query_v2_filters_exact_lexical_path() {
     assert_eq!(
         result["event_query_result"]["source_state"]["completeness"],
         "complete"
+    );
+
+    let prefix_query = directory.0.join("path-prefix-query.json");
+    fs::write(
+        &prefix_query,
+        br#"{"schema":"sideeffect.event_query","schema_version":3,"filters":{"path_prefix":"/tmp"},"limit":5}"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["query", "--query"])
+        .arg(prefix_query)
+        .args(["--session"])
+        .arg(&session)
+        .args(["--source", "runtime"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["event_query_result"]["matched_count"], 1);
+    assert_eq!(
+        result["event_query_result"]["events"][0]["path_observation"]["path"],
+        "/tmp/item"
     );
 }
 

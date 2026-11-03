@@ -22,13 +22,13 @@ use crate::event::{
 use crate::model::SyscallOutcome;
 
 pub const QUERY_SCHEMA: &str = "sideeffect.event_query";
-pub const QUERY_SCHEMA_VERSION: u32 = 2;
+pub const QUERY_SCHEMA_VERSION: u32 = 3;
 pub const QUERY_RESULT_SCHEMA: &str = "sideeffect.event_query_result";
-pub const QUERY_RESULT_SCHEMA_VERSION: u32 = 2;
+pub const QUERY_RESULT_SCHEMA_VERSION: u32 = 3;
 pub const SESSION_QUERY_RESULT_SCHEMA: &str = "sideeffect.session_event_query_result";
-pub const SESSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 2;
+pub const SESSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 3;
 pub const MULTI_SESSION_QUERY_RESULT_SCHEMA: &str = "sideeffect.multi_session_event_query_result";
-pub const MULTI_SESSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 2;
+pub const MULTI_SESSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 3;
 pub const MAX_QUERY_SESSIONS: usize = 16;
 pub const MAX_MULTI_SESSION_RESULTS: usize = MAX_QUERY_RESULTS;
 pub const MAX_MULTI_SESSION_INPUT_BYTES: u64 = 256 * 1024 * 1024;
@@ -936,6 +936,10 @@ pub struct EventQueryFilters {
     /// This does not normalize, resolve, glob, or substring-match the value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_exact: Option<String>,
+    /// Literal string prefix against a source-derived path/name, without path semantics.
+    /// This can also match a sibling spelling such as `/tmp/a` and `/tmp/abc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
     /// Exact source-local evidence tuple; not portable across captures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<EvidenceFilter>,
@@ -971,13 +975,16 @@ impl EventQuery {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema != QUERY_SCHEMA || !matches!(self.schema_version, 1 | 2) {
+        if self.schema != QUERY_SCHEMA || !matches!(self.schema_version, 1..=3) {
             return Err(format!(
-                "query schema must be {QUERY_SCHEMA} version 1 or 2"
+                "query schema must be {QUERY_SCHEMA} version 1, 2, or 3"
             ));
         }
         if self.schema_version == 1 && self.filters.path_exact.is_some() {
             return Err("path_exact requires event query schema version 2".to_owned());
+        }
+        if self.schema_version < 3 && self.filters.path_prefix.is_some() {
+            return Err("path_prefix requires event query schema version 3".to_owned());
         }
         if self.limit == 0 || self.limit as usize > MAX_QUERY_RESULTS {
             return Err(format!(
@@ -1001,6 +1008,16 @@ impl EventQuery {
             {
                 return Err(format!(
                     "path_exact must contain 1..{MAX_PATH_FILTER_BYTES} printable UTF-8 bytes"
+                ));
+            }
+        }
+        if let Some(prefix) = &self.filters.path_prefix {
+            if prefix.is_empty()
+                || prefix.len() > MAX_PATH_FILTER_BYTES
+                || prefix.chars().any(char::is_control)
+            {
+                return Err(format!(
+                    "path_prefix must contain 1..{MAX_PATH_FILTER_BYTES} printable UTF-8 bytes"
                 ));
             }
         }
@@ -1313,6 +1330,14 @@ fn matches_event(
     }) {
         return false;
     }
+    if filters.path_prefix.as_ref().is_some_and(|prefix| {
+        event
+            .path_observation
+            .as_ref()
+            .is_none_or(|observation| !observation.path.starts_with(prefix))
+    }) {
+        return false;
+    }
     if filters
         .event_kind
         .as_ref()
@@ -1594,6 +1619,7 @@ mod tests {
                     outcome: Some(OutcomeFilter::Failure),
                     process_observation_id: None,
                     path_exact: None,
+                    path_prefix: None,
                     evidence: None,
                 },
                 10,
@@ -1667,6 +1693,34 @@ mod tests {
     }
 
     #[test]
+    fn query_path_prefix_is_a_case_sensitive_literal_string_prefix() {
+        let trace = b"123 1700000000.1 openat(AT_FDCWD</tmp>, \"alpha\", O_RDONLY) = 3\n123 1700000000.2 openat(AT_FDCWD</tmp>, \"alphabet\", O_RDONLY) = 4\n123 1700000000.3 openat(AT_FDCWD</tmp>, \"Alpha\", O_RDONLY) = 5\n123 1700000000.4 openat(AT_FDCWD, \"unknown\", O_RDONLY) = 6\n";
+        let envelope = linux_envelope(trace);
+        let prefix = execute_query(
+            &envelope,
+            &query(
+                EventQueryFilters {
+                    path_prefix: Some("/tmp/alpha".to_owned()),
+                    ..EventQueryFilters::default()
+                },
+                5,
+            ),
+        )
+        .unwrap();
+        assert_eq!(prefix.matched_count, 2);
+        assert_eq!(
+            prefix.events[0].path_observation.as_ref().unwrap().path,
+            "/tmp/alpha"
+        );
+        assert_eq!(
+            prefix.events[1].path_observation.as_ref().unwrap().path,
+            "/tmp/alphabet"
+        );
+        assert_eq!(prefix.source_state, envelope.source_state);
+        assert_eq!(prefix.diagnostics, envelope.diagnostics);
+    }
+
+    #[test]
     fn path_exact_query_contract_is_bounded_and_versioned() {
         assert!(EventQuery::from_json(
             br#"{"schema":"sideeffect.event_query","schema_version":1,"filters":{"path_exact":"/tmp/x"}}"#
@@ -1689,6 +1743,31 @@ mod tests {
         });
         let query = EventQuery::from_json(&serde_json::to_vec(&accepted).unwrap()).unwrap();
         assert_eq!(query.filters.path_exact.as_deref(), Some(injection_text));
+
+        for version in [1, 2] {
+            let legacy_with_prefix = serde_json::json!({
+                "schema": QUERY_SCHEMA,
+                "schema_version": version,
+                "filters": { "path_prefix": "/tmp" }
+            });
+            assert!(
+                EventQuery::from_json(&serde_json::to_vec(&legacy_with_prefix).unwrap()).is_err()
+            );
+        }
+        let oversized_prefix = serde_json::json!({
+            "schema": QUERY_SCHEMA,
+            "schema_version": 3,
+            "filters": { "path_prefix": "x".repeat(MAX_PATH_FILTER_BYTES + 1) }
+        });
+        assert!(EventQuery::from_json(&serde_json::to_vec(&oversized_prefix).unwrap()).is_err());
+        for invalid in ["", "x\ny"] {
+            let value = serde_json::json!({
+                "schema": QUERY_SCHEMA,
+                "schema_version": 3,
+                "filters": { "path_prefix": invalid }
+            });
+            assert!(EventQuery::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
     }
 
     #[test]

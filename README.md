@@ -168,6 +168,19 @@ Schema v2 adds an optional exact path filter:
 
 `path_exact` compares the full string exactly. It does not normalize separators or case, resolve `.`/`..` or symlinks, or perform glob/substring matching. Linux currently exposes hints only for supported `openat`/`openat2` trace spellings with a usable absolute base. Windows exposes a name only when a supported ETW FileIo name record has a validated raw-payload sidecar; many file events contain no path, and some observed Windows names may omit a drive letter. Unsupported, pathless, undecoded, or lost events cannot match. No match does not show that the path was not accessed. Schema v1 event queries remain accepted; `path_exact` requires schema v2. Query text output escapes terminal controls; JSON output remains ordinary data and may contain sensitive paths.
 
+Schema v3 adds a literal string-prefix filter:
+
+```json
+{
+  "schema": "sideeffect.event_query",
+  "schema_version": 3,
+  "filters": { "path_prefix": "/tmp/app" },
+  "limit": 100
+}
+```
+
+`path_prefix` is case-sensitive and compares the observed path spelling as text. For example, `/tmp/app` also matches `/tmp/apple`; this is not directory containment. Neither path filter resolves symlinks or canonicalizes paths. Query v1 and v2 remain accepted for their existing filters; event-query, session-result, and multi-session-result schemas are v3.
+
 Apply it directly to a Linux trace or Windows ETW capture:
 
 ```sh
