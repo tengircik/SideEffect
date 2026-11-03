@@ -66,7 +66,9 @@ use sideeffect::inventory::{WindowsStartupStatus, collect_windows_startup};
 use sideeffect::limits::MAX_BUNDLE_MANIFEST_BYTES;
 use sideeffect::limits::{MAX_REPORT_BYTES, MAX_TRACE_BYTES, ParseLimits};
 use sideeffect::model::{BundleCaptureContext, ParseCompleteness, TraceDiff, TraceRecordKind};
-use sideeffect::model_manager::{EvaluationStatus, ModelTask, ResolvedModel};
+use sideeffect::model_manager::{
+    ConfiguredRuntime, EvaluationStatus, ModelRegistry, ModelTask, ResolvedModel,
+};
 #[cfg(target_os = "linux")]
 use sideeffect::record::AnchoredOutput;
 #[cfg(target_os = "linux")]
@@ -96,7 +98,7 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect model-query --question <question> [--runtime <llama-completion>] --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect query --query <query.json> --trace <trace> | --windows-runtime <capture.json>\n\
        sideeffect query --query <query.json> --session <session-directory> --source runtime|selected_root\n\
-       sideeffect model list | show <id> | install <id> | setup <id> | add | select <task> <id> | remove <id>\n\
+       sideeffect model list | show <id> | install <id> | setup <id> [--runtime <existing-file>] | add | select <task> <id> | remove <id>\n\
        sideeffect model runtime set <task> <existing-file> | show [task] | clear <task>\n\
        sideeffect model doctor --task explanation [--runtime <llama-completion>] [--backend auto|cpu|cuda]\n\
        sideeffect correlate-startup <startup-inventory.json> <strace-trace-file>\n\
@@ -281,10 +283,20 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         [command, operation] if command == "model" && operation == "list" => model_list(),
         [command, operation, id] if command == "model" && operation == "show" => model_show(id),
         [command, operation, id] if command == "model" && operation == "install" => {
-            model_install(id, false)
+            model_install(id, false, None)
         }
         [command, operation, id] if command == "model" && operation == "setup" => {
-            model_install(id, true)
+            model_install(id, true, None)
+        }
+        [command, operation, id, runtime_flag, runtime_path]
+            if command == "model" && operation == "setup" && runtime_flag == "--runtime" =>
+        {
+            model_install(id, true, Some(runtime_path))
+        }
+        [command, operation, id, runtime_flag]
+            if command == "model" && operation == "setup" && runtime_flag == "--runtime" =>
+        {
+            Err("model setup --runtime requires an existing runtime path".to_owned())
         }
         [command, operation, task, id] if command == "model" && operation == "select" => {
             model_select(task, id)
@@ -1963,13 +1975,13 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect attribute --windows-runtime CAPTURE.json\nWrites a separate evidence-linked candidate view over a validated Windows ETW v3 capture. Descendant process links require supported process-start payloads and observed active parent IDs. Network association uses the decoded payload process ID. File and disk header PIDs remain context candidates, not ownership. Capture bytes are unchanged. Missing lifecycle data, ambiguity, unsupported records, or reported/unavailable loss is surfaced as partial or unassigned evidence; no causal or absence claims are made."
         }
         "model" => {
-            "Usage: sideeffect model list\n       sideeffect model show ID\n       sideeffect model install ID\n       sideeffect model setup ID\n       sideeffect model add --name NAME --path FILE --for evidence|explanation|query [--license ID]\n       sideeffect model select evidence|explanation|query ID\n       sideeffect model remove ID\n       sideeffect model runtime set evidence|explanation|query EXISTING_FILE\n       sideeffect model runtime show [evidence|explanation|query]\n       sideeffect model runtime clear evidence|explanation|query\n       sideeffect model doctor --task explanation [--runtime LLAMA_COMPLETION] [--backend auto|cpu|cuda]\n\nLists pinned catalog candidates and user-provided models. Catalog evaluation status is shown separately from runtime compatibility. Installing a catalog model requires explicit license acceptance; analysis never downloads weights implicitly. The setup command installs and selects the catalog model for its declared task. Runtime configuration stores a per-task path without executing the file; runtime revision checks happen only when doctor or analysis is run. Catalog models still carry their task-specific evaluation warnings, and no model is approved for answer quality. Registering a local model records its size and SHA-256, but does not verify task compatibility, licensing, or quality. Removing a custom registration leaves the model file untouched. Select a model for its task before running a model preview."
+            "Usage: sideeffect model list\n       sideeffect model show ID\n       sideeffect model install ID\n       sideeffect model setup ID [--runtime EXISTING_FILE]\n       sideeffect model add --name NAME --path FILE --for evidence|explanation|query [--license ID]\n       sideeffect model select evidence|explanation|query ID\n       sideeffect model remove ID\n       sideeffect model runtime set evidence|explanation|query EXISTING_FILE\n       sideeffect model runtime show [evidence|explanation|query]\n       sideeffect model runtime clear evidence|explanation|query\n       sideeffect model doctor --task explanation [--runtime LLAMA_COMPLETION] [--backend auto|cpu|cuda]\n\nLists pinned catalog candidates and user-provided models. Catalog evaluation status is shown separately from runtime compatibility. Installing a catalog model requires explicit license acceptance; analysis never downloads weights implicitly. The setup command installs and selects the catalog model for its declared task. An optional --runtime path records an existing runtime for that task without executing or downloading it; for explanation, run model doctor --task explanation to check its reported revision. Runtime configuration stores a per-task path without executing the file; runtime revision checks happen only when doctor or analysis is run. Catalog models still carry their task-specific evaluation warnings, and no model is approved for answer quality. Registering a local model records its size and SHA-256, but does not verify task compatibility, licensing, or quality. Removing a custom registration leaves the model file untouched. Select a model for its task before running a model preview."
         }
         "model doctor" => {
             "Usage: sideeffect model doctor --task explanation [--runtime LLAMA_COMPLETION] [--backend auto|cpu|cuda]\nUses --runtime when supplied, otherwise the configured explanation runtime. It checks the selected model registration and SHA-256, then runs only bounded runtime version and (unless CPU is selected) device-enumeration checks. It does not read a trace, load model weights, or run inference. A reported CUDA device is not proof of successful GPU inference. The selected runtime is executable code and must be trusted separately."
         }
         "model setup" => {
-            "Usage: sideeffect model setup MODEL_ID\nShows the catalog license and model evaluation status, downloads the exact pinned file after explicit typed acceptance, verifies its size and SHA-256, then selects it for its declared task. The local inference runtime is obtained separately; configure its existing path with 'sideeffect model runtime set TASK PATH' or pass --runtime on an analysis command."
+            "Usage: sideeffect model setup MODEL_ID [--runtime EXISTING_FILE]\nShows the catalog license and model evaluation status, downloads the exact pinned file after explicit typed acceptance, verifies its size and SHA-256, then selects it for its declared task. Optional --runtime records an already obtained runtime path for that task after setup succeeds; it does not download or execute the runtime. For an explanation setup, run 'sideeffect model doctor --task explanation' to check the configured runtime."
         }
         "model list" => {
             "Usage: sideeffect model list\nLists pinned catalog candidates, installation status, task, license, exact size, evaluation status, and selected model per task. Every listed model's SHA-256 is rechecked before use."
@@ -5979,11 +5991,18 @@ fn model_show(id: &OsString) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn model_install(id: &OsString, select_after_install: bool) -> Result<ExitCode, String> {
+fn model_install(
+    id: &OsString,
+    select_after_install: bool,
+    runtime_path: Option<&OsString>,
+) -> Result<ExitCode, String> {
     let id = id.to_str().ok_or("model ID must be valid UTF-8")?;
     let model = sideeffect::model_manager::catalog_model(id).ok_or_else(|| {
         "model ID is not in the pinned catalog; install accepts catalog IDs only".to_owned()
     })?;
+    if runtime_path.is_some() && !select_after_install {
+        return Err("--runtime is available only with model setup".to_owned());
+    }
     println!("Model: {}", terminal_safe_text(model.name));
     println!(
         "Source: {} at revision {}",
@@ -6004,6 +6023,17 @@ fn model_install(id: &OsString, select_after_install: bool) -> Result<ExitCode, 
     );
     if !model_task_supported_here(model.task) {
         return Err("this model task is not supported on the current platform".to_owned());
+    }
+    let prevalidated_runtime = runtime_path
+        .map(|path| validate_setup_runtime(model.task, path))
+        .transpose()?;
+    if let Some(runtime) = &prevalidated_runtime {
+        println!(
+            "Existing runtime file: {} ({} bytes; SHA-256 {}). It will not be executed or downloaded by this command.",
+            terminal_safe_path(&runtime.path),
+            runtime.size_bytes,
+            runtime.sha256
+        );
     }
     println!(
         "This download sends no trace or prompt data. It contacts Hugging Face hosts only to fetch the pinned model file."
@@ -6042,9 +6072,14 @@ fn model_install(id: &OsString, select_after_install: bool) -> Result<ExitCode, 
         },
     )?;
     if select_after_install {
-        sideeffect::model_manager::update_registry(|registry| {
-            registry.resolve(id, model.task)?;
-            registry.select(model.task, id)
+        let configured_runtime = sideeffect::model_manager::update_registry(|registry| {
+            complete_model_setup_in_registry(
+                registry,
+                id,
+                model.task,
+                runtime_path,
+                prevalidated_runtime.as_ref(),
+            )
         })?;
         println!(
             "\nInstalled and selected {} for {} ({} bytes, SHA-256 {}).",
@@ -6053,6 +6088,20 @@ fn model_install(id: &OsString, select_after_install: bool) -> Result<ExitCode, 
             receipt.size_bytes,
             receipt.sha256
         );
+        if let Some(runtime) = configured_runtime {
+            println!(
+                "Configured runtime path for {}: {} ({} bytes; SHA-256 {}). This command did not execute the runtime.",
+                model_task_label(model.task),
+                terminal_safe_path(&runtime.path),
+                runtime.size_bytes,
+                runtime.sha256
+            );
+            if model.task == ModelTask::Explanation {
+                println!(
+                    "Run `sideeffect model doctor --task explanation` to check its reported revision and readiness."
+                );
+            }
+        }
     } else {
         println!(
             "\nInstalled {} ({} bytes, SHA-256 {}). Select it with `sideeffect model select {} {}` before analysis.",
@@ -6068,6 +6117,44 @@ fn model_install(id: &OsString, select_after_install: bool) -> Result<ExitCode, 
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn validate_setup_runtime(task: ModelTask, path: &OsStr) -> Result<ConfiguredRuntime, String> {
+    let mut registry = ModelRegistry::default();
+    registry.set_runtime(task, Path::new(path))
+}
+
+fn complete_model_setup_in_registry(
+    registry: &mut ModelRegistry,
+    model_id: &str,
+    task: ModelTask,
+    runtime_path: Option<&OsString>,
+    preflight_runtime: Option<&ConfiguredRuntime>,
+) -> Result<Option<ConfiguredRuntime>, String> {
+    let mut updated = registry.clone();
+    updated.resolve(model_id, task)?;
+    updated.select(task, model_id)?;
+    let runtime = runtime_path
+        .map(|path| updated.set_runtime(task, Path::new(path)))
+        .transpose()?;
+    match (runtime.as_ref(), preflight_runtime) {
+        (Some(runtime), Some(preflight))
+            if runtime.path == preflight.path
+                && runtime.size_bytes == preflight.size_bytes
+                && runtime.sha256 == preflight.sha256 => {}
+        (None, None) => {}
+        (Some(_), Some(_)) => {
+            return Err(
+                "runtime file changed after setup preflight; model setup was not completed"
+                    .to_owned(),
+            );
+        }
+        _ => {
+            return Err("runtime setup preflight state is inconsistent".to_owned());
+        }
+    }
+    *registry = updated;
+    Ok(runtime)
 }
 
 fn model_add(arguments: &[OsString]) -> Result<ExitCode, String> {
@@ -7778,5 +7865,250 @@ mod tests {
             Some("runtime_manifest_trace_contract_mismatch")
         );
         assert!(invalid.source_diffs[0].comparison.is_none());
+    }
+}
+
+#[cfg(test)]
+mod model_setup_tests {
+    use super::complete_model_setup_in_registry;
+    use sha2::{Digest, Sha256};
+    use sideeffect::model_manager::{ModelRegistry, ModelTask};
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_SETUP_DIR_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TempSetupDir(PathBuf);
+
+    impl TempSetupDir {
+        fn new() -> Self {
+            loop {
+                let id = NEXT_SETUP_DIR_ID.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "sideeffect-model-setup-test-{}-{id}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("could not create model-setup test directory: {error}"),
+                }
+            }
+        }
+    }
+
+    impl Drop for TempSetupDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn assert_setup_rejects_runtime_mismatch(
+        temp: &TempSetupDir,
+        final_runtime_path: &std::path::Path,
+        preflight_runtime: &sideeffect::model_manager::ConfiguredRuntime,
+    ) {
+        let old_model_path = temp.0.join("previous.gguf");
+        fs::write(&old_model_path, b"GGUF\x03\0\0\0previous model").unwrap();
+        let setup_model_path = temp.0.join("setup.gguf");
+        fs::write(&setup_model_path, b"GGUF\x03\0\0\0setup model").unwrap();
+        let old_runtime_path = temp.0.join("previous-runtime.bin");
+        fs::write(&old_runtime_path, b"previous runtime bytes").unwrap();
+
+        let mut registry = ModelRegistry::default();
+        let old_model_id = registry
+            .register_custom(
+                "Previous model",
+                &old_model_path,
+                None,
+                vec![ModelTask::Explanation],
+            )
+            .unwrap();
+        let setup_model_id = registry
+            .register_custom(
+                "Setup model",
+                &setup_model_path,
+                None,
+                vec![ModelTask::Explanation],
+            )
+            .unwrap();
+        registry
+            .select(ModelTask::Explanation, &old_model_id)
+            .unwrap();
+        registry
+            .set_runtime(ModelTask::Explanation, &old_runtime_path)
+            .unwrap();
+        let before = registry.clone();
+
+        let final_runtime_path_os = OsString::from(final_runtime_path);
+        let error = complete_model_setup_in_registry(
+            &mut registry,
+            &setup_model_id,
+            ModelTask::Explanation,
+            Some(&final_runtime_path_os),
+            Some(preflight_runtime),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("runtime file changed after setup preflight"));
+        assert_eq!(registry, before);
+    }
+
+    #[test]
+    fn successful_setup_finalization_selects_model_and_hash_registers_runtime_for_same_task() {
+        let temp = TempSetupDir::new();
+        let model_path = temp.0.join("synthetic.gguf");
+        fs::write(&model_path, b"GGUF\x03\0\0\0synthetic setup model").unwrap();
+        let runtime_path = temp.0.join("inert-runtime-file.bin");
+        let runtime_bytes = b"inert test fixture; never execute";
+        fs::write(&runtime_path, runtime_bytes).unwrap();
+
+        let mut registry = ModelRegistry::default();
+        let model_id = registry
+            .register_custom(
+                "Synthetic setup model",
+                &model_path,
+                None,
+                vec![ModelTask::Explanation],
+            )
+            .unwrap();
+        let runtime_path_os = OsString::from(&runtime_path);
+        let preflight_runtime = ModelRegistry::default()
+            .set_runtime(ModelTask::Explanation, &runtime_path)
+            .unwrap();
+        let configured = complete_model_setup_in_registry(
+            &mut registry,
+            &model_id,
+            ModelTask::Explanation,
+            Some(&runtime_path_os),
+            Some(&preflight_runtime),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            registry.selected_by_task.get(&ModelTask::Explanation),
+            Some(&model_id)
+        );
+        assert_eq!(
+            registry.runtime_by_task.get(&ModelTask::Explanation),
+            Some(&configured)
+        );
+        assert!(!registry.runtime_by_task.contains_key(&ModelTask::QueryPlan));
+        assert_eq!(configured.path, runtime_path.canonicalize().unwrap());
+        assert_eq!(configured.size_bytes, runtime_bytes.len() as u64);
+        assert_eq!(
+            configured.sha256,
+            format!("{:x}", Sha256::digest(runtime_bytes))
+        );
+    }
+
+    #[test]
+    fn setup_finalization_without_runtime_preserves_model_only_behavior() {
+        let temp = TempSetupDir::new();
+        let model_path = temp.0.join("synthetic.gguf");
+        fs::write(&model_path, b"GGUF\x03\0\0\0synthetic setup model").unwrap();
+
+        let mut registry = ModelRegistry::default();
+        let model_id = registry
+            .register_custom(
+                "Synthetic setup model",
+                &model_path,
+                None,
+                vec![ModelTask::Explanation],
+            )
+            .unwrap();
+        assert!(
+            complete_model_setup_in_registry(
+                &mut registry,
+                &model_id,
+                ModelTask::Explanation,
+                None,
+                None,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            registry.selected_by_task.get(&ModelTask::Explanation),
+            Some(&model_id)
+        );
+        assert!(registry.runtime_by_task.is_empty());
+    }
+
+    #[test]
+    fn setup_finalization_rejects_runtime_change_without_partial_registry_mutation() {
+        let temp = TempSetupDir::new();
+        let model_path = temp.0.join("synthetic.gguf");
+        fs::write(&model_path, b"GGUF\x03\0\0\0synthetic setup model").unwrap();
+        let mut registry = ModelRegistry::default();
+        let model_id = registry
+            .register_custom(
+                "Synthetic setup model",
+                &model_path,
+                None,
+                vec![ModelTask::Explanation],
+            )
+            .unwrap();
+        let missing_runtime = OsString::from(temp.0.join("missing-runtime.exe"));
+
+        assert!(
+            complete_model_setup_in_registry(
+                &mut registry,
+                &model_id,
+                ModelTask::Explanation,
+                Some(&missing_runtime),
+                None,
+            )
+            .is_err()
+        );
+        assert!(registry.selected_by_task.is_empty());
+        assert!(registry.runtime_by_task.is_empty());
+    }
+
+    #[test]
+    fn setup_finalization_rejects_changed_runtime_bytes_without_registry_mutation() {
+        let temp = TempSetupDir::new();
+        let runtime_path = temp.0.join("runtime.bin");
+        let original_bytes = b"runtime fixture bytes";
+        let changed_bytes = b"runtime altered bytes";
+        assert_eq!(original_bytes.len(), changed_bytes.len());
+        fs::write(&runtime_path, original_bytes).unwrap();
+        let preflight_runtime = ModelRegistry::default()
+            .set_runtime(ModelTask::Explanation, &runtime_path)
+            .unwrap();
+        fs::write(&runtime_path, changed_bytes).unwrap();
+
+        assert_setup_rejects_runtime_mismatch(&temp, &runtime_path, &preflight_runtime);
+    }
+
+    #[test]
+    fn setup_finalization_rejects_changed_runtime_size_without_registry_mutation() {
+        let temp = TempSetupDir::new();
+        let runtime_path = temp.0.join("runtime.bin");
+        fs::write(&runtime_path, b"runtime").unwrap();
+        let preflight_runtime = ModelRegistry::default()
+            .set_runtime(ModelTask::Explanation, &runtime_path)
+            .unwrap();
+        fs::write(&runtime_path, b"runtime changed to a larger file").unwrap();
+
+        assert_setup_rejects_runtime_mismatch(&temp, &runtime_path, &preflight_runtime);
+    }
+
+    #[test]
+    fn setup_finalization_rejects_changed_runtime_canonical_path_without_registry_mutation() {
+        let temp = TempSetupDir::new();
+        let preflight_path = temp.0.join("runtime-before.bin");
+        let final_path = temp.0.join("runtime-after.bin");
+        let same_bytes = b"same runtime bytes at a different path";
+        fs::write(&preflight_path, same_bytes).unwrap();
+        fs::write(&final_path, same_bytes).unwrap();
+        let preflight_runtime = ModelRegistry::default()
+            .set_runtime(ModelTask::Explanation, &preflight_path)
+            .unwrap();
+
+        assert_setup_rejects_runtime_mismatch(&temp, &final_path, &preflight_runtime);
     }
 }

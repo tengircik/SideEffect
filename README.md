@@ -366,6 +366,10 @@ SideEffect does not run startup entries or scripts. It does not upload audit dat
 
 SideEffect provides a native Rust CLI for Linux x86_64 and Windows x64. The Linux workflow uses the external `strace` executable. The Windows runtime collector uses ETW. Linux CI validates the real `strace` workflow on Ubuntu 24.04; Windows Server 2022 and 2025 CI exercises live process, file, and loopback network ETW events. The [compatibility matrix](docs/INSTALL.md#compatibility-and-observation-matrix) lists the exact tested environments and source boundaries.
 
+## Optional local models
+
+Local-model analysis is optional and experimental; no model is approved for answer quality, and SideEffect works without one. `sideeffect model setup ID [--runtime EXISTING_FILE]` installs pinned catalog weights after exact license acceptance and selects the model for its task. If `--runtime` is supplied, the file must already have been obtained by you; setup validates its canonical regular file, size, and SHA-256 before the license prompt, never downloads or executes it, and saves it for the same task after the weights install successfully. For the explanation task, `sideeffect model doctor --task explanation` checks the configured runtime revision and readiness. Without `--runtime`, runtime setup remains available separately through `model runtime set`. See [local model setup and readiness](docs/LOCAL_MODEL_DOCTOR.md) and the [Windows explanation setup and limitations](docs/LOCAL_MODEL_WINDOWS_SETUP.md).
+
 ## Documentation
 
 - [Build, install, and platform compatibility](docs/INSTALL.md)

@@ -49,13 +49,19 @@ sideeffect.exe model list
 sideeffect.exe model show explanation-qwen3.5-4b-q4-k-m
 ```
 
-If you choose to install the pinned catalog weights, `setup` downloads that model file and selects it for explanation after displaying its source, license, platform, and evaluation status and receiving the exact `ACCEPT Apache-2.0` confirmation:
+If you choose to install the pinned catalog weights, `setup` downloads that model file and selects it for explanation after displaying its source, license, platform, and evaluation status and receiving the exact `ACCEPT Apache-2.0` confirmation. You can include `--runtime EXISTING_FILE` if you have already obtained a llama.cpp executable:
 
 ```powershell
+# Without registering a runtime during setup:
 sideeffect.exe model setup explanation-qwen3.5-4b-q4-k-m
+
+# With an already-obtained runtime (replace this path with your executable):
+sideeffect.exe model setup explanation-qwen3.5-4b-q4-k-m --runtime .\path\to\llama-completion.exe
 ```
 
-This action contacts the pinned Hugging Face file hosts and verifies the catalog size and SHA-256. It does not download or install llama.cpp, execute model weights, or send a trace or prompt. You can instead register an existing local GGUF with `model add`; that records a file and hash, but does not verify its license, quality, or compatibility with llama.cpp. Registration is not a recommendation. Select a registered model explicitly before analysis:
+When supplied, the runtime path is resolved to a canonical regular file and its bounded size and SHA-256 are checked before the catalog license prompt. The runtime must already have been obtained by you; setup neither downloads nor executes it. After the pinned weights install successfully, setup selects the model and saves that runtime for the explanation task. Run `sideeffect.exe model doctor --task explanation --backend auto` to check the reported runtime revision and readiness. Without `--runtime`, configure the runtime separately with `model runtime set explanation PATH`.
+
+This action contacts the pinned Hugging Face file hosts and verifies the catalog model size and SHA-256. It does not download or install llama.cpp, execute model weights, or send a trace or prompt. You can instead register an existing local GGUF with `model add`; that records a file and hash, but does not verify its license, quality, or compatibility with llama.cpp. Registration is not a recommendation. Select a registered model explicitly before analysis:
 
 ```powershell
 sideeffect.exe model add --name "My local GGUF" --path .\model.gguf --for explanation
