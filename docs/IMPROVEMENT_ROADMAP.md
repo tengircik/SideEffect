@@ -91,6 +91,8 @@ Milestones are ordered by dependency. Work may be split into independently revie
 
 **Acceptance gate:** per-platform reports show tested source/OS/provider/version combinations, reproducible real collector scenarios, measured event-loss behavior, status behavior for partial capture, and overhead/resource measurements. Fuzz/property testing has bounded inputs and actionable crash handling. Unsupported platforms/providers and privilege requirements are documented. This gate validates only those named combinations.
 
+**Native Windows client evidence (2026-11-03):** a release CLI rebuilt from branch commit `a160cae` ran the read-only process, startup, and PATH inventories on Windows 11 Pro build 26300 under a non-elevated token. All three wrote their current native schemas and surfaced partial status with source diagnostics; temporary reports were deleted without committing row values. This adds a native client source-execution check but does not validate Windows ETW, completeness, loss behavior, or performance. Details are in [SOURCE_ACCEPTANCE.md](SOURCE_ACCEPTANCE.md#native-windows-11-inventory-only-check-2026-11-03). R1 remains partial.
+
 **Failure gate:** unresolved silent loss, failure states presented as empty success, unbounded parsing/collection, inability to reproduce real-capture checks, or unacceptable measured impact pauses dependent features and narrows the supported profile.
 
 ### R2 — Software, process, and startup discovery

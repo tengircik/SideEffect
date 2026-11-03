@@ -60,6 +60,10 @@ These rules describe what each current consumer may claim from its inputs. “Co
 
 Durable cross-source process identity remains a future capability, and broad OS/provider validation remains in R1. The bounded R0 contract is accepted because current consumers retain source-specific candidate/unresolved status and suppress unsupported identity or presence claims; they do not promote these associations into durable identity.
 
+## Native Windows 11 inventory-only check (2026-11-03)
+
+The release CLI was rebuilt from branch commit `a160cae` and run on Windows 11 Pro x64, build 26300, under a non-elevated token. The three read-only commands `inventory processes`, `inventory startup`, and `inventory path-executables` each wrote their expected native schema and returned partial status (exit code `2`) rather than hiding unavailable or unsupported rows. Process schema v4 reported inaccessible/malformed process-time or token fields and invalid process identifiers; startup schema v5 reported a service API failure and unsupported scheduled-task action types; PATH schema v1 reported unavailable directories and skipped symlink/reparse-point entries. The artifacts were kept in a unique current-user temporary directory for inspection and then deleted; no row values or raw artifacts were committed. This verifies that the bounded inventory commands run on this named Windows client and surface their limitations. It does not validate row completeness, Windows ETW, elevated capture, or performance, and does not substitute for the Server 2022/2025 ETW acceptance.
+
 ## Linux
 
 | Source | Collected facts | Explicit exclusions | Status, loss, and truncation reporting | Identity and provenance available | Platform validation evidence in repository | Comparability caveats |
