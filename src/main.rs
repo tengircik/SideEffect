@@ -31,6 +31,8 @@ use sideeffect::format::{
 };
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{AccessOperation, analyze_current_process_access};
+#[cfg(windows)]
+use sideeffect::inventory::{AppPathStatus, collect_windows_app_paths};
 #[cfg(target_os = "linux")]
 use sideeffect::inventory::{InventoryStatus, collect_packages};
 use sideeffect::inventory::{
@@ -107,12 +109,13 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect inventory processes --output <new-inventory.json>\n\
        sideeffect inventory startup --output <new-inventory.json>\n\
        sideeffect inventory path-executables --output <new-inventory.json>\n\
+       sideeffect inventory app-paths --output <new-inventory.json> (native Windows)\n\
        sideeffect inventory root --output <new-inventory.json> <selected-directory>\n\
        sideeffect inventory permissions --output <new-inventory.json> <path>...\n\
        sideeffect inventory access-check --operation read|write|execute --output <new-result.json> <absolute-path> (Linux; current credentials)\n\
        sideeffect inventory access-check --pid <pid> --creation-time-filetime <100ns-value> --operation read|write|execute --output <new-result.json> <absolute-path> (Windows)\n\
        sideeffect audit --output <new-session-directory> [--packages] [--processes] [--startup] [--path-executables] [--root <directory> [--hash-regular-files]] [--permission <path>]... [--runtime-duration-seconds <1..3600> -- <program> [args...]]\n\
-       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect record --trace <new-trace-file> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect help [command [subcommand]]\n       sideeffect version\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. On Linux, inventory packages reads available local dpkg, RPM, pacman, and APK databases plus optional fixed-path Flatpak installed references; on Windows, it reads selected current-user and machine-wide Uninstall registry entries. Both are bounded source snapshots and can miss unregistered software. Windows does not use Win32_Product or launch uninstall commands. On Linux, inventory processes reads bounded numeric /proc status entries and executable-link identities; on Windows, it reads a Tool Help snapshot and queries accessible image paths. Neither adapter reads command lines or promises atomic or exhaustive coverage. On Linux, inventory startup discovers curated sources; on Windows, it inventories selected Run/RunOnce values, Startup folders, and visible service configuration and boot/logon triggers in tasks visible to the current token. For tasks, bounded Exec-action executable paths, arguments, and working directories are recorded as inert text; other action types remain unsupported with unknown action-specific fields. Neither platform establishes that a configured entry ran. Inventory permissions inspects only explicit Linux paths and records ownership/type/mode, supported POSIX ACLs, and Linux file-capability xattrs; it never follows the final path symlink or calculates effective access. Record follows a selected command's traced descendants and may enforce a requested wall-clock limit; this is observation, not isolation or a safety check.";
+       sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect record --trace <new-trace-file> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect help [command [subcommand]]\n       sideeffect version\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. On Linux, inventory packages reads available local dpkg, RPM, pacman, and APK databases plus optional fixed-path Flatpak installed references; on Windows, it reads selected current-user and machine-wide Uninstall registry entries. Both are bounded source snapshots and can miss unregistered software. Windows does not use Win32_Product or launch uninstall commands. Windows `inventory app-paths` separately reads selected App Paths registry registrations; it does not expand, parse, execute, or validate their referenced paths. On Linux, inventory processes reads bounded numeric /proc status entries and executable-link identities; on Windows, it reads a Tool Help snapshot and queries accessible image paths. Neither adapter reads command lines or promises atomic or exhaustive coverage. On Linux, inventory startup discovers curated sources; on Windows, it inventories selected Run/RunOnce values, Startup folders, and visible service configuration and boot/logon triggers in tasks visible to the current token. For tasks, bounded Exec-action executable paths, arguments, and working directories are recorded as inert text; other action types remain unsupported with unknown action-specific fields. Neither platform establishes that a configured entry ran. Inventory permissions inspects only explicit Linux paths and records ownership/type/mode, supported POSIX ACLs, and Linux file-capability xattrs; it never follows the final path symlink or calculates effective access. Record follows a selected command's traced descendants and may enforce a requested wall-clock limit; this is observation, not isolation or a safety check.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -667,6 +670,11 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
                 && option == "--output" =>
         {
             inventory_path_executables(output)
+        }
+        [command, subcommand, option, output]
+            if command == "inventory" && subcommand == "app-paths" && option == "--output" =>
+        {
+            inventory_app_paths(output)
         }
         [command, subcommand, option, output, root]
             if command == "inventory" && subcommand == "root" && option == "--output" =>
@@ -1281,6 +1289,41 @@ fn inventory_packages(output: &OsString) -> Result<ExitCode, String> {
     }
 }
 
+fn inventory_app_paths(output: &OsString) -> Result<ExitCode, String> {
+    #[cfg(windows)]
+    {
+        let document = collect_windows_app_paths();
+        let complete = document.status == AppPathStatus::Complete;
+        let mut json = CappedBuffer::new(MAX_REPORT_BYTES);
+        serde_json::to_writer(&mut json, &document).map_err(|error| {
+            format!("could not serialize Windows App Paths inventory within the {MAX_REPORT_BYTES} byte limit: {error}")
+        })?;
+        let published =
+            publish_private_windows_file(Path::new(output), &json.bytes, MAX_REPORT_BYTES)
+                .map_err(|error| {
+                    format!("could not publish private Windows App Paths inventory: {error}")
+                })?;
+        if complete {
+            eprintln!(
+                "Saved a complete snapshot of selected Windows App Paths registry entries to {}. Registrations do not establish that their targets exist or can be launched.",
+                terminal_safe_path(&published)
+            );
+            Ok(ExitCode::SUCCESS)
+        } else {
+            eprintln!(
+                "Saved a partial Windows App Paths registration snapshot to {}. Check source status and diagnostics; unavailable or incomplete registrations remain unknown.",
+                terminal_safe_path(&published)
+            );
+            Ok(ExitCode::from(2))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = output;
+        Err("inventory app-paths is supported only on native Windows".to_owned())
+    }
+}
+
 fn inventory_processes(output: &OsString) -> Result<ExitCode, String> {
     #[cfg(target_os = "linux")]
     {
@@ -1887,7 +1930,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             }
         }
         "inventory" => {
-            "Usage: sideeffect inventory packages|processes|startup|path-executables|root|permissions|access-check ...\nCollects bounded, local snapshots from sources supported on this platform. Sources are curated and coverage can be partial; inspect output and diagnostics before drawing conclusions."
+            "Usage: sideeffect inventory packages|processes|startup|path-executables|app-paths|root|permissions|access-check ...\nCollects bounded, local snapshots from sources supported on this platform. Sources are curated and coverage can be partial; inspect output and diagnostics before drawing conclusions."
         }
         "inventory startup" => {
             #[cfg(target_os = "linux")]
@@ -1915,6 +1958,16 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             #[cfg(not(any(target_os = "linux", windows)))]
             {
                 "Usage: sideeffect inventory packages --output FILE\nPackage inventory is not supported on this platform."
+            }
+        }
+        "inventory app-paths" => {
+            #[cfg(windows)]
+            {
+                "Usage: sideeffect inventory app-paths --output FILE\nReads selected current-user and accessible machine App Paths registrations in native and WOW64 views. Values remain literal and inert. This does not scan the filesystem or establish that a registered executable exists or can be launched."
+            }
+            #[cfg(not(windows))]
+            {
+                "Usage: sideeffect inventory app-paths --output FILE\nApp Paths inventory is supported only on native Windows."
             }
         }
         "inventory processes" => {

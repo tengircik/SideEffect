@@ -35,6 +35,8 @@ mod startup_state;
 mod startup_windows;
 #[cfg(target_os = "linux")]
 mod systemd_units;
+#[cfg(windows)]
+mod windows_app_paths;
 mod windows_software_diff;
 
 #[cfg(target_os = "linux")]
@@ -160,3 +162,8 @@ pub use startup_windows::{
 };
 #[cfg(target_os = "linux")]
 pub use systemd_units::{UnitInventory as SystemdUnitInventory, UnitRecord as SystemdUnitRecord};
+#[cfg(windows)]
+pub use windows_app_paths::{
+    AppPathDiagnostic, AppPathEntry, AppPathEvidence, AppPathRegistryView, AppPathSource,
+    AppPathStatus, AppPathValue, WindowsAppPathInventoryDocument, collect_windows_app_paths,
+};

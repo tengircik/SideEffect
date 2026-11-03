@@ -445,6 +445,14 @@ The Windows startup command writes `sideeffect.windows_startup_inventory` v5 (v4
 
 On Windows, `inventory packages` writes the separate `sideeffect.windows_software_inventory` v1 schema. It reads selected values from HKCU native/32-bit and accessible HKLM 64/32-bit `Software\Microsoft\Windows\CurrentVersion\Uninstall` views. The collector does not use `Win32_Product`, expand `REG_EXPAND_SZ`, parse commands, or launch uninstallers. It limits registrations to 8,192 total and 2,048 per registry view; subkey names to 16,384 UTF-16 code units; selected value data to 64 KiB each and 4 MiB aggregate; aggregate subkey names to 1 Mi UTF-16 code units; and the scan to a 10-second deadline checked between registry calls. An in-flight Windows API call cannot be cancelled and can exceed that interval. Exact returned value bytes are retained as hexadecimal. Inaccessible, malformed, unsupported, and limit-affected data remain partial/unknown. Output uses the current-user-only DACL and no-clobber publisher. Portable, unregistered, and other package formats can be absent.
 
+To inspect App Paths registrations separately, run:
+
+```powershell
+sideeffect.exe inventory app-paths --output .\app-paths.json
+```
+
+The `sideeffect.windows_app_path_inventory` v1 snapshot reads subkey names and the default and `Path` values from HKCU's native view and accessible HKLM 32-bit and 64-bit views of `Software\Microsoft\Windows\CurrentVersion\App Paths`. The default and `Path` values remain inert; `REG_EXPAND_SZ` is displayed literally, not expanded. It does not inspect the referenced filesystem path, parse command text, or establish that a target exists, is installed, available, or launchable. It caps enumeration at 4,096 entries total, names at 1,024 UTF-16 code units each and 1 Mi aggregate, registry values at 64 KiB each and 4 MiB aggregate, and collection at a 10-second cooperative deadline between API calls. A registry call already in progress cannot be cancelled. Raw returned bytes and exact UTF-16 subkey encodings are retained; paths and names can disclose sensitive local information. The output uses the current-user-only DACL and no-clobber publisher. Inaccessible, malformed, unsupported, and limit-affected data remain partial/unknown; partial artifacts are written and exit with status `2`. This is a separate registration snapshot and has no offline comparison command.
+
 ## Inspect selected Linux file permissions and ACLs
 
 ```sh
