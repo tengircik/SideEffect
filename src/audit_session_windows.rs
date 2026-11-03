@@ -195,7 +195,7 @@ pub fn collect_and_publish(
             ArtifactKind::WindowsStartup,
             "startup.windows.json",
             "sideeffect.windows_startup_inventory",
-            4,
+            5,
             value,
         ));
     }

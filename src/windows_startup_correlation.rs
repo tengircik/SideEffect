@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 pub const WINDOWS_STARTUP_INVENTORY_SCHEMA: &str = "sideeffect.windows_startup_inventory";
-pub const WINDOWS_STARTUP_INVENTORY_SCHEMA_VERSION: u32 = 4;
+pub const WINDOWS_STARTUP_INVENTORY_SCHEMA_VERSION: u32 = 5;
 const MAX_STARTUP_DOCUMENT_BYTES: usize = crate::limits::MAX_REPORT_BYTES;
 const MAX_TASK_ACTIONS: usize = 8_192;
 const MAX_ACTION_METADATA_BYTES: usize = 8 * 1024 * 1024;
@@ -50,7 +50,7 @@ pub struct WindowsAssociatedBehaviorInputs {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct WindowsAssociatedInputIdentity {
-    pub source_format: &'static str,
+    pub source_format: String,
     pub sha256: String,
     pub source_status: String,
     pub capture_completeness: &'static str,
@@ -98,6 +98,7 @@ pub struct WindowsProcessStartEvidenceReference {
 }
 
 struct StartupInput {
+    schema_version: u32,
     status: String,
     actions: Vec<StartupAction>,
 }
@@ -272,7 +273,7 @@ pub fn summarize_windows_startup_behavior(
             version: 1,
             basis: "exact_equality_of_drive_rooted_windows_path_strings",
         },
-        platform_adapter: "windows_startup_inventory_v4_windows_runtime_capture_v3",
+        platform_adapter: "windows_startup_inventory_v4_or_v5_windows_runtime_capture_v3",
         capture_completeness: "unknown",
         status: if partial { "partial" } else { "complete" },
         association_status: if associations.is_empty() {
@@ -282,13 +283,16 @@ pub fn summarize_windows_startup_behavior(
         },
         inputs: WindowsAssociatedBehaviorInputs {
             startup_inventory: WindowsAssociatedInputIdentity {
-                source_format: "sideeffect.windows_startup_inventory_v4",
+                source_format: format!(
+                    "{WINDOWS_STARTUP_INVENTORY_SCHEMA}_v{}",
+                    startup.schema_version
+                ),
                 sha256: startup_sha256,
                 source_status: startup_status,
                 capture_completeness: "unknown",
             },
             runtime_capture: WindowsAssociatedInputIdentity {
-                source_format: "sideeffect.windows_runtime_capture_v3",
+                source_format: "sideeffect.windows_runtime_capture_v3".to_owned(),
                 sha256: capture_sha256,
                 source_status: match runtime.collection_status {
                     CollectionStatus::Complete => "complete",
@@ -332,9 +336,9 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "Windows startup inventory must be a JSON object".to_owned())?;
+    let schema_version = object.get("schema_version").and_then(Value::as_u64);
     if object.get("schema").and_then(Value::as_str) != Some(WINDOWS_STARTUP_INVENTORY_SCHEMA)
-        || object.get("schema_version").and_then(Value::as_u64)
-            != Some(u64::from(WINDOWS_STARTUP_INVENTORY_SCHEMA_VERSION))
+        || !matches!(schema_version, Some(4 | 5))
         || object.get("platform").and_then(Value::as_str) != Some("windows")
     {
         return Err("unsupported Windows startup inventory schema or platform".to_owned());
@@ -359,9 +363,7 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
             .keys()
             .any(|key| !REQUIRED_FIELDS.contains(&key.as_str()))
     {
-        return Err(
-            "Windows startup inventory v4 has missing or unknown top-level fields".to_owned(),
-        );
+        return Err("Windows startup inventory has missing or unknown top-level fields".to_owned());
     }
     bounded_string(object.get("scope"), MAX_ACTION_FIELD_BYTES, "scope")?;
     let capture_started = object
@@ -392,7 +394,7 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
             ));
         }
         for (index, entry) in entries.iter().enumerate() {
-            validate_inventory_row(field, index, entry)?;
+            validate_inventory_row(field, index, entry, schema_version == Some(5))?;
         }
     }
     let status = object
@@ -429,15 +431,20 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
         let action = value
             .as_object()
             .ok_or_else(|| format!("scheduled-task action {index} must be an object"))?;
+        let has_states = schema_version == Some(5);
+        let mut required_action_fields = vec![
+            "action_index",
+            "action_type",
+            "action_type_code",
+            "status",
+            "evidence",
+        ];
+        if has_states {
+            required_action_fields.push("startup_state");
+        }
         validate_object_fields(
             action,
-            &[
-                "action_index",
-                "action_type",
-                "action_type_code",
-                "status",
-                "evidence",
-            ],
+            &required_action_fields,
             &[
                 "task_path",
                 "executable_path",
@@ -446,6 +453,12 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
             ],
             &format!("scheduled-task action {index}"),
         )?;
+        if has_states {
+            validate_startup_state_value(
+                action.get("startup_state"),
+                &format!("scheduled-task action {index}"),
+            )?;
+        }
         let action_index = action
             .get("action_index")
             .and_then(Value::as_u64)
@@ -570,6 +583,7 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
         });
     }
     Ok(StartupInput {
+        schema_version: schema_version.unwrap() as u32,
         status: status.to_owned(),
         actions: parsed_actions,
     })
@@ -613,12 +627,17 @@ fn validate_object_fields(
     Ok(())
 }
 
-fn validate_inventory_row(field: &str, index: usize, value: &Value) -> Result<(), String> {
+fn validate_inventory_row(
+    field: &str,
+    index: usize,
+    value: &Value,
+    has_states: bool,
+) -> Result<(), String> {
     let label = format!("Windows startup inventory {field}[{index}]");
     let object = value
         .as_object()
         .ok_or_else(|| format!("{label} must be an object"))?;
-    let (required, optional): (&[&str], &[&str]) = match field {
+    let (base_required, optional): (&[&str], &[&str]) = match field {
         "sources" => (
             &["id", "status", "entries_seen", "diagnostics"],
             &[
@@ -674,7 +693,15 @@ fn validate_inventory_row(field: &str, index: usize, value: &Value) -> Result<()
         ),
         _ => return Err("unsupported Windows inventory array".to_owned()),
     };
-    validate_object_fields(object, required, optional, &label)?;
+    let row_has_states = has_states && field != "sources";
+    let mut required = base_required.to_vec();
+    if row_has_states {
+        required.push("startup_state");
+    }
+    validate_object_fields(object, &required, optional, &label)?;
+    if row_has_states {
+        validate_startup_state_value(object.get("startup_state"), &label)?;
+    }
     match field {
         "sources" => {
             bounded_string(object.get("id"), MAX_ACTION_FIELD_BYTES, "source.id")?;
@@ -916,6 +943,51 @@ fn validate_inventory_row(field: &str, index: usize, value: &Value) -> Result<()
     Ok(())
 }
 
+fn validate_startup_state_value(value: Option<&Value>, label: &str) -> Result<(), String> {
+    let state = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{label} has no startup_state object"))?;
+    validate_object_fields(
+        state,
+        &["schema_version", "configured", "effective", "observed"],
+        &[],
+        &format!("{label}.startup_state"),
+    )?;
+    if state.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || state.get("configured").and_then(Value::as_str) != Some("present")
+    {
+        return Err(format!("{label} has an unsupported startup_state contract"));
+    }
+    for dimension in ["effective", "observed"] {
+        let object = state
+            .get(dimension)
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("{label}.startup_state.{dimension} must be an object"))?;
+        let fields: &[&str] = if dimension == "effective" {
+            &["status", "context", "evidence"]
+        } else {
+            &["status", "capture_interval", "evidence"]
+        };
+        validate_object_fields(
+            object,
+            fields,
+            &[],
+            &format!("{label}.startup_state.{dimension}"),
+        )?;
+        if object.get("status").and_then(Value::as_str) != Some("unknown")
+            || fields
+                .iter()
+                .skip(1)
+                .any(|field| object.get(*field).is_none_or(|value| !value.is_null()))
+        {
+            return Err(format!(
+                "{label}.startup_state.{dimension} must remain unknown without linked evidence"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_evidence(
     value: Option<&Value>,
     required: &[&str],
@@ -1062,6 +1134,12 @@ mod tests {
             "executable_path": path,
             "arguments": null,
             "working_directory": null,
+            "startup_state": {
+                "schema_version": 1,
+                "configured": "present",
+                "effective": {"status": "unknown", "context": null, "evidence": null},
+                "observed": {"status": "unknown", "capture_interval": null, "evidence": null}
+            },
             "evidence": {
                 "source": "synthetic fixture scheduled-task action",
                 "task_index": 3,
@@ -1278,7 +1356,7 @@ mod tests {
     fn unsupported_versions_malformed_fields_and_duplicate_keys_are_rejected() {
         let mut startup: Value =
             serde_json::from_slice(&startup_bytes(vec![], "complete")).unwrap();
-        startup["schema_version"] = Value::from(5);
+        startup["schema_version"] = Value::from(6);
         assert!(
             summarize_windows_startup_behavior(
                 &serde_json::to_vec(&startup).unwrap(),
@@ -1328,6 +1406,34 @@ mod tests {
             &capture_bytes(vec![], CollectionStatus::Complete, 0)
         )
         .is_err());
+    }
+
+    #[test]
+    fn legacy_v4_startup_inventory_without_row_state_remains_accepted() {
+        let mut startup: Value = serde_json::from_slice(&startup_bytes(
+            vec![action(Some(r"C:\Apps\worker.exe"), "observed", 0)],
+            "complete",
+        ))
+        .unwrap();
+        startup["schema_version"] = Value::from(4);
+        startup["scheduled_task_actions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("startup_state");
+        let summary = summarize_windows_startup_behavior(
+            &serde_json::to_vec(&startup).unwrap(),
+            &capture_bytes(vec![], CollectionStatus::Complete, 0),
+        )
+        .unwrap();
+        assert_eq!(summary.association_status, "insufficient_evidence");
+        assert_eq!(
+            summary.platform_adapter,
+            "windows_startup_inventory_v4_or_v5_windows_runtime_capture_v3"
+        );
+        assert_eq!(
+            summary.inputs.startup_inventory.source_format,
+            "sideeffect.windows_startup_inventory_v4"
+        );
     }
 
     #[test]

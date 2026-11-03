@@ -30,6 +30,7 @@ mod startup;
 mod startup_diff;
 #[cfg(target_os = "linux")]
 mod startup_legacy;
+mod startup_state;
 #[cfg(windows)]
 mod startup_windows;
 #[cfg(target_os = "linux")]

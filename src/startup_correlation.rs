@@ -106,7 +106,7 @@ pub struct AssociatedBehaviorSummary {
     pub schema: &'static str,
     pub schema_version: u32,
     pub algorithm: AssociationAlgorithm,
-    pub platform_adapter: &'static str,
+    pub platform_adapter: String,
     pub capture_completeness: &'static str,
     pub status: &'static str,
     /// `candidate_match` is never promoted to a causal or execution claim.
@@ -133,7 +133,7 @@ pub struct AssociatedBehaviorInputs {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AssociatedInputIdentity {
-    pub source_format: &'static str,
+    pub source_format: String,
     pub sha256: String,
     pub source_status: String,
     pub capture_completeness: &'static str,
@@ -284,11 +284,11 @@ pub fn correlate_startup_bytes(
     let startup: StartupInput = serde_json::from_slice(startup_bytes)
         .map_err(|_| "startup input is not a valid bounded JSON inventory".to_owned())?;
     if startup.schema != "sideeffect.startup_inventory"
-        || startup.schema_version != 2
+        || !matches!(startup.schema_version, 2 | 3)
         || startup.platform != "linux"
     {
         return Err(
-            "startup input must be a Linux sideeffect.startup_inventory schema v2 document"
+            "startup input must be a Linux sideeffect.startup_inventory schema v2 or v3 document"
                 .to_owned(),
         );
     }
@@ -629,6 +629,14 @@ pub fn summarize_associated_startup_behavior(
     trace_bytes: &[u8],
 ) -> Result<AssociatedBehaviorSummary, String> {
     let source = correlate_startup_bytes(startup_bytes, trace_bytes)?;
+    let startup_schema_version = serde_json::from_slice::<serde_json::Value>(startup_bytes)
+        .ok()
+        .and_then(|document| {
+            document
+                .get("schema_version")
+                .and_then(|value| value.as_u64())
+        })
+        .ok_or_else(|| "validated startup inventory has no schema version".to_owned())?;
     let partial = source.status != "complete";
     let associations = source
         .candidate_matches
@@ -670,7 +678,7 @@ pub fn summarize_associated_startup_behavior(
             version: 1,
             basis: "exact_literal_absolute_path_string_equality",
         },
-        platform_adapter: "linux_startup_inventory_v2_strace_v1",
+        platform_adapter: "linux_startup_inventory_v2_or_v3_strace_v1".to_owned(),
         capture_completeness: "unknown",
         status: if partial { "partial" } else { "complete" },
         association_status: if associations.is_empty() {
@@ -680,13 +688,13 @@ pub fn summarize_associated_startup_behavior(
         },
         inputs: AssociatedBehaviorInputs {
             startup_inventory: AssociatedInputIdentity {
-                source_format: "sideeffect.startup_inventory_v2",
+                source_format: format!("sideeffect.startup_inventory_v{startup_schema_version}"),
                 sha256: source.startup_inventory_sha256,
                 source_status: source.startup_inventory_status,
                 capture_completeness: "unknown",
             },
             runtime_trace: AssociatedInputIdentity {
-                source_format: "strace_text",
+                source_format: "strace_text".to_owned(),
                 sha256: source.trace_sha256,
                 source_status: match source.trace_parse_status {
                     ParseCompleteness::Complete => "complete".to_owned(),
@@ -976,6 +984,40 @@ mod tests {
     }
 
     #[test]
+    fn schema_v3_startup_rows_remain_candidate_only_in_correlation() {
+        let mut inventory: serde_json::Value =
+            serde_json::from_slice(&startup(&[("user", "/usr/bin/example")])).unwrap();
+        inventory["schema_version"] = json!(3);
+        inventory["xdg_autostart"]["schema_version"] = json!(2);
+        inventory["systemd_units"]["schema_version"] = json!(2);
+        inventory["legacy_sources"]["schema_version"] = json!(2);
+        inventory["xdg_autostart"]["entries"][0]["startup_state"] = json!({
+            "schema_version": 1,
+            "configured": "present",
+            "effective": {"status":"unknown", "context":null, "evidence":null},
+            "observed": {"status":"unknown", "capture_interval":null, "evidence":null}
+        });
+        let inventory = serde_json::to_vec(&inventory).unwrap();
+        let result = correlate_startup_bytes(
+            &inventory,
+            b"100 execve(\"/usr/bin/example\", [], []) = 0\n",
+        )
+        .unwrap();
+        assert_eq!(result.schema_version, 1);
+        assert_eq!(result.candidate_matches[0].status, "candidate_match");
+        assert!(result.claim.contains("does not prove a startup hook ran"));
+        let associated = summarize_associated_startup_behavior(
+            &inventory,
+            b"100 execve(\"/usr/bin/example\", [], []) = 0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            associated.inputs.startup_inventory.source_format,
+            "sideeffect.startup_inventory_v3"
+        );
+    }
+
+    #[test]
     fn parses_only_unescaped_quoted_filename_arguments() {
         assert_eq!(
             strace_argument("\"/usr/bin/a\", [\"x\"], []", 0, 3),
@@ -1182,7 +1224,11 @@ mod tests {
         assert_eq!(summary.algorithm.version, 1);
         assert_eq!(
             summary.platform_adapter,
-            "linux_startup_inventory_v2_strace_v1"
+            "linux_startup_inventory_v2_or_v3_strace_v1"
+        );
+        assert_eq!(
+            summary.inputs.startup_inventory.source_format,
+            "sideeffect.startup_inventory_v2"
         );
         assert_eq!(summary.capture_completeness, "unknown");
         assert_eq!(summary.status, "complete");

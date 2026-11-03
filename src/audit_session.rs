@@ -967,6 +967,8 @@ fn artifact_version_supported(
     session_version: u32,
 ) -> bool {
     observed == current
+        || (kind == ArtifactKind::Startup && matches!(observed, 2 | 3))
+        || (kind == ArtifactKind::WindowsStartup && matches!(observed, 4 | 5))
         || (kind == ArtifactKind::SelectedRoot
             && session_version == AUDIT_SESSION_SCHEMA_VERSION
             && observed == 2)
@@ -1011,7 +1013,7 @@ fn artifact_contract(
         ArtifactKind::Packages => ("packages.json", "sideeffect.inventory", 2),
         ArtifactKind::Processes => ("processes.json", "sideeffect.process_inventory", 5),
         ArtifactKind::Permissions => ("permissions.json", "sideeffect.permission_inventory", 1),
-        ArtifactKind::Startup => ("startup.json", "sideeffect.startup_inventory", 2),
+        ArtifactKind::Startup => ("startup.json", "sideeffect.startup_inventory", 3),
         ArtifactKind::PathExecutables => (
             "path-executables.json",
             "sideeffect.path_executable_inventory",
@@ -1040,7 +1042,7 @@ fn artifact_contract(
         ArtifactKind::WindowsStartup => (
             "startup.windows.json",
             "sideeffect.windows_startup_inventory",
-            4,
+            5,
         ),
         ArtifactKind::RuntimeManifest => ("run.json", "sideeffect.run", 2),
         ArtifactKind::RuntimeTrace => ("trace.strace", "strace_text", 1),
@@ -2301,6 +2303,33 @@ mod tests {
             2,
             super::AUDIT_SESSION_SCHEMA_VERSION,
         ));
+    }
+
+    #[test]
+    fn startup_artifact_contracts_accept_legacy_and_current_versions() {
+        for (kind, current, legacy) in [
+            (ArtifactKind::Startup, 3, 2),
+            (ArtifactKind::WindowsStartup, 5, 4),
+        ] {
+            assert!(super::artifact_version_supported(
+                kind,
+                current,
+                current,
+                super::AUDIT_SESSION_SCHEMA_VERSION,
+            ));
+            assert!(super::artifact_version_supported(
+                kind,
+                legacy,
+                current,
+                super::AUDIT_SESSION_SCHEMA_VERSION,
+            ));
+            assert!(!super::artifact_version_supported(
+                kind,
+                legacy + 10,
+                current,
+                super::AUDIT_SESSION_SCHEMA_VERSION,
+            ));
+        }
     }
 
     #[test]

@@ -147,6 +147,7 @@ pub struct LegacyStartupEntry {
     pub entry_kind: EntryKind,
     pub path: String,
     pub path_bytes_hex: String,
+    pub startup_state: super::startup_state::StartupRowState,
     /// Raw symlink target bytes. This is metadata, not a resolved path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symlink_target: Option<String>,
@@ -392,7 +393,7 @@ pub fn collect_legacy_startup_from(
 
     LegacyStartupDocument {
         schema: "sideeffect.legacy_startup_inventory",
-        schema_version: 1,
+        schema_version: 2,
         platform: "linux",
         scope: "common_sysv_cron_paths_only",
         capture_started_at_unix_ms: capture_started,
@@ -717,6 +718,7 @@ fn scan_file(
         entry_kind: EntryKind::InertFile,
         path: display_path(path),
         path_bytes_hex: hex(path.as_os_str().as_bytes()),
+        startup_state: super::startup_state::StartupRowState::configured_present(),
         symlink_target: None,
         symlink_target_hex: None,
         symlink_target_sha256: None,
@@ -761,6 +763,7 @@ fn read_link_entry(
         },
         path: display_path(path),
         path_bytes_hex: hex(path.as_os_str().as_bytes()),
+        startup_state: super::startup_state::StartupRowState::configured_present(),
         symlink_target: target.to_str().map(str::to_owned),
         symlink_target_hex: Some(hex(target_bytes)),
         symlink_target_sha256: Some(sha256_hex(target_bytes)),

@@ -398,6 +398,7 @@ pub struct WindowsRegistryStartupEntry {
     pub command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_utf16_hex: Option<String>,
+    pub startup_state: super::startup_state::StartupRowState,
     pub evidence: WindowsRegistryStartupEvidence,
 }
 
@@ -419,6 +420,7 @@ pub struct WindowsStartupFolderEntry {
     pub display_path: String,
     pub path_utf16_hex: String,
     pub kind: &'static str,
+    pub startup_state: super::startup_state::StartupRowState,
     pub evidence: WindowsStartupFolderEvidence,
 }
 
@@ -440,6 +442,7 @@ pub struct WindowsServiceStartupEntry {
     pub account: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binary_path: Option<String>,
+    pub startup_state: super::startup_state::StartupRowState,
     pub evidence: WindowsServiceStartupEvidence,
 }
 
@@ -457,6 +460,7 @@ pub struct WindowsScheduledTaskStartupEntry {
     pub trigger_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logon_user: Option<String>,
+    pub startup_state: super::startup_state::StartupRowState,
     pub evidence: WindowsScheduledTaskStartupEvidence,
 }
 
@@ -488,6 +492,7 @@ pub struct WindowsScheduledTaskAction {
     pub arguments: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<String>,
+    pub startup_state: super::startup_state::StartupRowState,
     pub evidence: WindowsScheduledTaskActionEvidence,
 }
 
@@ -869,7 +874,7 @@ pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
     };
     WindowsStartupInventoryDocument {
         schema: "sideeffect.windows_startup_inventory",
-        schema_version: 4,
+        schema_version: 5,
         platform: "windows",
         scope: "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks",
         capture_started_at_unix_ms: started_at,
@@ -1240,6 +1245,7 @@ fn collect_service_start_configuration(
                 start_type_code: config.start_type,
                 account,
                 binary_path,
+                startup_state: super::startup_state::StartupRowState::configured_present(),
                 evidence: WindowsServiceStartupEvidence {
                     source: "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW",
                     service_index: enumerated,
@@ -1830,6 +1836,7 @@ fn collect_scheduled_task_triggers(
                     trigger_type: trigger_name,
                     trigger_enabled,
                     logon_user,
+                    startup_state: super::startup_state::StartupRowState::configured_present(),
                     evidence: WindowsScheduledTaskStartupEvidence {
                         source: "Task Scheduler IRegisteredTask/ITaskDefinition/ITrigger",
                         task_index,
@@ -2110,6 +2117,7 @@ fn collect_task_actions(
                 executable_path: None,
                 arguments: None,
                 working_directory: None,
+                startup_state: super::startup_state::StartupRowState::configured_present(),
                 evidence: WindowsScheduledTaskActionEvidence {
                     source: "Task Scheduler IActionCollection/IAction",
                     task_index,
@@ -2145,6 +2153,7 @@ fn collect_task_actions(
                 executable_path: None,
                 arguments: None,
                 working_directory: None,
+                startup_state: super::startup_state::StartupRowState::configured_present(),
                 evidence: WindowsScheduledTaskActionEvidence {
                     source: "Task Scheduler IActionCollection/IAction",
                     task_index,
@@ -2181,6 +2190,7 @@ fn collect_task_actions(
                     executable_path: None,
                     arguments: None,
                     working_directory: None,
+                    startup_state: super::startup_state::StartupRowState::configured_present(),
                     evidence: WindowsScheduledTaskActionEvidence {
                         source: "Task Scheduler IActionCollection/IExecAction",
                         task_index,
@@ -2276,6 +2286,7 @@ fn collect_task_actions(
             executable_path,
             arguments,
             working_directory,
+            startup_state: crate::inventory::startup_state::StartupRowState::configured_present(),
             evidence: WindowsScheduledTaskActionEvidence {
                 source: "Task Scheduler IActionCollection/IExecAction",
                 task_index,
@@ -2792,6 +2803,7 @@ fn collect_registry_source_with_api<A: StartupRegistryApi>(
             value_type: type_name,
             command,
             command_utf16_hex: raw_hex,
+            startup_state: super::startup_state::StartupRowState::configured_present(),
             evidence: WindowsRegistryStartupEvidence {
                 source: "RegEnumValueW",
                 hive: source.hive,
@@ -3088,6 +3100,7 @@ fn collect_startup_folder(
             display_path: display_path.clone(),
             path_utf16_hex: hex.clone(),
             kind,
+            startup_state: super::startup_state::StartupRowState::configured_present(),
             evidence: WindowsStartupFolderEvidence {
                 source: "SHGetKnownFolderPath/FindFirstFileW",
                 folder_scope,
@@ -3711,6 +3724,7 @@ mod tests {
             executable_path: Some(r"%TEMP%\worker.exe".to_owned()),
             arguments: Some(r#"--name "value"; $(not-run)"#.to_owned()),
             working_directory: Some(r"C:\Work".to_owned()),
+            startup_state: crate::inventory::startup_state::StartupRowState::configured_present(),
             evidence: WindowsScheduledTaskActionEvidence {
                 source: "synthetic unit-test value",
                 task_index: 4,

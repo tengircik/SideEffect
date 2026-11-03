@@ -83,7 +83,7 @@ fn cli_emits_candidate_association_with_all_evidence_and_disclaimers() {
     assert_eq!(report["algorithm"]["version"], 1);
     assert_eq!(
         report["platform_adapter"],
-        "linux_startup_inventory_v2_strace_v1"
+        "linux_startup_inventory_v2_or_v3_strace_v1"
     );
     assert_eq!(report["capture_completeness"], "unknown");
     assert_eq!(report["association_status"], "candidate_match");

@@ -33,7 +33,7 @@ fn windows_startup_command_reports_service_and_task_sources() {
     let bytes = fs::read(&output).unwrap();
     let document: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(document["schema"], "sideeffect.windows_startup_inventory");
-    assert_eq!(document["schema_version"], 4);
+    assert_eq!(document["schema_version"], 5);
     assert_eq!(document["platform"], "windows");
     match document["status"].as_str().unwrap() {
         "complete" => assert_eq!(first.status.code(), Some(0)),
@@ -85,6 +85,9 @@ fn windows_startup_command_reports_service_and_task_sources() {
         document["scheduled_task_entries"].as_array().unwrap().len() as u64
     );
     for entry in document["service_entries"].as_array().unwrap() {
+        assert_eq!(entry["startup_state"]["configured"], "present");
+        assert_eq!(entry["startup_state"]["effective"]["status"], "unknown");
+        assert_eq!(entry["startup_state"]["observed"]["status"], "unknown");
         assert!(entry["service_name"].is_string());
         assert!(entry["display_name"].is_string());
         assert!(entry["start_type"].is_string());
@@ -110,6 +113,9 @@ fn windows_startup_command_reports_service_and_task_sources() {
         assert!(entry["evidence"]["trigger_index"].is_number());
     }
     for action in document["scheduled_task_actions"].as_array().unwrap() {
+        assert_eq!(action["startup_state"]["configured"], "present");
+        assert_eq!(action["startup_state"]["effective"]["status"], "unknown");
+        assert_eq!(action["startup_state"]["observed"]["status"], "unknown");
         assert!(action["task_path"].is_null() || action["task_path"].is_string());
         assert!(action["action_index"].is_number());
         assert!(action["action_type"].is_string());

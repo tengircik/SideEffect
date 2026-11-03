@@ -80,6 +80,7 @@ pub struct Entry {
     pub scope: &'static str,
     pub source_path: String,
     pub applicability: &'static str,
+    pub startup_state: super::startup_state::StartupRowState,
     pub keys: Vec<KeyEvidence>,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -120,7 +121,7 @@ pub fn collect_startup() -> StartupInventoryDocument {
     };
     StartupInventoryDocument {
         schema: "sideeffect.startup_inventory",
-        schema_version: 2,
+        schema_version: 3,
         platform: "linux",
         scope: "curated_xdg_systemd_sysv_cron_sources",
         capture_started_at_unix_ms: started,
@@ -393,6 +394,7 @@ fn collect_with_record_limit(
                 scope,
                 source_path: display_path(&path),
                 applicability: "not_evaluated",
+                startup_state: super::startup_state::StartupRowState::configured_present(),
                 keys: parsed.keys,
             });
             if record_limit_reached {
@@ -423,7 +425,7 @@ fn collect_with_record_limit(
     }
     XdgAutostartInventory {
         schema: "sideeffect.xdg_autostart_inventory",
-        schema_version: 1,
+        schema_version: 2,
         platform: "linux",
         scope: "xdg_autostart_files_only",
         capture_started_at_unix_ms: capture_started,

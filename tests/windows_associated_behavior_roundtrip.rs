@@ -88,7 +88,7 @@ fn synthetic_runtime_capture() -> Vec<u8> {
 }
 
 #[test]
-fn native_startup_v4_output_is_accepted_by_windows_associated_behavior_v1() {
+fn native_startup_v5_output_is_accepted_by_windows_associated_behavior_v1() {
     // This exercises the native startup serializer and offline adapter only.
     // The ETW input is synthetic and does not validate a live provider or capture.
     let temp = Temp::new();
@@ -108,7 +108,7 @@ fn native_startup_v4_output_is_accepted_by_windows_associated_behavior_v1() {
     let startup_bytes = fs::read(&startup_path).unwrap();
     let startup: Value = serde_json::from_slice(&startup_bytes).unwrap();
     assert_eq!(startup["schema"], "sideeffect.windows_startup_inventory");
-    assert_eq!(startup["schema_version"], 4);
+    assert_eq!(startup["schema_version"], 5);
     assert!(matches!(
         startup["status"].as_str(),
         Some("complete" | "partial")
@@ -141,11 +141,11 @@ fn native_startup_v4_output_is_accepted_by_windows_associated_behavior_v1() {
     assert_eq!(report["schema_version"], 1);
     assert_eq!(
         report["platform_adapter"],
-        "windows_startup_inventory_v4_windows_runtime_capture_v3"
+        "windows_startup_inventory_v4_or_v5_windows_runtime_capture_v3"
     );
     assert_eq!(
         report["inputs"]["startup_inventory"]["source_format"],
-        "sideeffect.windows_startup_inventory_v4"
+        "sideeffect.windows_startup_inventory_v5"
     );
     assert_eq!(
         report["inputs"]["startup_inventory"]["source_status"],

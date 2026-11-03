@@ -221,10 +221,24 @@ fn compare_source_role(
         && right_ref.schema == "sideeffect.selected_root_inventory"
         && matches!(left_ref.schema_version, 1 | 2)
         && matches!(right_ref.schema_version, 1 | 2);
+    let startup_versions_compatible = role == SourceRole::Startup
+        && left_ref.kind == right_ref.kind
+        && match left_ref.kind {
+            ArtifactKind::Startup => {
+                matches!(left_ref.schema_version, 2 | 3)
+                    && matches!(right_ref.schema_version, 2 | 3)
+            }
+            ArtifactKind::WindowsStartup => {
+                matches!(left_ref.schema_version, 4 | 5)
+                    && matches!(right_ref.schema_version, 4 | 5)
+            }
+            _ => false,
+        };
     if left_ref.kind != right_ref.kind
         || left_ref.schema != right_ref.schema
         || (left_ref.schema_version != right_ref.schema_version
-            && !selected_root_versions_compatible)
+            && !selected_root_versions_compatible
+            && !startup_versions_compatible)
     {
         return result.incomparable("artifact_contract_mismatch");
     }
@@ -760,6 +774,8 @@ mod tests {
             kind: spec.kind,
             path: match spec.kind {
                 ArtifactKind::Permissions => "permissions.json",
+                ArtifactKind::Startup => "startup.json",
+                ArtifactKind::WindowsStartup => "startup.windows.json",
                 ArtifactKind::PathExecutables => "path-executables.json",
                 ArtifactKind::SelectedRoot => "root-snapshot.json",
                 _ => "packages.json",
@@ -836,6 +852,71 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    fn linux_startup(version: u32, component_version: u32) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema":"sideeffect.startup_inventory",
+            "schema_version":version,
+            "platform":"linux",
+            "scope":"curated_xdg_systemd_sysv_cron_sources",
+            "capture_started_at_unix_ms":1000,
+            "capture_ended_at_unix_ms":1001,
+            "status":"complete",
+            "xdg_autostart":{"schema":"sideeffect.xdg_autostart_inventory","schema_version":component_version,"platform":"linux","scope":"xdg_autostart_files_only","capture_started_at_unix_ms":1000,"capture_ended_at_unix_ms":1001,"status":"complete","directories":[],"entries":[]},
+            "systemd_units":{"schema":"sideeffect.systemd_unit_inventory","schema_version":component_version,"platform":"linux","scope":"systemd_unit_files_and_enablement_symlink_references","capture_started_at_unix_ms":1000,"capture_ended_at_unix_ms":1001,"status":"complete","directories":[],"records":[]},
+            "legacy_sources":{"schema":"sideeffect.legacy_startup_inventory","schema_version":component_version,"platform":"linux","scope":"common_sysv_cron_paths_only","capture_started_at_unix_ms":1000,"capture_ended_at_unix_ms":1001,"status":"complete","sources":[],"entries":[]}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn session_item_diff_keeps_mixed_legacy_and_stateful_startup_artifacts_comparable_as_items() {
+        let before_bytes = linux_startup(2, 1);
+        let after_bytes = linux_startup(3, 2);
+        let spec = |version| SessionSpec {
+            role: SourceRole::Startup,
+            kind: ArtifactKind::Startup,
+            platform: "linux",
+            schema: "sideeffect.startup_inventory",
+            schema_version: version,
+            scope: "curated_xdg_systemd_sysv_cron_sources",
+        };
+        let (before, _) = session_for(
+            &before_bytes,
+            "0123456789abcdef0123456789abcdef",
+            spec(2),
+            SourceStatus::Complete,
+        );
+        let (after, _) = session_for(
+            &after_bytes,
+            "fedcba9876543210fedcba9876543210",
+            spec(3),
+            SourceStatus::Complete,
+        );
+        let result = compare_audit_sessions(
+            &before,
+            &after,
+            &[VerifiedArtifactBytes {
+                kind: ArtifactKind::Startup,
+                path: "startup.json",
+                bytes: &before_bytes,
+            }],
+            &[VerifiedArtifactBytes {
+                kind: ArtifactKind::Startup,
+                path: "startup.json",
+                bytes: &after_bytes,
+            }],
+        );
+        assert_eq!(result.source_diffs[0].status, "compared");
+        assert_eq!(
+            result.source_diffs[0].comparison.as_ref().unwrap()["counts"]["changed"],
+            0
+        );
+        assert!(
+            !result.comparable,
+            "metadata still requires matching artifact versions"
+        );
     }
 
     #[test]

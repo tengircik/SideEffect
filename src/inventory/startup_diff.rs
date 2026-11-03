@@ -267,6 +267,18 @@ fn keys(v: &Value, allowed: &[&str]) -> Result<(), StartupDiffError> {
         Ok(())
     }
 }
+fn startup_row_keys(
+    value: &Value,
+    fields: &[&str],
+    has_states: bool,
+) -> Result<(), StartupDiffError> {
+    if !has_states {
+        return keys(value, fields);
+    }
+    let mut allowed = fields.to_vec();
+    allowed.push("startup_state");
+    keys(value, &allowed)
+}
 fn arr<'a>(v: &'a Value, k: &str) -> Result<&'a [Value], StartupDiffError> {
     v.get(k)
         .and_then(Value::as_array)
@@ -321,16 +333,22 @@ fn validate_path_diagnostics(items: &[Value], with_raw_path: bool) -> Result<(),
     Ok(())
 }
 fn validate(v: &Value, k: Kind) -> Result<(), StartupDiffError> {
-    let (schema, platform, scope, version) = match k {
-        Kind::Linux => (LINUX, "linux", "curated_xdg_systemd_sysv_cron_sources", 2),
+    let (schema, platform, scope, versions) = match k {
+        Kind::Linux => (
+            LINUX,
+            "linux",
+            "curated_xdg_systemd_sysv_cron_sources",
+            &[2_u64, 3][..],
+        ),
         Kind::Windows => (
             WINDOWS,
             "windows",
             "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks",
-            4,
+            &[4_u64, 5][..],
         ),
     };
-    if text(v, "schema")? != schema || num(v, "schema_version")? != version {
+    let version = num(v, "schema_version")?;
+    if text(v, "schema")? != schema || !versions.contains(&version) {
         return Err(StartupDiffError::UnsupportedSchema);
     }
     if text(v, "platform")? != platform {
@@ -384,9 +402,9 @@ fn validate(v: &Value, k: Kind) -> Result<(), StartupDiffError> {
         return Err(StartupDiffError::MalformedInput);
     }
     if k == Kind::Linux {
-        validate_linux(v)?
+        validate_linux(v, version == 3)?
     } else {
-        validate_windows(v)?
+        validate_windows(v, version == 5)?
     }
     Ok(())
 }
@@ -443,6 +461,18 @@ fn validate_known_fields(v: &Value) -> Result<(), StartupDiffError> {
         "raw_line_hex",
         "lines",
         "applicability",
+        "startup_state",
+        "configured",
+        "effective",
+        "observed",
+        "context",
+        "capture_interval",
+        "started_at_unix_ms",
+        "ended_at_unix_ms",
+        "artifact_path",
+        "artifact_schema",
+        "artifact_schema_version",
+        "record_locator",
         "keys",
         "code",
         "message",
@@ -560,14 +590,99 @@ fn validate_header(
     }
     Ok(())
 }
-fn validate_linux(v: &Value) -> Result<(), StartupDiffError> {
+fn validate_startup_state(value: &Value) -> Result<(), StartupDiffError> {
+    keys(
+        value,
+        &["schema_version", "configured", "effective", "observed"],
+    )?;
+    if num(value, "schema_version")? != 1 {
+        return Err(StartupDiffError::UnsupportedSchema);
+    }
+    if text(value, "configured")? != "present" {
+        return Err(StartupDiffError::MalformedInput);
+    }
+    let effective = value
+        .get("effective")
+        .ok_or(StartupDiffError::MalformedInput)?;
+    keys(effective, &["status", "context", "evidence"])?;
+    match text(effective, "status")? {
+        "unknown" => {
+            if !effective["context"].is_null() || !effective["evidence"].is_null() {
+                return Err(StartupDiffError::MalformedInput);
+            }
+        }
+        "effective" | "not_effective" => {
+            let context = text(effective, "context")?;
+            if context.is_empty() || context.len() > 512 {
+                return Err(StartupDiffError::LimitExceeded);
+            }
+            validate_state_evidence(&effective["evidence"])?;
+        }
+        _ => return Err(StartupDiffError::MalformedInput),
+    }
+    let observed = value
+        .get("observed")
+        .ok_or(StartupDiffError::MalformedInput)?;
+    keys(observed, &["status", "capture_interval", "evidence"])?;
+    match text(observed, "status")? {
+        "unknown" => {
+            if !observed["capture_interval"].is_null() || !observed["evidence"].is_null() {
+                return Err(StartupDiffError::MalformedInput);
+            }
+        }
+        "observed" => {
+            let interval = observed
+                .get("capture_interval")
+                .ok_or(StartupDiffError::MalformedInput)?;
+            keys(interval, &["started_at_unix_ms", "ended_at_unix_ms"])?;
+            if num(interval, "started_at_unix_ms")? > num(interval, "ended_at_unix_ms")? {
+                return Err(StartupDiffError::MalformedInput);
+            }
+            validate_state_evidence(&observed["evidence"])?;
+        }
+        _ => return Err(StartupDiffError::MalformedInput),
+    }
+    Ok(())
+}
+fn validate_state_evidence(value: &Value) -> Result<(), StartupDiffError> {
+    keys(
+        value,
+        &[
+            "artifact_path",
+            "artifact_schema",
+            "artifact_schema_version",
+            "record_locator",
+        ],
+    )?;
+    let path = text(value, "artifact_path")?;
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(StartupDiffError::MalformedInput);
+    }
+    for field in ["artifact_path", "artifact_schema", "record_locator"] {
+        check_str(value, field, 1024)?;
+        if text(value, field)?.is_empty() {
+            return Err(StartupDiffError::MalformedInput);
+        }
+    }
+    if num(value, "artifact_schema_version")? == 0 {
+        return Err(StartupDiffError::MalformedInput);
+    }
+    Ok(())
+}
+fn validate_linux(v: &Value, has_states: bool) -> Result<(), StartupDiffError> {
     let x = v
         .get("xdg_autostart")
         .ok_or(StartupDiffError::MalformedInput)?;
     validate_header(
         x,
         "sideeffect.xdg_autostart_inventory",
-        1,
+        if has_states { 2 } else { 1 },
         "linux",
         "xdg_autostart_files_only",
         &["complete", "partial"],
@@ -587,7 +702,21 @@ fn validate_linux(v: &Value) -> Result<(), StartupDiffError> {
         return Err(StartupDiffError::LimitExceeded);
     }
     for e in arr(x, "entries")? {
-        keys(e, &["scope", "source_path", "applicability", "keys"])?;
+        let allowed = if has_states {
+            &[
+                "scope",
+                "source_path",
+                "applicability",
+                "startup_state",
+                "keys",
+            ][..]
+        } else {
+            &["scope", "source_path", "applicability", "keys"][..]
+        };
+        keys(e, allowed)?;
+        if has_states {
+            validate_startup_state(&e["startup_state"])?;
+        }
         for f in ["scope", "source_path", "applicability"] {
             check_str(e, f, 32768)?;
         }
@@ -622,7 +751,7 @@ fn validate_linux(v: &Value) -> Result<(), StartupDiffError> {
     validate_header(
         u,
         "sideeffect.systemd_unit_inventory",
-        1,
+        if has_states { 2 } else { 1 },
         "linux",
         "systemd_unit_files_and_enablement_symlink_references",
         &["complete", "partial"],
@@ -652,17 +781,27 @@ fn validate_linux(v: &Value) -> Result<(), StartupDiffError> {
         return Err(StartupDiffError::LimitExceeded);
     }
     for r in arr(u, "records")? {
-        keys(
-            r,
-            &[
-                "scope",
-                "source_path",
-                "source_path_bytes_hex",
-                "record_type",
-                "symlink_target",
-                "directives",
-            ],
-        )?;
+        let allowed = [
+            "scope",
+            "source_path",
+            "source_path_bytes_hex",
+            "record_type",
+            "symlink_target",
+            "directives",
+        ];
+        let allowed_new = [
+            "scope",
+            "source_path",
+            "source_path_bytes_hex",
+            "record_type",
+            "startup_state",
+            "symlink_target",
+            "directives",
+        ];
+        keys(r, if has_states { &allowed_new } else { &allowed })?;
+        if has_states {
+            validate_startup_state(&r["startup_state"])?;
+        }
         for f in [
             "scope",
             "source_path",
@@ -704,7 +843,7 @@ fn validate_linux(v: &Value) -> Result<(), StartupDiffError> {
     validate_header(
         l,
         "sideeffect.legacy_startup_inventory",
-        1,
+        if has_states { 2 } else { 1 },
         "linux",
         "common_sysv_cron_paths_only",
         &["complete", "partial"],
@@ -744,19 +883,31 @@ fn validate_linux(v: &Value) -> Result<(), StartupDiffError> {
         return Err(StartupDiffError::LimitExceeded);
     }
     for e in arr(l, "entries")? {
-        keys(
-            e,
-            &[
-                "source_kind",
-                "entry_kind",
-                "path",
-                "path_bytes_hex",
-                "symlink_target",
-                "symlink_target_hex",
-                "symlink_target_sha256",
-                "lines",
-            ],
-        )?;
+        let allowed = [
+            "source_kind",
+            "entry_kind",
+            "path",
+            "path_bytes_hex",
+            "symlink_target",
+            "symlink_target_hex",
+            "symlink_target_sha256",
+            "lines",
+        ];
+        let allowed_new = [
+            "source_kind",
+            "entry_kind",
+            "path",
+            "path_bytes_hex",
+            "startup_state",
+            "symlink_target",
+            "symlink_target_hex",
+            "symlink_target_sha256",
+            "lines",
+        ];
+        keys(e, if has_states { &allowed_new } else { &allowed })?;
+        if has_states {
+            validate_startup_state(&e["startup_state"])?;
+        }
         for f in [
             "source_kind",
             "entry_kind",
@@ -788,7 +939,7 @@ fn validate_linux(v: &Value) -> Result<(), StartupDiffError> {
     }
     Ok(())
 }
-fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
+fn validate_windows(v: &Value, has_states: bool) -> Result<(), StartupDiffError> {
     let all = &[
         ("sources", 8192usize),
         ("registry_entries", 8192),
@@ -889,7 +1040,7 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
         return Err(StartupDiffError::MalformedInput);
     }
     for e in arr(v, "registry_entries")? {
-        keys(
+        startup_row_keys(
             e,
             &[
                 "registry_key",
@@ -902,7 +1053,11 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
                 "command_utf16_hex",
                 "evidence",
             ],
+            has_states,
         )?;
+        if has_states {
+            validate_startup_state(&e["startup_state"])?;
+        }
         for f in [
             "registry_key",
             "hive",
@@ -949,7 +1104,7 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
         let _ = num(ev, "registry_type")?;
     }
     for e in arr(v, "folder_entries")? {
-        keys(
+        startup_row_keys(
             e,
             &[
                 "folder_scope",
@@ -959,7 +1114,11 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
                 "kind",
                 "evidence",
             ],
+            has_states,
         )?;
+        if has_states {
+            validate_startup_state(&e["startup_state"])?;
+        }
         for f in [
             "folder_scope",
             "trigger",
@@ -984,7 +1143,7 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
         }
     }
     for e in arr(v, "service_entries")? {
-        keys(
+        startup_row_keys(
             e,
             &[
                 "service_name",
@@ -995,7 +1154,11 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
                 "binary_path",
                 "evidence",
             ],
+            has_states,
         )?;
+        if has_states {
+            validate_startup_state(&e["startup_state"])?;
+        }
         for f in [
             "service_name",
             "display_name",
@@ -1014,7 +1177,7 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
         let _ = num(ev, "service_index")?;
     }
     for e in arr(v, "scheduled_task_entries")? {
-        keys(
+        startup_row_keys(
             e,
             &[
                 "task_path",
@@ -1024,7 +1187,11 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
                 "logon_user",
                 "evidence",
             ],
+            has_states,
         )?;
+        if has_states {
+            validate_startup_state(&e["startup_state"])?;
+        }
         for f in ["task_path", "trigger_type", "logon_user"] {
             check_str(e, f, 131072)?;
         }
@@ -1037,7 +1204,7 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
         let _ = num(ev, "trigger_index")?;
     }
     for e in arr(v, "scheduled_task_actions")? {
-        keys(
+        startup_row_keys(
             e,
             &[
                 "task_path",
@@ -1050,7 +1217,11 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
                 "working_directory",
                 "evidence",
             ],
+            has_states,
         )?;
+        if has_states {
+            validate_startup_state(&e["startup_state"])?;
+        }
         for f in [
             "task_path",
             "action_type",
@@ -1097,10 +1268,41 @@ fn ptr(prefix: &str, i: usize) -> String {
 fn value(v: &Value) -> String {
     serde_json::to_string(v).unwrap_or_default()
 }
+fn startup_state_fact(row: &Value) -> String {
+    let Some(state) = row.get("startup_state") else {
+        // Legacy startup rows imply only that the source row was configured.
+        // They provide no evidence about effectiveness or runtime observation.
+        return digest(&value(&serde_json::json!({
+            "configured": "present",
+            "effective": {"status": "unknown", "context": null},
+            "observed": {"status": "unknown"}
+        })));
+    };
+    // These fields express the compared state. Evidence locations and capture
+    // intervals stay available in the inputs but may vary between snapshots
+    // without changing the state itself.
+    digest(&value(&serde_json::json!({
+        "configured": state["configured"],
+        "effective": {
+            "status": state["effective"]["status"],
+            "context": state["effective"]["context"]
+        },
+        "observed": {"status": state["observed"]["status"]}
+    })))
+}
 fn objfact(v: &Value, fields: &[(&'static str, &str)]) -> Vec<(&'static str, String)> {
     fields
         .iter()
-        .map(|(n, k)| (*n, v.get(*k).map(value).unwrap_or_else(|| "null".into())))
+        .map(|(n, k)| {
+            (
+                *n,
+                if *k == "startup_state" {
+                    startup_state_fact(v)
+                } else {
+                    v.get(*k).map(value).unwrap_or_else(|| "null".into())
+                },
+            )
+        })
         .collect()
 }
 fn side(r: &Row) -> StartupEvidenceSide {
@@ -1323,7 +1525,10 @@ fn linux_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
         rows.push(Row {
             category: "xdg_autostart",
             key,
-            facts: vec![("selected_keys", digest(&fields))],
+            facts: vec![
+                ("selected_keys", digest(&fields)),
+                ("startup_state", startup_state_fact(e)),
+            ],
             refs: vec![ptr("/xdg_autostart/entries", i)],
             complete: linux_component_complete(&v["xdg_autostart"]),
             lossy_identity,
@@ -1338,6 +1543,7 @@ fn linux_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
         let facts = vec![
             ("directives", digest(&value(&e["directives"]))),
             ("symlink_target", digest(&value(&e["symlink_target"]))),
+            ("startup_state", startup_state_fact(e)),
         ];
         rows.push(Row {
             category: "systemd_units",
@@ -1357,6 +1563,7 @@ fn linux_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
         let facts = vec![
             ("symlink_target", digest(&value(&e["symlink_target_hex"]))),
             ("line_evidence", digest(&value(&e["lines"]))),
+            ("startup_state", startup_state_fact(e)),
         ];
         rows.push(Row {
             category: "legacy_sources",
@@ -1417,6 +1624,7 @@ fn windows_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
                     ("value_type", "value_type"),
                     ("command", "command"),
                     ("command_encoding", "command_utf16_hex"),
+                    ("startup_state", "startup_state"),
                 ],
             ),
             refs: vec![ptr("/registry_entries", i)],
@@ -1434,7 +1642,7 @@ fn windows_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
         rows.push(Row {
             category: "startup_folder_entry",
             key,
-            facts: objfact(e, &[("kind", "kind")]),
+            facts: objfact(e, &[("kind", "kind"), ("startup_state", "startup_state")]),
             refs: vec![ptr("/folder_entries", i)],
             complete: source_complete(v, id),
             lossy_identity: false,
@@ -1454,6 +1662,7 @@ fn windows_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
                     ("start_type_code", "start_type_code"),
                     ("account", "account"),
                     ("binary_path", "binary_path"),
+                    ("startup_state", "startup_state"),
                 ],
             ),
             refs: vec![ptr("/service_entries", i)],
@@ -1473,6 +1682,7 @@ fn windows_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
                     ("task_enabled", "task_enabled"),
                     ("trigger_enabled", "trigger_enabled"),
                     ("logon_user", "logon_user"),
+                    ("startup_state", "startup_state"),
                 ],
             ),
             refs: vec![ptr("/scheduled_task_entries", i)],
@@ -1500,9 +1710,16 @@ fn windows_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
                         "executable_path",
                         "arguments",
                         "working_directory",
+                        "startup_state",
                     ]
                     .iter()
-                    .map(|k| e[*k].clone())
+                    .map(|k| {
+                        if *k == "startup_state" {
+                            Value::String(startup_state_fact(e))
+                        } else {
+                            e[*k].clone()
+                        }
+                    })
                     .collect(),
                 ))
             })
@@ -1528,6 +1745,15 @@ fn windows_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    fn startup_state() -> Value {
+        json!({
+            "schema_version": 1,
+            "configured": "present",
+            "effective": {"status":"unknown", "context":null, "evidence":null},
+            "observed": {"status":"unknown", "capture_interval":null, "evidence":null}
+        })
+    }
 
     fn linux() -> Value {
         json!({
@@ -1556,6 +1782,168 @@ mod tests {
         ];
         json!({"schema":WINDOWS,"schema_version":4,"platform":"windows","scope":"current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks","capture_started_at_unix_ms":1,"capture_ended_at_unix_ms":2,"status":"complete","sources":ids.into_iter().map(|id|json!({"id":id,"status":"complete","entries_seen":0,"diagnostics":[]})).collect::<Vec<_>>(),"registry_entries":[],"folder_entries":[],"service_entries":[],"scheduled_task_entries":[],"scheduled_task_actions":[]})
     }
+
+    fn linux_v3() -> Value {
+        let mut value = linux();
+        value["schema_version"] = json!(3);
+        value["xdg_autostart"]["schema_version"] = json!(2);
+        value["systemd_units"]["schema_version"] = json!(2);
+        value["legacy_sources"]["schema_version"] = json!(2);
+        value
+    }
+
+    fn windows_v5() -> Value {
+        let mut value = windows();
+        value["schema_version"] = json!(5);
+        value
+    }
+
+    #[test]
+    fn startup_state_contract_requires_direct_evidence_for_known_dimensions() {
+        let state = startup_state();
+        validate_startup_state(&state).unwrap();
+
+        let mut effective_without_context = state.clone();
+        effective_without_context["effective"]["status"] = json!("effective");
+        assert!(validate_startup_state(&effective_without_context).is_err());
+
+        let mut observed_without_interval = state;
+        observed_without_interval["observed"]["status"] = json!("observed");
+        assert!(validate_startup_state(&observed_without_interval).is_err());
+    }
+
+    #[test]
+    fn legacy_and_stateful_startup_versions_compare_without_rewriting_inputs() {
+        let linux_old = serde_json::to_vec(&linux()).unwrap();
+        let linux_new = serde_json::to_vec(&linux_v3()).unwrap();
+        assert_eq!(
+            compare_startup_inventory_json(&linux_old, &linux_new)
+                .unwrap()
+                .status,
+            StartupDiffStatus::Complete
+        );
+
+        let windows_old = serde_json::to_vec(&windows()).unwrap();
+        let windows_new = serde_json::to_vec(&windows_v5()).unwrap();
+        assert_eq!(
+            compare_startup_inventory_json(&windows_old, &windows_new)
+                .unwrap()
+                .status,
+            StartupDiffStatus::Complete
+        );
+    }
+
+    #[test]
+    fn linux_v2_v3_mixed_rows_ignore_default_state_but_compare_source_facts() {
+        let mut old = linux();
+        let mut current = linux_v3();
+        let entry = |command: &str| {
+            json!({
+                "scope":"user",
+                "source_path":"/home/u/.config/autostart/editor.desktop",
+                "applicability":"not_evaluated",
+                "keys":[{"key":"Exec","value":command,"value_hex":null,"line":3,"byte_offset":24,"byte_length":command.len(),"line_sha256":"fixture-line-hash"}]
+            })
+        };
+        old["xdg_autostart"]["entries"] = json!([entry("editor --open")]);
+        let mut current_entry = entry("editor --open");
+        current_entry["startup_state"] = startup_state();
+        current["xdg_autostart"]["entries"] = json!([current_entry]);
+
+        let unchanged = compare_startup_inventory_json(&bytes(&old), &bytes(&current)).unwrap();
+        assert_eq!(unchanged.counts.changed, 0);
+        assert!(unchanged.deltas.is_empty());
+
+        current["xdg_autostart"]["entries"][0]["keys"][0]["value"] = json!("editor --safe-mode");
+        let changed = compare_startup_inventory_json(&bytes(&old), &bytes(&current)).unwrap();
+        assert_eq!(changed.counts.changed, 1);
+        assert_eq!(changed.deltas[0].changed_fields, ["selected_keys"]);
+    }
+
+    #[test]
+    fn windows_v4_v5_mixed_rows_ignore_default_state_but_compare_source_facts() {
+        let mut old = windows();
+        let mut current = windows_v5();
+        let service = |binary_path: &str| {
+            json!({
+                "service_name":"EditorService",
+                "display_name":"Editor Service",
+                "start_type":"SERVICE_AUTO_START",
+                "start_type_code":2,
+                "account":"LocalSystem",
+                "binary_path":binary_path,
+                "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW","service_index":0}
+            })
+        };
+        old["service_entries"] = json!([service("C:\\Tools\\editor.exe --service")]);
+        let mut current_service = service("C:\\Tools\\editor.exe --service");
+        current_service["startup_state"] = startup_state();
+        current["service_entries"] = json!([current_service]);
+
+        let unchanged = compare_startup_inventory_json(&bytes(&old), &bytes(&current)).unwrap();
+        assert_eq!(unchanged.counts.changed, 0);
+        assert!(unchanged.deltas.is_empty());
+
+        current["service_entries"][0]["binary_path"] = json!("C:\\Tools\\editor.exe --safe-mode");
+        let changed = compare_startup_inventory_json(&bytes(&old), &bytes(&current)).unwrap();
+        assert_eq!(changed.counts.changed, 1);
+        assert_eq!(changed.deltas[0].changed_fields, ["binary_path"]);
+    }
+
+    #[test]
+    fn startup_state_compares_meaning_while_retaining_evidence_metadata() {
+        let mut before = linux_v3();
+        let mut after = linux_v3();
+        let entry = json!({
+            "scope":"user",
+            "source_path":"/home/u/.config/autostart/editor.desktop",
+            "applicability":"not_evaluated",
+            "keys":[{"key":"Exec","value":"editor","value_hex":null,"line":3,"byte_offset":24,"byte_length":6,"line_sha256":"fixture-line-hash"}],
+            "startup_state": {
+                "schema_version":1,
+                "configured":"present",
+                "effective":{
+                    "status":"effective",
+                    "context":"user-session",
+                    "evidence":{"artifact_path":"context.json","artifact_schema":"sideeffect.context","artifact_schema_version":1,"record_locator":"/context/0"}
+                },
+                "observed":{
+                    "status":"observed",
+                    "capture_interval":{"started_at_unix_ms":10,"ended_at_unix_ms":20},
+                    "evidence":{"artifact_path":"runtime.json","artifact_schema":"sideeffect.runtime","artifact_schema_version":1,"record_locator":"/events/0"}
+                }
+            }
+        });
+        before["xdg_autostart"]["entries"] = json!([entry]);
+        after["xdg_autostart"]["entries"] = json!([entry]);
+        after["xdg_autostart"]["entries"][0]["startup_state"]["effective"]["evidence"]["artifact_path"] =
+            json!("context-after.json");
+        after["xdg_autostart"]["entries"][0]["startup_state"]["effective"]["evidence"]["record_locator"] =
+            json!("/context/1");
+        after["xdg_autostart"]["entries"][0]["startup_state"]["observed"]["capture_interval"] =
+            json!({"started_at_unix_ms":30,"ended_at_unix_ms":40});
+        after["xdg_autostart"]["entries"][0]["startup_state"]["observed"]["evidence"]["record_locator"] =
+            json!("/events/7");
+
+        let unchanged = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
+        assert_eq!(unchanged.counts.changed, 0);
+        assert!(unchanged.deltas.is_empty());
+
+        after["xdg_autostart"]["entries"][0]["startup_state"]["effective"]["status"] =
+            json!("not_effective");
+        let changed = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
+        assert_eq!(changed.counts.changed, 1);
+        assert_eq!(changed.deltas[0].changed_fields, ["startup_state"]);
+
+        after["xdg_autostart"]["entries"][0]["startup_state"]["effective"]["status"] =
+            json!("effective");
+        after["xdg_autostart"]["entries"][0]["startup_state"]["effective"]["context"] =
+            json!("system-session");
+        let changed = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
+        assert_eq!(changed.counts.changed, 1);
+        assert_eq!(changed.deltas[0].changed_fields, ["startup_state"]);
+    }
+
     fn bytes(v: &Value) -> Vec<u8> {
         serde_json::to_vec(v).unwrap()
     }
