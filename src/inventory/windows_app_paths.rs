@@ -561,16 +561,6 @@ fn collect_source<A: AppPathsRegistryApi>(
                 continue;
             }
         };
-        let mut read = |value_name| {
-            if started.elapsed().as_millis() >= MAX_SCAN_DURATION_MS {
-                return Err(ERROR_MORE_DATA);
-            }
-            api.read_value(
-                &entry_key,
-                value_name,
-                values_remaining.saturating_sub(values_used),
-            )
-        };
         let decode = |name,
                       value: Result<Option<(u32, Vec<u8>)>, u32>,
                       diagnostics: &mut Vec<AppPathDiagnostic>,
@@ -595,7 +585,11 @@ fn collect_source<A: AppPathsRegistryApi>(
                 }
             }
         };
-        let default_value = read("");
+        let default_value = if started.elapsed().as_millis() >= MAX_SCAN_DURATION_MS {
+            Err(ERROR_MORE_DATA)
+        } else {
+            api.read_value(&entry_key, "", values_remaining.saturating_sub(values_used))
+        };
         let executable = decode(
             "(Default)",
             default_value,
@@ -603,7 +597,15 @@ fn collect_source<A: AppPathsRegistryApi>(
             &mut status,
             &mut values_used,
         );
-        let path_value = read("Path");
+        let path_value = if started.elapsed().as_millis() >= MAX_SCAN_DURATION_MS {
+            Err(ERROR_MORE_DATA)
+        } else {
+            api.read_value(
+                &entry_key,
+                "Path",
+                values_remaining.saturating_sub(values_used),
+            )
+        };
         let search = decode(
             "Path",
             path_value,
