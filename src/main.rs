@@ -293,7 +293,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         {
             model_install(id, true, Some(runtime_path))
         }
-        [command, operation, id, runtime_flag]
+        [command, operation, _id, runtime_flag]
             if command == "model" && operation == "setup" && runtime_flag == "--runtime" =>
         {
             Err("model setup --runtime requires an existing runtime path".to_owned())
