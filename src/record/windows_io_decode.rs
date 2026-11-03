@@ -274,6 +274,7 @@ pub(crate) struct NetworkPayloadInput<'a> {
     pub serialized_decoding: Option<&'a serde_json::Value>,
 }
 
+#[cfg(windows)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FilePathCrossCheck {
     NotFileProvider,
@@ -283,6 +284,7 @@ pub(crate) enum FilePathCrossCheck {
     Malformed,
 }
 
+#[cfg(windows)]
 pub(crate) struct FilePathInput<'a> {
     pub provider_guid: &'a str,
     pub event_id: u16,
@@ -294,6 +296,7 @@ pub(crate) struct FilePathInput<'a> {
     pub serialized_decoding: Option<&'a serde_json::Value>,
 }
 
+#[cfg(windows)]
 /// Re-decode a selected classic FileIo event and return a path only when its
 /// complete typed observation exactly matches the serialized sidecar.
 pub(crate) fn cross_check_file_path(input: FilePathInput<'_>) -> FilePathCrossCheck {
@@ -1097,6 +1100,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn file_path_cross_check_requires_exact_raw_payload_sidecar_match() {
         let path = r"C:\audit\fixture.txt";
         let payload = file_name_payload(PointerWidth::Bits64, path);
