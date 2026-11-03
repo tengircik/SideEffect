@@ -22,7 +22,7 @@ fn adapts_syscall_attempt_with_failure_and_exact_source_reference() {
     let envelope = from_linux_strace(&parsed, SYNTHETIC_TRACE, "trace.txt");
 
     assert_eq!(envelope.schema, "sideeffect.common_event_envelope");
-    assert_eq!(envelope.schema_version, 4);
+    assert_eq!(envelope.schema_version, 5);
     assert_eq!(envelope.source.schema_version, 7);
     assert_eq!(
         envelope.source.sha256.as_deref(),
@@ -98,7 +98,7 @@ fn process_creation_links_caller_task_to_returned_child_pid_without_parentage_cl
     let parsed = parse_trace_bytes(bytes, ParseLimits::default()).unwrap();
     let envelope = from_linux_strace(&parsed, bytes, "synthetic-fork.trace");
 
-    assert_eq!(envelope.schema_version, 4);
+    assert_eq!(envelope.schema_version, 5);
     assert_eq!(envelope.process_observations.len(), 2);
     assert!(matches!(
         envelope.process_observations[0].identity,
@@ -193,7 +193,7 @@ fn explicit_task_termination_splits_only_source_local_task_epochs() {
     );
 
     let selected = timeline(&envelope, None, Some(2)).unwrap();
-    assert_eq!(selected.schema_version, 4);
+    assert_eq!(selected.schema_version, 5);
     assert_eq!(selected.items.len(), 1);
     assert_eq!(
         selected.selected_process_observation.unwrap().end_evidence,
@@ -608,7 +608,7 @@ fn process_filtered_graph_keeps_selected_observation_when_it_has_no_event_link()
 
     let graph = graph(&envelope, None, Some(1)).unwrap();
     assert_eq!(graph.schema, "sideeffect.event_graph");
-    assert_eq!(graph.schema_version, 4);
+    assert_eq!(graph.schema_version, 5);
     assert_eq!(graph.filter.process_observation_id, Some(1));
     assert!(graph.nodes.iter().any(|node| {
         node.kind == sideeffect::event::EventGraphNodeKind::ProcessObservation

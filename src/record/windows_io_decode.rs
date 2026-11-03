@@ -274,6 +274,72 @@ pub(crate) struct NetworkPayloadInput<'a> {
     pub serialized_decoding: Option<&'a serde_json::Value>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FilePathCrossCheck {
+    NotFileProvider,
+    Matched(Option<String>),
+    Mismatch,
+    Unsupported,
+    Malformed,
+}
+
+pub(crate) struct FilePathInput<'a> {
+    pub provider_guid: &'a str,
+    pub event_id: u16,
+    pub event_version: u8,
+    pub opcode: u8,
+    pub header_flags: u16,
+    pub event_kind: &'a str,
+    pub raw_payload: &'a [u8],
+    pub serialized_decoding: Option<&'a serde_json::Value>,
+}
+
+/// Re-decode a selected classic FileIo event and return a path only when its
+/// complete typed observation exactly matches the serialized sidecar.
+pub(crate) fn cross_check_file_path(input: FilePathInput<'_>) -> FilePathCrossCheck {
+    let Some(normalized) = normalize_guid(input.provider_guid) else {
+        return FilePathCrossCheck::NotFileProvider;
+    };
+    if !normalized.eq_ignore_ascii_case(FILE_IO_GUID) {
+        return FilePathCrossCheck::NotFileProvider;
+    }
+    let pointer_width = match input.header_flags {
+        flags if flags & 0x0020 != 0 && flags & 0x0040 == 0 => Some(PointerWidth::Bits32),
+        flags if flags & 0x0040 != 0 && flags & 0x0020 == 0 => Some(PointerWidth::Bits64),
+        _ => None,
+    };
+    let decoded = decode_classic_event(
+        normalized,
+        input.event_id,
+        input.event_version,
+        input.opcode,
+        pointer_width,
+        input.raw_payload,
+    );
+    let Some(observation) = decoded.observation.as_ref() else {
+        return if decoded.status == DecodeStatus::MalformedPayload {
+            FilePathCrossCheck::Malformed
+        } else {
+            FilePathCrossCheck::Unsupported
+        };
+    };
+    let Activity::File(file) = &observation.activity else {
+        return FilePathCrossCheck::Unsupported;
+    };
+    let Ok(raw_value) = serde_json::to_value(&decoded) else {
+        return FilePathCrossCheck::Malformed;
+    };
+    let matches = input.event_kind == "file_io_observation"
+        && input
+            .serialized_decoding
+            .is_some_and(|serialized| *serialized == raw_value);
+    if !matches {
+        FilePathCrossCheck::Mismatch
+    } else {
+        FilePathCrossCheck::Matched(file.path.clone())
+    }
+}
+
 /// Re-decode a supported classic TCP/UDP event and use only its raw PID.
 pub(crate) fn cross_check_network_payload(
     input: NetworkPayloadInput<'_>,
@@ -1028,6 +1094,102 @@ mod tests {
 
     fn decode(provider: &str, opcode: u8, payload: &[u8]) -> DecodeResult {
         decode_classic_event(provider, 0, 2, opcode, Some(PointerWidth::Bits64), payload)
+    }
+
+    #[test]
+    fn file_path_cross_check_requires_exact_raw_payload_sidecar_match() {
+        let path = r"C:\audit\fixture.txt";
+        let payload = file_name_payload(PointerWidth::Bits64, path);
+        let decoded = decode(FILE_IO_GUID, 36, &payload);
+        let sidecar = serde_json::to_value(&decoded).unwrap();
+        let matched = cross_check_file_path(FilePathInput {
+            provider_guid: FILE_IO_GUID,
+            event_id: 0,
+            event_version: 2,
+            opcode: 36,
+            header_flags: 0x0040,
+            event_kind: "file_io_observation",
+            raw_payload: &payload,
+            serialized_decoding: Some(&sidecar),
+        });
+        assert_eq!(matched, FilePathCrossCheck::Matched(Some(path.to_owned())));
+
+        let mut forged = sidecar.clone();
+        forged["observation"]["activity"]["observation"]["path"] =
+            serde_json::json!(r"C:\audit\other.txt");
+        assert_eq!(
+            cross_check_file_path(FilePathInput {
+                provider_guid: FILE_IO_GUID,
+                event_id: 0,
+                event_version: 2,
+                opcode: 36,
+                header_flags: 0x0040,
+                event_kind: "file_io_observation",
+                raw_payload: &payload,
+                serialized_decoding: Some(&forged),
+            }),
+            FilePathCrossCheck::Mismatch
+        );
+
+        let mut no_path_payload = Vec::new();
+        for value in [1, 2, 3, 4] {
+            pointer(&mut no_path_payload, value, PointerWidth::Bits64);
+        }
+        let no_path = decode(FILE_IO_GUID, 66, &no_path_payload);
+        let no_path_sidecar = serde_json::to_value(no_path).unwrap();
+        assert_eq!(
+            cross_check_file_path(FilePathInput {
+                provider_guid: FILE_IO_GUID,
+                event_id: 0,
+                event_version: 2,
+                opcode: 66,
+                header_flags: 0x0040,
+                event_kind: "file_io_observation",
+                raw_payload: &no_path_payload,
+                serialized_decoding: Some(&no_path_sidecar),
+            }),
+            FilePathCrossCheck::Matched(None)
+        );
+
+        assert_eq!(
+            cross_check_file_path(FilePathInput {
+                provider_guid: FILE_IO_GUID,
+                event_id: 0,
+                event_version: 9,
+                opcode: 36,
+                header_flags: 0x0040,
+                event_kind: "file_io_observation",
+                raw_payload: &payload,
+                serialized_decoding: Some(&sidecar),
+            }),
+            FilePathCrossCheck::Unsupported
+        );
+        assert_eq!(
+            cross_check_file_path(FilePathInput {
+                provider_guid: FILE_IO_GUID,
+                event_id: 0,
+                event_version: 2,
+                opcode: 36,
+                header_flags: 0x0040,
+                event_kind: "file_io_observation",
+                raw_payload: &payload[..payload.len() - 1],
+                serialized_decoding: Some(&sidecar),
+            }),
+            FilePathCrossCheck::Malformed
+        );
+        assert_eq!(
+            cross_check_file_path(FilePathInput {
+                provider_guid: TCP_IP_GUID,
+                event_id: 0,
+                event_version: 2,
+                opcode: 36,
+                header_flags: 0x0040,
+                event_kind: "file_io_observation",
+                raw_payload: &payload,
+                serialized_decoding: Some(&sidecar),
+            }),
+            FilePathCrossCheck::NotFileProvider
+        );
     }
 
     #[test]

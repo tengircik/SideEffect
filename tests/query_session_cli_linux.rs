@@ -14,7 +14,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
-const TRACE: &[u8] = b"123 1700000000.1 openat(AT_FDCWD, \"/tmp/item\", O_RDONLY) = 3\n";
+const TRACE: &[u8] = b"123 1700000000.1 openat(AT_FDCWD</tmp>, \"item\", O_RDONLY) = 3\n";
 const QUERY: &[u8] = br#"{"schema":"sideeffect.event_query","schema_version":1,"filters":{"event_kind":"openat"},"limit":5}"#;
 
 struct TestDirectory(PathBuf);
@@ -445,6 +445,38 @@ fn multi_session_query_keeps_results_and_evidence_scoped_by_session() {
             1
         );
     }
+}
+
+#[test]
+fn verified_linux_session_query_v2_filters_exact_lexical_path() {
+    let directory = TestDirectory::new();
+    let session = directory.0.join("path-session");
+    write_session(&session, Some((TRACE, false, false, false)));
+    let query_path = directory.0.join("path-query.json");
+    fs::write(
+        &query_path,
+        br#"{"schema":"sideeffect.event_query","schema_version":2,"filters":{"path_exact":"/tmp/item"},"limit":5}"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["query", "--query"])
+        .arg(query_path)
+        .args(["--session"])
+        .arg(session)
+        .args(["--source", "runtime"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["event_query_result"]["matched_count"], 1);
+    assert_eq!(
+        result["event_query_result"]["events"][0]["path_observation"]["path"],
+        "/tmp/item"
+    );
+    assert_eq!(
+        result["event_query_result"]["source_state"]["completeness"],
+        "complete"
+    );
 }
 
 #[test]

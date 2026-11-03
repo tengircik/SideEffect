@@ -216,6 +216,49 @@ fn network_event(start_event: &Value, record_ordinal: u64, process_id: u32) -> V
     network
 }
 
+#[cfg(windows)]
+fn file_name_event(start_event: &Value, record_ordinal: u64, path: &str) -> Value {
+    let file_object = 0x1122_3344_5566_7788_u64;
+    let mut payload = file_object.to_le_bytes().to_vec();
+    for unit in path.encode_utf16().chain(std::iter::once(0)) {
+        payload.extend_from_slice(&unit.to_le_bytes());
+    }
+    let mut file = start_event.clone();
+    file["record_ordinal"] = json!(record_ordinal);
+    file["provider_guid"] = json!("90cbdc39-4a3e-11d1-84f4-0000f80464e3");
+    file["event_id"] = json!(0);
+    file["event_version"] = json!(2);
+    file["opcode"] = json!(36);
+    file["event_kind"] = json!("file_io_observation");
+    file["header_process_id"] = json!(42);
+    file["header_flags"] = json!(0x40);
+    file["raw_payload_hex"] = json!(lower_hex(&payload));
+    file["payload_decoding"] = Value::Null;
+    file["observation_decoding"] = json!({
+        "status": "decoded",
+        "diagnostic": null,
+        "observation": {
+            "schema": "windows.kernel_file_io",
+            "schema_version": 2,
+            "activity": { "kind": "file", "observation": {
+                "operation": "rundown_name",
+                "thread_id": null,
+                "file_object": file_object,
+                "file_key": null,
+                "path": path,
+                "requested_bytes": null,
+                "file_offset": null,
+                "create_options": null,
+                "file_attributes": null,
+                "share_access": null,
+                "information_class": null,
+                "extra_info": null
+            } }
+        }
+    });
+    file
+}
+
 #[test]
 fn inspect_json_preserves_capture_claim_and_disclaims_authenticity() {
     let input = fixture(CollectionStatus::Complete);
@@ -293,7 +336,7 @@ fn events_windows_runtime_validates_capture_and_preserves_source_context() {
     );
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["schema"], "sideeffect.common_event_envelope");
-    assert_eq!(envelope["schema_version"], 4);
+    assert_eq!(envelope["schema_version"], 5);
     assert_eq!(envelope["source"]["platform"], "windows");
     assert_eq!(envelope["source"]["schema"], WINDOWS_RUNTIME_CAPTURE_SCHEMA);
     assert_eq!(
@@ -369,7 +412,7 @@ fn timeline_windows_runtime_filters_kind_and_preserves_source_evidence_and_diagn
     );
     let timeline: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(timeline["schema"], "sideeffect.event_timeline");
-    assert_eq!(timeline["schema_version"], 4);
+    assert_eq!(timeline["schema_version"], 5);
     assert_eq!(timeline["source"]["platform"], "windows");
     assert_eq!(timeline["source"]["schema"], WINDOWS_RUNTIME_CAPTURE_SCHEMA);
     assert_eq!(timeline["source_state"]["completeness"], "partial");
@@ -440,7 +483,7 @@ fn timeline_windows_process_observation_preserves_candidate_link_and_partial_sta
 
     assert_eq!(output.status.code(), Some(2));
     let timeline: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(timeline["schema_version"], 4);
+    assert_eq!(timeline["schema_version"], 5);
     assert_eq!(timeline["filter"]["process_observation_id"], 1);
     assert_eq!(timeline["source_state"]["completeness"], "partial");
     assert_eq!(timeline["items"].as_array().unwrap().len(), 1);
@@ -682,7 +725,7 @@ fn graph_windows_runtime_keeps_pid_context_separate_from_process_instance() {
     assert_eq!(output.status.code(), Some(2));
     let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(graph["schema"], "sideeffect.event_graph");
-    assert_eq!(graph["schema_version"], 4);
+    assert_eq!(graph["schema_version"], 5);
     assert_eq!(graph["filter"]["event_kind"], "process_start");
     assert_eq!(graph["source_state"]["completeness"], "partial");
     let nodes = graph["nodes"].as_array().unwrap();
@@ -734,7 +777,7 @@ fn graph_process_observation_filter_preserves_candidate_context_and_relationship
 
     assert_eq!(output.status.code(), Some(2));
     let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(graph["schema_version"], 4);
+    assert_eq!(graph["schema_version"], 5);
     assert_eq!(graph["filter"]["event_kind"], Value::Null);
     assert_eq!(graph["filter"]["process_observation_id"], 1);
     assert_eq!(graph["source_state"]["completeness"], "partial");
@@ -886,21 +929,7 @@ fn events_windows_runtime_marks_reused_process_ids_ambiguous() {
 fn events_windows_runtime_links_network_payload_and_labels_file_header_candidate() {
     let mut value: Value = serde_json::from_slice(&fixture(CollectionStatus::Complete)).unwrap();
     let network = network_event(&value["events"][0], 2, 42);
-    let mut file = network.clone();
-    file["record_ordinal"] = json!(3);
-    file["provider_guid"] = json!("90cbdc39-4a3e-11d1-84f4-0000f80464e3");
-    file["event_version"] = json!(2);
-    file["opcode"] = json!(36);
-    file["event_kind"] = json!("file_io_observation");
-    file["header_process_id"] = json!(42);
-    file["observation_decoding"] = json!({
-        "status": "decoded",
-        "observation": {
-            "schema": "windows.kernel_file_io",
-            "schema_version": 2,
-            "activity": { "kind": "file", "observation": {} }
-        }
-    });
+    let file = file_name_event(&value["events"][0], 3, r"C:\fixture.txt");
     value["events"]
         .as_array_mut()
         .unwrap()
@@ -910,6 +939,14 @@ fn events_windows_runtime_links_network_payload_and_labels_file_header_candidate
 
     assert_eq!(output.status.code(), Some(2));
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["events"][2]["path_observation"]["path"],
+        r"C:\fixture.txt"
+    );
+    assert_eq!(
+        envelope["events"][2]["path_observation"]["basis"]["kind"],
+        "windows_etw_validated_file_name"
+    );
     let links = envelope["event_process_links"].as_array().unwrap();
     assert!(links.iter().any(|link| {
         link["role"] == "windows_network_payload_pid" && link["status"] == "context_candidate"
@@ -918,6 +955,47 @@ fn events_windows_runtime_links_network_payload_and_labels_file_header_candidate
         link["role"] == "windows_file_disk_header_pid_context_candidate"
             && link["status"] == "context_candidate"
     }));
+}
+
+#[cfg(windows)]
+#[test]
+fn events_windows_runtime_rejects_forged_or_unsupported_file_path_sidecars() {
+    for (case, mutate, expected_diagnostic) in [
+        ("mismatch", 0_u8, "file_observation_sidecar_mismatch"),
+        ("unsupported", 1_u8, "file_observation_unverified"),
+    ] {
+        let mut value: Value =
+            serde_json::from_slice(&fixture(CollectionStatus::Complete)).unwrap();
+        let mut file = file_name_event(&value["events"][0], 2, r"C:\fixture.txt");
+        if mutate == 0 {
+            file["observation_decoding"]["observation"]["activity"]["observation"]["path"] =
+                json!(r"C:\forged.txt");
+        } else {
+            file["event_version"] = json!(9);
+        }
+        value["events"].as_array_mut().unwrap().push(file);
+        let (path, output) = with_events_input(&rehashed_capture(value));
+        fs::remove_file(path).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{case}");
+        let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            envelope["events"][1]["path_observation"],
+            Value::Null,
+            "{case}"
+        );
+        assert!(
+            envelope["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["code"] == expected_diagnostic }),
+            "{case}"
+        );
+        assert_eq!(
+            envelope["source_state"]["completeness"], "partial",
+            "{case}"
+        );
+    }
 }
 
 #[cfg(windows)]

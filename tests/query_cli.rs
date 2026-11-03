@@ -82,6 +82,43 @@ fn cli_query_keeps_raw_evidence_and_emits_safe_text_or_json() {
 }
 
 #[test]
+fn cli_query_v2_filters_exact_lexical_paths_and_displays_them_as_terminal_safe_text() {
+    let mut files = TempFiles(Vec::new());
+    let trace = files.write(
+        "trace",
+        b"123 1700000000.1 openat(AT_FDCWD</tmp>, \"<script>alert(1)</script>\", O_RDONLY) = 3\n123 1700000000.2 openat(AT_FDCWD</tmp>, \"<script>alert(1)</script>.bak\", O_RDONLY) = 4\n",
+    );
+    let query = files.write(
+        "json",
+        br#"{"schema":"sideeffect.event_query","schema_version":2,"filters":{"path_exact":"/tmp/<script>alert(1)</script>"},"limit":5}"#,
+    );
+    let output = run(&trace, &query, "json");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["schema_version"], 2);
+    assert_eq!(result["matched_count"], 1);
+    assert_eq!(
+        result["events"][0]["path_observation"]["path"],
+        "/tmp/<script>alert(1)</script>"
+    );
+    assert_eq!(
+        result["events"][0]["path_observation"]["basis"]["kind"],
+        "linux_strace_lexical_hint"
+    );
+
+    let output = run(&trace, &query, "text");
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("path=/tmp/<script>alert(1)</script>"));
+    assert!(!text.contains(".bak"));
+    assert!(!text.contains("\u{1b}"));
+}
+
+#[test]
 fn cli_query_preserves_partial_status_and_rejects_unsupported_filter_keys() {
     let mut files = TempFiles(Vec::new());
     let trace = files.write("trace", b"123 1700000000.1 close(4) = 0\nmalformed row\n");

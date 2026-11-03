@@ -136,7 +136,7 @@ On native Windows, a validated ETW capture can also be adapted:
 sideeffect.exe events --windows-runtime .\runtime.windows.json
 ```
 
-The command writes versioned JSON to stdout and never runs represented commands or modifies the input. Events keep their source-local order, timestamps, outcome/status, and evidence links. Envelope v4 adds source-local process observations and event links: Linux process-creation rows link the caller task ID to the returned child PID, while exact prefixed task-termination rows can split trace-task observations into source-local epochs on complete parses. These epochs are not OS process/PID generations or ancestry, and partial parses retain task-ID-only observations. Windows process start/end IDs are decoded from retained raw bytes only for reviewed Kernel-Process v0-v3 layouts and checked against the serialized TDH sidecar; image names remain decoder metadata only. For supported classic TCP/UDP rows, the adapter re-decodes retained raw payload bytes and checks the serialized observation; a mismatch is diagnosed and only the raw payload PID can support a context-candidate link. Unsupported or malformed payloads remain raw with an unresolved link and diagnostic. Windows file/disk header PIDs remain context candidates. These links do not form a merged process graph or causal view. A partial or unknown source exits with status `2`; the envelope does not infer one global clock or process ownership.
+The command writes versioned JSON to stdout and never runs represented commands or modifies the input. Events keep their source-local order, timestamps, outcome/status, and evidence links. Envelope v5 adds optional `path_observation` values tied to each event's source evidence. Linux paths are limited to parser-derived lexical hints; Windows names are emitted only when the FileIo sidecar exactly matches a re-decoding of its raw payload. These values are literal source spellings, not resolved filesystem identities. Envelope v5 also preserves source-local process observations and event links: Linux process-creation rows link the caller task ID to the returned child PID, while exact prefixed task-termination rows can split trace-task observations into source-local epochs on complete parses. These epochs are not OS process/PID generations or ancestry, and partial parses retain task-ID-only observations. Windows process start/end IDs are decoded from retained raw bytes only for reviewed Kernel-Process v0-v3 layouts and checked against the serialized TDH sidecar; image names remain decoder metadata only. For supported classic TCP/UDP rows, the adapter re-decodes retained raw payload bytes and checks the serialized observation; a mismatch is diagnosed and only the raw payload PID can support a context-candidate link. Unsupported or malformed payloads remain raw with an unresolved link and diagnostic. Windows file/disk header PIDs remain context candidates. These links do not form a merged process graph or causal view. A partial or unknown source exits with status `2`; the envelope does not infer one global clock or process ownership.
 
 ### Query runtime evidence
 
@@ -154,6 +154,19 @@ Create an exact-filter query file:
   "limit": 100
 }
 ```
+
+Schema v2 adds an optional exact path filter:
+
+```json
+{
+  "schema": "sideeffect.event_query",
+  "schema_version": 2,
+  "filters": { "path_exact": "/tmp/example.txt" },
+  "limit": 100
+}
+```
+
+`path_exact` compares the full string exactly. It does not normalize separators or case, resolve `.`/`..` or symlinks, or perform glob/substring matching. Linux currently exposes hints only for supported `openat`/`openat2` trace spellings with a usable absolute base. Windows exposes a name only when a supported ETW FileIo name record has a validated raw-payload sidecar; many file events contain no path, and some observed Windows names may omit a drive letter. Unsupported, pathless, undecoded, or lost events cannot match. No match does not show that the path was not accessed. Schema v1 event queries remain accepted; `path_exact` requires schema v2. Query text output escapes terminal controls; JSON output remains ordinary data and may contain sensitive paths.
 
 Apply it directly to a Linux trace or Windows ETW capture:
 
@@ -185,7 +198,7 @@ sideeffect query --query ./query.json --session ./before --session ./after --sou
 sideeffect.exe query --query .\query.json --session .\before --session .\after --source runtime
 ```
 
-An optional `evidence` filter matches one complete source-native locator exactly. For Linux the locator contains `kind: "raw_trace_record"`, `line_number`, `byte_offset`, and `byte_length`; for Windows it contains `kind: "windows_etw_record"`, `record_ordinal`, `json_pointer`, and `raw_payload_sha256`. Copy the tuple from an event result when constructing the query. These fields are exact evidence references: the query does not reinterpret paths or timestamps. Evidence locators and `process_observation_id` are source-local, so both are rejected across sessions. Each session's results stay nested under that session ID; event ordinals and evidence remain source-local. Multi-session queries cap aggregate runtime artifacts at 256 MiB, total matching rows at 5,000, a cooperative 10-second total-work budget checked between sessions, and output at 8 MiB. Session/source/capture/parse status and diagnostics remain separate. Linux `run.json` must bind `trace.strace` by exact schema, length, and SHA-256. Windows uses the session reader's verified ETW v3 artifact and validates its capture fingerprint. A missing or invalid selected session is an error; partial or unknown evidence exits `2`.
+An optional `evidence` filter matches one complete source-native locator exactly. For Linux the locator contains `kind: "raw_trace_record"`, `line_number`, `byte_offset`, and `byte_length`; for Windows it contains `kind: "windows_etw_record"`, `record_ordinal`, `json_pointer`, and `raw_payload_sha256`. Copy the tuple from an event result when constructing the query. Evidence locators are exact tuple matches; path filtering is a separate schema-v2 feature with source-specific limits. Evidence locators and `process_observation_id` are source-local, so both are rejected across sessions. Each session's results stay nested under that session ID; event ordinals and evidence remain source-local. Multi-session queries cap aggregate runtime artifacts at 256 MiB, total matching rows at 5,000, a cooperative 10-second total-work budget checked between sessions, and output at 8 MiB. Session/source/capture/parse status and diagnostics remain separate. Linux `run.json` must bind `trace.strace` by exact schema, length, and SHA-256. Windows uses the session reader's verified ETW v3 artifact and validates its capture fingerprint. A missing or invalid selected session is an error; partial or unknown evidence exits `2`.
 
 Query selected-root snapshots from one or more verified sessions with the separate `sideeffect.inventory_query` v1 contract:
 

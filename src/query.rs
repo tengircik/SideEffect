@@ -1,8 +1,8 @@
 //! Bounded, read-only exact filters over the versioned common event envelope.
 //!
 //! Query results preserve source status, diagnostics, event evidence, and the
-//! source-local process links needed to inspect the selected rows. This first
-//! contract intentionally does not claim path, endpoint, or time filtering.
+//! source-local process links needed to inspect the selected rows. Path filtering
+//! is exact over an optional source-derived lexical/name observation only.
 
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -22,18 +22,19 @@ use crate::event::{
 use crate::model::SyscallOutcome;
 
 pub const QUERY_SCHEMA: &str = "sideeffect.event_query";
-pub const QUERY_SCHEMA_VERSION: u32 = 1;
+pub const QUERY_SCHEMA_VERSION: u32 = 2;
 pub const QUERY_RESULT_SCHEMA: &str = "sideeffect.event_query_result";
-pub const QUERY_RESULT_SCHEMA_VERSION: u32 = 1;
+pub const QUERY_RESULT_SCHEMA_VERSION: u32 = 2;
 pub const SESSION_QUERY_RESULT_SCHEMA: &str = "sideeffect.session_event_query_result";
-pub const SESSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 1;
+pub const SESSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 2;
 pub const MULTI_SESSION_QUERY_RESULT_SCHEMA: &str = "sideeffect.multi_session_event_query_result";
-pub const MULTI_SESSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 1;
+pub const MULTI_SESSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 2;
 pub const MAX_QUERY_SESSIONS: usize = 16;
 pub const MAX_MULTI_SESSION_RESULTS: usize = MAX_QUERY_RESULTS;
 pub const MAX_MULTI_SESSION_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_MULTI_SESSION_ELAPSED: Duration = Duration::from_secs(10);
 pub const MAX_QUERY_BYTES: usize = 16 * 1024;
+pub const MAX_PATH_FILTER_BYTES: usize = 8 * 1024;
 pub const MAX_QUERY_RESULTS: usize = 5_000;
 pub const MAX_QUERY_ELAPSED: Duration = Duration::from_secs(2);
 pub const MAX_QUERY_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
@@ -931,6 +932,10 @@ pub struct EventQueryFilters {
     pub outcome: Option<OutcomeFilter>,
     /// Source-local ProcessObservation ID, not an OS PID or cross-capture ID.
     pub process_observation_id: Option<u64>,
+    /// Exact equality against a source-derived path/name field when available.
+    /// This does not normalize, resolve, glob, or substring-match the value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_exact: Option<String>,
     /// Exact source-local evidence tuple; not portable across captures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<EvidenceFilter>,
@@ -966,10 +971,13 @@ impl EventQuery {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema != QUERY_SCHEMA || self.schema_version != QUERY_SCHEMA_VERSION {
+        if self.schema != QUERY_SCHEMA || !matches!(self.schema_version, 1 | 2) {
             return Err(format!(
-                "query schema must be {QUERY_SCHEMA} version {QUERY_SCHEMA_VERSION}"
+                "query schema must be {QUERY_SCHEMA} version 1 or 2"
             ));
+        }
+        if self.schema_version == 1 && self.filters.path_exact.is_some() {
+            return Err("path_exact requires event query schema version 2".to_owned());
         }
         if self.limit == 0 || self.limit as usize > MAX_QUERY_RESULTS {
             return Err(format!(
@@ -983,6 +991,16 @@ impl EventQuery {
             {
                 return Err(format!(
                     "event_kind must contain 1..{MAX_FILTER_TEXT_BYTES} printable UTF-8 bytes"
+                ));
+            }
+        }
+        if let Some(path) = &self.filters.path_exact {
+            if path.is_empty()
+                || path.len() > MAX_PATH_FILTER_BYTES
+                || path.chars().any(char::is_control)
+            {
+                return Err(format!(
+                    "path_exact must contain 1..{MAX_PATH_FILTER_BYTES} printable UTF-8 bytes"
                 ));
             }
         }
@@ -1287,6 +1305,14 @@ fn matches_event(
     process_evidence: Option<&HashSet<EvidenceKey>>,
     filters: &EventQueryFilters,
 ) -> bool {
+    if filters.path_exact.as_ref().is_some_and(|path| {
+        event
+            .path_observation
+            .as_ref()
+            .is_none_or(|observation| observation.path != *path)
+    }) {
+        return false;
+    }
     if filters
         .event_kind
         .as_ref()
@@ -1567,6 +1593,7 @@ mod tests {
                     operation_kind: Some(OperationKind::SyscallAttempt),
                     outcome: Some(OutcomeFilter::Failure),
                     process_observation_id: None,
+                    path_exact: None,
                     evidence: None,
                 },
                 10,
@@ -1587,6 +1614,81 @@ mod tests {
                 .diagnostics
                 .contains(&"source_parse_partial".to_owned())
         );
+    }
+
+    #[test]
+    fn query_path_exact_matches_only_supported_literal_path_observations() {
+        let trace = b"123 1700000000.1 openat(AT_FDCWD</tmp>, \"one.txt\", O_RDONLY) = 3\n123 1700000000.2 openat(AT_FDCWD</tmp>, \"two.txt\", O_RDONLY) = 4\n123 1700000000.3 openat(AT_FDCWD, \"unknown.txt\", O_RDONLY) = 5\n";
+        let envelope = linux_envelope(trace);
+        assert_eq!(
+            envelope.events[0].path_observation.as_ref().unwrap().path,
+            "/tmp/one.txt"
+        );
+        assert_eq!(
+            envelope.events[1].path_observation.as_ref().unwrap().path,
+            "/tmp/two.txt"
+        );
+        assert!(envelope.events[2].path_observation.is_none());
+
+        let exact = execute_query(
+            &envelope,
+            &query(
+                EventQueryFilters {
+                    path_exact: Some("/tmp/one.txt".to_owned()),
+                    ..EventQueryFilters::default()
+                },
+                5,
+            ),
+        )
+        .unwrap();
+        assert_eq!(exact.matched_count, 1);
+        assert_eq!(exact.events[0].event_kind, "openat");
+        assert_eq!(
+            exact.events[0].path_observation.as_ref().unwrap().path,
+            "/tmp/one.txt"
+        );
+
+        for unmatched in ["/tmp/one", "/tmp/ONE.txt", "/tmp/unknown.txt"] {
+            let result = execute_query(
+                &envelope,
+                &query(
+                    EventQueryFilters {
+                        path_exact: Some(unmatched.to_owned()),
+                        ..EventQueryFilters::default()
+                    },
+                    5,
+                ),
+            )
+            .unwrap();
+            assert_eq!(result.matched_count, 0, "filter: {unmatched}");
+            assert_eq!(result.source_state, envelope.source_state);
+            assert_eq!(result.diagnostics, envelope.diagnostics);
+        }
+    }
+
+    #[test]
+    fn path_exact_query_contract_is_bounded_and_versioned() {
+        assert!(EventQuery::from_json(
+            br#"{"schema":"sideeffect.event_query","schema_version":1,"filters":{"path_exact":"/tmp/x"}}"#
+        )
+        .is_err());
+        let oversized = "x".repeat(MAX_PATH_FILTER_BYTES + 1);
+        for invalid in ["", "x\ny", oversized.as_str()] {
+            let value = serde_json::json!({
+                "schema": QUERY_SCHEMA,
+                "schema_version": 2,
+                "filters": { "path_exact": invalid }
+            });
+            assert!(EventQuery::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+        let injection_text = "<script>alert(1)</script>";
+        let accepted = serde_json::json!({
+            "schema": QUERY_SCHEMA,
+            "schema_version": 2,
+            "filters": { "path_exact": injection_text }
+        });
+        let query = EventQuery::from_json(&serde_json::to_vec(&accepted).unwrap()).unwrap();
+        assert_eq!(query.filters.path_exact.as_deref(), Some(injection_text));
     }
 
     #[test]

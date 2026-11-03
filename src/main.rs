@@ -1829,7 +1829,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect events --trace TRACE\n       sideeffect events --windows-runtime CAPTURE.json (native Windows)\nAdapts one local runtime source into a versioned common event envelope and writes JSON only. Source-local order and timestamps are preserved; no cross-platform ordering, parentage, ownership, or causation is inferred. Partial or unknown source status exits with status 2. Windows runtime input is strictly bounded and schema-validated before adaptation."
         }
         "query" => {
-            "Usage: sideeffect query --query QUERY.json --trace TRACE [--format json|text]\n       sideeffect query --query QUERY.json --windows-runtime CAPTURE.json [--format json|text] (native Windows)\n       sideeffect query --query QUERY.json --session SESSION_DIR --source runtime|selected_root [--format json|text]\n       sideeffect query --query QUERY.json --session SESSION_DIR --session SESSION_DIR --source runtime|selected_root [--format json|text] (2..16 sessions)\nRuns a versioned, read-only exact-filter query over runtime evidence or selected-root inventory artifacts in explicitly selected verified sessions. Event query filters are exact event_kind, operation_kind, syscall outcome, and source-local evidence locators; process_observation_id is supported for one runtime source only. Evidence locators match the complete source-native tuple and are rejected across sessions. Inventory query schema v1 accepts exact native-encoding root_path_hex and entry_name_hex filters; Linux values encode bytes and Windows values encode UTF-16LE. Query JSON is capped at 16 KiB, matching rows at 5,000, multi-session verified artifact bytes at 256 MiB, total work at 10 seconds checked between sessions, and serialized output at 8 MiB. Selected-root v1/v2 documents are strictly validated with 10,000-entry and 8 MiB aggregate encoded-name caps. Results retain session/source status, diagnostics, artifact digests, and direct-child entry ordinals. Missing and partial sources remain not checked or partial; zero matches are not evidence of absence. Invalid sessions or malformed documents fail the request. Partial or unknown evidence exits with status 2."
+            "Usage: sideeffect query --query QUERY.json --trace TRACE [--format json|text]\n       sideeffect query --query QUERY.json --windows-runtime CAPTURE.json [--format json|text] (native Windows)\n       sideeffect query --query QUERY.json --session SESSION_DIR --source runtime|selected_root [--format json|text]\n       sideeffect query --query QUERY.json --session SESSION_DIR --session SESSION_DIR --source runtime|selected_root [--format json|text] (2..16 sessions)\nRuns a versioned, read-only exact-filter query over runtime evidence or selected-root inventory artifacts in explicitly selected verified sessions. Event query schema v2 adds path_exact: exact string equality against a Linux lexical path hint or a raw-payload-validated Windows ETW file name when available. It does not normalize, case-fold, resolve, glob, or substring-match paths; unsupported/pathless rows cannot match, and zero matches do not establish absence. Schema v1 queries remain accepted, but path_exact requires v2. Other event filters are exact event_kind, operation_kind, syscall outcome, and source-local evidence locators; process_observation_id is supported for one runtime source only. Evidence locators match the complete source-native tuple and are rejected across sessions. Inventory query schema v1 accepts exact native-encoding root_path_hex and entry_name_hex filters; Linux values encode bytes and Windows values encode UTF-16LE. Query JSON is capped at 16 KiB, path_exact at 8 KiB, matching rows at 5,000, multi-session verified artifact bytes at 256 MiB, total work at 10 seconds checked between sessions, and serialized output at 8 MiB. Selected-root v1/v2 documents are strictly validated with 10,000-entry and 8 MiB aggregate encoded-name caps. Results retain session/source status, diagnostics, artifact digests, and direct-child entry ordinals. Missing and partial sources remain not checked or partial. Invalid sessions or malformed documents fail the request. Partial or unknown evidence exits with status 2."
         }
         "graph" => {
             "Usage: sideeffect graph --trace TRACE [--event-kind KIND | --process-observation ID]\n       sideeffect graph --windows-runtime CAPTURE.json [--event-kind KIND | --process-observation ID] (native Windows)\nBuilds a bounded source-local graph of event rows, process observations, reported PID context, and evidence-linked relationships. --event-kind selects exact event-kind matches. --process-observation selects a source-local ProcessObservation ID (not a PID or cross-capture ID) and retains events linked to that observation plus its direct process relationships. Retained links preserve their status and basis; diagnostics and source status remain for the full input. An empty event selection is not evidence of absence. PID-only context nodes are kept separate and never merged into process instances. Edges do not establish ownership, causation, or a complete process tree. Partial or unknown source status exits with status 2."
@@ -4041,16 +4041,22 @@ fn format_event_query_text(result: &sideeffect::query::EventQueryResult) -> Resu
     for event in &result.events {
         let evidence = serde_json::to_string(&event.evidence)
             .map_err(|error| format!("could not format event evidence: {error}"))?;
+        let path = event
+            .path_observation
+            .as_ref()
+            .map(|observation| format!(" path={}", terminal_safe_text(&observation.path)))
+            .unwrap_or_default();
         writeln!(
             text,
-            "- #{} {} [{}] evidence={}",
+            "- #{} {} [{}] evidence={}{}",
             event.source_local_ordinal,
             terminal_safe_text(&event.event_kind),
             match &event.operation {
                 sideeffect::event::OperationSemantics::SyscallAttempt { .. } => "syscall_attempt",
                 sideeffect::event::OperationSemantics::NativeObservation => "native_observation",
             },
-            evidence
+            evidence,
+            path
         )
         .map_err(|_| "could not format event query text".to_owned())?;
         check_event_query_text_limit(&text)?;
@@ -7417,6 +7423,7 @@ mod tests {
                     byte_length: 1,
                 },
                 identity_context: Vec::new(),
+                path_observation: None,
             }],
             event_process_links: Vec::new(),
             process_observations: Vec::new(),

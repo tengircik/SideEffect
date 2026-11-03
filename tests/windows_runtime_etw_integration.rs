@@ -136,7 +136,7 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
     );
     let envelope: Value = serde_json::from_slice(&envelope_output.stdout).unwrap();
     assert_eq!(envelope["schema"], "sideeffect.common_event_envelope");
-    assert_eq!(envelope["schema_version"], 4);
+    assert_eq!(envelope["schema_version"], 5);
     let target_version = events
         .iter()
         .find(|event| {

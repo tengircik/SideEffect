@@ -119,6 +119,63 @@ fn runtime_capture() -> Vec<u8> {
     serde_json::to_vec(&capture).unwrap()
 }
 
+fn runtime_capture_with_file_path(path: &str) -> Vec<u8> {
+    let mut capture: WindowsRuntimeCapture = serde_json::from_slice(&runtime_capture()).unwrap();
+    let mut raw_payload = 0x1122_3344_5566_7788_u64.to_le_bytes().to_vec();
+    for unit in path.encode_utf16().chain(std::iter::once(0)) {
+        raw_payload.extend_from_slice(&unit.to_le_bytes());
+    }
+    capture.events.push(NativeRuntimeEvent {
+        record_ordinal: 2,
+        provider_guid: "90cbdc39-4a3e-11d1-84f4-0000f80464e3".to_owned(),
+        event_id: 0,
+        event_version: 2,
+        opcode: 36,
+        event_kind: "file_io_observation".to_owned(),
+        header_process_id: 42,
+        header_thread_id: 43,
+        header_flags: 0x0040,
+        timestamp_qpc: 11,
+        raw_payload_hex: hex(&raw_payload),
+        payload_decoding: None,
+        observation_decoding: Some(json!({
+            "status": "decoded",
+            "diagnostic": null,
+            "observation": {
+                "schema": "windows.kernel_file_io",
+                "schema_version": 2,
+                "activity": { "kind": "file", "observation": {
+                    "operation": "rundown_name",
+                    "thread_id": null,
+                    "file_object": 0x1122_3344_5566_7788_u64,
+                    "file_key": null,
+                    "path": path,
+                    "requested_bytes": null,
+                    "file_offset": null,
+                    "create_options": null,
+                    "file_attributes": null,
+                    "share_access": null,
+                    "information_class": null,
+                    "extra_info": null
+                } }
+            }
+        })),
+    });
+    capture.document_sha256.clear();
+    capture.document_sha256 = digest(&serde_json::to_vec(&capture).unwrap());
+    serde_json::to_vec(&capture).unwrap()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(DIGITS[(byte >> 4) as usize] as char);
+        encoded.push(DIGITS[(byte & 0xf) as usize] as char);
+    }
+    encoded
+}
+
 fn session_manifest_with_id(runtime: Option<&[u8]>, session_id: &str) -> Vec<u8> {
     let artifacts = runtime
         .map(|bytes| {
@@ -414,6 +471,67 @@ fn session_query_uses_verified_windows_etw_artifact_and_keeps_capture_status_unk
     assert_eq!(
         result["event_query_result"]["events"][0]["evidence"]["kind"],
         "windows_etw_record"
+    );
+}
+
+#[test]
+fn verified_windows_session_query_v2_matches_only_raw_payload_validated_file_names() {
+    let directory = TestDirectory::new();
+    let session = directory.0.join("path-session");
+    let path = r"C:\Windows\Temp\fixture.txt";
+    publish_session(&session, Some(runtime_capture_with_file_path(path)));
+    let query_path = directory.0.join("path-query.json");
+    fs::write(
+        &query_path,
+        serde_json::to_vec(&json!({
+            "schema": "sideeffect.event_query",
+            "schema_version": 2,
+            "filters": { "path_exact": path },
+            "limit": 5
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["query", "--query"])
+        .arg(query_path)
+        .args(["--session"])
+        .arg(session)
+        .args(["--source", "runtime"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["event_query_result"]["matched_count"], 1);
+    assert_eq!(
+        result["event_query_result"]["events"][0]["path_observation"]["path"],
+        path
+    );
+    assert_eq!(
+        result["event_query_result"]["events"][0]["path_observation"]["basis"]["kind"],
+        "windows_etw_validated_file_name"
+    );
+
+    let no_path_query = directory.0.join("no-path-query.json");
+    fs::write(
+        &no_path_query,
+        br#"{"schema":"sideeffect.event_query","schema_version":2,"filters":{"path_exact":"C:\\Windows\\Temp\\other.txt"},"limit":5}"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["query", "--query"])
+        .arg(no_path_query)
+        .args(["--session"])
+        .arg(directory.0.join("path-session"))
+        .args(["--source", "runtime"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["event_query_result"]["matched_count"], 0);
+    assert_eq!(
+        result["event_query_result"]["source_state"]["completeness"],
+        "unknown"
     );
 }
 

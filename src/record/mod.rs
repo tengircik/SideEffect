@@ -28,7 +28,8 @@ pub use windows_etw::{
     WindowsRuntimeCapture, record_windows_runtime_capture,
 };
 pub(crate) use windows_io_decode::{
-    NetworkPayloadCrossCheck, NetworkPayloadInput, cross_check_network_payload,
+    FilePathCrossCheck, FilePathInput, NetworkPayloadCrossCheck, NetworkPayloadInput,
+    cross_check_file_path, cross_check_network_payload,
 };
 
 #[cfg(target_os = "linux")]

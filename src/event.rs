@@ -13,11 +13,11 @@ use crate::model::{
 };
 
 pub const COMMON_EVENT_SCHEMA: &str = "sideeffect.common_event_envelope";
-pub const COMMON_EVENT_SCHEMA_VERSION: u32 = 4;
+pub const COMMON_EVENT_SCHEMA_VERSION: u32 = 5;
 pub const EVENT_GRAPH_SCHEMA: &str = "sideeffect.event_graph";
-pub const EVENT_GRAPH_SCHEMA_VERSION: u32 = 4;
+pub const EVENT_GRAPH_SCHEMA_VERSION: u32 = 5;
 pub const EVENT_TIMELINE_SCHEMA: &str = "sideeffect.event_timeline";
-pub const EVENT_TIMELINE_SCHEMA_VERSION: u32 = 4;
+pub const EVENT_TIMELINE_SCHEMA_VERSION: u32 = 5;
 #[cfg(windows)]
 const WINDOWS_RUNTIME_SCHEMA: &str = "sideeffect.windows_runtime_capture";
 #[cfg(windows)]
@@ -94,6 +94,23 @@ pub struct EventIdentityContext {
     pub ambiguity: String,
 }
 
+/// A bounded source-derived file-name observation attached to one event's evidence.
+/// It remains a literal spelling and is never resolved against the filesystem.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EventPathObservation {
+    pub path: String,
+    pub basis: EventPathBasis,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EventPathBasis {
+    LinuxStraceLexicalHint {
+        lexical_basis: crate::trace::LexicalPathBasis,
+    },
+    WindowsEtwValidatedFileName,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CommonEvent {
     /// Source-local one-based row position, not a cross-source sequence.
@@ -103,6 +120,8 @@ pub struct CommonEvent {
     pub operation: OperationSemantics,
     pub evidence: EvidenceReference,
     pub identity_context: Vec<EventIdentityContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_observation: Option<EventPathObservation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -659,6 +678,36 @@ pub fn graph(
     Ok(graph)
 }
 
+#[cfg(all(test, windows))]
+mod path_diagnostic_tests {
+    use super::{EventDiagnostic, MAX_COMMON_PROCESS_DIAGNOSTICS, push_path_diagnostic};
+
+    #[test]
+    fn path_validation_diagnostics_use_a_bounded_path_specific_truncation_marker() {
+        let mut diagnostics = Vec::<EventDiagnostic>::new();
+        let mut count = 0;
+        for ordinal in 1..=MAX_COMMON_PROCESS_DIAGNOSTICS + 10 {
+            push_path_diagnostic(
+                &mut diagnostics,
+                &mut count,
+                "file_observation_unverified",
+                "synthetic diagnostic",
+                Some(ordinal as u64),
+                None,
+            );
+        }
+
+        assert_eq!(diagnostics.len(), MAX_COMMON_PROCESS_DIAGNOSTICS);
+        assert_eq!(count, MAX_COMMON_PROCESS_DIAGNOSTICS);
+        assert_eq!(
+            diagnostics
+                .last()
+                .map(|diagnostic| diagnostic.code.as_str()),
+            Some("path_diagnostics_truncated")
+        );
+    }
+}
+
 /// Build a bounded timeline view from an already adapted envelope. The
 /// envelope's source-local ordinals and evidence references remain unchanged.
 pub fn timeline(
@@ -771,6 +820,38 @@ fn push_process_diagnostic(
                 evidence: None,
             });
             *process_diagnostic_count += 1;
+        }
+        std::cmp::Ordering::Greater => {}
+    }
+}
+
+#[cfg(windows)]
+fn push_path_diagnostic(
+    diagnostics: &mut Vec<EventDiagnostic>,
+    diagnostic_count: &mut usize,
+    code: &str,
+    message: &str,
+    source_local_ordinal: Option<u64>,
+    evidence: Option<EvidenceReference>,
+) {
+    match (*diagnostic_count).cmp(&(MAX_COMMON_PROCESS_DIAGNOSTICS - 1)) {
+        std::cmp::Ordering::Less => {
+            diagnostics.push(EventDiagnostic {
+                code: code.to_owned(),
+                message: message.to_owned(),
+                source_local_ordinal,
+                evidence,
+            });
+            *diagnostic_count += 1;
+        }
+        std::cmp::Ordering::Equal => {
+            diagnostics.push(EventDiagnostic {
+                code: "path_diagnostics_truncated".to_owned(),
+                message: "path validation diagnostics exceeded the 256 entry limit".to_owned(),
+                source_local_ordinal: None,
+                evidence: None,
+            });
+            *diagnostic_count += 1;
         }
         std::cmp::Ordering::Greater => {}
     }
@@ -1075,6 +1156,12 @@ pub fn from_linux_strace(
                 value: pid.to_string(),
                 ambiguity: "source-local tracing context; no ownership or cross-platform identity asserted".to_owned(),
             }]).unwrap_or_default(),
+            path_observation: record.lexical_path_hint.as_ref().map(|hint| EventPathObservation {
+                path: hint.path.clone(),
+                basis: EventPathBasis::LinuxStraceLexicalHint {
+                    lexical_basis: hint.basis,
+                },
+            }),
         };
         if let Some(task_id) = record.process_id {
             if let std::collections::btree_map::Entry::Vacant(entry) =
@@ -1669,6 +1756,8 @@ fn from_windows_etw_source(capture: &impl EtwCaptureView) -> CommonEventEnvelope
     let mut event_process_links = Vec::new();
     let mut adapted_event_evidence = BTreeMap::<u64, EvidenceReference>::new();
     let mut diagnostics = Vec::new();
+    let mut path_diagnostic_count = 0;
+    let mut path_diagnostic_codes = BTreeSet::new();
     let mut source_diagnostics = capture
         .diagnostics()
         .iter()
@@ -1789,6 +1878,62 @@ fn from_windows_etw_source(capture: &impl EtwCaptureView) -> CommonEventEnvelope
                     .to_owned(),
         }];
         adapted_event_evidence.insert(expected, evidence.clone());
+        let path_observation = match cross_checked_windows_file_path(&event) {
+            crate::record::FilePathCrossCheck::NotFileProvider
+            | crate::record::FilePathCrossCheck::Matched(None) => None,
+            crate::record::FilePathCrossCheck::Matched(Some(path)) => Some(EventPathObservation {
+                path,
+                basis: EventPathBasis::WindowsEtwValidatedFileName,
+            }),
+            crate::record::FilePathCrossCheck::Mismatch => {
+                push_path_diagnostic(
+                    &mut diagnostics,
+                    &mut path_diagnostic_count,
+                    "file_observation_sidecar_mismatch",
+                    "raw ETW file payload does not match its serialized observation sidecar; path filtering is unavailable for this row",
+                    Some(expected),
+                    Some(evidence.clone()),
+                );
+                push_unique_source_diagnostic(
+                    &mut source_diagnostics,
+                    &mut path_diagnostic_codes,
+                    "file_observation_sidecar_mismatch",
+                );
+                None
+            }
+            crate::record::FilePathCrossCheck::Unsupported => {
+                push_path_diagnostic(
+                    &mut diagnostics,
+                    &mut path_diagnostic_count,
+                    "file_observation_unverified",
+                    "ETW file observation could not be validated against its retained raw payload; path filtering is unavailable for this row",
+                    Some(expected),
+                    Some(evidence.clone()),
+                );
+                push_unique_source_diagnostic(
+                    &mut source_diagnostics,
+                    &mut path_diagnostic_codes,
+                    "file_observation_unverified",
+                );
+                None
+            }
+            crate::record::FilePathCrossCheck::Malformed => {
+                push_path_diagnostic(
+                    &mut diagnostics,
+                    &mut path_diagnostic_count,
+                    "file_observation_malformed",
+                    "ETW file observation raw payload is malformed; path filtering is unavailable for this row",
+                    Some(expected),
+                    Some(evidence.clone()),
+                );
+                push_unique_source_diagnostic(
+                    &mut source_diagnostics,
+                    &mut path_diagnostic_codes,
+                    "file_observation_malformed",
+                );
+                None
+            }
+        };
         events.push(CommonEvent {
             source_local_ordinal: expected,
             source_timestamp: Some(SourceTimestamp {
@@ -1799,6 +1944,7 @@ fn from_windows_etw_source(capture: &impl EtwCaptureView) -> CommonEventEnvelope
             operation: OperationSemantics::NativeObservation,
             evidence,
             identity_context,
+            path_observation,
         });
     }
     let loss = capture.event_loss();
@@ -2900,6 +3046,29 @@ fn is_file_or_disk_observation(event: &EtwEventView<'_>) -> bool {
         (Some("3d6fa8d4-fe05-11d0-9dda-00c04fd7ba7c"), Some("disk"), Some("windows.kernel_disk_io"), Some(0), 0, 0, 10 | 11 | 14)
             if event.event_kind == "disk_io_observation"
     )
+}
+
+#[cfg(windows)]
+fn cross_checked_windows_file_path(event: &EtwEventView<'_>) -> crate::record::FilePathCrossCheck {
+    if event.event_kind != "file_io_observation"
+        || !normalized_guid(event.provider_guid)
+            .is_some_and(|guid| guid == "90cbdc39-4a3e-11d1-84f4-0000f80464e3")
+    {
+        return crate::record::FilePathCrossCheck::NotFileProvider;
+    }
+    let Some(raw_payload) = decode_hex(event.raw_payload_hex) else {
+        return crate::record::FilePathCrossCheck::Malformed;
+    };
+    crate::record::cross_check_file_path(crate::record::FilePathInput {
+        provider_guid: event.provider_guid,
+        event_id: event.event_id,
+        event_version: event.event_version,
+        opcode: event.opcode,
+        header_flags: event.header_flags,
+        event_kind: event.event_kind,
+        raw_payload: &raw_payload,
+        serialized_decoding: event.observation_decoding,
+    })
 }
 
 fn is_sha256_hex(value: &str) -> bool {
