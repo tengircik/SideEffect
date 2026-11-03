@@ -45,6 +45,8 @@ Freeze metric definitions and case-level outputs before inference. Report numera
 
 Maintainers must choose and justify task-specific minimums for quality, abstention, unsupported-claim tolerance, baseline advantage, privacy, and resources before candidate inference. Existing frozen gates in the relevant evaluation documents may supply those minimums for their named task and corpus. This proposal does not create numeric thresholds. Any new or changed threshold requires review and a new pre-registered run; never relax criteria after seeing candidate results.
 
+For an implementation-grounded scenario map, see the proposed [scenario-to-oracle matrix](LOCAL_MODEL_BENCHMARK_MATRIX.md). It maps existing Linux and Windows evidence fields to candidate benchmark classes and records which classes currently lack an adequate oracle or platform corpus.
+
 ## Run record and reproducibility
 
 Use an isolated, user-controlled model registry and the supported SideEffect inference path. Do not start a runtime or download/register weights without explicit user action. Keep inference local and offline; verify that the runtime's actual behavior matches the documented controls. A local model/runtime is executable code and is not automatically sandboxed.
