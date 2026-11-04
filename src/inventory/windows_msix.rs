@@ -141,7 +141,7 @@ impl StringBudget {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StringEvidenceError {
     IndividualLimit,
     AggregateLimit,
@@ -774,4 +774,86 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn string_evidence_preserves_invalid_utf16_and_marks_display_replacement() {
+        let mut budget = StringBudget::new();
+        let evidence = budget
+            .retain(HSTRING::from_wide(&[0x0041, 0xd800]))
+            .expect("bounded UTF-16 evidence should be retained");
+
+        assert_eq!(evidence.text, "A\u{fffd}");
+        assert_eq!(evidence.utf16_hex, "0041d800");
+        assert!(evidence.display_replaced_invalid_utf16);
+        assert_eq!(budget.used_units, 2);
+    }
+
+    #[test]
+    fn string_evidence_marks_valid_display_without_replacement() {
+        let mut budget = StringBudget::new();
+        let evidence = budget
+            .retain(HSTRING::from("Package name"))
+            .expect("bounded package text should be retained");
+
+        assert_eq!(evidence.text, "Package name");
+        assert_eq!(
+            evidence.utf16_hex,
+            "005000610063006b0061006700650020006e0061006d0065"
+        );
+        assert!(!evidence.display_replaced_invalid_utf16);
+    }
+
+    #[test]
+    fn oversized_string_is_rejected_without_consuming_budget() {
+        let mut budget = StringBudget::new();
+        let oversized = vec![0x0041; MAX_STRING_UNITS + 1];
+
+        assert!(matches!(
+            budget.retain(HSTRING::from_wide(&oversized)),
+            Err(StringEvidenceError::IndividualLimit)
+        ));
+        assert_eq!(budget.used_units, 0);
+    }
+
+    #[test]
+    fn aggregate_string_limit_rejects_later_field_without_overflow() {
+        let mut budget = StringBudget::new();
+        let bounded = vec![0x0042; MAX_STRING_UNITS];
+        for _ in 0..(MAX_AGGREGATE_STRING_UNITS / MAX_STRING_UNITS) {
+            budget
+                .retain(HSTRING::from_wide(&bounded))
+                .expect("each bounded string should fit in the remaining budget");
+        }
+        assert_eq!(budget.used_units, MAX_AGGREGATE_STRING_UNITS);
+
+        assert!(matches!(
+            budget.retain(HSTRING::from("x")),
+            Err(StringEvidenceError::AggregateLimit)
+        ));
+        assert_eq!(budget.used_units, MAX_AGGREGATE_STRING_UNITS);
+    }
+
+    #[test]
+    fn diagnostics_stop_at_the_configured_cap() {
+        let mut diagnostics = Vec::new();
+        for _ in 0..(MAX_DIAGNOSTICS + 1) {
+            push_diagnostic(
+                &mut diagnostics,
+                WindowsMsixDiagnostic {
+                    code: "test_diagnostic",
+                    package_ordinal: None,
+                    field: None,
+                    message: "Synthetic diagnostic used only by this unit test.",
+                    hresult: None,
+                },
+            );
+        }
+
+        assert_eq!(diagnostics.len(), MAX_DIAGNOSTICS);
+    }
 }
