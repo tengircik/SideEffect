@@ -450,6 +450,57 @@ fn case_cli_initializes_and_resolves_against_a_verified_session_without_overwrit
     assert!(!html.contains("<script>alert(1)</script>"));
     assert!(!html.contains("https://"));
 
+    let redaction_preview = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("resolve")
+        .arg("--format")
+        .arg("html")
+        .arg("--redact")
+        .arg("case-text")
+        .arg("--preview-redaction")
+        .arg("--case")
+        .arg(&updated_case_path)
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(
+        redaction_preview.status.success() || redaction_preview.status.code() == Some(2),
+        "redaction preview failed: {}",
+        String::from_utf8_lossy(&redaction_preview.stderr)
+    );
+    let preview_text = String::from_utf8(redaction_preview.stdout).unwrap();
+    assert!(preview_text.contains("case-text: 2 field occurrence(s) would be omitted"));
+    assert!(!preview_text.contains("alert(1)"));
+    assert!(!preview_text.contains("<script>"));
+
+    let redacted_path = directory.0.join("review-redacted.html");
+    let redacted = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("resolve")
+        .arg("--format")
+        .arg("html")
+        .arg("--redact")
+        .arg("case-text")
+        .arg("--output")
+        .arg(&redacted_path)
+        .arg("--case")
+        .arg(&updated_case_path)
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(
+        redacted.status.success() || redacted.status.code() == Some(2),
+        "redacted case HTML resolve failed: {}",
+        String::from_utf8_lossy(&redacted.stderr)
+    );
+    let redacted_html = fs::read_to_string(&redacted_path).unwrap();
+    assert!(redacted_html.contains("Redacted export"));
+    assert!(redacted_html.contains("[OMITTED: case text]"));
+    assert!(!redacted_html.contains("alert(1)"));
+    assert_eq!(fs::read(&updated_case_path).unwrap(), updated_case_bytes);
+
     let html_overwrite = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .arg("case")
         .arg("resolve")

@@ -10,7 +10,10 @@ mod windows_runtime_html;
 mod windows_runtime_text;
 
 pub use audit_session_text::{write_audit_session_json, write_audit_session_text};
-pub use case_html::write_case_html;
+pub use case_html::{
+    CaseHtmlRedactionPolicy, RedactionPreviewItem, preview_case_html_redactions, write_case_html,
+    write_case_html_with_redactions,
+};
 pub use html::write_html_diff;
 pub use inspect_text::{write_trace_evidence_text, write_trace_text};
 pub use summary::{RedactedDiffSummary, summarize_diff, write_html_summary};

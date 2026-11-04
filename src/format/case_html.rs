@@ -4,17 +4,89 @@ use crate::case_evidence::{ResolvedCase, ResolvedEvidenceFact};
 
 const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; connect-src 'none'; frame-src 'none'; media-src 'none'; script-src 'none'";
 
+/// Exact structured fields that an analyst can omit from a resolved case HTML export.
+/// This is deliberately not a substring detector or secret scanner.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CaseHtmlRedactionPolicy {
+    pub case_text: bool,
+    pub artifact_paths: bool,
+    pub source_records: bool,
+    pub evidence_identifiers: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RedactionPreviewItem {
+    pub field_group: &'static str,
+    pub affected_field_occurrences: usize,
+}
+
+/// Return counts only; preview output intentionally never includes the values being removed.
+pub fn preview_case_html_redactions(
+    case: &ResolvedCase,
+    policy: CaseHtmlRedactionPolicy,
+) -> Result<Vec<RedactionPreviewItem>, serde_json::Error> {
+    let mut items = Vec::new();
+    let mut push = |enabled: bool, field_group, affected_field_occurrences| {
+        if enabled {
+            items.push(RedactionPreviewItem {
+                field_group,
+                affected_field_occurrences,
+            });
+        }
+    };
+    push(policy.case_text, "case-text", 1 + case.entries.len());
+    let nested_artifact_paths = if policy.artifact_paths && !policy.source_records {
+        case.facts.iter().try_fold(0usize, |count, fact| {
+            let source_record = serde_json::to_value(&fact.fact)?;
+            Ok::<usize, serde_json::Error>(
+                count + count_exact_named_fields(&source_record, "artifact_path"),
+            )
+        })?
+    } else {
+        0
+    };
+    push(
+        policy.artifact_paths,
+        "artifact-paths",
+        case.facts.len() + nested_artifact_paths,
+    );
+    push(policy.source_records, "source-records", case.facts.len());
+    push(
+        policy.evidence_identifiers,
+        "evidence-identifiers",
+        1 + case.entries.len() + case.sessions.len() * 2 + case.facts.len(),
+    );
+    Ok(items)
+}
+
 /// Render resolved case evidence as a static offline report.
 ///
 /// Case text and source evidence are untrusted and may be sensitive. Dynamic strings are emitted
 /// only as escaped text; the caller must enforce a rendered-output byte limit.
 pub fn write_case_html<W: Write>(case: &ResolvedCase, writer: &mut W) -> io::Result<()> {
+    write_case_html_with_redactions(case, writer, CaseHtmlRedactionPolicy::default())
+}
+
+pub fn write_case_html_with_redactions<W: Write>(
+    case: &ResolvedCase,
+    writer: &mut W,
+    redactions: CaseHtmlRedactionPolicy,
+) -> io::Result<()> {
     writer.write_all(b"<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta http-equiv=\"Content-Security-Policy\" content=\"")?;
     writer.write_all(CSP.as_bytes())?;
     writer.write_all(b"\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>SideEffect investigation case</title>\n<style>:root{color-scheme:light dark;font:16px/1.5 system-ui,sans-serif}body{max-width:76rem;margin:2rem auto;padding:0 1rem}h1,h2,h3{line-height:1.25}.notice{border-left:.25rem solid #b87900;padding:.5rem 1rem}.card{border:1px solid #8886;border-radius:.5rem;padding:1rem;margin:1rem 0}dl{display:grid;grid-template-columns:minmax(10rem,16rem) minmax(0,1fr);gap:.35rem 1rem}dt{font-weight:600}.value{unicode-bidi:isolate;white-space:pre-wrap;overflow-wrap:anywhere}pre{overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid #8886;border-radius:.35rem;padding:1rem}.skip-link{position:absolute;left:1rem;top:0;z-index:1;transform:translateY(-150%);background:Canvas;color:CanvasText;padding:.5rem 1rem;border:2px solid currentColor}.skip-link:focus{transform:translateY(1rem)}@media(max-width:40rem){dl{grid-template-columns:1fr;gap:0}dt{margin-top:.5rem}}</style>\n</head>\n<body>\n<a class=\"skip-link\" href=\"#report-content\">Skip to report content</a>\n<main id=\"report-content\" tabindex=\"-1\">\n<header><h1>Investigation case: ")?;
-    write_text(writer, &case.title)?;
-    writer.write_all(b"</h1><p class=\"notice\">This report contains local audit evidence and analyst-supplied text. It may expose sensitive paths, arguments, process data, or payloads. Review before sharing. It does not authenticate session producers or verify analyst assertions.</p></header>\n<section class=\"card\"><h2>Case context</h2><dl><dt>Case ID</dt><dd>")?;
-    write_text(writer, &case.case_id)?;
+    write_redacted_text(writer, &case.title, redactions.case_text, "case text")?;
+    if has_redactions(redactions) {
+        writer.write_all(b"</h1><p class=\"notice\">Redacted export. Only the explicitly selected structured fields were omitted. This does not detect sensitive substrings in remaining text or guarantee that the report is safe to share; review the complete output.</p><p class=\"notice\">This report does not authenticate session producers or verify analyst assertions.</p></header>\n<section class=\"card\"><h2>Case context</h2><dl><dt>Case ID</dt><dd>")?;
+    } else {
+        writer.write_all(b"</h1><p class=\"notice\">This report contains local audit evidence and analyst-supplied text. It may expose sensitive paths, arguments, process data, or payloads. Review before sharing. It does not authenticate session producers or verify analyst assertions.</p></header>\n<section class=\"card\"><h2>Case context</h2><dl><dt>Case ID</dt><dd>")?;
+    }
+    write_redacted_text(
+        writer,
+        &case.case_id,
+        redactions.evidence_identifiers,
+        "evidence identifier",
+    )?;
     let lifecycle_html = if let Some(lifecycle) = &case.lifecycle {
         format!(
             "</dd><dt>Case status</dt><dd>{}</dd><dt>Case revision</dt><dd>{}",
@@ -37,7 +109,12 @@ pub fn write_case_html<W: Write>(case: &ResolvedCase, writer: &mut W) -> io::Res
     writer.write_all(b"<section><h2>Sessions</h2>")?;
     for session in &case.sessions {
         writer.write_all(b"<article class=\"card\"><h3>Session ")?;
-        write_text(writer, &session.session_id)?;
+        write_redacted_text(
+            writer,
+            &session.session_id,
+            redactions.evidence_identifiers,
+            "evidence identifier",
+        )?;
         writer.write_all(b"</h3><dl><dt>Platform</dt><dd>")?;
         write_text(writer, &session.platform)?;
         write!(
@@ -45,7 +122,12 @@ pub fn write_case_html<W: Write>(case: &ResolvedCase, writer: &mut W) -> io::Res
             "</dd><dt>Manifest schema version</dt><dd>{}</dd><dt>Manifest SHA-256</dt><dd>",
             session.manifest_schema_version
         )?;
-        write_text(writer, &session.manifest_sha256)?;
+        write_redacted_text(
+            writer,
+            &session.manifest_sha256,
+            redactions.evidence_identifiers,
+            "evidence identifier",
+        )?;
         writer.write_all(b"</dd><dt>Session status</dt><dd>")?;
         write_text(writer, status_name(session.status))?;
         writer.write_all(b"</dd></dl><h4>Sources</h4><ul>")?;
@@ -69,13 +151,18 @@ pub fn write_case_html<W: Write>(case: &ResolvedCase, writer: &mut W) -> io::Res
     }
     for entry in &case.entries {
         writer.write_all(b"<article class=\"card\"><h3>Entry ")?;
-        write_text(writer, &entry.id)?;
+        write_redacted_text(
+            writer,
+            &entry.id,
+            redactions.evidence_identifiers,
+            "evidence identifier",
+        )?;
         writer.write_all(b"</h3><dl><dt>Kind</dt><dd>")?;
         write_text(writer, entry.kind.label())?;
         writer.write_all(b"</dd><dt>Authorship</dt><dd>")?;
         write_text(writer, &entry.authorship)?;
         writer.write_all(b"</dd><dt>Statement</dt><dd><span class=\"value\">")?;
-        write_text(writer, &entry.text)?;
+        write_redacted_text(writer, &entry.text, redactions.case_text, "case text")?;
         writer.write_all(b"</span></dd>")?;
         if let Some(severity) = entry.severity {
             writer.write_all(b"<dt>Analyst severity</dt><dd>")?;
@@ -113,7 +200,7 @@ pub fn write_case_html<W: Write>(case: &ResolvedCase, writer: &mut W) -> io::Res
         writer.write_all(b"<p>No evidence locators were resolved.</p>")?;
     }
     for (index, fact) in case.facts.iter().enumerate() {
-        write_fact(index, fact, writer)?;
+        write_fact(index, fact, writer, redactions)?;
     }
     writer.write_all(b"</section>\n</main>\n</body>\n</html>\n")
 }
@@ -122,20 +209,103 @@ fn write_fact<W: Write>(
     index: usize,
     fact: &ResolvedEvidenceFact,
     writer: &mut W,
+    redactions: CaseHtmlRedactionPolicy,
 ) -> io::Result<()> {
     write!(
         writer,
         "<article class=\"card\" id=\"fact-{index}\"><h3>Evidence fact {}</h3><dl><dt>Artifact</dt><dd>",
         index + 1
     )?;
-    write_text(writer, &fact.artifact_path)?;
+    write_redacted_text(
+        writer,
+        &fact.artifact_path,
+        redactions.artifact_paths,
+        "artifact path",
+    )?;
     writer.write_all(b"</dd><dt>Locator</dt><dd>")?;
-    let locator = serde_json::to_string(&fact.locator).map_err(io::Error::other)?;
-    write_text(writer, &locator)?;
-    writer.write_all(b"</dd></dl><details><summary>Source record (JSON)</summary><pre>")?;
-    let evidence = serde_json::to_string_pretty(&fact.fact).map_err(io::Error::other)?;
-    write_text(writer, &evidence)?;
-    writer.write_all(b"</pre></details></article>")
+    if redactions.evidence_identifiers {
+        write_redaction_marker(writer, "evidence identifier")?;
+    } else {
+        let locator = serde_json::to_string(&fact.locator).map_err(io::Error::other)?;
+        write_text(writer, &locator)?;
+    }
+    writer.write_all(b"</dd></dl>")?;
+    if redactions.source_records {
+        writer.write_all(
+            b"<p class=\"notice\">Source record omitted by the selected redaction policy.</p>",
+        )?;
+    } else {
+        writer.write_all(b"<details><summary>Source record (JSON)</summary><pre>")?;
+        let evidence = if redactions.artifact_paths {
+            let mut value = serde_json::to_value(&fact.fact).map_err(io::Error::other)?;
+            replace_exact_named_fields(&mut value, "artifact_path", "[OMITTED: artifact path]");
+            serde_json::to_string_pretty(&value).map_err(io::Error::other)?
+        } else {
+            serde_json::to_string_pretty(&fact.fact).map_err(io::Error::other)?
+        };
+        write_text(writer, &evidence)?;
+        writer.write_all(b"</pre></details>")?;
+    }
+    writer.write_all(b"</article>")
+}
+
+fn has_redactions(policy: CaseHtmlRedactionPolicy) -> bool {
+    policy.case_text
+        || policy.artifact_paths
+        || policy.source_records
+        || policy.evidence_identifiers
+}
+
+fn write_redacted_text<W: Write>(
+    writer: &mut W,
+    value: &str,
+    redacted: bool,
+    field_group: &str,
+) -> io::Result<()> {
+    if redacted {
+        write_redaction_marker(writer, field_group)
+    } else {
+        write_text(writer, value)
+    }
+}
+
+fn write_redaction_marker<W: Write>(writer: &mut W, field_group: &str) -> io::Result<()> {
+    writer.write_all(b"<span class=\"value\">[OMITTED: ")?;
+    write_text(writer, field_group)?;
+    writer.write_all(b"]</span>")
+}
+
+fn count_exact_named_fields(value: &serde_json::Value, field_name: &str) -> usize {
+    match value {
+        serde_json::Value::Object(object) => object.iter().fold(0usize, |count, (key, value)| {
+            count + usize::from(key == field_name) + count_exact_named_fields(value, field_name)
+        }),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(|value| count_exact_named_fields(value, field_name))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn replace_exact_named_fields(value: &mut serde_json::Value, field_name: &str, replacement: &str) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object.iter_mut() {
+                if key == field_name {
+                    *value = serde_json::Value::String(replacement.to_owned());
+                } else {
+                    replace_exact_named_fields(value, field_name, replacement);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                replace_exact_named_fields(value, field_name, replacement);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn status_name(status: crate::audit_session::SessionStatus) -> &'static str {
@@ -203,7 +373,10 @@ fn is_default_ignorable(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::write_case_html;
+    use super::{
+        CaseHtmlRedactionPolicy, count_exact_named_fields, preview_case_html_redactions,
+        replace_exact_named_fields, write_case_html, write_case_html_with_redactions,
+    };
     use crate::audit_session::SessionStatus;
     use crate::case::{CaseEntryKind, CaseEvidenceLocator};
     use crate::case_evidence::{
@@ -237,7 +410,7 @@ mod tests {
                     entry: RootQueryEntry {
                         ordinal: 0,
                         name_hex: "3c7363726970743e".to_owned(),
-                        display_name: "<script>".to_owned(),
+                        display_name: "C:\\Users\\alice\\<script>".to_owned(),
                         object_type: "regular_file".to_owned(),
                         size_bytes: Some(1),
                         modified_at_unix_ms: None,
@@ -255,7 +428,7 @@ mod tests {
                 id: "A001".to_owned(),
                 kind: CaseEntryKind::Assertion,
                 authorship: "analyst_supplied_unverified".to_owned(),
-                text: "Inspect <script>alert(1)</script>\u{202e}".to_owned(),
+                text: "Inspect <script>alert(1)</script> at C:\\Users\\alice; arg=--token secret; endpoint=203.0.113.9\u{202e}".to_owned(),
                 severity: None,
                 confidence: None,
                 evidence_fact_indexes: vec![0],
@@ -278,9 +451,91 @@ mod tests {
         assert!(html.contains("id=\"fact-0\""));
         assert!(html.contains("<dt>Case status</dt><dd>in_review</dd>"));
         assert!(html.contains("<dt>Case revision</dt><dd>3</dd>"));
-        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;&amp;#x202E;"));
+        assert!(html.contains("Inspect &lt;script&gt;alert(1)&lt;/script&gt; at C:\\Users\\alice; arg=--token secret; endpoint=203.0.113.9&amp;#x202E;"));
         assert!(!html.contains("<script"));
         assert!(!html.contains("<img"));
         assert!(!html.contains("https://"));
+
+        let policy = CaseHtmlRedactionPolicy {
+            case_text: true,
+            artifact_paths: true,
+            source_records: true,
+            evidence_identifiers: true,
+        };
+        let preview = preview_case_html_redactions(&case, policy).unwrap();
+        assert_eq!(
+            preview
+                .iter()
+                .map(|item| (item.field_group, item.affected_field_occurrences))
+                .collect::<Vec<_>>(),
+            vec![
+                ("case-text", 2),
+                ("artifact-paths", 1),
+                ("source-records", 1),
+                ("evidence-identifiers", 5),
+            ]
+        );
+        let preview_text = format!("{preview:?}");
+        assert!(!preview_text.contains("alice"));
+        assert!(!preview_text.contains("secret"));
+        assert!(!preview_text.contains("203.0.113.9"));
+
+        let mut redacted = Vec::new();
+        write_case_html_with_redactions(&case, &mut redacted, policy).unwrap();
+        let redacted = String::from_utf8(redacted).unwrap();
+        assert!(redacted.contains("Redacted export"));
+        assert!(redacted.contains("does not detect sensitive substrings"));
+        assert!(redacted.contains("[OMITTED: case text]"));
+        assert!(redacted.contains("[OMITTED: artifact path]"));
+        assert!(redacted.contains("[OMITTED: evidence identifier]"));
+        assert!(redacted.contains("Source record omitted by the selected redaction policy."));
+        assert!(!redacted.contains("alice"));
+        assert!(!redacted.contains("secret"));
+        assert!(!redacted.contains("203.0.113.9"));
+        assert!(!redacted.contains("root-snapshot.json"));
+
+        let artifact_paths_only = CaseHtmlRedactionPolicy {
+            artifact_paths: true,
+            ..CaseHtmlRedactionPolicy::default()
+        };
+        let path_preview = preview_case_html_redactions(&case, artifact_paths_only).unwrap();
+        assert_eq!(path_preview[0].field_group, "artifact-paths");
+        assert_eq!(path_preview[0].affected_field_occurrences, 2);
+        let mut path_only_html = Vec::new();
+        write_case_html_with_redactions(&case, &mut path_only_html, artifact_paths_only).unwrap();
+        let path_only_html = String::from_utf8(path_only_html).unwrap();
+        assert!(!path_only_html.contains("root-snapshot.json"));
+        assert!(path_only_html.contains("[OMITTED: artifact path]"));
+        assert!(path_only_html.contains("alice"));
+
+        let mut exact_key_fixture = serde_json::json!({
+            "artifact_path": "C:/private/artifact.json",
+            "path": "C:/observed/event/path",
+            "display_name": "path=C:/free-text/path",
+            "nested": [{"artifact_path": "C:/private/nested.json", "path": "C:/nested/event/path"}]
+        });
+        assert_eq!(
+            count_exact_named_fields(&exact_key_fixture, "artifact_path"),
+            2
+        );
+        replace_exact_named_fields(
+            &mut exact_key_fixture,
+            "artifact_path",
+            "[OMITTED: artifact path]",
+        );
+        assert_eq!(
+            exact_key_fixture["artifact_path"],
+            "[OMITTED: artifact path]"
+        );
+        assert_eq!(
+            exact_key_fixture["nested"][0]["artifact_path"],
+            "[OMITTED: artifact path]"
+        );
+        assert_eq!(exact_key_fixture["path"], "C:/observed/event/path");
+        assert_eq!(
+            exact_key_fixture["nested"][0]["path"],
+            "C:/nested/event/path"
+        );
+        assert_eq!(exact_key_fixture["display_name"], "path=C:/free-text/path");
     }
 }

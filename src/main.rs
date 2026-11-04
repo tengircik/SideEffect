@@ -91,7 +91,7 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect case migrate --case <v1.json> --status draft|open --output <v2.json> --session <session-directory>...\n\
        sideeffect case set-status --case <v2.json> --status <status> --output <new-v2.json> --session <session-directory>...\n\
        sideeffect case add-entry --case <v2.json> --entry <entry.json> --output <new-v2.json> --session <session-directory>...\n\
-       sideeffect case resolve [--format json|html] [--output <new-report.html>] --case <case.json> --session <session-directory>...\n\
+       sideeffect case resolve [--format json|html] [--redact case-text|artifact-paths|source-records|evidence-identifiers]... [--preview-redaction | --output <new-report.html>] --case <case.json> --session <session-directory>...\n\
        sideeffect model-preview --question <question> <strace-trace-file>\n\
        sideeffect model-analyze --question <question> [--runtime <llama-cli>] --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect model-explain-preview --question <question> --backend auto|cpu|cuda <strace-trace-file>\n\
@@ -1953,7 +1953,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect compare-sessions BEFORE_SESSION_DIR AFTER_SESSION_DIR\nVerifies both local audit sessions, reports metadata comparability, and compares bounded item-level inventory and runtime evidence from verified artifacts. Per-source status and evidence references remain visible; missing, partial, unsupported, or incompatible sources do not become empty results. This is not an exhaustive history or coverage claim, and it does not establish causation or event absence. Incomparable or partial results exit with status 2 and include stable reason codes."
         }
         "case" => {
-            "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case migrate --case V1_CASE.json --status draft|open --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case set-status --case V2_CASE.json --status draft|open|in_review|closed|cancelled --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-entry --case V2_CASE.json --entry ENTRY.json --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case resolve [--format json|html] [--output NEW_REPORT.html] --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nCreates a private schema-v2 draft, explicitly migrates a schema-v1 case with a user-selected initial status, applies validated lifecycle transitions, appends one analyst-authored entry to a draft/open v2 case, or resolves evidence against supplied verified sessions. Each update writes a new private file and never replaces an existing file. Closed and cancelled cases are terminal. Case-authored assertions remain unverified; lifecycle status is an analyst workflow label. Hash checks establish byte consistency, not producer authenticity or capture completeness. JSON output may contain sensitive local evidence. Incomplete, partial, or unknown source status remains visible and exits with status 2."
+            "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case migrate --case V1_CASE.json --status draft|open --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case set-status --case V2_CASE.json --status draft|open|in_review|closed|cancelled --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-entry --case V2_CASE.json --entry ENTRY.json --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case resolve [--format json|html] [--output NEW_REPORT.html] [--redact GROUP...] [--preview-redaction] --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nCreates a private schema-v2 draft, explicitly migrates a schema-v1 case with a user-selected initial status, applies validated lifecycle transitions, appends one analyst-authored entry to a draft/open v2 case, or resolves evidence against supplied verified sessions. Each update writes a new private file and never replaces an existing file. Closed and cancelled cases are terminal. Case-authored assertions remain unverified; lifecycle status is an analyst workflow label. Hash checks establish byte consistency, not producer authenticity or capture completeness. JSON output may contain sensitive local evidence. HTML redaction groups are explicit whole-field omissions; preview reports counts only. Redaction does not scan text for sensitive substrings or make an export safe to share. Incomplete, partial, or unknown source status remains visible and exits with status 2."
         }
         "case init" => {
             "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\nCreates an empty schema-v2 draft bound to the exact manifests of supplied verified sessions. It does not add findings or evidence locators. Revision 1 has no parent digest. The output is private and never overwrites an existing file."
@@ -1968,7 +1968,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect case add-entry --case V2_CASE.json --entry ENTRY.json --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nValidates one bounded note/assertion JSON object and appends it only to a draft/open schema-v2 case after strict verification of all bound sessions and evidence locators. The source case is unchanged; output increments the branch-local revision and never overwrites an existing file. Schema-v1 cases require explicit migration first. Assertions require evidence locators and remain analyst_supplied_unverified."
         }
         "case resolve" => {
-            "Usage: sideeffect case resolve [--format json|html] [--output NEW_REPORT.html] --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nVerifies supplied sessions and resolves each case locator to its exact source record or selected-root entry. HTML is static, offline, bounded, private, and no-clobber. Session and artifact hashes establish consistency with the supplied manifest, not authenticity. Author-written assertions remain unverified; runtime completeness may remain unknown. Reports can contain sensitive paths, arguments, and raw payloads. Review before sharing."
+            "Usage: sideeffect case resolve [--format json|html] [--redact case-text|artifact-paths|source-records|evidence-identifiers]... [--preview-redaction | --output NEW_REPORT.html] --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nVerifies supplied sessions and resolves each case locator to its exact source record or selected-root entry. HTML is static, offline, bounded, private, and no-clobber. Repeat --redact with exact field groups; --preview-redaction reports only which groups and how many field occurrences would be omitted, and writes no report. A redacted export marks omitted fields. The artifact-paths group matches the exact structured key artifact_path, not path, display_name, or substrings. Group redaction does not detect paths, usernames, secrets, or other substrings in remaining free text and is not a safe-to-share guarantee; inspect the full output. The source case and evidence are unchanged. Session and artifact hashes establish consistency with the supplied manifest, not authenticity. Author-written assertions remain unverified; runtime completeness may remain unknown. Reports can contain sensitive paths, arguments, and raw payloads. Review before sharing."
         }
         "explain" => {
             "Usage: sideeffect explain TRACE\n       sideeffect explain --diff LEFT RIGHT\n       sideeffect explain --inventory-diff BEFORE.json AFTER.json\nCreates bounded deterministic summaries. It does not use a language model."
@@ -3046,9 +3046,19 @@ fn case_resolve_command(arguments: &[OsString]) -> Result<ExitCode, String> {
     let mut output_path: Option<&OsString> = None;
     let mut output_format = "json";
     let mut format_seen = false;
+    let mut redaction_preview = false;
+    let mut redactions = sideeffect::format::CaseHtmlRedactionPolicy::default();
     let mut index = 0;
     while index < arguments.len() {
         let flag = &arguments[index];
+        if flag.to_str() == Some("--preview-redaction") {
+            if redaction_preview {
+                return Err("duplicate case resolve --preview-redaction option".to_owned());
+            }
+            redaction_preview = true;
+            index += 1;
+            continue;
+        }
         let value = arguments.get(index + 1).ok_or_else(|| {
             format!(
                 "case resolve option {} requires a value",
@@ -3068,6 +3078,23 @@ fn case_resolve_command(arguments: &[OsString]) -> Result<ExitCode, String> {
                 format_seen = true;
             }
             Some("--format") => return Err("duplicate case resolve --format option".to_owned()),
+            Some("--redact") => {
+                let group = value
+                    .to_str()
+                    .ok_or("case resolve redaction group must be valid ASCII")?;
+                let selected = match group {
+                    "case-text" => &mut redactions.case_text,
+                    "artifact-paths" => &mut redactions.artifact_paths,
+                    "source-records" => &mut redactions.source_records,
+                    "evidence-identifiers" => &mut redactions.evidence_identifiers,
+                    _ => {
+                        return Err("case resolve --redact must be case-text, artifact-paths, source-records, or evidence-identifiers".to_owned());
+                    }
+                };
+                if std::mem::replace(selected, true) {
+                    return Err(format!("duplicate case resolve redaction group {group}"));
+                }
+            }
             Some("--output") if output_path.replace(value).is_none() => {}
             Some("--output") => return Err("duplicate case resolve --output option".to_owned()),
             Some("--case") => return Err("duplicate case resolve --case option".to_owned()),
@@ -3081,7 +3108,22 @@ fn case_resolve_command(arguments: &[OsString]) -> Result<ExitCode, String> {
         index += 2;
     }
     let case_path = case_path.ok_or("case resolve requires --case CASE.json")?;
-    if output_format == "html" && output_path.is_none() {
+    let any_redactions = redactions.case_text
+        || redactions.artifact_paths
+        || redactions.source_records
+        || redactions.evidence_identifiers;
+    if (any_redactions || redaction_preview) && output_format != "html" {
+        return Err("case resolve redaction options require --format html".to_owned());
+    }
+    if redaction_preview && !any_redactions {
+        return Err(
+            "case resolve --preview-redaction requires at least one --redact group".to_owned(),
+        );
+    }
+    if redaction_preview && output_path.is_some() {
+        return Err("case resolve --preview-redaction cannot be combined with --output".to_owned());
+    }
+    if output_format == "html" && output_path.is_none() && !redaction_preview {
         return Err("case resolve --format html requires --output NEW_REPORT.html".to_owned());
     }
     if output_format == "json" && output_path.is_some() {
@@ -3176,11 +3218,25 @@ fn case_resolve_command(arguments: &[OsString]) -> Result<ExitCode, String> {
             } => inventory_status != "complete",
             _ => false,
         });
-        if output_format == "json" {
+        if redaction_preview {
+            println!("Redaction preview for the resolved case HTML report:");
+            for item in sideeffect::format::preview_case_html_redactions(&resolved, redactions)
+                .map_err(|error| format!("could not preview case HTML redactions: {error}"))?
+            {
+                println!(
+                    "  {}: {} field occurrence(s) would be omitted",
+                    item.field_group, item.affected_field_occurrences
+                );
+            }
+            println!(
+                "No report was written. The preview contains counts only; inspect the redacted report before sharing. Selected structured fields are omitted as complete fields; substrings in remaining text are not detected."
+            );
+        } else if output_format == "json" {
             write_json(&resolved, "resolved investigation case")?;
         } else {
             let mut html = CappedBuffer::new(MAX_REPORT_BYTES);
-            sideeffect::format::write_case_html(&resolved, &mut html).map_err(|error| {
+            sideeffect::format::write_case_html_with_redactions(&resolved, &mut html, redactions)
+                .map_err(|error| {
                 if html.exceeded {
                     format!("case HTML report exceeds the {MAX_REPORT_BYTES} byte output limit")
                 } else {
@@ -3202,10 +3258,17 @@ fn case_resolve_command(arguments: &[OsString]) -> Result<ExitCode, String> {
                 let _ = output;
                 return Err("case workflows are not supported on this platform".to_owned());
             };
-            eprintln!(
-                "Offline case HTML report written to {}. It contains sensitive local evidence; review before sharing.",
-                terminal_safe_path(&published)
-            );
+            if any_redactions {
+                eprintln!(
+                    "Redacted offline case HTML report written to {}. Only selected structured fields were omitted; this is not a safe-to-share guarantee. Review the entire report before sharing.",
+                    terminal_safe_path(&published)
+                );
+            } else {
+                eprintln!(
+                    "Offline case HTML report written to {}. It contains sensitive local evidence; review before sharing.",
+                    terminal_safe_path(&published)
+                );
+            }
         }
         Ok(if incomplete {
             ExitCode::from(2)

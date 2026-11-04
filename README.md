@@ -366,6 +366,17 @@ sideeffect case resolve --format html --output ./review.html --case ./review.cas
 
 The default command writes bounded JSON; HTML is static, offline, size-bounded, private, and never overwrites an existing file. Both formats retain case status/revision and source/session status. Exit status `2` means some source or capture remains partial or unknown. Manifest, artifact, and parent-case hashes establish byte consistency; they do not authenticate who produced the evidence or prove an assertion, and the parent hash does not prevent forks or rewrites. Entry authoring is one JSON entry at a time; there is no interactive editor or role-specific report set yet. Reports can contain sensitive paths, arguments, and event payloads; keep them local and review before sharing.
 
+To preview exact whole-field omissions for an HTML export, select one or more groups. The preview prints only group names and affected field-occurrence counts and writes no report; rerun without `--preview-redaction` to write a separate redacted report:
+
+```sh
+sideeffect case resolve --format html --redact case-text --redact artifact-paths --redact source-records --redact evidence-identifiers --preview-redaction --case ./review.case.json --session ./audit-session
+sideeffect case resolve --format html --redact case-text --redact artifact-paths --redact source-records --redact evidence-identifiers --output ./review-redacted.html --case ./review.case.json --session ./audit-session
+```
+
+These groups omit the named structured fields as a whole and leave the source case and evidence unchanged. `artifact-paths` also replaces values under the exact structured key `artifact_path` inside source records that remain in the report; unrelated keys such as `path` or `display_name`, and substrings in free text, remain untouched. The feature does not scan text for path, username, endpoint, credential, or other sensitive substrings and does not guarantee that an export is safe to share. Review the complete output before sharing.
+
+`case-text` covers the case title and analyst entry text; `source-records` omits each resolved record block; `evidence-identifiers` omits the case/session identifiers and locator objects. Identifiers inside a retained source record remain unless `source-records` is also selected.
+
 ## What you can do
 
 | Workflow | Evidence and output |
