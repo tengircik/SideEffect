@@ -1472,7 +1472,7 @@ fn inventory_startup(output: &OsString) -> Result<ExitCode, String> {
             format!("could not publish private Windows startup inventory: {error}")
         })?;
         eprintln!(
-            "Saved a {} Windows startup-configuration snapshot to {}. It covers selected current-user and accessible machine Run/RunOnce keys, current/common Startup folders, visible service configuration, and boot/logon triggers in tasks visible to the current token; command text remains inert.",
+            "Saved a {} Windows startup-configuration snapshot to {}. It covers selected current-user and accessible machine Run/RunOnce keys, Startup folders, services, current-token-visible tasks, and local ROOT\\subscription WMI objects; command and script text remains inert.",
             if complete { "complete" } else { "partial" },
             terminal_safe_path(&path)
         );

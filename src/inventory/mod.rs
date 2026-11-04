@@ -33,6 +33,8 @@ mod startup_legacy;
 mod startup_state;
 #[cfg(windows)]
 mod startup_windows;
+#[cfg(windows)]
+mod startup_wmi;
 #[cfg(target_os = "linux")]
 mod systemd_units;
 #[cfg(windows)]
@@ -155,12 +157,19 @@ pub use startup_legacy::{
     ScanStatus as LegacyStartupStatus, collect_legacy_startup,
 };
 #[cfg(windows)]
+pub(crate) use startup_windows::collect_windows_startup_v5;
+#[cfg(windows)]
 pub use startup_windows::{
     WindowsRegistryStartupEntry, WindowsRegistryStartupEvidence, WindowsRegistryView,
     WindowsScheduledTaskStartupEntry, WindowsScheduledTaskStartupEvidence,
     WindowsServiceStartupEntry, WindowsServiceStartupEvidence, WindowsStartupDiagnostic,
     WindowsStartupFolderEntry, WindowsStartupFolderEvidence, WindowsStartupInventoryDocument,
     WindowsStartupSource, WindowsStartupStatus, collect_windows_startup,
+};
+#[cfg(windows)]
+pub use startup_wmi::{
+    WmiConsumerStatus, WmiEventConsumer, WmiEventFilter, WmiFilterConsumerBinding,
+    WmiReferenceStatus, WmiSubscriptionEvidence,
 };
 #[cfg(target_os = "linux")]
 pub use systemd_units::{UnitInventory as SystemdUnitInventory, UnitRecord as SystemdUnitRecord};

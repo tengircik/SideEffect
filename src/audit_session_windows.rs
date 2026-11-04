@@ -9,7 +9,7 @@ use crate::audit_session::{
 use crate::fingerprint::sha256_hex;
 use crate::inventory::{
     collect_path_executables, collect_windows_msix, collect_windows_permissions,
-    collect_windows_processes, collect_windows_software, collect_windows_startup,
+    collect_windows_processes, collect_windows_software, collect_windows_startup_v5,
 };
 use crate::record::publish_private_windows_directory;
 use serde::Serialize;
@@ -216,7 +216,7 @@ pub fn collect_and_publish(
         ));
     }
     if options.startup {
-        let doc = collect_windows_startup();
+        let doc = collect_windows_startup_v5();
         let (status, diagnostics) = status_from_serialized(&doc, "status");
         let value = serde_json::to_vec(&doc)
             .map_err(|e| format!("could not serialize startup inventory: {e}"))?;

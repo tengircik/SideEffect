@@ -82,7 +82,7 @@ On Windows:
 sideeffect.exe inventory startup --output .\startup.json
 ```
 
-The inventory retains source-linked configuration facts for supported startup locations, including XDG, systemd, SysV, and cron on Linux; Windows Run/RunOnce entries, Startup folders, visible services, and visible Task Scheduler boot/logon triggers. Configured commands remain inert evidence.
+The inventory retains source-linked configuration facts for supported startup locations, including XDG, systemd, SysV, and cron on Linux; Windows Run/RunOnce entries, Startup folders, visible services, Task Scheduler boot/logon triggers, and permanent WMI subscriptions from the local `ROOT\subscription` namespace. WMI query, command, and script strings remain inert evidence. Startup schema v6 includes the WMI source; audit-session v9 intentionally retains its pinned Windows startup v5 artifact until a separate session-schema update.
 
 On Windows, inspect registered executable path metadata with `sideeffect.exe inventory app-paths --output .\app-paths.json`. This reads only selected current-user and accessible machine App Paths registry entries. It does not scan disks, expand environment strings, or establish that a registered program exists or can be launched. Registry paths and names can be sensitive.
 

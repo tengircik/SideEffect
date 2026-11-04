@@ -4,6 +4,9 @@
 //! This module never expands environment strings, parses command lines, or
 //! launches entries.
 
+use super::startup_wmi::{
+    WmiEventConsumer, WmiEventFilter, WmiFilterConsumerBinding, collect_wmi_startup,
+};
 use serde::Serialize;
 use std::ffi::{OsStr, c_void};
 use std::fs;
@@ -549,6 +552,12 @@ pub struct WindowsStartupInventoryDocument {
     pub service_entries: Vec<WindowsServiceStartupEntry>,
     pub scheduled_task_entries: Vec<WindowsScheduledTaskStartupEntry>,
     pub scheduled_task_actions: Vec<WindowsScheduledTaskAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wmi_event_filters: Option<Vec<WmiEventFilter>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wmi_event_consumers: Option<Vec<WmiEventConsumer>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wmi_filter_consumer_bindings: Option<Vec<WmiFilterConsumerBinding>>,
 }
 
 #[derive(Clone, Copy)]
@@ -779,6 +788,16 @@ fn now_ms() -> u128 {
 }
 
 pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
+    collect_windows_startup_with_wmi(true)
+}
+
+/// Session schema v9 pins startup artifacts to v5; keep its legacy collector
+/// route until a separately reviewed session schema can adopt startup v6.
+pub(crate) fn collect_windows_startup_v5() -> WindowsStartupInventoryDocument {
+    collect_windows_startup_with_wmi(false)
+}
+
+fn collect_windows_startup_with_wmi(include_wmi: bool) -> WindowsStartupInventoryDocument {
     let started_at = now_ms();
     let started = Instant::now();
     let mut sources = Vec::new();
@@ -862,6 +881,10 @@ pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
     sources.push(task_source);
     scheduled_task_entries.extend(tasks);
     let scheduled_task_actions = task_actions;
+    let wmi = include_wmi.then(|| collect_wmi_startup(started));
+    if let Some(wmi) = &wmi {
+        sources.push(wmi.source.clone());
+    }
     let status = if sources.iter().any(|source| {
         !matches!(
             source.status,
@@ -874,9 +897,13 @@ pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
     };
     WindowsStartupInventoryDocument {
         schema: "sideeffect.windows_startup_inventory",
-        schema_version: 5,
+        schema_version: if include_wmi { 6 } else { 5 },
         platform: "windows",
-        scope: "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks",
+        scope: if include_wmi {
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+        } else {
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks"
+        },
         capture_started_at_unix_ms: started_at,
         capture_ended_at_unix_ms: now_ms(),
         status,
@@ -886,6 +913,9 @@ pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
         service_entries,
         scheduled_task_entries,
         scheduled_task_actions,
+        wmi_event_filters: wmi.as_ref().map(|wmi| wmi.filters.clone()),
+        wmi_event_consumers: wmi.as_ref().map(|wmi| wmi.consumers.clone()),
+        wmi_filter_consumer_bindings: wmi.as_ref().map(|wmi| wmi.bindings.clone()),
     }
 }
 
@@ -2510,7 +2540,7 @@ fn bounded_optional_wide_in_buffer(
     }
 }
 
-fn elapsed(started: Instant) -> bool {
+pub(super) fn elapsed(started: Instant) -> bool {
     started.elapsed().as_millis() >= MAX_SCAN_DURATION_MS
 }
 
@@ -3124,7 +3154,7 @@ fn collect_startup_folder(
     )
 }
 
-fn source_result(
+pub(super) fn source_result(
     id: &'static str,
     status: WindowsStartupStatus,
     entries_seen: usize,
@@ -3164,7 +3194,7 @@ fn source_result_with_location(
     }
 }
 
-fn diagnostic(
+pub(super) fn diagnostic(
     code: &'static str,
     item_index: Option<usize>,
     message: &'static str,
@@ -3193,7 +3223,7 @@ fn diagnostic_win32(
     }
 }
 
-fn diagnostic_hresult(
+pub(super) fn diagnostic_hresult(
     code: &'static str,
     item_index: Option<usize>,
     message: &'static str,

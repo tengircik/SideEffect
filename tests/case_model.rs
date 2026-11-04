@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use sideeffect::audit_session::AUDIT_SESSION_SCHEMA_VERSION;
 use sideeffect::case::{
     CASE_SCHEMA, CASE_SCHEMA_VERSION, CasePlatform, Confidence, InvestigationCase, MAX_CASE_BYTES,
     MAX_CASE_ENTRIES, MAX_CASE_SESSIONS, Severity,
@@ -388,6 +389,19 @@ fn case_model_validates_platform_specific_locator_shapes() {
     let mut malformed = windows_case;
     malformed["entries"][0]["evidence"][0]["json_pointer"] = json!("events/1");
     assert!(parse(&malformed).unwrap_err().contains("JSON pointer"));
+}
+
+#[test]
+fn case_model_accepts_current_audit_session_schema_and_rejects_future_versions() {
+    let mut current = valid_case();
+    current["sessions"][0]["manifest_schema_version"] = json!(AUDIT_SESSION_SCHEMA_VERSION);
+    assert!(parse(&current).is_ok());
+
+    let mut future = valid_case();
+    future["sessions"][0]["manifest_schema_version"] = json!(AUDIT_SESSION_SCHEMA_VERSION + 1);
+    assert!(parse(&future).unwrap_err().contains(&format!(
+        "must be between 1 and {AUDIT_SESSION_SCHEMA_VERSION}"
+    )));
 }
 
 #[test]

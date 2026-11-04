@@ -273,7 +273,7 @@ pub fn summarize_windows_startup_behavior(
             version: 1,
             basis: "exact_equality_of_drive_rooted_windows_path_strings",
         },
-        platform_adapter: "windows_startup_inventory_v4_or_v5_windows_runtime_capture_v3",
+        platform_adapter: "windows_startup_inventory_v4_v5_or_v6_windows_runtime_capture_v3",
         capture_completeness: "unknown",
         status: if partial { "partial" } else { "complete" },
         association_status: if associations.is_empty() {
@@ -315,6 +315,7 @@ pub fn summarize_windows_startup_behavior(
         diagnostics,
         limitations: vec![
             "Only observed Exec scheduled-task actions with drive-rooted literal paths are considered.",
+            "WMI permanent event subscriptions are retained by the startup inventory but are not correlated with ETW process-start observations by this adapter.",
             "Only decoded process-start events with a drive-rooted ImageFileName string are considered; no basename matching, path normalization, environment expansion, or device-path conversion is performed.",
             "A candidate path match does not establish that a task ran, launched the observed process, or caused any behavior.",
             "The Windows ETW capture is system-wide for a bounded window; target and descendant attribution is not established.",
@@ -338,12 +339,12 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
         .ok_or_else(|| "Windows startup inventory must be a JSON object".to_owned())?;
     let schema_version = object.get("schema_version").and_then(Value::as_u64);
     if object.get("schema").and_then(Value::as_str) != Some(WINDOWS_STARTUP_INVENTORY_SCHEMA)
-        || !matches!(schema_version, Some(4 | 5))
+        || !matches!(schema_version, Some(4..=6))
         || object.get("platform").and_then(Value::as_str) != Some("windows")
     {
         return Err("unsupported Windows startup inventory schema or platform".to_owned());
     }
-    const REQUIRED_FIELDS: [&str; 13] = [
+    const REQUIRED_FIELDS_V4_V5: [&str; 13] = [
         "schema",
         "schema_version",
         "platform",
@@ -358,10 +359,23 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
         "scheduled_task_entries",
         "scheduled_task_actions",
     ];
-    if object.len() != REQUIRED_FIELDS.len()
+    const WMI_FIELDS: [&str; 3] = [
+        "wmi_event_filters",
+        "wmi_event_consumers",
+        "wmi_filter_consumer_bindings",
+    ];
+    let expected_fields = if schema_version == Some(6) {
+        REQUIRED_FIELDS_V4_V5
+            .into_iter()
+            .chain(WMI_FIELDS)
+            .collect::<Vec<_>>()
+    } else {
+        REQUIRED_FIELDS_V4_V5.to_vec()
+    };
+    if object.len() != expected_fields.len()
         || object
             .keys()
-            .any(|key| !REQUIRED_FIELDS.contains(&key.as_str()))
+            .any(|key| !expected_fields.contains(&key.as_str()))
     {
         return Err("Windows startup inventory has missing or unknown top-level fields".to_owned());
     }
@@ -394,7 +408,195 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
             ));
         }
         for (index, entry) in entries.iter().enumerate() {
-            validate_inventory_row(field, index, entry, schema_version == Some(5))?;
+            validate_inventory_row(field, index, entry, schema_version.is_some_and(|v| v >= 5))?;
+        }
+    }
+    if schema_version == Some(6) {
+        let mut copied_bytes = 0usize;
+        for (field, expected_class) in [
+            ("wmi_event_filters", "__EventFilter"),
+            ("wmi_event_consumers", "__EventConsumer"),
+            ("wmi_filter_consumer_bindings", "__FilterToConsumerBinding"),
+        ] {
+            let rows = object
+                .get(field)
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("Windows startup inventory {field} must be an array"))?;
+            if rows.len() > 2048 {
+                return Err(format!(
+                    "Windows startup inventory {field} exceeds the 2048 row limit"
+                ));
+            }
+            for (index, row) in rows.iter().enumerate() {
+                let fields: &[&str] = match field {
+                    "wmi_event_filters" => &[
+                        "object_path",
+                        "name",
+                        "creator_sid",
+                        "event_namespace",
+                        "query_language",
+                        "query",
+                        "evidence",
+                    ],
+                    "wmi_event_consumers" => &[
+                        "object_path",
+                        "class_name",
+                        "name",
+                        "creator_sid",
+                        "status",
+                        "executable_path",
+                        "command_line_template",
+                        "script_file_name",
+                        "script_text",
+                        "evidence",
+                    ],
+                    _ => &[
+                        "object_path",
+                        "filter_reference",
+                        "consumer_reference",
+                        "filter_reference_status",
+                        "consumer_reference_status",
+                        "creator_sid",
+                        "delivery_qos",
+                        "evidence",
+                    ],
+                };
+                let optional_fields: &[&str] = if field == "wmi_event_consumers" {
+                    &["detail_evidence"]
+                } else {
+                    &[]
+                };
+                let row = row
+                    .as_object()
+                    .ok_or_else(|| format!("{field}[{index}] must be an object"))?;
+                if row.keys().any(|key| {
+                    !fields.contains(&key.as_str()) && !optional_fields.contains(&key.as_str())
+                }) || fields.iter().any(|key| !row.contains_key(*key))
+                {
+                    return Err(format!("{field}[{index}] has missing or unknown fields"));
+                }
+                for key in fields.iter().filter(|key| **key != "evidence") {
+                    let value = row.get(*key).unwrap();
+                    if value.is_null()
+                        && *key != "object_path"
+                        && *key != "class_name"
+                        && *key != "filter_reference"
+                        && *key != "consumer_reference"
+                        && *key != "status"
+                        && *key != "filter_reference_status"
+                        && *key != "consumer_reference_status"
+                    {
+                        continue;
+                    }
+                    let text = value.as_str().ok_or_else(|| {
+                        format!("{field}[{index}].{key} must be bounded text or null")
+                    })?;
+                    if text.len() > MAX_ACTION_FIELD_BYTES {
+                        return Err(format!(
+                            "{field}[{index}].{key} exceeds the {MAX_ACTION_FIELD_BYTES} byte limit"
+                        ));
+                    }
+                    copied_bytes = copied_bytes
+                        .checked_add(text.len())
+                        .filter(|total| *total <= MAX_ACTION_METADATA_BYTES)
+                        .ok_or_else(|| {
+                            "Windows startup WMI metadata exceeds the 8 MiB copied-field budget"
+                                .to_owned()
+                        })?;
+                }
+                let evidence = row
+                    .get("evidence")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| format!("{field}[{index}].evidence must be an object"))?;
+                const EVIDENCE_FIELDS: [&str; 4] =
+                    ["source", "namespace", "class_name", "object_index"];
+                if evidence.len() != EVIDENCE_FIELDS.len()
+                    || evidence
+                        .keys()
+                        .any(|key| !EVIDENCE_FIELDS.contains(&key.as_str()))
+                {
+                    return Err(format!(
+                        "{field}[{index}].evidence has missing or unknown fields"
+                    ));
+                }
+                if evidence.get("class_name").and_then(Value::as_str) != Some(expected_class)
+                    || evidence.get("namespace").and_then(Value::as_str)
+                        != Some("ROOT\\subscription")
+                {
+                    return Err(format!(
+                        "{field}[{index}].evidence does not match the declared WMI source"
+                    ));
+                }
+                for key in ["source", "namespace", "class_name"] {
+                    bounded_string(evidence.get(key), MAX_ACTION_FIELD_BYTES, "wmi evidence")?;
+                }
+                if evidence
+                    .get("object_index")
+                    .and_then(Value::as_u64)
+                    .is_none()
+                {
+                    return Err(format!(
+                        "{field}[{index}].evidence.object_index must be an unsigned integer"
+                    ));
+                }
+                if let Some(detail_value) = row.get("detail_evidence") {
+                    let detail = detail_value.as_object().ok_or_else(|| {
+                        format!("{field}[{index}].detail_evidence must be an object")
+                    })?;
+                    if detail.len() != EVIDENCE_FIELDS.len()
+                        || detail
+                            .keys()
+                            .any(|key| !EVIDENCE_FIELDS.contains(&key.as_str()))
+                    {
+                        return Err(format!(
+                            "{field}[{index}].detail_evidence has missing or unknown fields"
+                        ));
+                    }
+                    if !matches!(
+                        detail.get("class_name").and_then(Value::as_str),
+                        Some("CommandLineEventConsumer" | "ActiveScriptEventConsumer")
+                    ) || detail.get("source").and_then(Value::as_str)
+                        != Some("IWbemLocator/IWbemServices/IEnumWbemClassObject")
+                        || detail.get("namespace").and_then(Value::as_str)
+                            != Some("ROOT\\subscription")
+                    {
+                        return Err(format!(
+                            "{field}[{index}].detail_evidence does not match a fixed consumer projection"
+                        ));
+                    }
+                    for key in ["source", "namespace", "class_name"] {
+                        bounded_string(
+                            detail.get(key),
+                            MAX_ACTION_FIELD_BYTES,
+                            "wmi detail evidence",
+                        )?;
+                    }
+                    if detail.get("object_index").and_then(Value::as_u64).is_none() {
+                        return Err(format!(
+                            "{field}[{index}].detail_evidence.object_index must be an unsigned integer"
+                        ));
+                    }
+                }
+                if field == "wmi_event_consumers"
+                    && !matches!(
+                        row.get("status").and_then(Value::as_str),
+                        Some("observed" | "unsupported_class" | "partial")
+                    )
+                {
+                    return Err(format!("{field}[{index}].status is unsupported"));
+                }
+                if field == "wmi_filter_consumer_bindings"
+                    && (!matches!(
+                        row.get("filter_reference_status").and_then(Value::as_str),
+                        Some("resolved" | "unresolved")
+                    ) || !matches!(
+                        row.get("consumer_reference_status").and_then(Value::as_str),
+                        Some("resolved" | "unresolved")
+                    ))
+                {
+                    return Err(format!("{field}[{index}] has an invalid reference status"));
+                }
+            }
         }
     }
     let status = object
@@ -431,7 +633,7 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
         let action = value
             .as_object()
             .ok_or_else(|| format!("scheduled-task action {index} must be an object"))?;
-        let has_states = schema_version == Some(5);
+        let has_states = schema_version.is_some_and(|version| version >= 5);
         let mut required_action_fields = vec![
             "action_index",
             "action_type",
@@ -1356,7 +1558,7 @@ mod tests {
     fn unsupported_versions_malformed_fields_and_duplicate_keys_are_rejected() {
         let mut startup: Value =
             serde_json::from_slice(&startup_bytes(vec![], "complete")).unwrap();
-        startup["schema_version"] = Value::from(6);
+        startup["schema_version"] = Value::from(7);
         assert!(
             summarize_windows_startup_behavior(
                 &serde_json::to_vec(&startup).unwrap(),
@@ -1428,7 +1630,7 @@ mod tests {
         assert_eq!(summary.association_status, "insufficient_evidence");
         assert_eq!(
             summary.platform_adapter,
-            "windows_startup_inventory_v4_or_v5_windows_runtime_capture_v3"
+            "windows_startup_inventory_v4_v5_or_v6_windows_runtime_capture_v3"
         );
         assert_eq!(
             summary.inputs.startup_inventory.source_format,

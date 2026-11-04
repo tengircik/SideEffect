@@ -18,7 +18,7 @@ fn temporary_directory() -> std::path::PathBuf {
 }
 
 #[test]
-fn windows_startup_command_reports_service_and_task_sources() {
+fn windows_startup_command_reports_native_startup_sources() {
     let directory = temporary_directory();
     let output = directory.join("startup.json");
     let run = || {
@@ -33,7 +33,7 @@ fn windows_startup_command_reports_service_and_task_sources() {
     let bytes = fs::read(&output).unwrap();
     let document: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(document["schema"], "sideeffect.windows_startup_inventory");
-    assert_eq!(document["schema_version"], 5);
+    assert_eq!(document["schema_version"], 6);
     assert_eq!(document["platform"], "windows");
     match document["status"].as_str().unwrap() {
         "complete" => assert_eq!(first.status.code(), Some(0)),
@@ -45,7 +45,7 @@ fn windows_startup_command_reports_service_and_task_sources() {
     }
     assert_eq!(
         document["scope"],
-        "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks"
+        "current_user_and_accessible_machine_run_keys_startup_folders_services_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
     );
     let sources = document["sources"].as_array().unwrap();
     for required in [
@@ -59,6 +59,9 @@ fn windows_startup_command_reports_service_and_task_sources() {
         "local_machine_run_once_32",
         "user_startup",
         "common_startup",
+        "service_start_configuration",
+        "scheduled_task_triggers",
+        "wmi_permanent_event_subscriptions",
     ] {
         assert!(sources.iter().any(|source| source["id"] == required));
     }
@@ -83,6 +86,31 @@ fn windows_startup_command_reports_service_and_task_sources() {
     assert_eq!(
         scheduled_tasks["entries_seen"].as_u64().unwrap(),
         document["scheduled_task_entries"].as_array().unwrap().len() as u64
+    );
+    let wmi_source = sources
+        .iter()
+        .find(|source| source["id"] == "wmi_permanent_event_subscriptions")
+        .unwrap();
+    assert!(matches!(
+        wmi_source["status"].as_str(),
+        Some("complete" | "partial" | "inaccessible" | "unavailable" | "error")
+    ));
+    assert_eq!(wmi_source["location_path"], "ROOT\\subscription");
+    for field in [
+        "wmi_event_filters",
+        "wmi_event_consumers",
+        "wmi_filter_consumer_bindings",
+    ] {
+        assert!(document[field].is_array());
+    }
+    assert_eq!(
+        wmi_source["entries_seen"].as_u64().unwrap(),
+        document["wmi_event_filters"].as_array().unwrap().len() as u64
+            + document["wmi_event_consumers"].as_array().unwrap().len() as u64
+            + document["wmi_filter_consumer_bindings"]
+                .as_array()
+                .unwrap()
+                .len() as u64
     );
     for entry in document["service_entries"].as_array().unwrap() {
         assert_eq!(entry["startup_state"]["configured"], "present");

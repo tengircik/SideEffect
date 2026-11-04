@@ -343,8 +343,12 @@ fn validate(v: &Value, k: Kind) -> Result<(), StartupDiffError> {
         Kind::Windows => (
             WINDOWS,
             "windows",
-            "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks",
-            &[4_u64, 5][..],
+            if num(v, "schema_version").unwrap_or(4) >= 6 {
+                "current_user_and_accessible_machine_run_keys_startup_folders_services_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+            } else {
+                "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks"
+            },
+            &[4_u64, 5, 6][..],
         ),
     };
     let version = num(v, "schema_version")?;
@@ -382,6 +386,9 @@ fn validate(v: &Value, k: Kind) -> Result<(), StartupDiffError> {
                 "service_entries",
                 "scheduled_task_entries",
                 "scheduled_task_actions",
+                "wmi_event_filters",
+                "wmi_event_consumers",
+                "wmi_filter_consumer_bindings",
             ][..],
         ]
         .concat()
@@ -404,7 +411,7 @@ fn validate(v: &Value, k: Kind) -> Result<(), StartupDiffError> {
     if k == Kind::Linux {
         validate_linux(v, version == 3)?
     } else {
-        validate_windows(v, version == 5)?
+        validate_windows(v, version)?
     }
     Ok(())
 }
@@ -426,6 +433,9 @@ fn validate_known_fields(v: &Value) -> Result<(), StartupDiffError> {
         "service_entries",
         "scheduled_task_entries",
         "scheduled_task_actions",
+        "wmi_event_filters",
+        "wmi_event_consumers",
+        "wmi_filter_consumer_bindings",
         "directories",
         "entries",
         "records",
@@ -492,6 +502,7 @@ fn validate_known_fields(v: &Value) -> Result<(), StartupDiffError> {
         "command",
         "command_utf16_hex",
         "evidence",
+        "detail_evidence",
         "value_index",
         "registry_type",
         "folder_scope",
@@ -514,6 +525,24 @@ fn validate_known_fields(v: &Value) -> Result<(), StartupDiffError> {
         "action_type",
         "action_type_code",
         "executable_path",
+        "object_path",
+        "name",
+        "creator_sid",
+        "event_namespace",
+        "query_language",
+        "query",
+        "class_name",
+        "status",
+        "command_line_template",
+        "script_file_name",
+        "script_text",
+        "filter_reference",
+        "consumer_reference",
+        "filter_reference_status",
+        "consumer_reference_status",
+        "delivery_qos",
+        "namespace",
+        "object_index",
         "arguments",
         "working_directory",
         "source",
@@ -939,8 +968,10 @@ fn validate_linux(v: &Value, has_states: bool) -> Result<(), StartupDiffError> {
     }
     Ok(())
 }
-fn validate_windows(v: &Value, has_states: bool) -> Result<(), StartupDiffError> {
-    let all = &[
+fn validate_windows(v: &Value, version: u64) -> Result<(), StartupDiffError> {
+    let has_states = version >= 5;
+    let has_wmi = version >= 6;
+    let mut all = vec![
         ("sources", 8192usize),
         ("registry_entries", 8192),
         ("folder_entries", 8192),
@@ -948,27 +979,42 @@ fn validate_windows(v: &Value, has_states: bool) -> Result<(), StartupDiffError>
         ("scheduled_task_entries", 8192),
         ("scheduled_task_actions", 8192),
     ];
+    if has_wmi {
+        all.extend([
+            ("wmi_event_filters", 2048),
+            ("wmi_event_consumers", 2048),
+            ("wmi_filter_consumer_bindings", 2048),
+        ]);
+    }
     for (key, cap) in all {
-        if arr(v, key)?.len() > *cap {
+        if arr(v, key)?.len() > cap {
             return Err(StartupDiffError::LimitExceeded);
         }
     }
-    let row_total = [
+    let mut row_fields = vec![
         "registry_entries",
         "folder_entries",
         "service_entries",
         "scheduled_task_entries",
         "scheduled_task_actions",
-    ]
-    .into_iter()
-    .map(|key| arr(v, key).map(<[Value]>::len))
-    .collect::<Result<Vec<_>, _>>()?
-    .into_iter()
-    .sum::<usize>();
+    ];
+    if has_wmi {
+        row_fields.extend([
+            "wmi_event_filters",
+            "wmi_event_consumers",
+            "wmi_filter_consumer_bindings",
+        ]);
+    }
+    let row_total = row_fields
+        .into_iter()
+        .map(|key| arr(v, key).map(<[Value]>::len))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .sum::<usize>();
     if row_total > MAX_ROWS {
         return Err(StartupDiffError::LimitExceeded);
     }
-    let expected_sources: BTreeSet<&str> = [
+    let mut expected_sources: BTreeSet<&str> = [
         "current_user_run_native",
         "current_user_run_once_native",
         "current_user_run_32",
@@ -984,6 +1030,9 @@ fn validate_windows(v: &Value, has_states: bool) -> Result<(), StartupDiffError>
     ]
     .into_iter()
     .collect();
+    if has_wmi {
+        expected_sources.insert("wmi_permanent_event_subscriptions");
+    }
     let mut seen_sources = BTreeSet::new();
     for s in arr(v, "sources")? {
         keys(
@@ -1243,6 +1292,111 @@ fn validate_windows(v: &Value, has_states: bool) -> Result<(), StartupDiffError>
             return Err(StartupDiffError::MalformedInput);
         }
         let _ = num(ev, "task_index")?;
+    }
+    if has_wmi {
+        for (field, expected_class) in [
+            ("wmi_event_filters", "__EventFilter"),
+            ("wmi_event_consumers", "__EventConsumer"),
+            ("wmi_filter_consumer_bindings", "__FilterToConsumerBinding"),
+        ] {
+            for (index, row) in arr(v, field)?.iter().enumerate() {
+                let fields: &[&str] = match field {
+                    "wmi_event_filters" => &[
+                        "object_path",
+                        "name",
+                        "creator_sid",
+                        "event_namespace",
+                        "query_language",
+                        "query",
+                        "evidence",
+                    ],
+                    "wmi_event_consumers" => &[
+                        "object_path",
+                        "class_name",
+                        "name",
+                        "creator_sid",
+                        "status",
+                        "executable_path",
+                        "command_line_template",
+                        "script_file_name",
+                        "script_text",
+                        "evidence",
+                        "detail_evidence",
+                    ],
+                    _ => &[
+                        "object_path",
+                        "filter_reference",
+                        "consumer_reference",
+                        "filter_reference_status",
+                        "consumer_reference_status",
+                        "creator_sid",
+                        "delivery_qos",
+                        "evidence",
+                    ],
+                };
+                keys(row, fields)?;
+                for name in fields
+                    .iter()
+                    .filter(|name| **name != "evidence" && **name != "detail_evidence")
+                {
+                    check_str(row, name, 32768)?;
+                }
+                let evidence = row
+                    .get("evidence")
+                    .ok_or(StartupDiffError::MalformedInput)?;
+                keys(
+                    evidence,
+                    &["source", "namespace", "class_name", "object_index"],
+                )?;
+                if text(evidence, "class_name")? != expected_class
+                    || text(evidence, "namespace")? != "ROOT\\subscription"
+                {
+                    return Err(StartupDiffError::MalformedInput);
+                }
+                if text(evidence, "source")? != "IWbemLocator/IWbemServices/IEnumWbemClassObject" {
+                    return Err(StartupDiffError::MalformedInput);
+                }
+                let _ = num(evidence, "object_index")?;
+                if field == "wmi_event_consumers"
+                    && !matches!(
+                        text(row, "status")?,
+                        "observed" | "unsupported_class" | "partial"
+                    )
+                {
+                    return Err(StartupDiffError::MalformedInput);
+                }
+                if field == "wmi_event_consumers"
+                    && let Some(detail) = row.get("detail_evidence")
+                {
+                    keys(
+                        detail,
+                        &["source", "namespace", "class_name", "object_index"],
+                    )?;
+                    if text(detail, "source")? != "IWbemLocator/IWbemServices/IEnumWbemClassObject"
+                        || text(detail, "namespace")? != "ROOT\\subscription"
+                        || !matches!(
+                            text(detail, "class_name")?,
+                            "CommandLineEventConsumer" | "ActiveScriptEventConsumer"
+                        )
+                    {
+                        return Err(StartupDiffError::MalformedInput);
+                    }
+                    let _ = num(detail, "object_index")?;
+                }
+                if field == "wmi_filter_consumer_bindings"
+                    && (!matches!(
+                        text(row, "filter_reference_status")?,
+                        "resolved" | "unresolved"
+                    ) || !matches!(
+                        text(row, "consumer_reference_status")?,
+                        "resolved" | "unresolved"
+                    ))
+                {
+                    return Err(StartupDiffError::MalformedInput);
+                }
+                let _ = index;
+            }
+        }
     }
     Ok(())
 }
@@ -1582,7 +1736,12 @@ fn linux_component_complete(v: &Value) -> bool {
 fn windows_complete(v: &Value) -> bool {
     v["status"] == "complete"
         && v["sources"].as_array().is_some_and(|a| {
-            a.len() == 12
+            a.len()
+                == if num(v, "schema_version").unwrap_or(5) >= 6 {
+                    13
+                } else {
+                    12
+                }
                 && a.iter()
                     .all(|s| matches!(s["status"].as_str(), Some("complete" | "not_present")))
         })
@@ -1689,6 +1848,72 @@ fn windows_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
             complete: source_complete(v, id),
             lossy_identity: false,
         });
+    }
+    if num(v, "schema_version").unwrap_or(5) >= 6 {
+        for (i, e) in arr(v, "wmi_event_filters")?.iter().enumerate() {
+            rows.push(Row {
+                category: "wmi_event_filter",
+                key: text(e, "object_path")?.to_owned(),
+                facts: objfact(
+                    e,
+                    &[
+                        ("name", "name"),
+                        ("creator_sid", "creator_sid"),
+                        ("event_namespace", "event_namespace"),
+                        ("query_language", "query_language"),
+                        ("query", "query"),
+                    ],
+                ),
+                refs: vec![ptr("/wmi_event_filters", i)],
+                complete: source_complete(v, "wmi_permanent_event_subscriptions"),
+                lossy_identity: false,
+            });
+        }
+        for (i, e) in arr(v, "wmi_event_consumers")?.iter().enumerate() {
+            rows.push(Row {
+                category: "wmi_event_consumer",
+                key: text(e, "object_path")?.to_owned(),
+                facts: objfact(
+                    e,
+                    &[
+                        ("class_name", "class_name"),
+                        ("name", "name"),
+                        ("creator_sid", "creator_sid"),
+                        ("status", "status"),
+                        ("executable_path", "executable_path"),
+                        ("command_line_template", "command_line_template"),
+                        ("script_file_name", "script_file_name"),
+                        ("script_text", "script_text"),
+                    ],
+                ),
+                refs: vec![ptr("/wmi_event_consumers", i)],
+                complete: source_complete(v, "wmi_permanent_event_subscriptions")
+                    && e["status"] == "observed",
+                lossy_identity: false,
+            });
+        }
+        for (i, e) in arr(v, "wmi_filter_consumer_bindings")?.iter().enumerate() {
+            rows.push(Row {
+                category: "wmi_filter_consumer_binding",
+                key: text(e, "object_path")?.to_owned(),
+                facts: objfact(
+                    e,
+                    &[
+                        ("filter_reference", "filter_reference"),
+                        ("consumer_reference", "consumer_reference"),
+                        ("filter_reference_status", "filter_reference_status"),
+                        ("consumer_reference_status", "consumer_reference_status"),
+                        ("creator_sid", "creator_sid"),
+                        ("delivery_qos", "delivery_qos"),
+                    ],
+                ),
+                refs: vec![ptr("/wmi_filter_consumer_bindings", i)],
+                complete: source_complete(v, "wmi_permanent_event_subscriptions")
+                    && e["filter_reference_status"] == "resolved"
+                    && e["consumer_reference_status"] == "resolved",
+                lossy_identity: false,
+            });
+        }
     }
     let mut groups = BTreeMap::<String, Vec<(usize, &Value)>>::new();
     for (i, e) in arr(v, "scheduled_task_actions")?.iter().enumerate() {
@@ -1798,6 +2023,19 @@ mod tests {
         value
     }
 
+    fn windows_v6() -> Value {
+        let mut value = windows_v5();
+        value["schema_version"] = json!(6);
+        value["scope"] = json!(
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+        );
+        value["sources"].as_array_mut().unwrap().push(json!({"id":"wmi_permanent_event_subscriptions","status":"complete","entries_seen":0,"location_path":"ROOT\\subscription","diagnostics":[]}));
+        value["wmi_event_filters"] = json!([]);
+        value["wmi_event_consumers"] = json!([]);
+        value["wmi_filter_consumer_bindings"] = json!([]);
+        value
+    }
+
     #[test]
     fn startup_state_contract_requires_direct_evidence_for_known_dimensions() {
         let state = startup_state();
@@ -1831,6 +2069,37 @@ mod tests {
                 .status,
             StartupDiffStatus::Complete
         );
+    }
+
+    #[test]
+    fn windows_v6_accepts_wmi_scope_and_keeps_legacy_readers() {
+        let old = serde_json::to_vec(&windows_v5()).unwrap();
+        let current = windows_v6();
+        let encoded = serde_json::to_vec(&current).unwrap();
+        validate(&parse(&encoded).unwrap(), Kind::Windows).unwrap();
+        let report = compare_startup_inventory_json(&old, &encoded).unwrap();
+        assert_eq!(report.platform, "windows");
+
+        let filter = json!({
+            "object_path":"__EventFilter.Name=\"f\"",
+            "name":"f",
+            "creator_sid":null,
+            "event_namespace":null,
+            "query_language":"WQL",
+            "query":"SELECT * FROM __InstanceCreationEvent",
+            "evidence":{"source":"IWbemLocator/IWbemServices/IEnumWbemClassObject","namespace":"ROOT\\subscription","class_name":"__EventFilter","object_index":0}
+        });
+        current_filter_smoke(filter);
+    }
+
+    fn current_filter_smoke(filter: Value) {
+        let mut value = windows_v6();
+        value["wmi_event_filters"] = json!([filter]);
+        value["sources"][12]["entries_seen"] = json!(1);
+        let encoded = serde_json::to_vec(&value).unwrap();
+        validate(&parse(&encoded).unwrap(), Kind::Windows).unwrap();
+        let report = compare_startup_inventory_json(&encoded, &encoded).unwrap();
+        assert!(report.deltas.is_empty());
     }
 
     #[test]

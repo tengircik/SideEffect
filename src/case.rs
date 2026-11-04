@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+use crate::audit_session::AUDIT_SESSION_SCHEMA_VERSION;
+
 pub const CASE_SCHEMA: &str = "sideeffect.investigation_case";
 pub const CASE_SCHEMA_V1: u32 = 1;
 pub const CASE_SCHEMA_VERSION: u32 = 2;
@@ -361,8 +363,10 @@ impl InvestigationCase {
             if session.platform != platform {
                 return Err("case sessions must use one native platform".to_owned());
             }
-            if !(1..=8).contains(&session.manifest_schema_version) {
-                return Err("manifest_schema_version must be between 1 and 8".to_owned());
+            if !(1..=AUDIT_SESSION_SCHEMA_VERSION).contains(&session.manifest_schema_version) {
+                return Err(format!(
+                    "manifest_schema_version must be between 1 and {AUDIT_SESSION_SCHEMA_VERSION}"
+                ));
             }
             validate_sha256("manifest_sha256", &session.manifest_sha256)?;
         }
