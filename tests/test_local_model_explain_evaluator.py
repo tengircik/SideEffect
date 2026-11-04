@@ -269,7 +269,7 @@ class ExplainEvaluatorV3HumanReviewTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.corpus, cls.digest = evaluation.load_corpus()
 
-    def _validate(self, results: dict[str, Any], packet_mutator=None, directory_mutator=None) -> dict[str, Any]:
+    def _validate(self, results: dict[str, Any], packet_mutator=None, directory_mutator=None, results_mutator=None) -> dict[str, Any]:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "results.json"
             packet_directory = Path(directory) / "packets"
@@ -279,7 +279,7 @@ class ExplainEvaluatorV3HumanReviewTests(unittest.TestCase):
                     continue
                 case = next(item for item in self.corpus["cases"] if item["id"] == row["case_id"])
                 packet = {
-                    "schema": "sideeffect.local_model_explain_blind_review_packet", "schema_version": 1,
+                    "schema": "sideeffect.local_model_explain_blind_review_packet", "schema_version": 2,
                     "corpus_sha256": self.digest, "case_id": row["case_id"], "question": case["question"],
                     "preview_schema": "sideeffect.local_model_explanation_preview", "preview_schema_version": 3,
                     "deterministic_abstain_reason": None, "system_prompt": "synthetic", "prompt": "{}",
@@ -289,10 +289,16 @@ class ExplainEvaluatorV3HumanReviewTests(unittest.TestCase):
                     "review_target_sha256": row["review_target_sha256"],
                     "run_case_input_sha256": row["run_case_input_sha256"],
                 }
+                binding = evaluation._review_input_binding_sha256(results["run"], row, packet)
+                packet["run_case_input_sha256"] = binding
                 packet["packet_sha256"] = evaluation._canonical_sha256(packet)
+                if row.get("run_case_input_sha256") == "e" * 64:
+                    row["run_case_input_sha256"] = binding
                 if row.get("review_packet_sha256") == "d" * 64:
                     row["review_packet_sha256"] = packet["packet_sha256"]
                 for review in row["human_reviews"]:
+                    if review.get("run_case_input_sha256") == "e" * 64:
+                        review["run_case_input_sha256"] = binding
                     if review.get("review_packet_sha256") == "d" * 64:
                         review["review_packet_sha256"] = packet["packet_sha256"]
                 if packet_mutator is not None:
@@ -300,6 +306,8 @@ class ExplainEvaluatorV3HumanReviewTests(unittest.TestCase):
                 (packet_directory / f"{row['case_id']}.json").write_text(json.dumps(packet), encoding="utf-8")
             if directory_mutator is not None:
                 directory_mutator(packet_directory)
+            if results_mutator is not None:
+                results_mutator(results)
             path.write_text(json.dumps(results), encoding="utf-8")
             return evaluation._validate_results(path, self.corpus, self.digest, packet_directory)
 
@@ -435,6 +443,26 @@ class ExplainEvaluatorV3HumanReviewTests(unittest.TestCase):
             packet["packet_sha256"] = evaluation._canonical_sha256({key: value for key, value in packet.items() if key != "packet_sha256"})
         with self.assertRaisesRegex(evaluation.ContractError, "corpus or question mismatch"):
             self._validate(results, alter_and_rehash)
+
+        results = _result(self.corpus, self.digest, version=3)
+        def alter_review_content_and_rehash(packet, row):
+            packet["prompt"] = '{"changed_after_preparation":true}'
+            packet["packet_sha256"] = evaluation._canonical_sha256({key: value for key, value in packet.items() if key != "packet_sha256"})
+            row["review_packet_sha256"] = packet["packet_sha256"]
+            for review in row["human_reviews"]:
+                review["review_packet_sha256"] = packet["packet_sha256"]
+        with self.assertRaisesRegex(evaluation.ContractError, "input binding mismatch"):
+            self._validate(results, alter_review_content_and_rehash)
+
+    def test_v3_rejects_changed_run_metadata_or_case_content_after_packet_preparation(self) -> None:
+        for name, mutate in (
+            ("run metadata", lambda results: results["run"].update(model_id="changed-model")),
+            ("case content", lambda results: next(row for row in results["cases"] if row["case_id"] == "exec-success-name").update(latency_ms=9)),
+        ):
+            with self.subTest(name=name):
+                results = _result(self.corpus, self.digest, version=3)
+                with self.assertRaisesRegex(evaluation.ContractError, "input binding mismatch"):
+                    self._validate(results, results_mutator=mutate)
 
         for name, mutate in (
             ("missing", lambda directory: (directory / "exec-success-name.json").unlink()),

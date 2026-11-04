@@ -128,6 +128,36 @@ def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+_REVIEW_ONLY_RESULT_FIELDS = {
+    "human_reviews", "preview_request_sha256", "review_target_sha256",
+    "review_packet_sha256", "run_case_input_sha256",
+}
+_REVIEW_INPUT_PACKET_FIELDS = (
+    "schema", "schema_version", "corpus_sha256", "case_id", "question",
+    "preview_schema", "preview_schema_version", "deterministic_abstain_reason",
+    "system_prompt", "prompt", "output_schema", "evidence_summary", "response",
+)
+
+
+def _review_input_binding_sha256(run: dict[str, Any], row: dict[str, Any], packet: dict[str, Any]) -> str:
+    """Bind current identity-bearing results to the exact allowlisted review content."""
+    packet_content = {key: packet[key] for key in _REVIEW_INPUT_PACKET_FIELDS}
+    result_row = {key: value for key, value in row.items() if key not in _REVIEW_ONLY_RESULT_FIELDS}
+    return _canonical_sha256({
+        "schema": "sideeffect.local_model_explain_review_input_binding",
+        "schema_version": 2,
+        "run": run,
+        "case_id": row["case_id"],
+        "corpus_sha256": packet["corpus_sha256"],
+        "review_digests": {
+            "preview_request_sha256": row["preview_request_sha256"],
+            "review_target_sha256": row["review_target_sha256"],
+        },
+        "result_row": result_row,
+        "packet_content": packet_content,
+    })
+
+
 def _bounded_packet_paths(directory: Path) -> list[Path]:
     try:
         metadata = directory.lstat()
@@ -147,7 +177,7 @@ def _bounded_packet_paths(directory: Path) -> list[Path]:
     return sorted(paths, key=lambda path: path.name)
 
 
-def _verify_review_packets(directory: Path, rows: list[dict[str, Any]], corpus: dict[str, Any], corpus_digest: str) -> None:
+def _verify_review_packets(directory: Path, rows: list[dict[str, Any]], corpus: dict[str, Any], corpus_digest: str, run: dict[str, Any]) -> None:
     reviewed = {row["case_id"]: row for row in rows if row["human_reviews"]}
     packet_paths = _bounded_packet_paths(directory)
     packets: dict[str, dict[str, Any]] = {}
@@ -174,7 +204,7 @@ def _verify_review_packets(directory: Path, rows: list[dict[str, Any]], corpus: 
     for case_id, row in reviewed.items():
         packet = packets[case_id]
         _require(set(packet) == packet_keys, f"review packet keys are incomplete or unknown for case {case_id}")
-        _require(packet["schema"] == "sideeffect.local_model_explain_blind_review_packet" and packet["schema_version"] == 1,
+        _require(packet["schema"] == "sideeffect.local_model_explain_blind_review_packet" and packet["schema_version"] == 2,
                  f"unsupported review packet contract for case {case_id}")
         claimed_packet_hash = packet["packet_sha256"]
         unhashed_packet = dict(packet)
@@ -190,6 +220,9 @@ def _verify_review_packets(directory: Path, rows: list[dict[str, Any]], corpus: 
                  f"review packet selector response mismatch for case {case_id}")
         _require(packet["packet_sha256"] == row.get("review_packet_sha256") and packet["run_case_input_sha256"] == row.get("run_case_input_sha256"),
                  f"review packet row binding mismatch for case {case_id}")
+        _require(packet["run_case_input_sha256"] == _review_input_binding_sha256(
+            run, row, packet
+        ), f"review packet input binding mismatch for case {case_id}")
 
 
 def _read_regular_file(path: Path, limit: int, label: str) -> bytes:
@@ -740,7 +773,7 @@ def _validate_results_v3(
     report = _validate_results_v2(selector_results, corpus, corpus_digest)
     if any(row["human_reviews"] for row in rows):
         _require(review_packet_directory is not None, "reviewed results require --review-packets with the exact packet directory")
-        _verify_review_packets(review_packet_directory, rows, corpus, corpus_digest)
+        _verify_review_packets(review_packet_directory, rows, corpus, corpus_digest, results["run"])
     elif review_packet_directory is not None:
         _require(not _bounded_packet_paths(review_packet_directory), "review packet directory contains packets without annotations")
     review_target_digests = {row["case_id"]: row["review_target_sha256"] for row in rows}

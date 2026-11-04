@@ -180,21 +180,9 @@ def prepare_packet(
     expected_target_digest = evaluator._review_target_sha256(result_row, case["question"], corpus_digest)
     _require(result_target_digest == expected_target_digest, "results review-target digest is invalid")
 
-    # Bind the exact identity-bearing inputs without putting them in the blind
-    # packet. The packet hash then commits to every allowlisted review field.
-    run_case_input_sha256 = _canonical_sha256({
-        "schema": "sideeffect.local_model_explain_review_input_binding",
-        "schema_version": 1,
-        "run": results["run"],
-        "case_id": case_id,
-        "corpus_sha256": corpus_digest,
-        "result_row": result_row,
-        "preview": preview,
-        "analysis": analysis,
-    })
     packet = {
         "schema": "sideeffect.local_model_explain_blind_review_packet",
-        "schema_version": 1,
+        "schema_version": 2,
         "corpus_sha256": corpus_digest,
         "case_id": case_id,
         "question": case["question"],
@@ -208,8 +196,11 @@ def prepare_packet(
         "response": response,
         "preview_request_sha256": request_digest,
         "review_target_sha256": result_target_digest,
-        "run_case_input_sha256": run_case_input_sha256,
     }
+    # Bind the identity-bearing run/current row to the precise review content
+    # that remains available to the evaluator, without copying run identity
+    # into the blind packet. Review-only digests are excluded from the binding.
+    packet["run_case_input_sha256"] = evaluator._review_input_binding_sha256(results["run"], result_row, packet)
     packet["packet_sha256"] = _canonical_sha256(packet)
     return packet
 

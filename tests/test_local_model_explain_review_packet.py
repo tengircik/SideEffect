@@ -134,6 +134,19 @@ class ExplainReviewPacketTests(unittest.TestCase):
             "evidence_ids": ["E001"],
             "abstain_reason": None,
         })
+        row = next(item for item in results["cases"] if item["case_id"] == packet["case_id"])
+        self.assertEqual(
+            packet["run_case_input_sha256"],
+            evaluator._review_input_binding_sha256(results["run"], row, packet),
+        )
+        for digest_name in ("preview_request_sha256", "review_target_sha256"):
+            changed_row = json.loads(json.dumps(row))
+            changed_row[digest_name] = "f" * 64
+            with self.subTest(digest=digest_name):
+                self.assertNotEqual(
+                    packet["run_case_input_sha256"],
+                    evaluator._review_input_binding_sha256(results["run"], changed_row, packet),
+                )
 
     def test_rejects_preview_digest_question_and_exact_row_mismatches(self) -> None:
         corpus, digest, results, preview, analysis = _fixture_inputs()
