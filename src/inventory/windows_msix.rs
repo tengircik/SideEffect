@@ -7,7 +7,7 @@
 use serde::Serialize;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use windows::Management::Deployment::PackageManager;
-use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
 use windows::core::HSTRING;
 
 const MAX_ROWS: usize = 4_096;
@@ -94,12 +94,12 @@ pub struct WindowsMsixInventoryDocument {
     pub packages: Vec<WindowsMsixPackage>,
 }
 
-struct ComApartment;
+struct WinRtApartment;
 
-impl Drop for ComApartment {
+impl Drop for WinRtApartment {
     fn drop(&mut self) {
-        // SAFETY: construction follows a successful CoInitializeEx call on this thread.
-        unsafe { CoUninitialize() };
+        // SAFETY: construction follows a successful RoInitialize call on this thread.
+        unsafe { RoUninitialize() };
     }
 }
 
@@ -154,9 +154,9 @@ pub fn collect_windows_msix() -> WindowsMsixInventoryDocument {
     let mut packages = Vec::new();
     let mut status = WindowsMsixStatus::Complete;
 
-    let init = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-    if init.is_err() {
-        status = if init.0 == E_ACCESSDENIED {
+    let init = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
+    if let Err(error) = init {
+        status = if error.code().0 == E_ACCESSDENIED {
             WindowsMsixStatus::Inaccessible
         } else {
             WindowsMsixStatus::Unavailable
@@ -167,13 +167,13 @@ pub fn collect_windows_msix() -> WindowsMsixInventoryDocument {
                 code: "winrt_apartment_initialization_failed",
                 package_ordinal: None,
                 field: None,
-                message: "Windows could not initialize the local COM apartment for package inventory.",
-                hresult: Some(init.0),
+                message: "Windows could not initialize the Windows Runtime apartment for package inventory.",
+                hresult: Some(error.code().0),
             },
         );
         return document(capture_started_at_unix_ms, status, diagnostics, packages);
     }
-    let _apartment = ComApartment;
+    let _apartment = WinRtApartment;
 
     let manager = match PackageManager::new() {
         Ok(manager) => manager,
