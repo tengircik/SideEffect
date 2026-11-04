@@ -10,7 +10,8 @@ use crate::inventory::{
     compare_package_inventory_json, compare_path_executable_inventory_json,
     compare_permission_inventory_json, compare_process_inventory_json,
     compare_selected_root_inventory_json, compare_startup_inventory_json,
-    compare_windows_msix_inventory_json, compare_windows_software_inventory_json,
+    compare_windows_app_paths_inventory_json, compare_windows_msix_inventory_json,
+    compare_windows_software_inventory_json,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -94,6 +95,7 @@ pub fn compare_audit_sessions(
         SourceRole::PathExecutables,
         SourceRole::SelectedRoot,
         SourceRole::Msix,
+        SourceRole::AppPaths,
     ];
     let source_diffs: Vec<_> = roles
         .into_iter()
@@ -299,7 +301,9 @@ fn selected_root_scope_extension_compatible(
     }
     let valid_scope = |version, scope| match version {
         AUDIT_SESSION_V7_SCHEMA_VERSION => scope == SELECTED_ROOT_METADATA_SCOPE,
-        AUDIT_SESSION_V9_SCHEMA_VERSION | AUDIT_SESSION_V10_SCHEMA_VERSION => {
+        AUDIT_SESSION_V9_SCHEMA_VERSION
+        | AUDIT_SESSION_V10_SCHEMA_VERSION
+        | crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION => {
             matches!(
                 scope,
                 SELECTED_ROOT_METADATA_SCOPE | SELECTED_ROOT_HASH_SCOPE
@@ -329,6 +333,13 @@ fn suppress_session_incomplete_presence(role: SourceRole, comparison: &mut Value
                 "unmatched_rows_with_incomplete_source",
             ),
             SourceRole::Msix => (
+                "removed",
+                "added",
+                "removals",
+                "additions",
+                "unmatched_rows_with_incomplete_source",
+            ),
+            SourceRole::AppPaths => (
                 "removed",
                 "added",
                 "removals",
@@ -510,6 +521,7 @@ fn supported_role_kind(role: SourceRole, kind: ArtifactKind) -> bool {
         ) | (SourceRole::PathExecutables, ArtifactKind::PathExecutables)
             | (SourceRole::SelectedRoot, ArtifactKind::SelectedRoot)
             | (SourceRole::Msix, ArtifactKind::WindowsMsix)
+            | (SourceRole::AppPaths, ArtifactKind::WindowsAppPaths)
     )
 }
 
@@ -591,6 +603,20 @@ fn compare_native(
             } else {
                 "partial"
             };
+            (
+                status,
+                serde_json::to_value(result).map_err(|_| NativeCompareError::Malformed)?,
+            )
+        }
+        (SourceRole::AppPaths, ArtifactKind::WindowsAppPaths) => {
+            let result = compare_windows_app_paths_inventory_json(left, right)
+                .map_err(map_app_paths_error)?;
+            let status =
+                if result.status == crate::inventory::WindowsAppPathsComparisonStatus::Complete {
+                    "compared"
+                } else {
+                    "partial"
+                };
             (
                 status,
                 serde_json::to_value(result).map_err(|_| NativeCompareError::Malformed)?,
@@ -745,6 +771,19 @@ fn map_msix_error(error: crate::inventory::WindowsMsixComparisonError) -> Native
         E::InputTooLarge => NativeCompareError::InputLimit,
         E::UnsupportedSchema => NativeCompareError::Unsupported,
         E::Incompatible => NativeCompareError::Incompatible,
+        E::LimitExceeded => NativeCompareError::Limit,
+    }
+}
+
+fn map_app_paths_error(
+    error: crate::inventory::WindowsAppPathsComparisonError,
+) -> NativeCompareError {
+    use crate::inventory::WindowsAppPathsComparisonError as E;
+    match error {
+        E::MalformedInput => NativeCompareError::Malformed,
+        E::InputTooLarge => NativeCompareError::InputLimit,
+        E::UnsupportedSchema => NativeCompareError::Unsupported,
+        E::Incompatible | E::InvalidSourceSet => NativeCompareError::Incompatible,
         E::LimitExceeded => NativeCompareError::Limit,
     }
 }

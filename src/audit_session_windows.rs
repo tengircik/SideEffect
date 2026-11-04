@@ -8,9 +8,9 @@ use crate::audit_session::{
 };
 use crate::fingerprint::sha256_hex;
 use crate::inventory::{
-    collect_path_executables, collect_windows_msix, collect_windows_permissions,
-    collect_windows_processes, collect_windows_software, collect_windows_startup,
-    collect_windows_startup_v5,
+    collect_path_executables, collect_windows_app_paths, collect_windows_msix,
+    collect_windows_permissions, collect_windows_processes, collect_windows_software,
+    collect_windows_startup, collect_windows_startup_v5,
 };
 use crate::record::publish_private_windows_directory;
 use serde::Serialize;
@@ -26,6 +26,7 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 pub struct WindowsAuditOptions {
     pub software: bool,
     pub msix: bool,
+    pub app_paths: bool,
     pub processes: bool,
     pub startup: bool,
     pub path_executables: bool,
@@ -58,6 +59,7 @@ pub fn collect_and_publish(
 ) -> Result<PublishedWindowsAuditSession, String> {
     if !options.software
         && !options.msix
+        && !options.app_paths
         && !options.processes
         && !options.startup
         && !options.path_executables
@@ -152,6 +154,35 @@ pub fn collect_and_publish(
             ArtifactKind::WindowsMsix,
             "msix.windows.json",
             "sideeffect.windows_msix_inventory",
+            1,
+            value,
+        ));
+    }
+    if options.app_paths {
+        let doc = collect_windows_app_paths();
+        let (status, diagnostics) = status_from_serialized(&doc, "status");
+        let value = serde_json::to_vec(&doc)
+            .map_err(|e| format!("could not serialize App Paths inventory: {e}"))?;
+        sources.push(source(
+            SourceRole::AppPaths,
+            "selected current-user native and accessible machine 32-bit and 64-bit App Paths registry entries",
+            doc.capture_started_at_unix_ms,
+            doc.capture_ended_at_unix_ms,
+            status,
+            diagnostics,
+            vec![
+                ("max_entries", crate::inventory::APP_PATHS_MAX_ENTRIES as u64),
+                ("max_name_utf16_units", crate::inventory::APP_PATHS_MAX_NAME_UNITS as u64),
+                ("max_aggregate_name_utf16_units", crate::inventory::APP_PATHS_MAX_AGGREGATE_NAME_UNITS as u64),
+                ("max_value_bytes", crate::inventory::APP_PATHS_MAX_VALUE_BYTES as u64),
+                ("max_aggregate_value_bytes", crate::inventory::APP_PATHS_MAX_AGGREGATE_VALUE_BYTES as u64),
+                ("scan_deadline_ms", crate::inventory::APP_PATHS_MAX_SCAN_DURATION_MS as u64),
+            ],
+        ));
+        artifacts.push(artifact(
+            ArtifactKind::WindowsAppPaths,
+            "app-paths.windows.json",
+            "sideeffect.windows_app_path_inventory",
             1,
             value,
         ));
@@ -494,7 +525,9 @@ pub fn collect_and_publish(
         sources,
         &artifacts,
         runtime_coverage_detail,
-        if options.startup {
+        if options.app_paths {
+            crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION
+        } else if options.startup {
             crate::audit_session::AUDIT_SESSION_V10_SCHEMA_VERSION
         } else {
             crate::audit_session::AUDIT_SESSION_V9_SCHEMA_VERSION
@@ -805,6 +838,7 @@ fn role_kind(role: SourceRole) -> Option<ArtifactKind> {
     match role {
         SourceRole::Packages => Some(ArtifactKind::WindowsSoftware),
         SourceRole::Msix => Some(ArtifactKind::WindowsMsix),
+        SourceRole::AppPaths => Some(ArtifactKind::WindowsAppPaths),
         SourceRole::Processes => Some(ArtifactKind::WindowsProcesses),
         SourceRole::Permissions => Some(ArtifactKind::WindowsPermissions),
         SourceRole::Startup => Some(ArtifactKind::WindowsStartup),
@@ -820,6 +854,7 @@ fn collect_windows_startup_for_session(
     match schema_version {
         crate::audit_session::AUDIT_SESSION_V9_SCHEMA_VERSION => Ok(collect_windows_startup_v5()),
         crate::audit_session::AUDIT_SESSION_V10_SCHEMA_VERSION => Ok(collect_windows_startup()),
+        crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION => Ok(collect_windows_startup()),
         _ => Err("unsupported Windows audit-session schema version".to_owned()),
     }
 }

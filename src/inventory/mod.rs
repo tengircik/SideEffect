@@ -39,6 +39,7 @@ mod startup_wmi;
 mod systemd_units;
 #[cfg(windows)]
 mod windows_app_paths;
+mod windows_app_paths_diff;
 #[cfg(windows)]
 mod windows_msix;
 mod windows_msix_diff;
@@ -83,6 +84,13 @@ pub use process_diff::{
 pub use startup_diff::{
     StartupDelta, StartupDiffCounts, StartupDiffError, StartupDiffStatus, StartupEvidenceSide,
     StartupInventoryDiff, compare_startup_inventory_json, is_startup_inventory_json,
+};
+pub use windows_app_paths_diff::{
+    WindowsAppPathsChangeKind, WindowsAppPathsComparisonDiagnostic, WindowsAppPathsComparisonError,
+    WindowsAppPathsComparisonStatus, WindowsAppPathsCounts, WindowsAppPathsDelta,
+    WindowsAppPathsEvidenceReference, WindowsAppPathsFacts, WindowsAppPathsIdentity,
+    WindowsAppPathsInventoryComparison, WindowsAppPathsValueFacts,
+    compare_windows_app_paths_inventory_json,
 };
 pub use windows_msix_diff::{
     WindowsMsixChangeKind, WindowsMsixComparisonDiagnostic, WindowsMsixComparisonError,
@@ -183,7 +191,12 @@ pub use systemd_units::{UnitInventory as SystemdUnitInventory, UnitRecord as Sys
 #[cfg(windows)]
 pub use windows_app_paths::{
     AppPathDiagnostic, AppPathEntry, AppPathEvidence, AppPathRegistryView, AppPathSource,
-    AppPathStatus, AppPathValue, WindowsAppPathInventoryDocument, collect_windows_app_paths,
+    AppPathStatus, AppPathValue, MAX_AGGREGATE_NAME_UNITS as APP_PATHS_MAX_AGGREGATE_NAME_UNITS,
+    MAX_AGGREGATE_VALUE_BYTES as APP_PATHS_MAX_AGGREGATE_VALUE_BYTES,
+    MAX_ENTRIES as APP_PATHS_MAX_ENTRIES, MAX_NAME_UNITS as APP_PATHS_MAX_NAME_UNITS,
+    MAX_SCAN_DURATION_MS as APP_PATHS_MAX_SCAN_DURATION_MS,
+    MAX_VALUE_BYTES as APP_PATHS_MAX_VALUE_BYTES, WindowsAppPathInventoryDocument,
+    collect_windows_app_paths,
 };
 #[cfg(windows)]
 pub use windows_msix::{WindowsMsixInventoryDocument, WindowsMsixStatus, collect_windows_msix};

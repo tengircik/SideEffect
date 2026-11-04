@@ -65,6 +65,23 @@ fn audit_msix(root: &Path, name: &str) -> PathBuf {
     output_path
 }
 
+fn audit_app_paths(root: &Path, name: &str) -> PathBuf {
+    let output_path = root.join(name);
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&output_path)
+        .arg("--app-paths")
+        .output()
+        .unwrap();
+    assert!(
+        matches!(output.status.code(), Some(0 | 2)),
+        "App Paths audit fixture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output_path
+}
+
 fn compare(before: &Path, after: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .arg("compare-sessions")
@@ -130,6 +147,142 @@ fn msix_row(ordinal: usize, version: u16) -> Value {
         "full_name":exact(&full_name),"family_name":exact(family_name),
         "install_location":exact("C:\\Apps\\Demo"),"version":{"major":version,"minor":0,"build":0,"revision":0},
         "is_framework":false,"is_resource_package":false,"is_bundle":false,"is_development_mode":false})
+}
+
+fn app_paths_document(name: &str, executable_path: &str) -> Vec<u8> {
+    fn utf16_hex(text: &str) -> String {
+        let mut output = String::with_capacity(text.encode_utf16().count() * 4);
+        for unit in text.encode_utf16() {
+            write!(&mut output, "{unit:04x}").unwrap();
+        }
+        output
+    }
+    fn raw_utf16_hex(text: &str) -> String {
+        let mut output = String::with_capacity((text.encode_utf16().count() + 1) * 4);
+        for unit in text.encode_utf16().chain(std::iter::once(0)) {
+            write!(&mut output, "{:02x}{:02x}", unit as u8, (unit >> 8) as u8).unwrap();
+        }
+        output
+    }
+    let mut sources = Vec::new();
+    for (id, hive, registry_view) in [
+        (
+            "current_user_native_app_paths",
+            "HKEY_CURRENT_USER",
+            "native",
+        ),
+        (
+            "local_machine_64_app_paths",
+            "HKEY_LOCAL_MACHINE",
+            "wow64_64",
+        ),
+        (
+            "local_machine_32_app_paths",
+            "HKEY_LOCAL_MACHINE",
+            "wow64_32",
+        ),
+    ] {
+        let contains_row = id == "current_user_native_app_paths";
+        sources.push(json!({
+            "id":id,"status":"complete","entries_seen":usize::from(contains_row),
+            "hive":hive,"registry_key":"Software\\Microsoft\\Windows\\CurrentVersion\\App Paths",
+            "registry_view":registry_view,"diagnostics":[]
+        }));
+    }
+    let entries = json!([{
+        "registered_name":name,"registered_name_utf16_hex":utf16_hex(name),
+        "executable_path":{"name":"(Default)","registry_type":2,"type_name":"REG_EXPAND_SZ",
+            "text":executable_path,"raw_data_hex":raw_utf16_hex(executable_path)},
+        "search_path":null,"duplicate_registration_name":false,
+        "evidence":{"source":"RegEnumKeyExW/RegQueryValueExW","hive":"HKEY_CURRENT_USER",
+            "registry_view":"native","registry_key":"Software\\Microsoft\\Windows\\CurrentVersion\\App Paths",
+            "entry_index":0,"registry_subkey":name}
+    }]);
+    serde_json::to_vec(&json!({
+        "schema":"sideeffect.windows_app_path_inventory","schema_version":1,"platform":"windows",
+        "scope":"selected_current_user_native_and_accessible_machine_32_bit_and_64_bit_app_paths_registry_entries",
+        "capture_started_at_unix_ms":1,"capture_ended_at_unix_ms":2,"status":"complete",
+        "sources":sources,"entries":entries,"duplicate_registration_names":0
+    })).unwrap()
+}
+
+fn write_app_paths_artifact(session: &Path, bytes: &[u8]) {
+    fs::write(session.join("app-paths.windows.json"), bytes).unwrap();
+    let mut value = manifest(session);
+    let source = value["sources"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|source| source["role"] == "app_paths")
+        .unwrap();
+    source["status"] = json!("complete");
+    source["artifacts"][0]["byte_length"] = json!(bytes.len());
+    source["artifacts"][0]["sha256"] = json!(format!("{:x}", sha2::Sha256::digest(bytes)));
+    let coverage_source = value["coverage_manifest"]["sources"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|source| source["role"] == "app_paths")
+        .unwrap();
+    coverage_source["status"] = json!("observed");
+    value["status"] = json!("complete");
+    write_manifest(session, &value);
+}
+
+#[test]
+fn compare_sessions_emits_private_app_paths_change_evidence_and_v11_contract() {
+    let root = TestDirectory::new();
+    let before_bytes =
+        app_paths_document("SensitiveProgram.exe", "%LOCALAPPDATA%\\Old\\program.exe");
+    let after_bytes =
+        app_paths_document("SensitiveProgram.exe", "%LOCALAPPDATA%\\New\\program.exe");
+    let direct = sideeffect::inventory::compare_windows_app_paths_inventory_json(
+        &before_bytes,
+        &after_bytes,
+    );
+    assert!(
+        direct.is_ok(),
+        "direct comparator error: {:?}",
+        direct.err()
+    );
+    let before = audit_app_paths(&root.0, "app-paths-before");
+    let after = audit_app_paths(&root.0, "app-paths-after");
+    assert_eq!(manifest(&before)["schema_version"], 11);
+    assert_eq!(
+        manifest(&before)["sources"][0]["artifacts"][0]["path"],
+        "app-paths.windows.json"
+    );
+    write_app_paths_artifact(&before, &before_bytes);
+    write_app_paths_artifact(&after, &after_bytes);
+    let output = compare(&before, &after);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let serialized = String::from_utf8_lossy(&output.stdout);
+    assert!(!serialized.contains("SensitiveProgram.exe"));
+    assert!(!serialized.contains("LOCALAPPDATA"));
+    let value = report(&output);
+    let source = value["source_diffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["role"] == "app_paths")
+        .unwrap();
+    assert_eq!(
+        source["status"], "compared",
+        "reason: {}",
+        source["reason_code"]
+    );
+    let delta = &source["comparison"]["deltas"][0];
+    assert_eq!(delta["kind"], "changed");
+    assert_eq!(delta["changed_fields"], json!(["executable_path"]));
+    assert_eq!(
+        delta["before"]["evidence"]["source_id"],
+        "current_user_native_app_paths"
+    );
 }
 
 #[test]

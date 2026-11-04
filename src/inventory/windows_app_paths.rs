@@ -22,11 +22,11 @@ const KEY_WOW64_32KEY: u32 = 0x0200;
 
 pub const MAX_ENTRIES: usize = 4_096;
 const MAX_ENTRIES_PER_SOURCE: usize = MAX_ENTRIES;
-const MAX_NAME_UNITS: usize = 1_024;
-const MAX_VALUE_BYTES: usize = 64 * 1024;
-const MAX_AGGREGATE_NAME_UNITS: usize = 1024 * 1024;
-const MAX_AGGREGATE_VALUE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_SCAN_DURATION_MS: u128 = 10_000;
+pub const MAX_NAME_UNITS: usize = 1_024;
+pub const MAX_VALUE_BYTES: usize = 64 * 1024;
+pub const MAX_AGGREGATE_NAME_UNITS: usize = 1024 * 1024;
+pub const MAX_AGGREGATE_VALUE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_SCAN_DURATION_MS: u128 = 10_000;
 
 const HKEY_CURRENT_USER: isize = -2_147_483_647;
 const HKEY_LOCAL_MACHINE: isize = -2_147_483_646;
