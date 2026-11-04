@@ -106,6 +106,9 @@ jobs:
           python3 tests/test_local_model_explain_review_packet.py
           python3 tests/test_run_local_model_explain_corpus.py
 
+      - name: Test Linux release archive smoke validator
+        run: python3 tests/test_smoke_linux_release_archive.py
+
       - name: Check formatting
         run: cargo fmt --all --check
 

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Future Linux release builds now inspect the assembled archive's exact file set and bounded member sizes, reject unsafe paths and non-regular entries, extract safely into a fresh runner temporary directory, and run the packaged CLI's `--help` and `version` checks before attestation. Linux, source, and Windows assets are attested in a separate downstream job with OIDC permissions, isolated from build and CLI execution. This workflow validation does not retroactively verify published v0.1.0 or replace native Linux installation acceptance.
 - Integrated Windows startup v7 into audit sessions: selecting `audit --startup` emits envelope v12 with startup v7; App Paths remains available in the same session, while App-Paths-only sessions remain v11. Readers preserve the v1-v11 artifact allowlists, v10/v11 accept startup v6 only, and v12 accepts startup v7 only. Session comparison accepts v7/v7 native startup diffs; v6/v7 remains metadata-incomparable and yields a partial native comparison without a service-state delta.
 
 - Added standalone Windows startup inventory schema v7 with a bounded point-in-time SCM service-state observation from `EnumServicesStatusExW`. SCM states 1–7 map to named known values; unsupported raw values remain explicitly unknown. Startup diff accepts v4-v7 and compares service state only when both snapshots carry v7+. This observation is separate from configured startup state and does not imply that a startup entry caused it. That earlier standalone-schema entry is followed by the session-v12 integration recorded above.
