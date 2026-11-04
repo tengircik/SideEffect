@@ -47,6 +47,23 @@ fn audit(root: &Path, name: &str) -> PathBuf {
     output_path
 }
 
+fn audit_msix(root: &Path, name: &str) -> PathBuf {
+    let output_path = root.join(name);
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&output_path)
+        .arg("--msix")
+        .output()
+        .unwrap();
+    assert!(
+        matches!(output.status.code(), Some(0 | 2)),
+        "MSIX audit fixture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output_path
+}
+
 fn compare(before: &Path, after: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .arg("compare-sessions")
@@ -261,4 +278,50 @@ fn windows_session_comparability_cli_preserves_metadata_only_and_reader_boundari
     let rejected = compare(&malformed, &malformed);
     assert_eq!(rejected.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("manifest"));
+}
+
+#[test]
+fn msix_source_selection_changes_comparability_and_reader_rejects_bad_artifacts() {
+    let root = TestDirectory::new();
+    let with_msix = audit_msix(&root.0, "with-msix");
+    let without_msix = audit(&root.0, "without-msix");
+    assert_code(&compare(&with_msix, &without_msix), "source_roles_mismatch");
+
+    let msix_manifest = manifest(&with_msix);
+    let msix_source = msix_manifest["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["role"] == "msix")
+        .unwrap();
+    assert_eq!(msix_source["artifacts"][0]["path"], "msix.windows.json");
+
+    let missing = audit_msix(&root.0, "missing-msix-artifact");
+    fs::remove_file(missing.join("msix.windows.json")).unwrap();
+    let rejected = compare(&missing, &missing);
+    assert_eq!(rejected.status.code(), Some(1));
+
+    let extra = audit_msix(&root.0, "extra-msix-entry");
+    fs::write(extra.join("unexpected.txt"), b"unexpected").unwrap();
+    let rejected = compare(&extra, &extra);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("not listed"));
+
+    let malformed = audit_msix(&root.0, "malformed-msix-artifact");
+    let malformed_bytes = b"{";
+    fs::write(malformed.join("msix.windows.json"), malformed_bytes).unwrap();
+    let mut malformed_manifest = manifest(&malformed);
+    let source = malformed_manifest["sources"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|source| source["role"] == "msix")
+        .unwrap();
+    source["artifacts"][0]["byte_length"] = json!(malformed_bytes.len());
+    source["artifacts"][0]["sha256"] =
+        json!(format!("{:x}", sha2::Sha256::digest(malformed_bytes)));
+    write_manifest(&malformed, &malformed_manifest);
+    let rejected = compare(&malformed, &malformed);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("bounded JSON"));
 }

@@ -326,6 +326,13 @@ fn suppress_session_incomplete_presence(role: SourceRole, comparison: &mut Value
                 "additions",
                 "unmatched_rows_with_incomplete_source",
             ),
+            SourceRole::Msix => (
+                "removed",
+                "added",
+                "removals",
+                "additions",
+                "unmatched_rows_with_incomplete_source",
+            ),
             SourceRole::Processes => (
                 "removed",
                 "added",
@@ -500,6 +507,7 @@ fn supported_role_kind(role: SourceRole, kind: ArtifactKind) -> bool {
             ArtifactKind::Startup | ArtifactKind::WindowsStartup
         ) | (SourceRole::PathExecutables, ArtifactKind::PathExecutables)
             | (SourceRole::SelectedRoot, ArtifactKind::SelectedRoot)
+            | (SourceRole::Msix, ArtifactKind::WindowsMsix)
     )
 }
 

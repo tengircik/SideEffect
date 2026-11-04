@@ -456,6 +456,7 @@ pub fn collect_and_publish(
             ArtifactKind::PathExecutables => SourceRole::PathExecutables,
             ArtifactKind::SelectedRoot => SourceRole::SelectedRoot,
             ArtifactKind::WindowsSoftware
+            | ArtifactKind::WindowsMsix
             | ArtifactKind::WindowsProcesses
             | ArtifactKind::WindowsPermissions
             | ArtifactKind::WindowsStartup

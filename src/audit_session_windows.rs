@@ -8,8 +8,8 @@ use crate::audit_session::{
 };
 use crate::fingerprint::sha256_hex;
 use crate::inventory::{
-    collect_path_executables, collect_windows_permissions, collect_windows_processes,
-    collect_windows_software, collect_windows_startup,
+    collect_path_executables, collect_windows_msix, collect_windows_permissions,
+    collect_windows_processes, collect_windows_software, collect_windows_startup,
 };
 use crate::record::publish_private_windows_directory;
 use serde::Serialize;
@@ -24,6 +24,7 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug, Default)]
 pub struct WindowsAuditOptions {
     pub software: bool,
+    pub msix: bool,
     pub processes: bool,
     pub startup: bool,
     pub path_executables: bool,
@@ -55,6 +56,7 @@ pub fn collect_and_publish(
     options: &WindowsAuditOptions,
 ) -> Result<PublishedWindowsAuditSession, String> {
     if !options.software
+        && !options.msix
         && !options.processes
         && !options.startup
         && !options.path_executables
@@ -121,6 +123,34 @@ pub fn collect_and_publish(
             ArtifactKind::WindowsSoftware,
             "software.windows.json",
             "sideeffect.windows_software_inventory",
+            1,
+            value,
+        ));
+    }
+    if options.msix {
+        let doc = collect_windows_msix();
+        let (status, diagnostics) = status_from_serialized(&doc, "status");
+        let value = serde_json::to_vec(&doc)
+            .map_err(|e| format!("could not serialize MSIX inventory: {e}"))?;
+        sources.push(source(
+            SourceRole::Msix,
+            "bounded current-user MSIX package registrations",
+            doc.capture_started_at_unix_ms,
+            doc.capture_ended_at_unix_ms,
+            status,
+            diagnostics,
+            vec![
+                ("max_packages", 4096),
+                ("max_string_utf16_units", 32768),
+                ("max_aggregate_string_utf16_units", 1_048_576),
+                ("max_diagnostics", 512),
+                ("scan_deadline_ms", 10000),
+            ],
+        ));
+        artifacts.push(artifact(
+            ArtifactKind::WindowsMsix,
+            "msix.windows.json",
+            "sideeffect.windows_msix_inventory",
             1,
             value,
         ));
@@ -765,6 +795,7 @@ fn windows_privilege() -> PrivilegeContext {
 fn role_kind(role: SourceRole) -> Option<ArtifactKind> {
     match role {
         SourceRole::Packages => Some(ArtifactKind::WindowsSoftware),
+        SourceRole::Msix => Some(ArtifactKind::WindowsMsix),
         SourceRole::Processes => Some(ArtifactKind::WindowsProcesses),
         SourceRole::Permissions => Some(ArtifactKind::WindowsPermissions),
         SourceRole::Startup => Some(ArtifactKind::WindowsStartup),

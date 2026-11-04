@@ -64,6 +64,75 @@ fn windows_session_publishes_and_inspects_selected_source_with_private_acl() {
 }
 
 #[test]
+fn windows_msix_session_publishes_a_separate_v9_artifact() {
+    let root = temp_dir();
+    let session = root.join("msix-audit");
+    let output = cli(&["audit", "--output", session.to_str().unwrap(), "--msix"]);
+    assert!(
+        published(&output),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(session.join("session.json")).unwrap()).unwrap();
+    assert_eq!(manifest["schema_version"], 9);
+    assert_eq!(manifest["sources"][0]["role"], "msix");
+    assert_eq!(
+        manifest["sources"][0]["collector"]["id"],
+        "windows.msix_package_registrations"
+    );
+    assert_eq!(
+        manifest["sources"][0]["artifacts"][0]["path"],
+        "msix.windows.json"
+    );
+    assert!(session.join("msix.windows.json").is_file());
+    assert!(!session.join("software.windows.json").exists());
+
+    let artifact: serde_json::Value =
+        serde_json::from_slice(&fs::read(session.join("msix.windows.json")).unwrap()).unwrap();
+    assert_eq!(artifact["schema"], "sideeffect.windows_msix_inventory");
+    assert_eq!(artifact["schema_version"], 1);
+    let inspect = cli(&[
+        "inspect",
+        "--format",
+        "json",
+        "--session",
+        session.to_str().unwrap(),
+    ]);
+    assert!(
+        published(&inspect),
+        "{}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let review: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(review["sources"][0]["role"], "msix");
+    assert_eq!(
+        review["sources"][0]["scope"],
+        "bounded current-user MSIX package registrations"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn windows_audit_rejects_repeated_msix_flag() {
+    let root = temp_dir();
+    let session = root.join("duplicate-msix");
+    let output = cli(&[
+        "audit",
+        "--output",
+        session.to_str().unwrap(),
+        "--msix",
+        "--msix",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--msix was specified more than once")
+    );
+    assert!(!session.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() {
     let root = temp_dir();
     let selected_path = root.join("selected.txt");
@@ -250,7 +319,7 @@ fn windows_audit_session_opt_in_hashing_compares_content_changes() {
     );
     let first_manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(before.join("session.json")).unwrap()).unwrap();
-    assert_eq!(first_manifest["schema_version"], 8);
+    assert_eq!(first_manifest["schema_version"], 9);
     let first_snapshot: serde_json::Value =
         serde_json::from_slice(&fs::read(before.join("root-snapshot.json")).unwrap()).unwrap();
     assert_eq!(first_snapshot["schema_version"], 2);

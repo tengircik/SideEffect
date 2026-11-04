@@ -474,6 +474,7 @@ fn source_role_name(role: SourceRole) -> &'static str {
         crate::audit_session::SourceRole::Startup => "startup",
         crate::audit_session::SourceRole::PathExecutables => "path_executables",
         crate::audit_session::SourceRole::SelectedRoot => "selected_root",
+        crate::audit_session::SourceRole::Msix => "msix",
         crate::audit_session::SourceRole::Runtime => "runtime",
     }
 }
@@ -487,6 +488,7 @@ fn artifact_kind_name(kind: crate::audit_session::ArtifactKind) -> &'static str 
         crate::audit_session::ArtifactKind::PathExecutables => "path_executables",
         crate::audit_session::ArtifactKind::SelectedRoot => "selected_root",
         crate::audit_session::ArtifactKind::WindowsSoftware => "windows_software",
+        crate::audit_session::ArtifactKind::WindowsMsix => "windows_msix",
         crate::audit_session::ArtifactKind::WindowsProcesses => "windows_processes",
         crate::audit_session::ArtifactKind::WindowsPermissions => "windows_permissions",
         crate::audit_session::ArtifactKind::WindowsStartup => "windows_startup",

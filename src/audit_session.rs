@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
 pub const AUDIT_SESSION_SCHEMA: &str = "sideeffect.audit_session";
-pub const AUDIT_SESSION_SCHEMA_VERSION: u32 = 8;
+pub const AUDIT_SESSION_SCHEMA_VERSION: u32 = 9;
 pub const AUDIT_SESSION_V1_SCHEMA_VERSION: u32 = 1;
 pub const AUDIT_SESSION_V2_SCHEMA_VERSION: u32 = 2;
 pub const AUDIT_SESSION_V3_SCHEMA_VERSION: u32 = 3;
@@ -16,6 +16,8 @@ pub const AUDIT_SESSION_V4_SCHEMA_VERSION: u32 = 4;
 pub const AUDIT_SESSION_V5_SCHEMA_VERSION: u32 = 5;
 pub const AUDIT_SESSION_V6_SCHEMA_VERSION: u32 = 6;
 pub const AUDIT_SESSION_V7_SCHEMA_VERSION: u32 = 7;
+pub const AUDIT_SESSION_V8_SCHEMA_VERSION: u32 = 8;
+pub const AUDIT_SESSION_V9_SCHEMA_VERSION: u32 = 9;
 pub const COVERAGE_MANIFEST_V1_VERSION: u32 = 1;
 pub const COVERAGE_MANIFEST_VERSION: u32 = 2;
 pub const MAX_AUDIT_SESSION_MANIFEST_BYTES: usize = 512 * 1024;
@@ -254,6 +256,7 @@ pub enum SourceRole {
     Runtime,
     PathExecutables,
     SelectedRoot,
+    Msix,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -369,6 +372,7 @@ pub enum ArtifactKind {
     Permissions,
     Startup,
     WindowsSoftware,
+    WindowsMsix,
     WindowsProcesses,
     WindowsPermissions,
     WindowsStartup,
@@ -431,6 +435,7 @@ impl AuditSessionManifest {
                 | AUDIT_SESSION_V5_SCHEMA_VERSION
                 | AUDIT_SESSION_V6_SCHEMA_VERSION
                 | AUDIT_SESSION_V7_SCHEMA_VERSION
+                | AUDIT_SESSION_V8_SCHEMA_VERSION
                 | AUDIT_SESSION_SCHEMA_VERSION,
             ) => {
                 for fact in [&context.os_name, &context.os_version] {
@@ -459,6 +464,7 @@ impl AuditSessionManifest {
                 | AUDIT_SESSION_V5_SCHEMA_VERSION
                 | AUDIT_SESSION_V6_SCHEMA_VERSION
                 | AUDIT_SESSION_V7_SCHEMA_VERSION
+                | AUDIT_SESSION_V8_SCHEMA_VERSION
                 | AUDIT_SESSION_SCHEMA_VERSION,
             ) => {
                 if !matches!(
@@ -524,6 +530,11 @@ impl AuditSessionManifest {
             {
                 return Err(ValidationError::InvalidSchema);
             }
+            if self.schema_version < AUDIT_SESSION_V9_SCHEMA_VERSION
+                && source.role == SourceRole::Msix
+            {
+                return Err(ValidationError::InvalidSchema);
+            }
             match (&source.collector, self.schema_version) {
                 (None, 1..=AUDIT_SESSION_V6_SCHEMA_VERSION) => {}
                 (
@@ -531,6 +542,7 @@ impl AuditSessionManifest {
                     AUDIT_SESSION_V5_SCHEMA_VERSION
                     | AUDIT_SESSION_V6_SCHEMA_VERSION
                     | AUDIT_SESSION_V7_SCHEMA_VERSION
+                    | AUDIT_SESSION_V8_SCHEMA_VERSION
                     | AUDIT_SESSION_SCHEMA_VERSION,
                 ) => {
                     validate_collector_identity(identity, &source.platform, source.role)?;
@@ -970,7 +982,7 @@ fn artifact_version_supported(
         || (kind == ArtifactKind::Startup && matches!(observed, 2 | 3))
         || (kind == ArtifactKind::WindowsStartup && matches!(observed, 4 | 5))
         || (kind == ArtifactKind::SelectedRoot
-            && session_version == AUDIT_SESSION_SCHEMA_VERSION
+            && session_version >= AUDIT_SESSION_V8_SCHEMA_VERSION
             && observed == 2)
         || (matches!(observed, 1..=4)
             && matches!(
@@ -984,6 +996,7 @@ fn expected_artifacts(
     platform: &str,
 ) -> Result<Vec<ArtifactKind>, ValidationError> {
     match platform {
+        "linux" if role == SourceRole::Msix => Err(ValidationError::UnsupportedArtifactPlatform),
         "linux" => Ok(match role {
             SourceRole::Packages => vec![ArtifactKind::Packages],
             SourceRole::Processes => vec![ArtifactKind::Processes],
@@ -992,6 +1005,7 @@ fn expected_artifacts(
             SourceRole::PathExecutables => vec![ArtifactKind::PathExecutables],
             SourceRole::SelectedRoot => vec![ArtifactKind::SelectedRoot],
             SourceRole::Runtime => vec![ArtifactKind::RuntimeManifest, ArtifactKind::RuntimeTrace],
+            SourceRole::Msix => return Err(ValidationError::UnsupportedArtifactPlatform),
         }),
         "windows" => Ok(match role {
             SourceRole::Packages => vec![ArtifactKind::WindowsSoftware],
@@ -1001,6 +1015,7 @@ fn expected_artifacts(
             SourceRole::PathExecutables => vec![ArtifactKind::PathExecutables],
             SourceRole::SelectedRoot => vec![ArtifactKind::SelectedRoot],
             SourceRole::Runtime => vec![ArtifactKind::WindowsRuntimeCapture],
+            SourceRole::Msix => vec![ArtifactKind::WindowsMsix],
         }),
         _ => Err(ValidationError::UnsupportedArtifactPlatform),
     }
@@ -1029,6 +1044,7 @@ fn artifact_contract(
             "sideeffect.windows_software_inventory",
             1,
         ),
+        ArtifactKind::WindowsMsix => ("msix.windows.json", "sideeffect.windows_msix_inventory", 1),
         ArtifactKind::WindowsProcesses => (
             "processes.windows.json",
             "sideeffect.windows_process_inventory",
@@ -1088,6 +1104,7 @@ pub fn collector_identity(platform: &str, role: SourceRole) -> CollectorIdentity
         ("linux", SourceRole::SelectedRoot) => "linux.selected_root_directory",
         ("linux", SourceRole::Runtime) => "linux.strace_runtime",
         ("windows", SourceRole::Packages) => "windows.software_registry",
+        ("windows", SourceRole::Msix) => "windows.msix_package_registrations",
         ("windows", SourceRole::Processes) => "windows.toolhelp_processes",
         ("windows", SourceRole::Permissions) => "windows.selected_path_permissions",
         ("windows", SourceRole::Startup) => "windows.curated_startup_sources",
@@ -1506,6 +1523,12 @@ mod tests {
             root_manifest(super::AUDIT_SESSION_V7_SCHEMA_VERSION, 2).validate(),
             Err(ValidationError::ArtifactContractMismatch),
             "v7 must retain the historical selected-root v1 contract"
+        );
+        assert!(
+            root_manifest(super::AUDIT_SESSION_V8_SCHEMA_VERSION, 2)
+                .validate()
+                .is_ok(),
+            "v8 must retain its selected-root v2 contract"
         );
         assert!(
             root_manifest(super::AUDIT_SESSION_SCHEMA_VERSION, 1)
@@ -2266,6 +2289,78 @@ mod tests {
             manifest.validate(),
             Err(ValidationError::ArtifactContractMismatch)
         );
+    }
+
+    fn windows_msix_manifest() -> AuditSessionManifest {
+        let mut manifest = valid_manifest();
+        manifest.platform = "windows".to_owned();
+        manifest.architecture = "x86_64".to_owned();
+        manifest.host_context.as_mut().unwrap().os_name.value = Some("Windows".to_owned());
+        let source = &mut manifest.sources[0];
+        source.role = SourceRole::Msix;
+        source.collector = Some(super::collector_identity("windows", SourceRole::Msix));
+        source.platform = "windows".to_owned();
+        source.scope = "bounded current-user MSIX package registrations".to_owned();
+        source.artifacts = vec![SessionArtifactRef {
+            kind: ArtifactKind::WindowsMsix,
+            path: "msix.windows.json".to_owned(),
+            schema: "sideeffect.windows_msix_inventory".to_owned(),
+            schema_version: 1,
+            byte_length: 1,
+            sha256: "a".repeat(64),
+        }];
+        manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
+        manifest
+    }
+
+    #[test]
+    fn msix_session_contract_is_windows_only_and_v9_only() {
+        use super::{AUDIT_SESSION_V8_SCHEMA_VERSION, AUDIT_SESSION_V9_SCHEMA_VERSION};
+
+        let valid = windows_msix_manifest();
+        assert_eq!(valid.schema_version, AUDIT_SESSION_V9_SCHEMA_VERSION);
+        assert!(valid.validate().is_ok());
+
+        let mut legacy = valid.clone();
+        legacy.schema_version = AUDIT_SESSION_V8_SCHEMA_VERSION;
+        assert_eq!(legacy.validate(), Err(ValidationError::InvalidSchema));
+
+        let mut linux = valid.clone();
+        linux.platform = "linux".to_owned();
+        linux.sources[0].platform = "linux".to_owned();
+        linux.sources[0].collector = Some(super::collector_identity("linux", SourceRole::Msix));
+        assert_eq!(
+            linux.validate(),
+            Err(ValidationError::UnsupportedArtifactPlatform)
+        );
+
+        let mut wrong_artifact = valid.clone();
+        wrong_artifact.sources[0].artifacts[0].kind = ArtifactKind::WindowsSoftware;
+        wrong_artifact.sources[0].artifacts[0].path = "software.windows.json".to_owned();
+        wrong_artifact.sources[0].artifacts[0].schema =
+            "sideeffect.windows_software_inventory".to_owned();
+        assert_eq!(
+            wrong_artifact.validate(),
+            Err(ValidationError::ArtifactContractMismatch)
+        );
+
+        let mut missing = valid.clone();
+        missing.sources[0].artifacts.clear();
+        assert_eq!(
+            missing.validate(),
+            Err(ValidationError::ArtifactSetMismatch)
+        );
+
+        let mut extra = valid;
+        extra.sources[0].artifacts.push(SessionArtifactRef {
+            kind: ArtifactKind::WindowsSoftware,
+            path: "software.windows.json".to_owned(),
+            schema: "sideeffect.windows_software_inventory".to_owned(),
+            schema_version: 1,
+            byte_length: 1,
+            sha256: "b".repeat(64),
+        });
+        assert_eq!(extra.validate(), Err(ValidationError::ArtifactSetMismatch));
     }
 
     #[test]
