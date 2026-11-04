@@ -24,9 +24,11 @@ from typing import Any
 
 
 MAX_CORPUS_BYTES = 128 * 1024
+MAX_HOLDOUT_MANIFEST_BYTES = 64 * 1024
 EXPECTED_CASE_COUNT = 100
 MAX_CASES = 100
 MAX_FIXTURE_BYTES = 32 * 1024 * 1024
+MAX_HOLDOUT_TOTAL_FIXTURE_BYTES = 64 * 1024 * 1024
 MAX_CHILD_OUTPUT_BYTES = 1024 * 1024
 MAX_REPORT_BYTES = 16 * 1024 * 1024
 RSS_SAMPLE_INTERVAL_SECONDS = 0.25
@@ -36,6 +38,10 @@ PREVIEW_TIMEOUT_SECONDS = 30
 MODEL_TIMEOUT_SECONDS = 120
 EXPECTED_CORPUS_SHA256 = "cdd73fe2a9847a7c78f40ba1f63496ee23b65cac303d7fc423013536333dbdea"
 CORPUS_RELATIVE_PATH = Path("tests/fixtures/local_query_plan_v2/corpus.json")
+HOLDOUT_MANIFEST_NAME = "holdout-manifest.json"
+HOLDOUT_MANIFEST_SCHEMA = "sideeffect.local_query_plan_external_holdout_manifest"
+HOLDOUT_MANIFEST_VERSION = 1
+HOLDOUT_TRACE_NAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,127}\.trace")
 RUST_QUERY_PLAN_SOURCE = Path(__file__).resolve().parents[1] / "src" / "local_query_plan.rs"
 RUST_STRACE_SOURCE = Path(__file__).resolve().parents[1] / "src" / "trace" / "strace.rs"
 MAX_RUST_CONTRACT_SOURCE_BYTES = 1024 * 1024
@@ -402,6 +408,65 @@ def _valid_sha256(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
+def _strict_json_loads(raw: bytes, label: str) -> Any:
+    def object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{label} contains a duplicate JSON object key")
+            result[key] = value
+        return result
+
+    def reject_non_json_constant(_: str) -> None:
+        raise ValueError(f"{label} contains a non-JSON numeric constant")
+
+    try:
+        return json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=object_without_duplicate_keys,
+            parse_constant=reject_non_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label} must be valid UTF-8 JSON") from error
+
+
+def _reject_symlink_components(path: Path, label: str) -> Path:
+    absolute = Path(os.path.abspath(path))
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current = current / component
+        try:
+            metadata = current.lstat()
+        except OSError as error:
+            raise ValueError(f"{label} path component is unavailable ({type(error).__name__})") from None
+        if _is_symlink_or_reparse_point(current, metadata):
+            raise ValueError(f"{label} path cannot contain symlinks or junctions")
+    return absolute
+
+
+def _is_symlink_or_reparse_point(path: Path, metadata: os.stat_result) -> bool:
+    is_junction = getattr(path, "is_junction", None)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    return (
+        stat.S_ISLNK(metadata.st_mode)
+        or (callable(is_junction) and is_junction())
+        or bool(attributes & reparse_flag)
+    )
+
+
+def _read_bounded_regular_nofollow(path: Path, byte_limit: int, label: str) -> bytes:
+    try:
+        descriptor = _open_regular_nofollow(path)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"{label} must be a regular non-symlink file ({type(error).__name__})") from None
+    with os.fdopen(descriptor, "rb") as source:
+        raw = source.read(byte_limit + 1)
+    if len(raw) > byte_limit:
+        raise ValueError(f"{label} exceeds the {byte_limit}-byte limit")
+    return raw
+
+
 def _positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
@@ -547,26 +612,23 @@ def validate_candidate_provenance(corpus: dict[str, Any]) -> None:
 
 
 def load_corpus(path: Path, *, require_registered_digest: bool) -> tuple[Path, dict[str, Any], str]:
-    try:
-        corpus_fd = _open_regular_nofollow(path)
-    except OSError as error:
-        raise ValueError(f"cannot open regular non-symlink corpus ({type(error).__name__})") from None
-    with os.fdopen(corpus_fd, "rb") as source:
-        raw = source.read(MAX_CORPUS_BYTES + 1)
-    if len(raw) > MAX_CORPUS_BYTES:
-        raise ValueError(f"corpus exceeds {MAX_CORPUS_BYTES} bytes")
+    raw = _read_bounded_regular_nofollow(path, MAX_CORPUS_BYTES, "corpus")
     digest = hashlib.sha256(raw).hexdigest()
     if require_registered_digest:
         if not _valid_sha256(EXPECTED_CORPUS_SHA256):
             raise ValueError("schema v2 corpus SHA-256 must be frozen before any model run")
         if digest != EXPECTED_CORPUS_SHA256:
             raise ValueError("corpus SHA-256 differs from the preregistered schema v2 digest")
-    try:
-        corpus = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        raise ValueError("corpus must be valid UTF-8 JSON") from None
+    corpus = _strict_json_loads(raw, "corpus")
     if not isinstance(corpus, dict):
         raise ValueError("corpus root must be an object")
+    expected_corpus_fields = {
+        "schema", "schema_version", "status", "independent_of", "case_count", "class_counts",
+        "plan_schema", "acceptance_criteria", "permutation_group_sizes", "resource_budgets",
+        "coverage_counts", "candidate_pins", "trace_sha256", "cases",
+    }
+    if set(corpus) != expected_corpus_fields:
+        raise ValueError("corpus root contains unknown or missing fields")
     if (
         corpus.get("schema") != "sideeffect.local_query_plan_evaluation_corpus"
         or corpus.get("schema_version") != EXPECTED_SCHEMA_VERSION
@@ -673,8 +735,103 @@ def load_corpus(path: Path, *, require_registered_digest: bool) -> tuple[Path, d
             raise ValueError(f"permutation group {group_name} does not have identical expected plans")
     return path.resolve(strict=True).parent, corpus, digest
 
-def prepare_fixtures(root: Path, corpus: dict[str, Any]) -> tuple[tempfile.TemporaryDirectory[str], dict[str, Path]]:
-    if root.name != "local_query_plan_v2":
+
+def load_external_holdout(directory: Path, expected_manifest_sha256: str) -> tuple[Path, dict[str, Any], str, str]:
+    """Validate one caller-pinned external holdout directory without running a model."""
+    if not _valid_sha256(expected_manifest_sha256):
+        raise ValueError("external holdout manifest SHA-256 must be 64 lowercase hexadecimal characters")
+    root = _reject_symlink_components(directory, "external holdout")
+    try:
+        root_metadata = root.lstat()
+    except OSError as error:
+        raise ValueError(f"external holdout directory is unavailable ({type(error).__name__})") from None
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise ValueError("external holdout path must be a directory")
+
+    manifest_path = root / HOLDOUT_MANIFEST_NAME
+    manifest_raw = _read_bounded_regular_nofollow(
+        manifest_path, MAX_HOLDOUT_MANIFEST_BYTES, "holdout manifest"
+    )
+    manifest_sha256 = hashlib.sha256(manifest_raw).hexdigest()
+    if manifest_sha256 != expected_manifest_sha256:
+        raise ValueError("external holdout manifest SHA-256 does not match the caller pin")
+    manifest = _strict_json_loads(manifest_raw, "holdout manifest")
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "schema", "schema_version", "corpus_path", "corpus_sha256", "fixtures",
+    }:
+        raise ValueError("holdout manifest has unknown or missing fields")
+    if (
+        manifest["schema"] != HOLDOUT_MANIFEST_SCHEMA
+        or type(manifest["schema_version"]) is not int
+        or manifest["schema_version"] != HOLDOUT_MANIFEST_VERSION
+        or manifest["corpus_path"] != "corpus.json"
+        or not _valid_sha256(manifest["corpus_sha256"])
+    ):
+        raise ValueError("holdout manifest schema or corpus declaration is invalid")
+
+    fixture_rows = manifest["fixtures"]
+    if not isinstance(fixture_rows, list) or not fixture_rows or len(fixture_rows) > MAX_CASES:
+        raise ValueError("holdout manifest fixtures must be a non-empty bounded array")
+    fixture_digests: dict[str, str] = {}
+    for row in fixture_rows:
+        if not isinstance(row, dict) or set(row) != {"path", "sha256"}:
+            raise ValueError("holdout fixture declarations have unknown or missing fields")
+        name = row["path"]
+        digest = row["sha256"]
+        if (
+            not isinstance(name, str)
+            or HOLDOUT_TRACE_NAME_PATTERN.fullmatch(name) is None
+            or name in {"corpus.json", HOLDOUT_MANIFEST_NAME}
+            or not _valid_sha256(digest)
+            or name in fixture_digests
+        ):
+            raise ValueError("holdout fixture path or digest is invalid")
+        fixture_digests[name] = digest
+
+    corpus_path = root / "corpus.json"
+    fixture_root, corpus, corpus_sha256 = load_corpus(corpus_path, require_registered_digest=False)
+    if corpus_sha256 != manifest["corpus_sha256"]:
+        raise ValueError("external holdout corpus SHA-256 does not match its manifest")
+    corpus_fixtures = corpus["trace_sha256"]
+    if fixture_digests != corpus_fixtures:
+        raise ValueError("manifest fixture allowlist does not exactly match the corpus trace pins")
+
+    expected_names = {HOLDOUT_MANIFEST_NAME, "corpus.json", *fixture_digests}
+    actual_names: set[str] = set()
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if entry.name in actual_names:
+                    raise ValueError("external holdout directory contains duplicate names")
+                entry_path = root / entry.name
+                entry_metadata = entry.stat(follow_symlinks=False)
+                if _is_symlink_or_reparse_point(entry_path, entry_metadata):
+                    raise ValueError("external holdout directory cannot contain symlinks")
+                if not stat.S_ISREG(entry_metadata.st_mode):
+                    raise ValueError("external holdout directory can contain only regular files")
+                actual_names.add(entry.name)
+    except OSError as error:
+        raise ValueError(f"cannot enumerate external holdout directory ({type(error).__name__})") from None
+    if actual_names != expected_names:
+        raise ValueError("external holdout directory contains missing or unlisted files")
+
+    total_fixture_bytes = 0
+    for name, expected_digest in fixture_digests.items():
+        raw = _read_bounded_regular_nofollow(root / name, MAX_FIXTURE_BYTES, "holdout fixture")
+        total_fixture_bytes += len(raw)
+        if total_fixture_bytes > MAX_HOLDOUT_TOTAL_FIXTURE_BYTES:
+            raise ValueError("external holdout fixtures exceed the aggregate byte limit")
+        if hashlib.sha256(raw).hexdigest() != expected_digest:
+            raise ValueError(f"external holdout fixture digest mismatch: {name}")
+    return fixture_root, corpus, corpus_sha256, manifest_sha256
+
+def prepare_fixtures(
+    root: Path,
+    corpus: dict[str, Any],
+    *,
+    external_holdout: bool = False,
+) -> tuple[tempfile.TemporaryDirectory[str], dict[str, Path]]:
+    if not external_holdout and root.name != "local_query_plan_v2":
         raise ValueError("the evaluator requires tests/fixtures/local_query_plan_v2/corpus.json")
     source_root = root
     if source_root.is_symlink() or not source_root.is_dir():
@@ -682,6 +839,7 @@ def prepare_fixtures(root: Path, corpus: dict[str, Any]) -> tuple[tempfile.Tempo
     private = tempfile.TemporaryDirectory(prefix="sideeffect-query-plan-corpus-")
     target_root = Path(private.name)
     paths: dict[str, Path] = {}
+    total_fixture_bytes = 0
     try:
         for name, expected_digest in corpus["trace_sha256"].items():
             source = source_root / name
@@ -691,7 +849,12 @@ def prepare_fixtures(root: Path, corpus: dict[str, Any]) -> tuple[tempfile.Tempo
                 raise ValueError(f"fixture is missing or is not a regular file: {name}") from error
             with os.fdopen(source_fd, "rb") as stream:
                 raw = stream.read(MAX_FIXTURE_BYTES + 1)
-            if len(raw) > MAX_FIXTURE_BYTES or hashlib.sha256(raw).hexdigest() != expected_digest:
+            total_fixture_bytes += len(raw)
+            if (
+                len(raw) > MAX_FIXTURE_BYTES
+                or (external_holdout and total_fixture_bytes > MAX_HOLDOUT_TOTAL_FIXTURE_BYTES)
+                or hashlib.sha256(raw).hexdigest() != expected_digest
+            ):
                 raise ValueError(f"fixture is oversized or SHA-256 mismatched: {name}")
             target = target_root / name
             target.write_bytes(raw)
@@ -722,6 +885,99 @@ def repository_provenance(repository: Path, *, require_clean: bool) -> dict[str,
         "worktree_clean": not dirty,
         "evaluator_sha256": hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest(),
     }
+
+
+def project_evaluation_report(report: dict[str, Any], *, external_holdout: bool) -> dict[str, Any]:
+    """Return the public report shape, removing case-level data for external scores."""
+    if not external_holdout:
+        return report
+
+    metric_scalar_fields = {
+        "case_count", "schema_and_pin_valid_cases", "schema_valid_output_rate", "valid_outputs",
+        "invalid_outputs", "answerable_case_count", "answerable_exact_result_accuracy",
+        "answerable_exact_plan_accuracy", "no_match_exact_plan_accuracy",
+        "answerable_accuracy_gain_over_baseline", "baseline_answerable_exact_result_accuracy",
+        "baseline_answerable_exact_plan_accuracy", "false_filters_on_must_abstain",
+        "false_filter_rate_on_must_abstain", "must_abstain_cases", "raw_plan_exact_accuracy",
+        "deterministic_match_consistency_rate",
+    }
+    allowed_failure_kinds = {
+        "exit_status", "invalid_output", "timeout", "output_limit", "launch_error", "unclassified",
+    }
+
+    def project_metrics(metrics: Any) -> dict[str, Any]:
+        if not isinstance(metrics, dict):
+            return {}
+        projected_metrics = {
+            key: value for key, value in metrics.items()
+            if key in metric_scalar_fields and isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+        invalid = metrics.get("invalid_run_aggregation")
+        if isinstance(invalid, dict):
+            invalid_count = invalid.get("invalid_run_count", 0)
+            projected_metrics["invalid_run_aggregation"] = {
+                "invalid_run_count": invalid_count if isinstance(invalid_count, int) and not isinstance(invalid_count, bool) else 0,
+                "by_failure_kind": {
+                    key: value for key, value in invalid.get("by_failure_kind", {}).items()
+                    if key in allowed_failure_kinds and isinstance(value, int) and not isinstance(value, bool)
+                } if isinstance(invalid.get("by_failure_kind"), dict) else {},
+                "by_exit_code": {
+                    key: value for key, value in invalid.get("by_exit_code", {}).items()
+                    if isinstance(key, str) and re.fullmatch(r"-?[0-9]{1,4}", key)
+                    and isinstance(value, int) and not isinstance(value, bool)
+                } if isinstance(invalid.get("by_exit_code"), dict) else {},
+            }
+        class_accuracy = metrics.get("per_answerable_class_accuracy")
+        if isinstance(class_accuracy, dict):
+            projected_metrics["per_answerable_class_accuracy"] = {
+                key: value for key, value in class_accuracy.items()
+                if key in ANSWERABLE_CLASSES and isinstance(value, (int, float)) and not isinstance(value, bool)
+            }
+        latency = metrics.get("latency_seconds")
+        if isinstance(latency, dict):
+            projected_metrics["latency_seconds"] = {
+                key: value for key, value in latency.items()
+                if key in {"count", "min_seconds", "median_seconds", "mean_seconds", "p95_seconds", "max_seconds"}
+                and (value is None or (isinstance(value, (int, float)) and not isinstance(value, bool)))
+            }
+        rss = metrics.get("sampled_process_tree_peak_rss_kib")
+        if isinstance(rss, dict):
+            projected_metrics["sampled_process_tree_peak_rss_kib"] = {
+                key: value for key, value in rss.items()
+                if key in {"measured_case_count", "maximum_across_cases", "sample_interval_seconds"}
+                and (value is None or (isinstance(value, (int, float)) and not isinstance(value, bool)))
+            }
+        permutation = metrics.get("permutation_group_correct")
+        if isinstance(permutation, dict):
+            projected_metrics["permutation_group_correct"] = {
+                key: value for key, value in permutation.items()
+                if key in REGISTERED_PERMUTATION_GROUP_SIZES and isinstance(value, bool)
+            }
+        return projected_metrics
+
+    provenance_fields = {
+        "repository_revision", "worktree_clean", "evaluator_sha256", "corpus_sha256",
+        "holdout_manifest_sha256", "model_repository", "model_repository_revision",
+        "model_sha256", "model_size_bytes", "runtime_source_revision", "runtime_version",
+    }
+    report_fields = {
+        "schema", "schema_version", "mode", "provenance", "previewed_cases", "criteria",
+        "metrics", "threshold_checks", "semantic_oracle_status",
+        "reviewer_independence_status", "baseline_description",
+    }
+    projected = {key: value for key, value in report.items() if key in report_fields}
+    if "metrics" in projected:
+        projected["metrics"] = project_metrics(projected["metrics"])
+    raw_provenance = report.get("provenance")
+    if isinstance(raw_provenance, dict):
+        projected["provenance"] = {
+            key: value for key, value in raw_provenance.items() if key in provenance_fields
+        }
+    projected["semantic_oracle_status"] = "caller_supplied_labels_not_independently_verified"
+    projected["reviewer_independence_status"] = "unverified"
+    projected["qualification_status"] = "not_assessed"
+    projected["per_case_oracle_data_emitted"] = False
+    return projected
 
 
 def _prompt_object(preview: dict[str, Any]) -> dict[str, Any]:
@@ -1365,10 +1621,24 @@ def main() -> int:
     parser.add_argument("--model", type=Path, help="Locally obtained pinned GGUF model")
     parser.add_argument("--preview-only", action="store_true", help="Validate all previews without model inference")
     parser.add_argument("--report", type=Path, help="Write a private no-clobber JSON report outside the repository")
+    parser.add_argument(
+        "--external-holdout-directory", type=Path,
+        help="Opt in to a caller-supplied external holdout directory",
+    )
+    parser.add_argument(
+        "--holdout-manifest-sha256",
+        help="Required exact SHA-256 pin for the external holdout manifest",
+    )
     args = parser.parse_args()
 
     repository = Path(__file__).resolve().parents[1]
-    corpus_path = repository / CORPUS_RELATIVE_PATH
+    external_holdout = args.external_holdout_directory is not None
+    if external_holdout != (args.holdout_manifest_sha256 is not None):
+        parser.error("--external-holdout-directory and --holdout-manifest-sha256 must be supplied together")
+    corpus_path = (
+        args.external_holdout_directory / "corpus.json"
+        if external_holdout else repository / CORPUS_RELATIVE_PATH
+    )
     if not args.sideeffect.is_file() or args.sideeffect.is_symlink():
         parser.error("--sideeffect must name a regular non-symlink executable")
     if args.model is None:
@@ -1377,8 +1647,18 @@ def main() -> int:
         parser.error("--runtime is required for a full model run")
     try:
         provenance = repository_provenance(repository, require_clean=not args.preview_only)
-        fixture_root, corpus, corpus_sha256 = load_corpus(corpus_path, require_registered_digest=not args.preview_only)
-        fixture_temp, trace_paths = prepare_fixtures(fixture_root, corpus)
+        holdout_manifest_sha256 = None
+        if external_holdout:
+            fixture_root, corpus, corpus_sha256, holdout_manifest_sha256 = load_external_holdout(
+                args.external_holdout_directory, args.holdout_manifest_sha256
+            )
+        else:
+            fixture_root, corpus, corpus_sha256 = load_corpus(
+                corpus_path, require_registered_digest=not args.preview_only
+            )
+        fixture_temp, trace_paths = prepare_fixtures(
+            fixture_root, corpus, external_holdout=external_holdout
+        )
         atexit.register(fixture_temp.cleanup)
         model_digest = None
         model_size = None
@@ -1574,8 +1854,13 @@ def main() -> int:
             report = {
                 "schema": "sideeffect.local_query_plan_evaluation_report",
                 "schema_version": 1,
-                "mode": "preview_only_no_model_run",
+                "mode": (
+                    "external_holdout_preview_only_no_model_run"
+                    if external_holdout else "preview_only_no_model_run"
+                ),
                 "provenance": {**provenance, "corpus_sha256": corpus_sha256,
+                               **({"holdout_manifest_sha256": holdout_manifest_sha256}
+                                  if external_holdout else {}),
                                "model_repository": EXPECTED_MODEL_REPOSITORY,
                                "model_repository_revision": EXPECTED_MODEL_REPOSITORY_REVISION,
                                "model_sha256": EXPECTED_MODEL_SHA256,
@@ -1583,8 +1868,16 @@ def main() -> int:
                                "runtime_source_revision": EXPECTED_RUNTIME_SOURCE_REVISION,
                                "runtime_version": EXPECTED_RUNTIME_VERSION},
                 "previewed_cases": len(preview_cache),
-                "cases": [item["record"] for item in preview_cache],
+                **({
+                    "semantic_oracle_status": "caller_supplied_labels_not_independently_verified",
+                    "reviewer_independence_status": "unverified",
+                    "qualification_status": "not_assessed",
+                    "per_case_oracle_data_emitted": False,
+                } if external_holdout else {
+                    "cases": [item["record"] for item in preview_cache],
+                }),
             }
+            report = project_evaluation_report(report, external_holdout=external_holdout)
             _emit(report, args.report, repository)
             model_store.cleanup()
             return 0
@@ -1711,8 +2004,10 @@ def main() -> int:
         report = {
             "schema": "sideeffect.local_query_plan_evaluation_report",
             "schema_version": 1,
-            "mode": "guarded_synthetic_model_evaluation",
+            "mode": "external_holdout_score_only" if external_holdout else "guarded_synthetic_model_evaluation",
             "provenance": {**provenance, "corpus_sha256": corpus_sha256,
+                           **({"holdout_manifest_sha256": holdout_manifest_sha256}
+                              if external_holdout else {}),
                            "trace_sha256": corpus["trace_sha256"],
                            "model_repository": EXPECTED_MODEL_REPOSITORY,
                            "model_repository_revision": EXPECTED_MODEL_REPOSITORY_REVISION,
@@ -1722,12 +2017,19 @@ def main() -> int:
                            "runtime_version": runtime_version},
             "criteria": criteria,
             "metrics": metrics,
-            "acceptance": acceptance,
+            **({
+                "threshold_checks": acceptance,
+                "semantic_oracle_status": "caller_supplied_labels_not_independently_verified",
+                "reviewer_independence_status": "unverified",
+                "qualification_status": "not_assessed",
+                "per_case_oracle_data_emitted": False,
+            } if external_holdout else {"acceptance": acceptance}),
             "baseline_description": "Frozen lexical baseline recognizes exact supported syscall names, fixed outcome synonyms, strict errno tokens, absolute path literals, explicit process relation language, and task/process IDs. Result accuracy compares semantic rows returned by that plan with rows selected by the fixture's expected plan; plan-signature accuracy is recorded separately. Paraphrases outside the frozen lexical rules are not inferred.",
-            "cases": cases,
+            **({} if external_holdout else {"cases": cases}),
         }
+        report = project_evaluation_report(report, external_holdout=external_holdout)
         _emit(report, args.report, repository)
-        return 0 if all(acceptance.values()) else 2
+        return 0 if external_holdout or all(acceptance.values()) else 2
     finally:
         fixture_temp.cleanup()
         model_store.cleanup()

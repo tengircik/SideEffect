@@ -1,9 +1,13 @@
 import importlib.util
+import hashlib
 import json
+import os
+import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -130,9 +134,9 @@ class RustContractTests(unittest.TestCase):
             "schema_version": EVALUATOR.EXPECTED_SCHEMA_VERSION,
             "question": question,
             "request_sha256": "0" * 64,
-            "model_repository": EVALUATOR.EXPECTED_MODEL_REPOSITORY,
+            "model_repository": "user-provided",
             "model_sha256": EVALUATOR.EXPECTED_MODEL_SHA256,
-            "model_repository_revision": EVALUATOR.EXPECTED_MODEL_REPOSITORY_REVISION,
+            "model_repository_revision": "user-provided",
             "runtime_source_revision": EVALUATOR.EXPECTED_RUNTIME_SOURCE_REVISION,
             "trace_sha256": EVALUATOR.hashlib.sha256(trace).hexdigest(),
             "system_prompt": EVALUATOR.EXPECTED_SYSTEM_PROMPT,
@@ -169,6 +173,228 @@ class RustContractTests(unittest.TestCase):
             self.assertTrue(all(path.parent == Path(temporary.name) for path in traces.values()))
         finally:
             temporary.cleanup()
+
+
+def make_external_holdout(directory: Path) -> str:
+    source_path = ROOT / EVALUATOR.CORPUS_RELATIVE_PATH
+    corpus_bytes = source_path.read_bytes()
+    corpus = json.loads(corpus_bytes)
+    (directory / "corpus.json").write_bytes(corpus_bytes)
+    fixture_rows = []
+    source_root = source_path.parent
+    for name in sorted(corpus["trace_sha256"]):
+        fixture_bytes = (source_root / name).read_bytes()
+        (directory / name).write_bytes(fixture_bytes)
+        fixture_rows.append({"path": name, "sha256": hashlib.sha256(fixture_bytes).hexdigest()})
+    manifest = {
+        "schema": EVALUATOR.HOLDOUT_MANIFEST_SCHEMA,
+        "schema_version": EVALUATOR.HOLDOUT_MANIFEST_VERSION,
+        "corpus_path": "corpus.json",
+        "corpus_sha256": hashlib.sha256(corpus_bytes).hexdigest(),
+        "fixtures": fixture_rows,
+    }
+    raw = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    (directory / EVALUATOR.HOLDOUT_MANIFEST_NAME).write_bytes(raw)
+    return hashlib.sha256(raw).hexdigest()
+
+
+class ExternalHoldoutTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self.temporary.name) / "holdout"
+        self.directory.mkdir()
+        self.manifest_digest = make_external_holdout(self.directory)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _rewrite_manifest(self, update: dict[str, object]) -> str:
+        path = self.directory / EVALUATOR.HOLDOUT_MANIFEST_NAME
+        manifest = json.loads(path.read_bytes())
+        manifest.update(update)
+        raw = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        path.write_bytes(raw)
+        self.manifest_digest = hashlib.sha256(raw).hexdigest()
+        return self.manifest_digest
+
+    def test_external_holdout_accepts_exact_manifest_corpus_and_fixture_set(self) -> None:
+        root, corpus, corpus_digest, manifest_digest = EVALUATOR.load_external_holdout(
+            self.directory, self.manifest_digest
+        )
+        self.assertEqual(root, self.directory.resolve())
+        self.assertEqual(corpus["schema_version"], 2)
+        self.assertEqual(corpus_digest, hashlib.sha256((root / "corpus.json").read_bytes()).hexdigest())
+        self.assertEqual(manifest_digest, self.manifest_digest)
+
+        temporary, fixtures = EVALUATOR.prepare_fixtures(root, corpus, external_holdout=True)
+        try:
+            self.assertEqual(set(fixtures), set(corpus["trace_sha256"]))
+            self.assertTrue(all(path.parent == Path(temporary.name) for path in fixtures.values()))
+        finally:
+            temporary.cleanup()
+
+    def test_manifest_requires_the_caller_supplied_exact_digest(self) -> None:
+        with self.assertRaisesRegex(ValueError, "manifest SHA-256"):
+            EVALUATOR.load_external_holdout(self.directory, "0" * 64)
+        with self.assertRaisesRegex(ValueError, "64 lowercase"):
+            EVALUATOR.load_external_holdout(self.directory, "not-a-digest")
+
+    def test_manifest_rejects_unknown_fields_and_duplicate_json_keys(self) -> None:
+        self._rewrite_manifest({"extra": True})
+        with self.assertRaisesRegex(ValueError, "unknown or missing"):
+            EVALUATOR.load_external_holdout(self.directory, self.manifest_digest)
+
+        path = self.directory / EVALUATOR.HOLDOUT_MANIFEST_NAME
+        raw = path.read_bytes()
+        duplicate = raw[:-1] + b',"schema":"unexpected"}'
+        path.write_bytes(duplicate)
+        digest = hashlib.sha256(duplicate).hexdigest()
+        with self.assertRaisesRegex(ValueError, "duplicate JSON object key"):
+            EVALUATOR.load_external_holdout(self.directory, digest)
+
+    def test_manifest_rejects_path_traversal_and_unlisted_corpus_paths(self) -> None:
+        self._rewrite_manifest({"corpus_path": "../corpus.json"})
+        with self.assertRaisesRegex(ValueError, "corpus declaration"):
+            EVALUATOR.load_external_holdout(self.directory, self.manifest_digest)
+
+        manifest = json.loads((self.directory / EVALUATOR.HOLDOUT_MANIFEST_NAME).read_bytes())
+        manifest["corpus_path"] = "corpus.json"
+        manifest["fixtures"][0]["path"] = "../outside.trace"
+        raw = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        (self.directory / EVALUATOR.HOLDOUT_MANIFEST_NAME).write_bytes(raw)
+        digest = hashlib.sha256(raw).hexdigest()
+        with self.assertRaisesRegex(ValueError, "fixture path or digest"):
+            EVALUATOR.load_external_holdout(self.directory, digest)
+
+    def test_external_corpus_is_digest_bound_and_rejects_unknown_fields(self) -> None:
+        self._rewrite_manifest({"corpus_sha256": "0" * 64})
+        with self.assertRaisesRegex(ValueError, "corpus SHA-256"):
+            EVALUATOR.load_external_holdout(self.directory, self.manifest_digest)
+
+        corpus_path = self.directory / "corpus.json"
+        corpus = json.loads(corpus_path.read_bytes())
+        corpus["unreviewed_annotation"] = "must not be silently ignored"
+        raw = json.dumps(corpus, separators=(",", ":")).encode("utf-8")
+        corpus_path.write_bytes(raw)
+        self._rewrite_manifest({"corpus_sha256": hashlib.sha256(raw).hexdigest()})
+        with self.assertRaisesRegex(ValueError, "unknown or missing fields"):
+            EVALUATOR.load_external_holdout(self.directory, self.manifest_digest)
+
+    def test_external_fixture_digest_mismatch_and_unknown_file_are_rejected(self) -> None:
+        fixture_name = next(name for name in self.directory.iterdir() if name.suffix == ".trace").name
+        (self.directory / fixture_name).write_bytes(b"changed fixture")
+        with self.assertRaisesRegex(ValueError, "fixture digest mismatch"):
+            EVALUATOR.load_external_holdout(self.directory, self.manifest_digest)
+
+        (self.directory / fixture_name).write_bytes((ROOT / EVALUATOR.CORPUS_RELATIVE_PATH).with_name(fixture_name).read_bytes())
+        (self.directory / "unlisted.json").write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "missing or unlisted files"):
+            EVALUATOR.load_external_holdout(self.directory, self.manifest_digest)
+
+    def test_external_holdout_enforces_aggregate_fixture_byte_limit(self) -> None:
+        with mock.patch.object(EVALUATOR, "MAX_HOLDOUT_TOTAL_FIXTURE_BYTES", 1):
+            with self.assertRaisesRegex(ValueError, "aggregate byte limit"):
+                EVALUATOR.load_external_holdout(self.directory, self.manifest_digest)
+
+    def test_external_holdout_rejects_oversize_manifest_and_symlink_root(self) -> None:
+        manifest_path = self.directory / EVALUATOR.HOLDOUT_MANIFEST_NAME
+        raw = manifest_path.read_bytes()
+        with mock.patch.object(EVALUATOR, "MAX_HOLDOUT_MANIFEST_BYTES", len(raw) - 1):
+            with self.assertRaisesRegex(ValueError, "holdout manifest exceeds"):
+                EVALUATOR.load_external_holdout(self.directory, self.manifest_digest)
+
+        symlink = Path(self.temporary.name) / "holdout-link"
+        try:
+            os.symlink(self.directory, symlink, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("this platform does not allow creating a test directory symlink")
+        with self.assertRaisesRegex(ValueError, "cannot contain symlinks or junctions"):
+            EVALUATOR.load_external_holdout(symlink, self.manifest_digest)
+
+    def test_external_holdout_rejects_unlisted_symlink_entry(self) -> None:
+        link = self.directory / "unlisted.trace"
+        try:
+            os.symlink(self.directory / "corpus.json", link)
+        except (OSError, NotImplementedError):
+            self.skipTest("this platform does not allow creating a test file symlink")
+        with self.assertRaisesRegex(ValueError, "cannot contain symlinks"):
+            EVALUATOR.load_external_holdout(self.directory, self.manifest_digest)
+
+    def test_windows_reparse_point_attribute_is_rejected(self) -> None:
+        metadata = mock.Mock(st_mode=0o100644, st_file_attributes=0x400)
+        self.assertTrue(
+            EVALUATOR._is_symlink_or_reparse_point(self.directory / "entry", metadata)
+        )
+
+
+class ReportProjectionTests(unittest.TestCase):
+    def test_external_projection_keeps_aggregate_results_and_drops_case_level_data(self) -> None:
+        report = {
+            "schema": "sideeffect.local_query_plan_evaluation_report",
+            "schema_version": 1,
+            "mode": "external_holdout_score_only",
+            "provenance": {
+                "repository_revision": "abc123",
+                "corpus_sha256": "a" * 64,
+                "holdout_manifest_sha256": "b" * 64,
+                "trace_sha256": {"private-case.trace": "c" * 64},
+            },
+            "criteria": {"minimum_accuracy": 0.9},
+            "metrics": {
+                "answerable_exact_result_accuracy": 0.75,
+                "per_answerable_class_accuracy": {
+                    "single_predicate": 0.8,
+                    "PRIVATE_LABEL": 1.0,
+                },
+                "latency_seconds": {
+                    "p95_seconds": 1.25,
+                    "PRIVATE_QUERY": "PRIVATE QUESTION",
+                },
+                "unexpected_case_payload": {
+                    "id": "PRIVATE_CASE_ID",
+                    "question": "PRIVATE QUESTION",
+                    "trace_filename": "private-case.trace",
+                },
+            },
+            "threshold_checks": {"minimum_accuracy": False},
+            "semantic_oracle_status": "caller_supplied_labels_not_independently_verified",
+            "reviewer_independence_status": "unverified",
+            "qualification_status": "incorrect-input-value",
+            "per_case_oracle_data_emitted": True,
+            "cases": [{
+                "id": "PRIVATE_CASE_ID",
+                "question": "PRIVATE QUESTION",
+                "expected_plan": {"decision": "filter"},
+                "trace_filename": "private-case.trace",
+                "trace_sha256": "c" * 64,
+            }],
+        }
+        projected = EVALUATOR.project_evaluation_report(report, external_holdout=True)
+        rendered = json.dumps(projected, sort_keys=True)
+
+        self.assertEqual(projected["metrics"]["answerable_exact_result_accuracy"], 0.75)
+        self.assertEqual(projected["metrics"]["per_answerable_class_accuracy"], {"single_predicate": 0.8})
+        self.assertEqual(projected["metrics"]["latency_seconds"], {"p95_seconds": 1.25})
+        self.assertNotIn("unexpected_case_payload", projected["metrics"])
+        self.assertEqual(projected["threshold_checks"], {"minimum_accuracy": False})
+        self.assertEqual(projected["qualification_status"], "not_assessed")
+        self.assertIs(projected["per_case_oracle_data_emitted"], False)
+        self.assertNotIn("cases", projected)
+        self.assertNotIn("trace_sha256", projected["provenance"])
+        for private_value in (
+            "PRIVATE_CASE_ID", "PRIVATE QUESTION", "expected_plan", "private-case.trace", "c" * 64,
+        ):
+            self.assertNotIn(private_value, rendered)
+
+    def test_development_projection_preserves_existing_detail(self) -> None:
+        report = {
+            "provenance": {"trace_sha256": {"public-case.trace": "d" * 64}},
+            "cases": [{"id": "public-case", "question": "public question"}],
+            "acceptance": {"quality_gate": True},
+        }
+        projected = EVALUATOR.project_evaluation_report(report, external_holdout=False)
+        self.assertIs(projected, report)
+        self.assertEqual(projected, report)
 
 
 class FailureAndAggregationTests(unittest.TestCase):

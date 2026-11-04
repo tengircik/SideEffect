@@ -2,6 +2,33 @@
 
 **Status: experimental and not release-approved.** This is a separately gated M8 experiment. No model candidate has passed the frozen v2 usefulness gate. This is not a claim that local model analysis is useful or accurate on real captures. The model-query command is currently implemented only for Linux x86_64; GPU model experiments below were run separately on Windows and do not establish native Windows product support.
 
+## Optional external holdout directory
+
+The evaluator can opt into a caller-supplied holdout directory instead of the repository's public development corpus. This mode accepts only the current strict query-plan v2 corpus contract and requires an exact caller-supplied SHA-256 pin for `holdout-manifest.json`:
+
+```text
+holdout-directory/
+  holdout-manifest.json
+  corpus.json
+  <each exact .trace basename listed in both manifest and corpus>
+```
+
+The manifest schema is `sideeffect.local_query_plan_external_holdout_manifest` v1 with exactly these fields: `schema`, `schema_version`, `corpus_path` (the literal `corpus.json`), `corpus_sha256`, and `fixtures` (a list of exact `{path, sha256}` objects). The folder may contain only that manifest, `corpus.json`, and the listed regular trace files. The evaluator rejects unlisted files, symlinks/junctions, path separators/traversal, duplicate JSON keys, unknown fields, oversized files, and manifest/corpus/trace digest mismatches. It stages verified fixtures into a private temporary directory before invoking SideEffect.
+
+Use it only after freezing the candidate and evaluation plan; do not expose holdout labels or per-case score feedback to prompt authors. Example full run:
+
+```sh
+python3 scripts/evaluate_local_query_plan.py \
+  --sideeffect ./target/release/sideeffect \
+  --model /path/to/pinned-model.gguf \
+  --runtime /path/to/pinned-llama-completion \
+  --external-holdout-directory /private/holdout-directory \
+  --holdout-manifest-sha256 EXPECTED_MANIFEST_SHA256 \
+  --report /private/holdout-score.json
+```
+
+The external mode emits aggregate score metrics only; it omits per-case oracle and model-output rows, case identifiers, questions, expected plans, and the per-trace filename/hash map. The manifest and hashes establish byte consistency against the caller's pin only. They do **not** verify semantic labels, corpus authorship, reviewer identity, reviewer independence, blinding, or qualification. Its report marks those review/qualification states unverified or not assessed. Repeated scoring and prompt/model tuning against the same holdout invalidate its use as a hidden holdout. This tool does not create or review a holdout; it evaluates only the caller-supplied directory and cannot establish that it was kept hidden. In this mode, exit code `0` means scoring completed and a report was produced; threshold outcomes are reported separately and do not affect that exit code or establish qualification.
+
 ## Select a query model
 
 On Linux x86_64, inspect the pinned query-plan candidates and their explicit no-go quality status with `sideeffect model list`, then use `sideeffect model show ID` for one entry. To install and select a listed candidate in one guided step, run `sideeffect model setup ID`, review its pinned source, revision, exact size, license terms, platform scope, and evaluation note, then type exactly `ACCEPT <license-id>`. Alternatively, `sideeffect model install ID` downloads without selecting. License acceptance is saved locally against that model ID, revision, license ID, and terms URL before the HTTPS request. It may remain saved if the transfer fails or is cancelled. Downloads are size-capped, SHA-256 checked, staged in the private per-user model store, and published without replacing an existing file. The manager does not install the runtime.
