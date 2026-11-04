@@ -98,6 +98,8 @@ The same inventory can be selected inside an audit session with `sideeffect audi
 
 To compare two sessions that both include this source, run `sideeffect compare-sessions ./before-session ./after-session` (PowerShell: `sideeffect.exe compare-sessions .\before-session .\after-session`). PATH candidate changes use exact platform path encodings and evidence references. Selected-root changes compare direct-child metadata and compare content only when both sides observed hashes; missing hashes remain unknown and make the item comparison partial when hashing was requested. Different roots are incomparable. Incomplete sources and ambiguous identities suppress one-sided presence claims. A candidate label is a metadata heuristic, not proof that a shell resolves or can launch a file. Session artifacts and comparison output can contain sensitive paths, names, timestamps, sizes, hashes, and local file-ID hints.
 
+When both Windows sessions include the optional `--msix` source, `compare-sessions` reports current-user package registration additions, removals, and selected metadata changes using exact valid family-name evidence. Incomplete or ambiguous sources suppress unmatched presence claims. A registration change does not establish package availability, health, launchability, or execution.
+
 ### Capture a selected Linux command
 
 ```sh

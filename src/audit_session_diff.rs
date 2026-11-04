@@ -10,7 +10,7 @@ use crate::inventory::{
     compare_package_inventory_json, compare_path_executable_inventory_json,
     compare_permission_inventory_json, compare_process_inventory_json,
     compare_selected_root_inventory_json, compare_startup_inventory_json,
-    compare_windows_software_inventory_json,
+    compare_windows_msix_inventory_json, compare_windows_software_inventory_json,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -93,6 +93,7 @@ pub fn compare_audit_sessions(
         SourceRole::Runtime,
         SourceRole::PathExecutables,
         SourceRole::SelectedRoot,
+        SourceRole::Msix,
     ];
     let source_diffs: Vec<_> = roles
         .into_iter()
@@ -581,6 +582,20 @@ fn compare_native(
                 serde_json::to_value(result).map_err(|_| NativeCompareError::Malformed)?,
             )
         }
+        (SourceRole::Msix, ArtifactKind::WindowsMsix) => {
+            let result =
+                compare_windows_msix_inventory_json(left, right).map_err(map_msix_error)?;
+            let status = if result.status == crate::inventory::WindowsMsixComparisonStatus::Complete
+            {
+                "compared"
+            } else {
+                "partial"
+            };
+            (
+                status,
+                serde_json::to_value(result).map_err(|_| NativeCompareError::Malformed)?,
+            )
+        }
         (SourceRole::Processes, ArtifactKind::Processes | ArtifactKind::WindowsProcesses)
         | (SourceRole::Permissions, ArtifactKind::Permissions | ArtifactKind::WindowsPermissions)
         | (SourceRole::Startup, ArtifactKind::Startup | ArtifactKind::WindowsStartup) => match role
@@ -723,6 +738,17 @@ fn map_software_error(
     }
 }
 
+fn map_msix_error(error: crate::inventory::WindowsMsixComparisonError) -> NativeCompareError {
+    use crate::inventory::WindowsMsixComparisonError as E;
+    match error {
+        E::MalformedInput => NativeCompareError::Malformed,
+        E::InputTooLarge => NativeCompareError::InputLimit,
+        E::UnsupportedSchema => NativeCompareError::Unsupported,
+        E::Incompatible => NativeCompareError::Incompatible,
+        E::LimitExceeded => NativeCompareError::Limit,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -734,6 +760,7 @@ mod tests {
         SessionArtifactRef, SessionStatus, SourceRole, SourceStatus,
     };
     use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
 
     #[test]
     fn selected_root_scope_extension_keeps_v7_v9_and_v10_compatible() {
@@ -825,6 +852,7 @@ mod tests {
                 ArtifactKind::WindowsStartup => "startup.windows.json",
                 ArtifactKind::PathExecutables => "path-executables.json",
                 ArtifactKind::SelectedRoot => "root-snapshot.json",
+                ArtifactKind::WindowsMsix => "msix.windows.json",
                 _ => "packages.json",
             }
             .into(),
@@ -899,6 +927,105 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    fn msix_snapshot(version: u16, include_extra: bool) -> Vec<u8> {
+        let exact = |text: String| {
+            let mut utf16_hex = String::with_capacity(text.encode_utf16().count() * 4);
+            for unit in text.encode_utf16() {
+                write!(&mut utf16_hex, "{unit:04x}").unwrap();
+            }
+            serde_json::json!({"text":text,"utf16_hex":utf16_hex,"display_replaced_invalid_utf16":false})
+        };
+        let mut packages = vec![serde_json::json!({
+            "ordinal":0,"name":exact("Demo".into()),"publisher":exact("Publisher".into()),
+            "full_name":exact(format!("Demo_{version}")),"family_name":exact("Demo_publisher".into()),
+            "install_location":exact("C:\\Apps\\Demo".into()),
+            "version":{"major":version,"minor":0,"build":0,"revision":0},"is_framework":false,"is_resource_package":false,"is_bundle":false,"is_development_mode":false
+        })];
+        if include_extra {
+            packages.push(serde_json::json!({
+                "ordinal":1,"name":exact("Other".into()),"publisher":exact("Publisher".into()),
+                "full_name":exact("Other_1".into()),"family_name":exact("Other_publisher".into()),
+                "install_location":exact("C:\\Apps\\Other".into()),
+                "version":{"major":1,"minor":0,"build":0,"revision":0},"is_framework":false,"is_resource_package":false,"is_bundle":false,"is_development_mode":false
+            }));
+        }
+        serde_json::to_vec(&serde_json::json!({
+            "schema":"sideeffect.windows_msix_inventory","schema_version":1,
+            "platform":"windows","scope":"current_user_registered_appx_and_msix_packages_only",
+            "capture_started_at_unix_ms":1000,"capture_ended_at_unix_ms":1001,"status":"complete",
+            "sources":[{"id":"current_user_appx_msix_packages","status":"complete","packages_seen":packages.len(),"scope":"calling_user_only","diagnostics":[]}],
+            "packages":packages
+        })).unwrap()
+    }
+
+    #[test]
+    fn msix_session_diff_uses_verified_artifacts_and_suppresses_partial_presence() {
+        let before_bytes = msix_snapshot(1, false);
+        let after_bytes = msix_snapshot(2, true);
+        assert!(
+            crate::inventory::compare_windows_msix_inventory_json(&before_bytes, &after_bytes)
+                .is_ok()
+        );
+        let spec = SessionSpec {
+            role: SourceRole::Msix,
+            kind: ArtifactKind::WindowsMsix,
+            platform: "windows",
+            schema: "sideeffect.windows_msix_inventory",
+            schema_version: 1,
+            scope: "bounded current-user MSIX package registrations",
+        };
+        let (before, before_digest) = session_for(
+            &before_bytes,
+            "0123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Complete,
+        );
+        let (after, after_digest) = session_for(
+            &after_bytes,
+            "1123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Complete,
+        );
+        let left = [VerifiedArtifactBytes {
+            kind: ArtifactKind::WindowsMsix,
+            path: "msix.windows.json",
+            bytes: &before_bytes,
+        }];
+        let right = [VerifiedArtifactBytes {
+            kind: ArtifactKind::WindowsMsix,
+            path: "msix.windows.json",
+            bytes: &after_bytes,
+        }];
+        let result = compare_audit_sessions(&before, &after, &left, &right);
+        let source = &result.source_diffs[0];
+        assert_eq!(
+            source.status, "compared",
+            "reason: {:?}",
+            source.reason_code
+        );
+        assert_eq!(source.before_artifacts[0].sha256, before_digest);
+        assert_eq!(source.after_artifacts[0].sha256, after_digest);
+        assert_eq!(source.comparison.as_ref().unwrap()["counts"]["changes"], 1);
+        let partial = session_for(
+            &after_bytes,
+            "2123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Partial,
+        )
+        .0;
+        let partial_result = compare_audit_sessions(&before, &partial, &left, &right);
+        let partial_source = &partial_result.source_diffs[0];
+        assert_eq!(partial_source.status, "partial");
+        assert_eq!(
+            partial_source.comparison.as_ref().unwrap()["counts"]["additions"],
+            0
+        );
+        assert_eq!(
+            partial_source.comparison.as_ref().unwrap()["counts"]["unmatched_rows_with_incomplete_source"],
+            1
+        );
     }
 
     fn linux_startup(version: u32, component_version: u32) -> Vec<u8> {

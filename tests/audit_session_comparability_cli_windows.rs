@@ -2,6 +2,7 @@
 
 use serde_json::{Value, json};
 use sha2::Digest;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -83,6 +84,90 @@ fn write_manifest(path: &Path, value: &Value) {
         serde_json::to_vec_pretty(value).unwrap(),
     )
     .unwrap();
+}
+
+fn msix_document(packages: Value) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "schema":"sideeffect.windows_msix_inventory","schema_version":1,
+        "platform":"windows","scope":"current_user_registered_appx_and_msix_packages_only",
+        "capture_started_at_unix_ms":1,"capture_ended_at_unix_ms":2,"status":"complete",
+        "sources":[{"id":"current_user_appx_msix_packages","status":"complete","packages_seen":packages.as_array().unwrap().len(),"scope":"calling_user_only","diagnostics":[]}],
+        "packages":packages
+    })).unwrap()
+}
+
+fn write_msix_artifact(session: &Path, bytes: &[u8]) {
+    fs::write(session.join("msix.windows.json"), bytes).unwrap();
+    let mut value = manifest(session);
+    let source = value["sources"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|source| source["role"] == "msix")
+        .unwrap();
+    source["status"] = json!("complete");
+    source["artifacts"][0]["byte_length"] = json!(bytes.len());
+    source["artifacts"][0]["sha256"] = json!(format!("{:x}", sha2::Sha256::digest(bytes)));
+    value["status"] = json!("complete");
+    write_manifest(session, &value);
+}
+
+fn msix_row(ordinal: usize, version: u16) -> Value {
+    fn exact(text: &str) -> Value {
+        let mut utf16_hex = String::with_capacity(text.encode_utf16().count() * 4);
+        for unit in text.encode_utf16() {
+            write!(&mut utf16_hex, "{unit:04x}").unwrap();
+        }
+        json!({"text":text,"utf16_hex":utf16_hex,"display_replaced_invalid_utf16":false})
+    }
+    let full_name = format!("Demo_{version}_neutral__publisher");
+    let family_name = if ordinal == 0 {
+        "Demo_publisher"
+    } else {
+        "Other_publisher"
+    };
+    json!({"ordinal":ordinal,"name":exact("Demo"),"publisher":exact("Publisher"),
+        "full_name":exact(&full_name),"family_name":exact(family_name),
+        "install_location":exact("C:\\Apps\\Demo"),"version":{"major":version,"minor":0,"build":0,"revision":0},
+        "is_framework":false,"is_resource_package":false,"is_bundle":false,"is_development_mode":false})
+}
+
+#[test]
+fn compare_sessions_emits_msix_item_changes_and_evidence() {
+    let root = TestDirectory::new();
+    let before = audit_msix(&root.0, "msix-before");
+    let after = audit_msix(&root.0, "msix-after");
+    write_msix_artifact(&before, &msix_document(json!([msix_row(0, 1)])));
+    write_msix_artifact(
+        &after,
+        &msix_document(json!([msix_row(0, 2), msix_row(1, 1)])),
+    );
+
+    let output = compare(&before, &after);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value = report(&output);
+    let source = value["source_diffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["role"] == "msix")
+        .unwrap();
+    assert_eq!(source["status"], "compared");
+    assert_eq!(source["comparison"]["counts"]["changes"], 1);
+    assert_eq!(source["comparison"]["counts"]["additions"], 1);
+    let changed = source["comparison"]["deltas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|delta| delta["kind"] == "changed")
+        .unwrap();
+    assert_eq!(changed["before"]["evidence"]["package_ordinal"], 0);
+    assert_eq!(changed["after"]["evidence"]["package_ordinal"], 0);
 }
 
 fn report(output: &Output) -> Value {

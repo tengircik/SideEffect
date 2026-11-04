@@ -41,6 +41,7 @@ mod systemd_units;
 mod windows_app_paths;
 #[cfg(windows)]
 mod windows_msix;
+mod windows_msix_diff;
 mod windows_software_diff;
 
 #[cfg(target_os = "linux")]
@@ -82,6 +83,12 @@ pub use process_diff::{
 pub use startup_diff::{
     StartupDelta, StartupDiffCounts, StartupDiffError, StartupDiffStatus, StartupEvidenceSide,
     StartupInventoryDiff, compare_startup_inventory_json, is_startup_inventory_json,
+};
+pub use windows_msix_diff::{
+    WindowsMsixChangeKind, WindowsMsixComparisonDiagnostic, WindowsMsixComparisonError,
+    WindowsMsixComparisonStatus, WindowsMsixCounts, WindowsMsixDelta, WindowsMsixEvidenceReference,
+    WindowsMsixFacts, WindowsMsixIdentity, WindowsMsixInventoryComparison,
+    compare_windows_msix_inventory_json,
 };
 pub use windows_software_diff::{
     WindowsSoftwareChangeKind, WindowsSoftwareComparisonCounts,
