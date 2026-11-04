@@ -1,8 +1,9 @@
 //! Bounded item-level comparison of verified audit-session inventory artifacts.
 
 use crate::audit_session::{
-    AUDIT_SESSION_SCHEMA_VERSION, AUDIT_SESSION_V7_SCHEMA_VERSION, ArtifactKind,
-    AuditSessionManifest, SessionArtifactRef, SourceRole, SourceStatus, compare_sessions,
+    AUDIT_SESSION_V7_SCHEMA_VERSION, AUDIT_SESSION_V9_SCHEMA_VERSION,
+    AUDIT_SESSION_V10_SCHEMA_VERSION, ArtifactKind, AuditSessionManifest, SessionArtifactRef,
+    SourceRole, SourceStatus, compare_sessions,
 };
 use crate::fingerprint::sha256_hex;
 use crate::inventory::{
@@ -297,7 +298,7 @@ fn selected_root_scope_extension_compatible(
     }
     let valid_scope = |version, scope| match version {
         AUDIT_SESSION_V7_SCHEMA_VERSION => scope == SELECTED_ROOT_METADATA_SCOPE,
-        AUDIT_SESSION_SCHEMA_VERSION => {
+        AUDIT_SESSION_V9_SCHEMA_VERSION | AUDIT_SESSION_V10_SCHEMA_VERSION => {
             matches!(
                 scope,
                 SELECTED_ROOT_METADATA_SCOPE | SELECTED_ROOT_HASH_SCOPE
@@ -724,12 +725,50 @@ fn map_software_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{VerifiedArtifactBytes, compare_audit_sessions};
+    use super::{
+        SELECTED_ROOT_HASH_SCOPE, SELECTED_ROOT_METADATA_SCOPE, VerifiedArtifactBytes,
+        compare_audit_sessions, selected_root_scope_extension_compatible,
+    };
     use crate::audit_session::{
         ArtifactKind, AuditSessionManifest, AuditSessionSource, IntervalSemantics,
         SessionArtifactRef, SessionStatus, SourceRole, SourceStatus,
     };
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn selected_root_scope_extension_keeps_v7_v9_and_v10_compatible() {
+        let role = SourceRole::SelectedRoot;
+        for (before_version, after_version) in [(7, 9), (7, 10), (9, 10)] {
+            assert!(selected_root_scope_extension_compatible(
+                role,
+                before_version,
+                after_version,
+                SELECTED_ROOT_METADATA_SCOPE,
+                SELECTED_ROOT_HASH_SCOPE,
+            ));
+            assert!(selected_root_scope_extension_compatible(
+                role,
+                after_version,
+                before_version,
+                SELECTED_ROOT_HASH_SCOPE,
+                SELECTED_ROOT_METADATA_SCOPE,
+            ));
+        }
+        assert!(!selected_root_scope_extension_compatible(
+            role,
+            8,
+            10,
+            SELECTED_ROOT_METADATA_SCOPE,
+            SELECTED_ROOT_HASH_SCOPE,
+        ));
+        assert!(!selected_root_scope_extension_compatible(
+            SourceRole::Packages,
+            9,
+            10,
+            SELECTED_ROOT_METADATA_SCOPE,
+            SELECTED_ROOT_HASH_SCOPE,
+        ));
+    }
 
     fn inventory(name: &str, version: &str, source_status: &str, global_status: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
