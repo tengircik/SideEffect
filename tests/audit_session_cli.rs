@@ -211,7 +211,7 @@ fn audit_sessions_capture_and_compare_one_selected_root_with_verified_evidence()
         String::from_utf8_lossy(&first.stderr)
     );
     let before_manifest = parse_manifest(&fs::read(before.join("session.json")).unwrap()).unwrap();
-    assert_eq!(before_manifest.schema_version, 8);
+    assert_eq!(before_manifest.schema_version, 9);
     let root_source = before_manifest
         .sources
         .iter()
@@ -338,7 +338,7 @@ fn audit_sessions_opt_in_to_root_hashes_and_compare_content_with_verified_eviden
         String::from_utf8_lossy(&first.stderr)
     );
     let before_manifest = parse_manifest(&fs::read(before.join("session.json")).unwrap()).unwrap();
-    assert_eq!(before_manifest.schema_version, 8);
+    assert_eq!(before_manifest.schema_version, 9);
     let before_root = before_manifest
         .sources
         .iter()
