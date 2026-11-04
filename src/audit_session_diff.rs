@@ -1178,9 +1178,9 @@ mod tests {
             },
             privilege: crate::audit_session::PrivilegeContext::Unknown,
         });
-        let coverage_manifest = Some(crate::audit_session::CoverageManifest::from_sources(&[
-            source.clone(),
-        ]));
+        let coverage_manifest = Some(crate::audit_session::CoverageManifest::from_sources(
+            std::slice::from_ref(&source),
+        ));
         AuditSessionManifest {
             schema: "sideeffect.audit_session".into(),
             schema_version: envelope_version,
