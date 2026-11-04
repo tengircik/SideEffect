@@ -143,6 +143,7 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
         .arg("--output")
         .arg(&session)
         .arg("--packages")
+        .arg("--msix")
         .arg("--processes")
         .arg("--startup")
         .arg("--path-executables")
@@ -157,6 +158,7 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
     );
     for file in [
         "software.windows.json",
+        "msix.windows.json",
         "processes.windows.json",
         "permissions.windows.json",
         "startup.windows.json",
@@ -182,6 +184,7 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
     assert_eq!(review["platform"], "windows");
     for (role, expected_scope) in [
         ("packages", "bounded uninstall-registry registrations"),
+        ("msix", "bounded current-user MSIX package registrations"),
         (
             "processes",
             "visible Tool Help process snapshot, permitted image paths, and token context",
@@ -190,10 +193,7 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
             "permissions",
             "explicit caller-selected paths only; no recursion or effective-access evaluation",
         ),
-        (
-            "startup",
-            "selected Run/RunOnce, Startup folders, services, and visible boot/logon scheduled tasks",
-        ),
+        ("startup", "WMI permanent event subscriptions"),
         (
             "path_executables",
             "one-level metadata snapshot of the current process PATH; candidate heuristics only, no execution or shell resolution",
@@ -205,12 +205,44 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
             .iter()
             .find(|source| source["role"] == role)
             .unwrap_or_else(|| panic!("missing {role} source in session review"));
-        assert_eq!(source["scope"], expected_scope);
+        if role == "startup" {
+            let scope = source["scope"].as_str().unwrap();
+            assert!(scope.contains("ROOT"));
+            assert!(scope.contains(expected_scope));
+        } else {
+            assert_eq!(source["scope"], expected_scope);
+        }
         assert!(source["started_at_unix_ms"].as_u64().is_some());
         assert!(source["ended_at_unix_ms"].as_u64().is_some());
         assert_eq!(source["artifacts"].as_array().unwrap().len(), 1);
     }
-    assert_eq!(review["sources"].as_array().unwrap().len(), 5);
+    assert_eq!(review["sources"].as_array().unwrap().len(), 6);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(session.join("session.json")).unwrap()).unwrap();
+    assert_eq!(manifest["schema_version"], 10);
+    let startup_source = manifest["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["role"] == "startup")
+        .unwrap();
+    assert!(
+        startup_source["scope"]
+            .as_str()
+            .unwrap()
+            .contains("WMI permanent event subscriptions")
+    );
+    assert_eq!(startup_source["artifacts"][0]["schema_version"], 6);
+    let startup: serde_json::Value =
+        serde_json::from_slice(&fs::read(session.join("startup.windows.json")).unwrap()).unwrap();
+    assert_eq!(startup["schema_version"], 6);
+    assert!(
+        startup["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| { source["id"] == "wmi_permanent_event_subscriptions" })
+    );
     fs::remove_dir_all(root).unwrap();
 }
 

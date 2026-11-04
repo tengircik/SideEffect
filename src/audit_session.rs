@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
 pub const AUDIT_SESSION_SCHEMA: &str = "sideeffect.audit_session";
-pub const AUDIT_SESSION_SCHEMA_VERSION: u32 = 9;
+pub const AUDIT_SESSION_SCHEMA_VERSION: u32 = 10;
 pub const AUDIT_SESSION_V1_SCHEMA_VERSION: u32 = 1;
 pub const AUDIT_SESSION_V2_SCHEMA_VERSION: u32 = 2;
 pub const AUDIT_SESSION_V3_SCHEMA_VERSION: u32 = 3;
@@ -18,6 +18,7 @@ pub const AUDIT_SESSION_V6_SCHEMA_VERSION: u32 = 6;
 pub const AUDIT_SESSION_V7_SCHEMA_VERSION: u32 = 7;
 pub const AUDIT_SESSION_V8_SCHEMA_VERSION: u32 = 8;
 pub const AUDIT_SESSION_V9_SCHEMA_VERSION: u32 = 9;
+pub const AUDIT_SESSION_V10_SCHEMA_VERSION: u32 = 10;
 pub const COVERAGE_MANIFEST_V1_VERSION: u32 = 1;
 pub const COVERAGE_MANIFEST_VERSION: u32 = 2;
 pub const MAX_AUDIT_SESSION_MANIFEST_BYTES: usize = 512 * 1024;
@@ -436,6 +437,7 @@ impl AuditSessionManifest {
                 | AUDIT_SESSION_V6_SCHEMA_VERSION
                 | AUDIT_SESSION_V7_SCHEMA_VERSION
                 | AUDIT_SESSION_V8_SCHEMA_VERSION
+                | AUDIT_SESSION_V9_SCHEMA_VERSION
                 | AUDIT_SESSION_SCHEMA_VERSION,
             ) => {
                 for fact in [&context.os_name, &context.os_version] {
@@ -465,6 +467,7 @@ impl AuditSessionManifest {
                 | AUDIT_SESSION_V6_SCHEMA_VERSION
                 | AUDIT_SESSION_V7_SCHEMA_VERSION
                 | AUDIT_SESSION_V8_SCHEMA_VERSION
+                | AUDIT_SESSION_V9_SCHEMA_VERSION
                 | AUDIT_SESSION_SCHEMA_VERSION,
             ) => {
                 if !matches!(
@@ -543,6 +546,7 @@ impl AuditSessionManifest {
                     | AUDIT_SESSION_V6_SCHEMA_VERSION
                     | AUDIT_SESSION_V7_SCHEMA_VERSION
                     | AUDIT_SESSION_V8_SCHEMA_VERSION
+                    | AUDIT_SESSION_V9_SCHEMA_VERSION
                     | AUDIT_SESSION_SCHEMA_VERSION,
                 ) => {
                     validate_collector_identity(identity, &source.platform, source.role)?;
@@ -978,9 +982,17 @@ fn artifact_version_supported(
     current: u32,
     session_version: u32,
 ) -> bool {
-    observed == current
+    (observed == current
+        && !(kind == ArtifactKind::WindowsStartup
+            && observed == 6
+            && session_version < AUDIT_SESSION_V10_SCHEMA_VERSION))
         || (kind == ArtifactKind::Startup && matches!(observed, 2 | 3))
-        || (kind == ArtifactKind::WindowsStartup && matches!(observed, 4 | 5))
+        || (kind == ArtifactKind::WindowsStartup
+            && session_version < AUDIT_SESSION_V10_SCHEMA_VERSION
+            && matches!(observed, 4 | 5))
+        || (kind == ArtifactKind::WindowsStartup
+            && session_version >= AUDIT_SESSION_V10_SCHEMA_VERSION
+            && observed == 6)
         || (kind == ArtifactKind::SelectedRoot
             && session_version >= AUDIT_SESSION_V8_SCHEMA_VERSION
             && observed == 2)
@@ -1058,7 +1070,7 @@ fn artifact_contract(
         ArtifactKind::WindowsStartup => (
             "startup.windows.json",
             "sideeffect.windows_startup_inventory",
-            5,
+            6,
         ),
         ArtifactKind::RuntimeManifest => ("run.json", "sideeffect.run", 2),
         ArtifactKind::RuntimeTrace => ("trace.strace", "strace_text", 1),
@@ -2293,6 +2305,7 @@ mod tests {
 
     fn windows_msix_manifest() -> AuditSessionManifest {
         let mut manifest = valid_manifest();
+        manifest.schema_version = super::AUDIT_SESSION_V9_SCHEMA_VERSION;
         manifest.platform = "windows".to_owned();
         manifest.architecture = "x86_64".to_owned();
         manifest.host_context.as_mut().unwrap().os_name.value = Some("Windows".to_owned());
@@ -2404,8 +2417,13 @@ mod tests {
     fn startup_artifact_contracts_accept_legacy_and_current_versions() {
         for (kind, current, legacy) in [
             (ArtifactKind::Startup, 3, 2),
-            (ArtifactKind::WindowsStartup, 5, 4),
+            (ArtifactKind::WindowsStartup, 6, 4),
         ] {
+            let legacy_session_version = if kind == ArtifactKind::WindowsStartup {
+                super::AUDIT_SESSION_V9_SCHEMA_VERSION
+            } else {
+                super::AUDIT_SESSION_SCHEMA_VERSION
+            };
             assert!(super::artifact_version_supported(
                 kind,
                 current,
@@ -2416,7 +2434,7 @@ mod tests {
                 kind,
                 legacy,
                 current,
-                super::AUDIT_SESSION_SCHEMA_VERSION,
+                legacy_session_version,
             ));
             assert!(!super::artifact_version_supported(
                 kind,
@@ -2425,6 +2443,51 @@ mod tests {
                 super::AUDIT_SESSION_SCHEMA_VERSION,
             ));
         }
+        assert!(!super::artifact_version_supported(
+            ArtifactKind::WindowsStartup,
+            6,
+            6,
+            super::AUDIT_SESSION_V9_SCHEMA_VERSION,
+        ));
+    }
+
+    #[test]
+    fn windows_startup_v6_is_v10_only_and_older_contract_stays_v5() {
+        let mut manifest = windows_msix_manifest();
+        manifest.schema_version = super::AUDIT_SESSION_V10_SCHEMA_VERSION;
+        let source = &mut manifest.sources[0];
+        source.role = SourceRole::Startup;
+        source.collector = Some(super::collector_identity("windows", SourceRole::Startup));
+        source.scope =
+            "selected Windows startup sources including local ROOT\\subscription WMI rows"
+                .to_owned();
+        source.artifacts[0] = SessionArtifactRef {
+            kind: ArtifactKind::WindowsStartup,
+            path: "startup.windows.json".to_owned(),
+            schema: "sideeffect.windows_startup_inventory".to_owned(),
+            schema_version: 6,
+            byte_length: 1,
+            sha256: "a".repeat(64),
+        };
+        manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
+        assert!(manifest.validate().is_ok());
+
+        let mut v10_with_v5 = manifest.clone();
+        v10_with_v5.sources[0].artifacts[0].schema_version = 5;
+        assert_eq!(
+            v10_with_v5.validate(),
+            Err(ValidationError::ArtifactContractMismatch)
+        );
+
+        let mut v9 = manifest.clone();
+        v9.schema_version = super::AUDIT_SESSION_V9_SCHEMA_VERSION;
+        v9.sources[0].artifacts[0].schema_version = 5;
+        assert!(v9.validate().is_ok());
+        v9.sources[0].artifacts[0].schema_version = 6;
+        assert_eq!(
+            v9.validate(),
+            Err(ValidationError::ArtifactContractMismatch)
+        );
     }
 
     #[test]

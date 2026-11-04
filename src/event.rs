@@ -3051,8 +3051,8 @@ fn is_file_or_disk_observation(event: &EtwEventView<'_>) -> bool {
 #[cfg(windows)]
 fn cross_checked_windows_file_path(event: &EtwEventView<'_>) -> crate::record::FilePathCrossCheck {
     if event.event_kind != "file_io_observation"
-        || !normalized_guid(event.provider_guid)
-            .is_some_and(|guid| guid == "90cbdc39-4a3e-11d1-84f4-0000f80464e3")
+        || normalized_guid(event.provider_guid)
+            .is_none_or(|guid| guid != "90cbdc39-4a3e-11d1-84f4-0000f80464e3")
     {
         return crate::record::FilePathCrossCheck::NotFileProvider;
     }

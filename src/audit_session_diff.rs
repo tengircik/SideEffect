@@ -229,8 +229,8 @@ fn compare_source_role(
                     && matches!(right_ref.schema_version, 2 | 3)
             }
             ArtifactKind::WindowsStartup => {
-                matches!(left_ref.schema_version, 4 | 5)
-                    && matches!(right_ref.schema_version, 4 | 5)
+                matches!(left_ref.schema_version, 4..=6)
+                    && matches!(right_ref.schema_version, 4..=6)
             }
             _ => false,
         };

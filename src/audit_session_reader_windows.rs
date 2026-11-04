@@ -704,6 +704,32 @@ mod tests {
     }
 
     #[test]
+    fn startup_v6_header_is_verified_only_for_the_declared_native_version() {
+        let reference = crate::audit_session::SessionArtifactRef {
+            kind: ArtifactKind::WindowsStartup,
+            path: "startup.windows.json".to_owned(),
+            schema: "sideeffect.windows_startup_inventory".to_owned(),
+            schema_version: 6,
+            byte_length: 1,
+            sha256: "a".repeat(64),
+        };
+        assert!(
+            verify_schema(
+                &reference,
+                br#"{"schema":"sideeffect.windows_startup_inventory","schema_version":6}"#
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            verify_schema(
+                &reference,
+                br#"{"schema":"sideeffect.windows_startup_inventory","schema_version":5}"#
+            ),
+            Err(SessionReadError::ArtifactSchemaMismatch(_))
+        ));
+    }
+
+    #[test]
     fn synthetic_windows_runtime_artifact_publishes_once_and_reader_verifies_contract() {
         let root = temp_dir("sideeffect-windows-runtime-session");
         let destination = root.join("audit");

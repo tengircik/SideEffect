@@ -1365,23 +1365,24 @@ fn validate_windows(v: &Value, version: u64) -> Result<(), StartupDiffError> {
                 {
                     return Err(StartupDiffError::MalformedInput);
                 }
-                if field == "wmi_event_consumers"
-                    && let Some(detail) = row.get("detail_evidence")
-                {
-                    keys(
-                        detail,
-                        &["source", "namespace", "class_name", "object_index"],
-                    )?;
-                    if text(detail, "source")? != "IWbemLocator/IWbemServices/IEnumWbemClassObject"
-                        || text(detail, "namespace")? != "ROOT\\subscription"
-                        || !matches!(
-                            text(detail, "class_name")?,
-                            "CommandLineEventConsumer" | "ActiveScriptEventConsumer"
-                        )
-                    {
-                        return Err(StartupDiffError::MalformedInput);
+                if field == "wmi_event_consumers" {
+                    if let Some(detail) = row.get("detail_evidence") {
+                        keys(
+                            detail,
+                            &["source", "namespace", "class_name", "object_index"],
+                        )?;
+                        if text(detail, "source")?
+                            != "IWbemLocator/IWbemServices/IEnumWbemClassObject"
+                            || text(detail, "namespace")? != "ROOT\\subscription"
+                            || !matches!(
+                                text(detail, "class_name")?,
+                                "CommandLineEventConsumer" | "ActiveScriptEventConsumer"
+                            )
+                        {
+                            return Err(StartupDiffError::MalformedInput);
+                        }
+                        let _ = num(detail, "object_index")?;
                     }
-                    let _ = num(detail, "object_index")?;
                 }
                 if field == "wmi_filter_consumer_bindings"
                     && (!matches!(

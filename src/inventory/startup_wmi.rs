@@ -748,10 +748,11 @@ fn bounded_variant_text(
         } else {
             unsafe { std::slice::from_raw_parts(data.cast::<u8>(), length) }
         };
-        let text = bytes
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let mut text = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            use std::fmt::Write as _;
+            let _ = write!(text, "{byte:02x}");
+        }
         let _ = unsafe { SafeArrayUnaccessData(array) };
         return Ok(text);
     }

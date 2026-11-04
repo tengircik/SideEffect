@@ -1,7 +1,7 @@
 //! Linux-first collection and publication for bounded local audit sessions.
 
 use crate::audit_session::{
-    AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, AppliedLimit, ArtifactKind,
+    AUDIT_SESSION_SCHEMA, AUDIT_SESSION_V9_SCHEMA_VERSION, AppliedLimit, ArtifactKind,
     AuditSessionManifest, AuditSessionSource, ContextFact, ContextFactStatus, CoverageManifest,
     HostContext, IntervalSemantics, MAX_SESSION_ARTIFACT_BYTES, MAX_SESSION_SOURCES,
     MAX_SESSION_TIMESTAMP_UNIX_MS, MAX_SESSION_TOTAL_ARTIFACT_BYTES, PrivilegeContext,
@@ -487,7 +487,7 @@ pub fn collect_and_publish(
     ));
     let manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
-        schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+        schema_version: AUDIT_SESSION_V9_SCHEMA_VERSION,
         session_id,
         platform: "linux".to_owned(),
         architecture: std::env::consts::ARCH.to_owned(),

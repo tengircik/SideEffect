@@ -1,15 +1,16 @@
 //! Bounded native Windows audit-session collection and private publication.
 
 use crate::audit_session::{
-    AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, ArtifactKind, AuditSessionManifest,
-    AuditSessionSource, ContextFact, ContextFactStatus, CoverageManifest, HostContext,
-    IntervalSemantics, PrivilegeContext, RuntimeCoverageDetail, SessionArtifactRef, SessionStatus,
-    SourceRole, SourceStatus, UnsupportedRuntimeCategoryCode,
+    AUDIT_SESSION_SCHEMA, ArtifactKind, AuditSessionManifest, AuditSessionSource, ContextFact,
+    ContextFactStatus, CoverageManifest, HostContext, IntervalSemantics, PrivilegeContext,
+    RuntimeCoverageDetail, SessionArtifactRef, SessionStatus, SourceRole, SourceStatus,
+    UnsupportedRuntimeCategoryCode,
 };
 use crate::fingerprint::sha256_hex;
 use crate::inventory::{
     collect_path_executables, collect_windows_msix, collect_windows_permissions,
-    collect_windows_processes, collect_windows_software, collect_windows_startup_v5,
+    collect_windows_processes, collect_windows_software, collect_windows_startup,
+    collect_windows_startup_v5,
 };
 use crate::record::publish_private_windows_directory;
 use serde::Serialize;
@@ -216,16 +217,18 @@ pub fn collect_and_publish(
         ));
     }
     if options.startup {
-        let doc = collect_windows_startup_v5();
+        let doc = collect_windows_startup_for_session(
+            crate::audit_session::AUDIT_SESSION_V10_SCHEMA_VERSION,
+        )?;
         let (status, diagnostics) = status_from_serialized(&doc, "status");
         let value = serde_json::to_vec(&doc)
             .map_err(|e| format!("could not serialize startup inventory: {e}"))?;
-        sources.push(source(SourceRole::Startup, "selected Run/RunOnce, Startup folders, services, and visible boot/logon scheduled tasks", doc.capture_started_at_unix_ms, doc.capture_ended_at_unix_ms, status, diagnostics, vec![("max_startup_entries", 8192), ("deadline_ms_between_calls", 10000)]));
+        sources.push(source(SourceRole::Startup, "selected Run/RunOnce, Startup folders, services, visible boot/logon scheduled tasks, and local ROOT\\subscription WMI permanent event subscriptions", doc.capture_started_at_unix_ms, doc.capture_ended_at_unix_ms, status, diagnostics, vec![("max_startup_entries", 8192), ("deadline_ms_between_calls", 10000)]));
         artifacts.push(artifact(
             ArtifactKind::WindowsStartup,
             "startup.windows.json",
             "sideeffect.windows_startup_inventory",
-            5,
+            doc.schema_version,
             value,
         ));
     }
@@ -491,6 +494,11 @@ pub fn collect_and_publish(
         sources,
         &artifacts,
         runtime_coverage_detail,
+        if options.startup {
+            crate::audit_session::AUDIT_SESSION_V10_SCHEMA_VERSION
+        } else {
+            crate::audit_session::AUDIT_SESSION_V9_SCHEMA_VERSION
+        },
     )?;
     let manifest_bytes = serde_json::to_vec(&manifest)
         .map_err(|e| format!("could not serialize audit manifest: {e}"))?;
@@ -593,6 +601,7 @@ fn build_manifest(
     mut sources: Vec<AuditSessionSource>,
     artifacts: &[Artifact],
     runtime_coverage_detail: Option<RuntimeCoverageDetail>,
+    schema_version: u32,
 ) -> Result<AuditSessionManifest, String> {
     for source in &mut sources {
         source.artifacts = artifacts
@@ -615,7 +624,7 @@ fn build_manifest(
     ));
     let manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
-        schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+        schema_version,
         session_id: format!(
             "{:016x}{:016x}",
             started as u64,
@@ -805,6 +814,16 @@ fn role_kind(role: SourceRole) -> Option<ArtifactKind> {
     }
 }
 
+fn collect_windows_startup_for_session(
+    schema_version: u32,
+) -> Result<crate::inventory::WindowsStartupInventoryDocument, String> {
+    match schema_version {
+        crate::audit_session::AUDIT_SESSION_V9_SCHEMA_VERSION => Ok(collect_windows_startup_v5()),
+        crate::audit_session::AUDIT_SESSION_V10_SCHEMA_VERSION => Ok(collect_windows_startup()),
+        _ => Err("unsupported Windows audit-session schema version".to_owned()),
+    }
+}
+
 fn now_ms() -> Result<u128, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -899,6 +918,7 @@ mod tests {
             vec![runtime_source],
             &artifacts,
             None,
+            crate::audit_session::AUDIT_SESSION_V10_SCHEMA_VERSION,
         )
         .unwrap();
         assert_eq!(manifest.status, SessionStatus::Partial);
