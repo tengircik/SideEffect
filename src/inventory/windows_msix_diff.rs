@@ -274,6 +274,7 @@ fn compare_documents(
     }
     let (left_map, left_ambiguous) = index(&before.packages, &mut counts);
     let (right_map, right_ambiguous) = index(&after.packages, &mut counts);
+    let presence_safe = left_complete && right_complete && counts.invalid_identity_rows == 0;
     let ambiguous: BTreeSet<_> = left_ambiguous.union(&right_ambiguous).cloned().collect();
     counts.ambiguous_identity_groups = ambiguous.len();
     if counts.invalid_identity_rows > 0 {
@@ -307,7 +308,7 @@ fn compare_documents(
                     counts.changes += 1;
                 }
             }
-            (Some(a), None) if left_complete && right_complete => {
+            (Some(a), None) if presence_safe => {
                 deltas.push(WindowsMsixDelta {
                     kind: WindowsMsixChangeKind::Removed,
                     identity: identity(&id),
@@ -317,7 +318,7 @@ fn compare_documents(
                 });
                 counts.removals += 1;
             }
-            (None, Some(b)) if left_complete && right_complete => {
+            (None, Some(b)) if presence_safe => {
                 deltas.push(WindowsMsixDelta {
                     kind: WindowsMsixChangeKind::Added,
                     identity: identity(&id),
@@ -615,6 +616,9 @@ mod tests {
         let suppressed = compare_windows_msix_inventory_json(&empty, &after).unwrap();
         assert_eq!(suppressed.counts.removals, 0);
         assert_eq!(suppressed.counts.invalid_identity_rows, 1);
+        let suppressed = compare_windows_msix_inventory_json(&empty, &before).unwrap();
+        assert_eq!(suppressed.counts.additions, 0);
+        assert_eq!(suppressed.counts.unmatched_rows_with_incomplete_source, 1);
     }
     #[test]
     fn partial_sources_suppress_presence_and_malformed_or_oversized_inputs_fail_closed() {
