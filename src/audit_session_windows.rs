@@ -10,7 +10,7 @@ use crate::fingerprint::sha256_hex;
 use crate::inventory::{
     collect_path_executables, collect_windows_app_paths, collect_windows_msix,
     collect_windows_permissions, collect_windows_processes, collect_windows_software,
-    collect_windows_startup, collect_windows_startup_v5,
+    collect_windows_startup_v5, collect_windows_startup_v6,
 };
 use crate::record::publish_private_windows_directory;
 use serde::Serialize;
@@ -853,8 +853,8 @@ fn collect_windows_startup_for_session(
 ) -> Result<crate::inventory::WindowsStartupInventoryDocument, String> {
     match schema_version {
         crate::audit_session::AUDIT_SESSION_V9_SCHEMA_VERSION => Ok(collect_windows_startup_v5()),
-        crate::audit_session::AUDIT_SESSION_V10_SCHEMA_VERSION => Ok(collect_windows_startup()),
-        crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION => Ok(collect_windows_startup()),
+        crate::audit_session::AUDIT_SESSION_V10_SCHEMA_VERSION => Ok(collect_windows_startup_v6()),
+        crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION => Ok(collect_windows_startup_v6()),
         _ => Err("unsupported Windows audit-session schema version".to_owned()),
     }
 }

@@ -333,6 +333,12 @@ fn validate_path_diagnostics(items: &[Value], with_raw_path: bool) -> Result<(),
     Ok(())
 }
 fn validate(v: &Value, k: Kind) -> Result<(), StartupDiffError> {
+    let version = num(v, "schema_version")?;
+    let windows_has_wmi = if k == Kind::Windows {
+        windows_has_wmi_contract(v, version)
+    } else {
+        false
+    };
     let (schema, platform, scope, versions) = match k {
         Kind::Linux => (
             LINUX,
@@ -343,17 +349,19 @@ fn validate(v: &Value, k: Kind) -> Result<(), StartupDiffError> {
         Kind::Windows => (
             WINDOWS,
             "windows",
-            if num(v, "schema_version").unwrap_or(4) >= 6 {
+            if windows_has_wmi {
                 "current_user_and_accessible_machine_run_keys_startup_folders_services_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
             } else {
                 "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks"
             },
-            &[4_u64, 5, 6][..],
+            &[4_u64, 5, 6, 7][..],
         ),
     };
-    let version = num(v, "schema_version")?;
     if text(v, "schema")? != schema || !versions.contains(&version) {
         return Err(StartupDiffError::UnsupportedSchema);
+    }
+    if k == Kind::Windows {
+        validate_windows_wmi_presence(v, version, windows_has_wmi)?;
     }
     if text(v, "platform")? != platform {
         return Err(StartupDiffError::PlatformMismatch);
@@ -513,6 +521,8 @@ fn validate_known_fields(v: &Value) -> Result<(), StartupDiffError> {
         "start_type_code",
         "account",
         "binary_path",
+        "service_observation",
+        "raw_state_code",
         "service_index",
         "task_path",
         "task_enabled",
@@ -570,6 +580,53 @@ fn validate_known_fields(v: &Value) -> Result<(), StartupDiffError> {
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn windows_has_wmi_contract(v: &Value, version: u64) -> bool {
+    if version == 6 {
+        return true;
+    }
+    if version < 7 {
+        return false;
+    }
+    [
+        "wmi_event_filters",
+        "wmi_event_consumers",
+        "wmi_filter_consumer_bindings",
+    ]
+    .iter()
+    .any(|field| v.get(*field).is_some())
+        || v.get("sources")
+            .and_then(Value::as_array)
+            .is_some_and(|sources| {
+                sources
+                    .iter()
+                    .any(|source| source["id"] == "wmi_permanent_event_subscriptions")
+            })
+}
+
+fn validate_windows_wmi_presence(
+    v: &Value,
+    version: u64,
+    has_wmi: bool,
+) -> Result<(), StartupDiffError> {
+    let fields = [
+        "wmi_event_filters",
+        "wmi_event_consumers",
+        "wmi_filter_consumer_bindings",
+    ];
+    let present_count = fields
+        .iter()
+        .filter(|field| v.get(**field).is_some())
+        .count();
+    if version == 6 && present_count != fields.len()
+        || version < 6 && (present_count != 0 || has_wmi)
+        || version >= 7 && (present_count != 0 && present_count != fields.len())
+        || version >= 7 && (present_count == fields.len()) != has_wmi
+    {
+        return Err(StartupDiffError::MalformedInput);
     }
     Ok(())
 }
@@ -673,6 +730,40 @@ fn validate_startup_state(value: &Value) -> Result<(), StartupDiffError> {
     }
     Ok(())
 }
+fn validate_service_observation(value: &Value) -> Result<(), StartupDiffError> {
+    let status = text(value, "status")?;
+    let raw_state_code = num(value, "raw_state_code")?;
+    if raw_state_code > u64::from(u32::MAX) {
+        return Err(StartupDiffError::MalformedInput);
+    }
+    let expected_state = match raw_state_code {
+        1 => Some("stopped"),
+        2 => Some("start_pending"),
+        3 => Some("stop_pending"),
+        4 => Some("running"),
+        5 => Some("continue_pending"),
+        6 => Some("pause_pending"),
+        7 => Some("paused"),
+        _ => None,
+    };
+    match status {
+        "known" => {
+            keys(value, &["status", "state", "raw_state_code"])?;
+            if text(value, "state")? != expected_state.ok_or(StartupDiffError::MalformedInput)? {
+                return Err(StartupDiffError::MalformedInput);
+            }
+        }
+        "unknown" => {
+            keys(value, &["status", "raw_state_code"])?;
+            if expected_state.is_some() {
+                return Err(StartupDiffError::MalformedInput);
+            }
+        }
+        _ => return Err(StartupDiffError::MalformedInput),
+    }
+    Ok(())
+}
+
 fn validate_state_evidence(value: &Value) -> Result<(), StartupDiffError> {
     keys(
         value,
@@ -970,7 +1061,8 @@ fn validate_linux(v: &Value, has_states: bool) -> Result<(), StartupDiffError> {
 }
 fn validate_windows(v: &Value, version: u64) -> Result<(), StartupDiffError> {
     let has_states = version >= 5;
-    let has_wmi = version >= 6;
+    let has_wmi = windows_has_wmi_contract(v, version);
+    let has_service_observation = version >= 7;
     let mut all = vec![
         ("sources", 8192usize),
         ("registry_entries", 8192),
@@ -1192,21 +1284,24 @@ fn validate_windows(v: &Value, version: u64) -> Result<(), StartupDiffError> {
         }
     }
     for e in arr(v, "service_entries")? {
-        startup_row_keys(
-            e,
-            &[
-                "service_name",
-                "display_name",
-                "start_type",
-                "start_type_code",
-                "account",
-                "binary_path",
-                "evidence",
-            ],
-            has_states,
-        )?;
+        let mut fields = vec![
+            "service_name",
+            "display_name",
+            "start_type",
+            "start_type_code",
+            "account",
+            "binary_path",
+            "evidence",
+        ];
+        if has_service_observation {
+            fields.push("service_observation");
+        }
+        startup_row_keys(e, &fields, has_states)?;
         if has_states {
             validate_startup_state(&e["startup_state"])?;
+        }
+        if has_service_observation {
+            validate_service_observation(&e["service_observation"])?;
         }
         for f in [
             "service_name",
@@ -1466,6 +1561,15 @@ fn side(r: &Row) -> StartupEvidenceSide {
     }
 }
 fn compare(l: &Value, r: &Value, k: Kind) -> Result<StartupInventoryDiff, StartupDiffError> {
+    let service_state_incomparable = if k == Kind::Windows {
+        let before_version = num(l, "schema_version")?;
+        let after_version = num(r, "schema_version")?;
+        let has_services =
+            !arr(l, "service_entries")?.is_empty() || !arr(r, "service_entries")?.is_empty();
+        has_services && (before_version >= 7) != (after_version >= 7)
+    } else {
+        false
+    };
     let (mut a, mut b, mut complete, mut lossy) = if k == Kind::Linux {
         (
             linux_rows(l)?,
@@ -1475,12 +1579,15 @@ fn compare(l: &Value, r: &Value, k: Kind) -> Result<StartupInventoryDiff, Startu
         )
     } else {
         (
-            windows_rows(l)?,
-            windows_rows(r)?,
+            windows_rows(l, !service_state_incomparable)?,
+            windows_rows(r, !service_state_incomparable)?,
             windows_complete(l) && windows_complete(r),
             0usize,
         )
     };
+    if service_state_incomparable {
+        complete = false;
+    }
     if k == Kind::Linux {
         lossy = a
             .iter()
@@ -1510,6 +1617,9 @@ fn compare(l: &Value, r: &Value, k: Kind) -> Result<StartupInventoryDiff, Startu
     };
     let mut diagnostics = BTreeSet::new();
     if k == Kind::Windows {
+        if service_state_incomparable {
+            diagnostics.insert("service-state observations are not present on both snapshots");
+        }
         let unkeyed = [l, r]
             .into_iter()
             .flat_map(|doc| {
@@ -1738,7 +1848,7 @@ fn windows_complete(v: &Value) -> bool {
     v["status"] == "complete"
         && v["sources"].as_array().is_some_and(|a| {
             a.len()
-                == if num(v, "schema_version").unwrap_or(5) >= 6 {
+                == if windows_has_wmi_contract(v, num(v, "schema_version").unwrap_or(5)) {
                     13
                 } else {
                     12
@@ -1764,7 +1874,10 @@ fn registry_source_complete(v: &Value, entry: &Value) -> bool {
         })
     })
 }
-fn windows_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
+fn windows_rows(
+    v: &Value,
+    compare_service_observation: bool,
+) -> Result<Vec<Row>, StartupDiffError> {
     let mut rows = Vec::new();
     for (i, e) in arr(v, "registry_entries")?.iter().enumerate() {
         let ev = &e["evidence"];
@@ -1811,20 +1924,24 @@ fn windows_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
     for (i, e) in arr(v, "service_entries")?.iter().enumerate() {
         let key = text(e, "service_name")?.to_owned();
         let id = "service_start_configuration";
+        let mut facts = objfact(
+            e,
+            &[
+                ("display_name", "display_name"),
+                ("start_type", "start_type"),
+                ("start_type_code", "start_type_code"),
+                ("account", "account"),
+                ("binary_path", "binary_path"),
+                ("startup_state", "startup_state"),
+            ],
+        );
+        if compare_service_observation && num(v, "schema_version")? >= 7 {
+            facts.push(("service_observation", value(&e["service_observation"])));
+        }
         rows.push(Row {
             category: "service_configuration",
             key,
-            facts: objfact(
-                e,
-                &[
-                    ("display_name", "display_name"),
-                    ("start_type", "start_type"),
-                    ("start_type_code", "start_type_code"),
-                    ("account", "account"),
-                    ("binary_path", "binary_path"),
-                    ("startup_state", "startup_state"),
-                ],
-            ),
+            facts,
             refs: vec![ptr("/service_entries", i)],
             complete: source_complete(v, id),
             lossy_identity: false,
@@ -1850,7 +1967,7 @@ fn windows_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
             lossy_identity: false,
         });
     }
-    if num(v, "schema_version").unwrap_or(5) >= 6 {
+    if windows_has_wmi_contract(v, num(v, "schema_version").unwrap_or(5)) {
         for (i, e) in arr(v, "wmi_event_filters")?.iter().enumerate() {
             rows.push(Row {
                 category: "wmi_event_filter",
@@ -2037,6 +2154,17 @@ mod tests {
         value
     }
 
+    fn windows_v7() -> Value {
+        let mut value = windows_v5();
+        value["schema_version"] = json!(7);
+        for service in value["service_entries"].as_array_mut().unwrap() {
+            service["service_observation"] = json!({
+                "status":"known", "state":"running", "raw_state_code":4
+            });
+        }
+        value
+    }
+
     #[test]
     fn startup_state_contract_requires_direct_evidence_for_known_dimensions() {
         let state = startup_state();
@@ -2091,6 +2219,85 @@ mod tests {
             "evidence":{"source":"IWbemLocator/IWbemServices/IEnumWbemClassObject","namespace":"ROOT\\subscription","class_name":"__EventFilter","object_index":0}
         });
         current_filter_smoke(filter);
+    }
+
+    #[test]
+    fn windows_v7_compares_only_service_state_snapshot_changes() {
+        let mut before = windows_v7();
+        let mut after = windows_v7();
+        let service = |observation: Value| {
+            json!({
+                "service_name":"EditorService",
+                "display_name":"Editor Service",
+                "start_type":"SERVICE_AUTO_START",
+                "start_type_code":2,
+                "account":"LocalSystem",
+                "binary_path":"C:\\Tools\\editor.exe --service",
+            "startup_state":startup_state(),
+                "service_observation":observation,
+                "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW","service_index":0}
+            })
+        };
+        before["service_entries"] = json!([service(json!({
+            "status":"known", "state":"stopped", "raw_state_code":1
+        }))]);
+        after["service_entries"] = json!([service(json!({
+            "status":"known", "state":"running", "raw_state_code":4
+        }))]);
+
+        let report = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
+        assert_eq!(report.status, StartupDiffStatus::Complete);
+        assert_eq!(report.counts.changed, 1);
+        assert_eq!(report.deltas[0].changed_fields, ["service_observation"]);
+    }
+
+    #[test]
+    fn windows_v7_preserves_unknown_service_state_codes_and_rejects_guesses() {
+        let mut snapshot = windows_v7();
+        snapshot["service_entries"] = json!([{
+            "service_name":"EditorService",
+            "display_name":"Editor Service",
+            "start_type":"SERVICE_AUTO_START",
+            "start_type_code":2,
+            "account":"LocalSystem",
+            "binary_path":"C:\\Tools\\editor.exe --service",
+            "startup_state":startup_state(),
+            "service_observation":{"status":"unknown","raw_state_code":4294967295_u64},
+            "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW","service_index":0}
+        }]);
+        validate(&snapshot, Kind::Windows).unwrap();
+        snapshot["service_entries"][0]["service_observation"] = json!({
+            "status":"known", "state":"running", "raw_state_code":0
+        });
+        assert!(validate(&snapshot, Kind::Windows).is_err());
+    }
+
+    #[test]
+    fn mixed_v6_v7_service_snapshots_do_not_compare_missing_service_state() {
+        let mut before = windows_v6();
+        let mut after = windows_v7();
+        let common = json!({
+            "service_name":"EditorService",
+            "display_name":"Editor Service",
+            "start_type":"SERVICE_AUTO_START",
+            "start_type_code":2,
+            "account":"LocalSystem",
+            "binary_path":"C:\\Tools\\editor.exe --service",
+            "startup_state":startup_state(),
+            "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW","service_index":0}
+        });
+        before["service_entries"] = json!([common.clone()]);
+        let mut service = common;
+        service["service_observation"] = json!({
+            "status":"known", "state":"running", "raw_state_code":4
+        });
+        after["service_entries"] = json!([service]);
+        let report = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
+        assert_eq!(report.status, StartupDiffStatus::Partial);
+        assert!(report.deltas.is_empty());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            *diagnostic == "service-state observations are not present on both snapshots"
+        }));
     }
 
     fn current_filter_smoke(filter: Value) {

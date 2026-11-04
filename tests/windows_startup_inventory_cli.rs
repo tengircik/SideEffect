@@ -33,7 +33,7 @@ fn windows_startup_command_reports_native_startup_sources() {
     let bytes = fs::read(&output).unwrap();
     let document: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(document["schema"], "sideeffect.windows_startup_inventory");
-    assert_eq!(document["schema_version"], 6);
+    assert_eq!(document["schema_version"], 7);
     assert_eq!(document["platform"], "windows");
     match document["status"].as_str().unwrap() {
         "complete" => assert_eq!(first.status.code(), Some(0)),
@@ -75,6 +75,25 @@ fn windows_startup_command_reports_native_startup_sources() {
     ));
     assert!(service_source["entries_seen"].as_u64().unwrap() > 0);
     assert!(!document["service_entries"].as_array().unwrap().is_empty());
+    for service in document["service_entries"].as_array().unwrap() {
+        let observation = service["service_observation"].as_object().unwrap();
+        let raw = observation["raw_state_code"].as_u64().unwrap();
+        match observation["status"].as_str().unwrap() {
+            "known" => {
+                assert!((1..=7).contains(&raw));
+                assert!(observation["state"].is_string());
+            }
+            "unknown" => {
+                assert!(!(1..=7).contains(&raw));
+                assert!(observation.get("state").is_none());
+            }
+            other => panic!("unexpected service observation status {other:?}"),
+        }
+        assert_ne!(
+            service["service_observation"],
+            service["startup_state"]["observed"]
+        );
+    }
     let scheduled_tasks = sources
         .iter()
         .find(|source| source["id"] == "scheduled_task_triggers")

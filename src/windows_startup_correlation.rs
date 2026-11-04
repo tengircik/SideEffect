@@ -273,7 +273,7 @@ pub fn summarize_windows_startup_behavior(
             version: 1,
             basis: "exact_equality_of_drive_rooted_windows_path_strings",
         },
-        platform_adapter: "windows_startup_inventory_v4_v5_or_v6_windows_runtime_capture_v3",
+        platform_adapter: "windows_startup_inventory_v4_v5_v6_or_v7_windows_runtime_capture_v3",
         capture_completeness: "unknown",
         status: if partial { "partial" } else { "complete" },
         association_status: if associations.is_empty() {
@@ -339,7 +339,7 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
         .ok_or_else(|| "Windows startup inventory must be a JSON object".to_owned())?;
     let schema_version = object.get("schema_version").and_then(Value::as_u64);
     if object.get("schema").and_then(Value::as_str) != Some(WINDOWS_STARTUP_INVENTORY_SCHEMA)
-        || !matches!(schema_version, Some(4..=6))
+        || !matches!(schema_version, Some(4..=7))
         || object.get("platform").and_then(Value::as_str) != Some("windows")
     {
         return Err("unsupported Windows startup inventory schema or platform".to_owned());
@@ -364,7 +364,16 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
         "wmi_event_consumers",
         "wmi_filter_consumer_bindings",
     ];
-    let expected_fields = if schema_version == Some(6) {
+    let wmi_field_count = WMI_FIELDS
+        .iter()
+        .filter(|field| object.contains_key(**field))
+        .count();
+    if schema_version == Some(6) && wmi_field_count != WMI_FIELDS.len()
+        || schema_version == Some(7) && wmi_field_count != 0 && wmi_field_count != WMI_FIELDS.len()
+    {
+        return Err("Windows startup inventory has an incomplete WMI field set".to_owned());
+    }
+    let expected_fields = if schema_version == Some(6) || wmi_field_count == WMI_FIELDS.len() {
         REQUIRED_FIELDS_V4_V5
             .into_iter()
             .chain(WMI_FIELDS)
@@ -408,10 +417,16 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
             ));
         }
         for (index, entry) in entries.iter().enumerate() {
-            validate_inventory_row(field, index, entry, schema_version.is_some_and(|v| v >= 5))?;
+            validate_inventory_row(
+                field,
+                index,
+                entry,
+                schema_version.is_some_and(|v| v >= 5),
+                schema_version == Some(7),
+            )?;
         }
     }
-    if schema_version == Some(6) {
+    if schema_version == Some(6) || wmi_field_count == WMI_FIELDS.len() {
         let mut copied_bytes = 0usize;
         for (field, expected_class) in [
             ("wmi_event_filters", "__EventFilter"),
@@ -834,6 +849,7 @@ fn validate_inventory_row(
     index: usize,
     value: &Value,
     has_states: bool,
+    has_service_observation: bool,
 ) -> Result<(), String> {
     let label = format!("Windows startup inventory {field}[{index}]");
     let object = value
@@ -900,9 +916,15 @@ fn validate_inventory_row(
     if row_has_states {
         required.push("startup_state");
     }
+    if field == "service_entries" && has_service_observation {
+        required.push("service_observation");
+    }
     validate_object_fields(object, &required, optional, &label)?;
     if row_has_states {
         validate_startup_state_value(object.get("startup_state"), &label)?;
+    }
+    if field == "service_entries" && has_service_observation {
+        validate_service_observation_value(object.get("service_observation"), &label)?;
     }
     match field {
         "sources" => {
@@ -1143,6 +1165,56 @@ fn validate_inventory_row(
         _ => unreachable!(),
     }
     Ok(())
+}
+
+fn validate_service_observation_value(value: Option<&Value>, label: &str) -> Result<(), String> {
+    let observation = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{label}.service_observation must be an object"))?;
+    let status = observation
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{label}.service_observation.status must be text"))?;
+    let raw = observation
+        .get("raw_state_code")
+        .and_then(Value::as_u64)
+        .filter(|raw| *raw <= u64::from(u32::MAX))
+        .ok_or_else(|| format!("{label}.service_observation.raw_state_code must be a u32"))?;
+    let expected = match raw {
+        1 => Some("stopped"),
+        2 => Some("start_pending"),
+        3 => Some("stop_pending"),
+        4 => Some("running"),
+        5 => Some("continue_pending"),
+        6 => Some("pause_pending"),
+        7 => Some("paused"),
+        _ => None,
+    };
+    let expected_keys: &[&str] = match status {
+        "known" => &["status", "state", "raw_state_code"],
+        "unknown" => &["status", "raw_state_code"],
+        _ => {
+            return Err(format!(
+                "{label}.service_observation has an unsupported status"
+            ));
+        }
+    };
+    if observation.len() != expected_keys.len()
+        || observation
+            .keys()
+            .any(|key| !expected_keys.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "{label}.service_observation has missing or unknown fields"
+        ));
+    }
+    match status {
+        "known" if observation.get("state").and_then(Value::as_str) == expected => Ok(()),
+        "unknown" if expected.is_none() => Ok(()),
+        _ => Err(format!(
+            "{label}.service_observation state does not match its raw code"
+        )),
+    }
 }
 
 fn validate_startup_state_value(value: Option<&Value>, label: &str) -> Result<(), String> {
@@ -1630,7 +1702,7 @@ mod tests {
         assert_eq!(summary.association_status, "insufficient_evidence");
         assert_eq!(
             summary.platform_adapter,
-            "windows_startup_inventory_v4_v5_or_v6_windows_runtime_capture_v3"
+            "windows_startup_inventory_v4_v5_v6_or_v7_windows_runtime_capture_v3"
         );
         assert_eq!(
             summary.inputs.startup_inventory.source_format,

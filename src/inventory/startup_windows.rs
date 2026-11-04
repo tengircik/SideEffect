@@ -77,6 +77,13 @@ const SERVICE_SYSTEM_START: u32 = 1;
 const SERVICE_AUTO_START: u32 = 2;
 const SERVICE_DEMAND_START: u32 = 3;
 const SERVICE_DISABLED: u32 = 4;
+const SERVICE_STOPPED: u32 = 1;
+const SERVICE_START_PENDING: u32 = 2;
+const SERVICE_STOP_PENDING: u32 = 3;
+const SERVICE_RUNNING: u32 = 4;
+const SERVICE_CONTINUE_PENDING: u32 = 5;
+const SERVICE_PAUSE_PENDING: u32 = 6;
+const SERVICE_PAUSED: u32 = 7;
 const KF_FLAG_DONT_VERIFY: u32 = 0x0000_4000;
 const REGISTRY_ROOT_CURRENT_USER: isize = -2_147_483_647;
 const REGISTRY_ROOT_LOCAL_MACHINE: isize = -2_147_483_646;
@@ -446,7 +453,54 @@ pub struct WindowsServiceStartupEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binary_path: Option<String>,
     pub startup_state: super::startup_state::StartupRowState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_observation: Option<WindowsServiceObservation>,
     pub evidence: WindowsServiceStartupEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsServiceState {
+    Stopped,
+    StartPending,
+    StopPending,
+    Running,
+    ContinuePending,
+    PausePending,
+    Paused,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WindowsServiceObservation {
+    Known {
+        state: WindowsServiceState,
+        raw_state_code: u32,
+    },
+    Unknown {
+        raw_state_code: u32,
+    },
+}
+
+impl WindowsServiceObservation {
+    fn from_scm_state(raw_state_code: u32) -> Self {
+        let state = match raw_state_code {
+            SERVICE_STOPPED => WindowsServiceState::Stopped,
+            SERVICE_START_PENDING => WindowsServiceState::StartPending,
+            SERVICE_STOP_PENDING => WindowsServiceState::StopPending,
+            SERVICE_RUNNING => WindowsServiceState::Running,
+            SERVICE_CONTINUE_PENDING => WindowsServiceState::ContinuePending,
+            SERVICE_PAUSE_PENDING => WindowsServiceState::PausePending,
+            SERVICE_PAUSED => WindowsServiceState::Paused,
+            _ => {
+                return Self::Unknown { raw_state_code };
+            }
+        };
+        Self::Known {
+            state,
+            raw_state_code,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -788,16 +842,24 @@ fn now_ms() -> u128 {
 }
 
 pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
-    collect_windows_startup_with_wmi(true)
+    collect_windows_startup_with_contract(true, 7, true)
 }
 
-/// Session schema v9 pins startup artifacts to v5; keep its legacy collector
-/// route until a separately reviewed session schema can adopt startup v6.
+/// Session schema v9 pins startup artifacts to v5.
 pub(crate) fn collect_windows_startup_v5() -> WindowsStartupInventoryDocument {
-    collect_windows_startup_with_wmi(false)
+    collect_windows_startup_with_contract(false, 5, false)
 }
 
-fn collect_windows_startup_with_wmi(include_wmi: bool) -> WindowsStartupInventoryDocument {
+/// Session schemas v10-v11 retain the standalone startup v6 contract.
+pub(crate) fn collect_windows_startup_v6() -> WindowsStartupInventoryDocument {
+    collect_windows_startup_with_contract(true, 6, false)
+}
+
+fn collect_windows_startup_with_contract(
+    include_wmi: bool,
+    schema_version: u32,
+    include_service_observation: bool,
+) -> WindowsStartupInventoryDocument {
     let started_at = now_ms();
     let started = Instant::now();
     let mut sources = Vec::new();
@@ -874,7 +936,8 @@ fn collect_windows_startup_with_wmi(include_wmi: bool) -> WindowsStartupInventor
         sources.push(result);
     }
 
-    let (service_source, services) = collect_service_start_configuration(started);
+    let (service_source, services) =
+        collect_service_start_configuration(started, include_service_observation);
     sources.push(service_source);
     service_entries.extend(services);
     let (task_source, tasks, task_actions) = collect_scheduled_task_triggers(started);
@@ -897,7 +960,7 @@ fn collect_windows_startup_with_wmi(include_wmi: bool) -> WindowsStartupInventor
     };
     WindowsStartupInventoryDocument {
         schema: "sideeffect.windows_startup_inventory",
-        schema_version: if include_wmi { 6 } else { 5 },
+        schema_version,
         platform: "windows",
         scope: if include_wmi {
             "current_user_and_accessible_machine_run_keys_startup_folders_services_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
@@ -939,6 +1002,7 @@ enum ServiceStringError {
 
 fn collect_service_start_configuration(
     started: Instant,
+    include_service_observation: bool,
 ) -> (WindowsStartupSource, Vec<WindowsServiceStartupEntry>) {
     let mut diagnostics = Vec::new();
     let mut entries = Vec::new();
@@ -1276,6 +1340,8 @@ fn collect_service_start_configuration(
                 account,
                 binary_path,
                 startup_state: super::startup_state::StartupRowState::configured_present(),
+                service_observation: include_service_observation
+                    .then(|| WindowsServiceObservation::from_scm_state(item.status.current_state)),
                 evidence: WindowsServiceStartupEvidence {
                     source: "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW",
                     service_index: enumerated,
@@ -3483,6 +3549,69 @@ mod tests {
         assert_eq!(service_start_type(SERVICE_DEMAND_START), "manual");
         assert_eq!(service_start_type(SERVICE_DISABLED), "disabled");
         assert_eq!(service_start_type(99), "unknown");
+    }
+
+    #[test]
+    fn service_state_mapping_preserves_all_known_and_unknown_scm_values() {
+        let known = [
+            (SERVICE_STOPPED, WindowsServiceState::Stopped, "stopped"),
+            (
+                SERVICE_START_PENDING,
+                WindowsServiceState::StartPending,
+                "start_pending",
+            ),
+            (
+                SERVICE_STOP_PENDING,
+                WindowsServiceState::StopPending,
+                "stop_pending",
+            ),
+            (SERVICE_RUNNING, WindowsServiceState::Running, "running"),
+            (
+                SERVICE_CONTINUE_PENDING,
+                WindowsServiceState::ContinuePending,
+                "continue_pending",
+            ),
+            (
+                SERVICE_PAUSE_PENDING,
+                WindowsServiceState::PausePending,
+                "pause_pending",
+            ),
+            (SERVICE_PAUSED, WindowsServiceState::Paused, "paused"),
+        ];
+
+        for (raw_state_code, state, serialized_state) in known {
+            let observation = WindowsServiceObservation::from_scm_state(raw_state_code);
+            assert_eq!(
+                observation,
+                WindowsServiceObservation::Known {
+                    state,
+                    raw_state_code,
+                }
+            );
+            assert_eq!(
+                serde_json::to_value(observation).unwrap(),
+                serde_json::json!({
+                    "status": "known",
+                    "state": serialized_state,
+                    "raw_state_code": raw_state_code
+                })
+            );
+        }
+
+        for raw_state_code in [0, u32::MAX] {
+            let observation = WindowsServiceObservation::from_scm_state(raw_state_code);
+            assert_eq!(
+                observation,
+                WindowsServiceObservation::Unknown { raw_state_code }
+            );
+            assert_eq!(
+                serde_json::to_value(observation).unwrap(),
+                serde_json::json!({
+                    "status": "unknown",
+                    "raw_state_code": raw_state_code
+                })
+            );
+        }
     }
 
     #[test]
