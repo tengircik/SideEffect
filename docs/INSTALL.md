@@ -453,6 +453,14 @@ sideeffect.exe inventory app-paths --output .\app-paths.json
 
 The `sideeffect.windows_app_path_inventory` v1 snapshot reads subkey names and the default and `Path` values from HKCU's native view and accessible HKLM 32-bit and 64-bit views of `Software\Microsoft\Windows\CurrentVersion\App Paths`. The default and `Path` values remain inert; `REG_EXPAND_SZ` is displayed literally, not expanded. It does not inspect the referenced filesystem path, parse command text, or establish that a target exists, is installed, available, or launchable. It caps enumeration at 4,096 entries total, names at 1,024 UTF-16 code units each and 1 Mi aggregate, registry values at 64 KiB each and 4 MiB aggregate, and collection at a 10-second cooperative deadline between API calls. A registry call already in progress cannot be cancelled. Raw returned bytes and exact UTF-16 subkey encodings are retained; paths and names can disclose sensitive local information. The output uses the current-user-only DACL and no-clobber publisher. Inaccessible, malformed, unsupported, and limit-affected data remain partial/unknown; partial artifacts are written and exit with status `2`. This is a separate registration snapshot and has no offline comparison command.
 
+To inspect current-user AppX/MSIX package registrations, run:
+
+```powershell
+sideeffect.exe inventory msix --output .\msix.json
+```
+
+The `sideeffect.windows_msix_inventory` v1 snapshot uses the Windows package query API for the calling user only. It reads package name, publisher, full/family names, version, install-location text, and package-type flags where available. It does not query other users, activate packages, inspect package files, or establish availability, launchability, health, or execution. Collection is capped at 4,096 rows, 32,768 UTF-16 code units per string, 1 Mi aggregate string units, 512 diagnostics, a cooperative 10-second deadline, and the shared report-output limit. Exact UTF-16 code units accompany display text, and malformed display decoding is flagged. The output uses the current-user-only DACL and no-clobber publisher. Partial or inaccessible data remains explicit, partial artifacts exit with status `2`. Package names, publishers, and installation paths can be sensitive. This standalone snapshot has no comparison or audit-session integration. Windows Server CI compilation is not live API acceptance; native Windows 10/11 package-query acceptance remains open.
+
 ## Inspect selected Linux file permissions and ACLs
 
 ```sh

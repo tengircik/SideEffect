@@ -37,6 +37,8 @@ mod startup_windows;
 mod systemd_units;
 #[cfg(windows)]
 mod windows_app_paths;
+#[cfg(windows)]
+mod windows_msix;
 mod windows_software_diff;
 
 #[cfg(target_os = "linux")]
@@ -167,3 +169,5 @@ pub use windows_app_paths::{
     AppPathDiagnostic, AppPathEntry, AppPathEvidence, AppPathRegistryView, AppPathSource,
     AppPathStatus, AppPathValue, WindowsAppPathInventoryDocument, collect_windows_app_paths,
 };
+#[cfg(windows)]
+pub use windows_msix::{WindowsMsixInventoryDocument, WindowsMsixStatus, collect_windows_msix};
