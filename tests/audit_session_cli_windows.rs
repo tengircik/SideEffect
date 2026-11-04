@@ -144,6 +144,7 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
         .arg(&session)
         .arg("--packages")
         .arg("--msix")
+        .arg("--app-paths")
         .arg("--processes")
         .arg("--startup")
         .arg("--path-executables")
@@ -159,6 +160,7 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
     for file in [
         "software.windows.json",
         "msix.windows.json",
+        "app-paths.windows.json",
         "processes.windows.json",
         "permissions.windows.json",
         "startup.windows.json",
@@ -185,6 +187,10 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
     for (role, expected_scope) in [
         ("packages", "bounded uninstall-registry registrations"),
         ("msix", "bounded current-user MSIX package registrations"),
+        (
+            "app_paths",
+            "selected current-user native and accessible machine 32-bit and 64-bit App Paths registry entries",
+        ),
         (
             "processes",
             "visible Tool Help process snapshot, permitted image paths, and token context",
@@ -216,10 +222,10 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
         assert!(source["ended_at_unix_ms"].as_u64().is_some());
         assert_eq!(source["artifacts"].as_array().unwrap().len(), 1);
     }
-    assert_eq!(review["sources"].as_array().unwrap().len(), 6);
+    assert_eq!(review["sources"].as_array().unwrap().len(), 7);
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(session.join("session.json")).unwrap()).unwrap();
-    assert_eq!(manifest["schema_version"], 10);
+    assert_eq!(manifest["schema_version"], 12);
     let startup_source = manifest["sources"]
         .as_array()
         .unwrap()
@@ -232,10 +238,10 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
             .unwrap()
             .contains("WMI permanent event subscriptions")
     );
-    assert_eq!(startup_source["artifacts"][0]["schema_version"], 6);
+    assert_eq!(startup_source["artifacts"][0]["schema_version"], 7);
     let startup: serde_json::Value =
         serde_json::from_slice(&fs::read(session.join("startup.windows.json")).unwrap()).unwrap();
-    assert_eq!(startup["schema_version"], 6);
+    assert_eq!(startup["schema_version"], 7);
     assert!(
         startup["sources"]
             .as_array()

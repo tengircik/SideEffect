@@ -249,7 +249,7 @@ pub fn collect_and_publish(
     }
     if options.startup {
         let doc = collect_windows_startup_for_session(
-            crate::audit_session::AUDIT_SESSION_V10_SCHEMA_VERSION,
+            crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION,
         )?;
         let (status, diagnostics) = status_from_serialized(&doc, "status");
         let value = serde_json::to_vec(&doc)
@@ -525,13 +525,7 @@ pub fn collect_and_publish(
         sources,
         &artifacts,
         runtime_coverage_detail,
-        if options.app_paths {
-            crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION
-        } else if options.startup {
-            crate::audit_session::AUDIT_SESSION_V10_SCHEMA_VERSION
-        } else {
-            crate::audit_session::AUDIT_SESSION_V9_SCHEMA_VERSION
-        },
+        session_schema_version(options),
     )?;
     let manifest_bytes = serde_json::to_vec(&manifest)
         .map_err(|e| format!("could not serialize audit manifest: {e}"))?;
@@ -855,7 +849,20 @@ fn collect_windows_startup_for_session(
         crate::audit_session::AUDIT_SESSION_V9_SCHEMA_VERSION => Ok(collect_windows_startup_v5()),
         crate::audit_session::AUDIT_SESSION_V10_SCHEMA_VERSION => Ok(collect_windows_startup_v6()),
         crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION => Ok(collect_windows_startup_v6()),
+        crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION => {
+            Ok(crate::inventory::collect_windows_startup())
+        }
         _ => Err("unsupported Windows audit-session schema version".to_owned()),
+    }
+}
+
+fn session_schema_version(options: &WindowsAuditOptions) -> u32 {
+    if options.startup {
+        crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION
+    } else if options.app_paths {
+        crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION
+    } else {
+        crate::audit_session::AUDIT_SESSION_V9_SCHEMA_VERSION
     }
 }
 
@@ -868,11 +875,33 @@ fn now_ms() -> Result<u128, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{artifact, build_manifest, source};
+    use super::{WindowsAuditOptions, artifact, build_manifest, session_schema_version, source};
     use crate::audit_session::{
         ArtifactKind, ContextFact, ContextFactStatus, HostContext, PrivilegeContext, SessionStatus,
         SourceRole, SourceStatus,
     };
+
+    #[test]
+    fn producer_selects_v12_for_startup_and_v11_for_app_paths_only() {
+        let startup_and_app_paths = WindowsAuditOptions {
+            startup: true,
+            app_paths: true,
+            ..WindowsAuditOptions::default()
+        };
+        assert_eq!(
+            session_schema_version(&startup_and_app_paths),
+            crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION
+        );
+
+        let app_paths_only = WindowsAuditOptions {
+            app_paths: true,
+            ..WindowsAuditOptions::default()
+        };
+        assert_eq!(
+            session_schema_version(&app_paths_only),
+            crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION
+        );
+    }
 
     #[test]
     fn windows_runtime_coverage_counts_only_fixed_decoder_diagnostic_categories() {

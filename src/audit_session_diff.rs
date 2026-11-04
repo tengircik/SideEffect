@@ -233,8 +233,8 @@ fn compare_source_role(
                     && matches!(right_ref.schema_version, 2 | 3)
             }
             ArtifactKind::WindowsStartup => {
-                matches!(left_ref.schema_version, 4..=6)
-                    && matches!(right_ref.schema_version, 4..=6)
+                matches!(left_ref.schema_version, 4..=7)
+                    && matches!(right_ref.schema_version, 4..=7)
             }
             _ => false,
         };
@@ -303,7 +303,8 @@ fn selected_root_scope_extension_compatible(
         AUDIT_SESSION_V7_SCHEMA_VERSION => scope == SELECTED_ROOT_METADATA_SCOPE,
         AUDIT_SESSION_V9_SCHEMA_VERSION
         | AUDIT_SESSION_V10_SCHEMA_VERSION
-        | crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION => {
+        | crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION
+        | crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION => {
             matches!(
                 scope,
                 SELECTED_ROOT_METADATA_SCOPE | SELECTED_ROOT_HASH_SCOPE
@@ -804,7 +805,9 @@ mod tests {
     #[test]
     fn selected_root_scope_extension_keeps_v7_v9_and_v10_compatible() {
         let role = SourceRole::SelectedRoot;
-        for (before_version, after_version) in [(7, 9), (7, 10), (9, 10)] {
+        for (before_version, after_version) in
+            [(7, 9), (7, 10), (9, 10), (7, 12), (9, 12), (10, 12)]
+        {
             assert!(selected_root_scope_extension_compatible(
                 role,
                 before_version,
@@ -1081,6 +1084,190 @@ mod tests {
             "legacy_sources":{"schema":"sideeffect.legacy_startup_inventory","schema_version":component_version,"platform":"linux","scope":"common_sysv_cron_paths_only","capture_started_at_unix_ms":1000,"capture_ended_at_unix_ms":1001,"status":"complete","sources":[],"entries":[]}
         }))
         .unwrap()
+    }
+
+    fn windows_startup(version: u32) -> Vec<u8> {
+        let observation = (version >= 7)
+            .then(|| serde_json::json!({"status":"known","state":"running","raw_state_code":4}));
+        let mut service = serde_json::json!({
+            "service_name":"ExampleService",
+            "display_name":"Example Service",
+            "start_type":"SERVICE_AUTO_START",
+            "start_type_code":2,
+            "account":null,
+            "binary_path":"C:\\Tools\\example.exe",
+            "startup_state": {
+                "schema_version":1,
+                "configured":"present",
+                "effective":{"status":"unknown","context":null,"evidence":null},
+                "observed":{"status":"unknown","capture_interval":null,"evidence":null}
+            },
+            "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW","service_index":0}
+        });
+        if let Some(observation) = observation {
+            service["service_observation"] = observation;
+        }
+        serde_json::to_vec(&serde_json::json!({
+            "schema":"sideeffect.windows_startup_inventory",
+            "schema_version":version,
+            "platform":"windows",
+            "scope":"current_user_and_accessible_machine_run_keys_startup_folders_services_current_token_visible_tasks_and_local_root_subscription_wmi_objects",
+            "capture_started_at_unix_ms":1000,
+            "capture_ended_at_unix_ms":1001,
+            "status":"complete",
+            "sources":[
+                {"id":"current_user_run_native","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"current_user_run_once_native","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"current_user_run_32","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"current_user_run_once_32","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"local_machine_run_64","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"local_machine_run_once_64","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"local_machine_run_32","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"local_machine_run_once_32","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"user_startup","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"common_startup","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"service_start_configuration","status":"complete","entries_seen":1,"diagnostics":[]},
+                {"id":"scheduled_task_triggers","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"wmi_permanent_event_subscriptions","status":"complete","entries_seen":0,"location_path":"ROOT\\subscription","diagnostics":[]}
+            ],
+            "registry_entries":[],"folder_entries":[],"service_entries":[service],
+            "scheduled_task_entries":[],"scheduled_task_actions":[],
+            "wmi_event_filters":[],"wmi_event_consumers":[],"wmi_filter_consumer_bindings":[]
+        })).unwrap()
+    }
+
+    fn windows_startup_session(
+        bytes: &[u8],
+        id: &str,
+        envelope_version: u32,
+        artifact_version: u32,
+    ) -> AuditSessionManifest {
+        let source = AuditSessionSource {
+            role: SourceRole::Startup,
+            collector: Some(crate::audit_session::collector_identity(
+                "windows",
+                SourceRole::Startup,
+            )),
+            platform: "windows".into(),
+            scope: "selected Windows startup sources".into(),
+            started_at_unix_ms: 1000,
+            ended_at_unix_ms: 1001,
+            status: SourceStatus::Complete,
+            applied_limits: vec![],
+            requested_settings: vec![],
+            effective_settings: vec![],
+            loss: None,
+            diagnostic_codes: vec![],
+            artifacts: vec![SessionArtifactRef {
+                kind: ArtifactKind::WindowsStartup,
+                path: "startup.windows.json".into(),
+                schema: "sideeffect.windows_startup_inventory".into(),
+                schema_version: artifact_version,
+                byte_length: bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+            }],
+        };
+        let host_context = Some(crate::audit_session::HostContext {
+            os_name: crate::audit_session::ContextFact {
+                status: crate::audit_session::ContextFactStatus::Observed,
+                value: Some("Windows".into()),
+            },
+            os_version: crate::audit_session::ContextFact {
+                status: crate::audit_session::ContextFactStatus::Observed,
+                value: Some("10.0".into()),
+            },
+            privilege: crate::audit_session::PrivilegeContext::Unknown,
+        });
+        let coverage_manifest = Some(crate::audit_session::CoverageManifest::from_sources(&[
+            source.clone(),
+        ]));
+        AuditSessionManifest {
+            schema: "sideeffect.audit_session".into(),
+            schema_version: envelope_version,
+            session_id: id.into(),
+            platform: "windows".into(),
+            architecture: "x86_64".into(),
+            started_at_unix_ms: 1000,
+            ended_at_unix_ms: 1002,
+            interval_semantics: crate::audit_session::IntervalSemantics::BestEffortNonAtomic,
+            status: SessionStatus::Complete,
+            sources: vec![source],
+            host_context,
+            coverage_manifest,
+        }
+    }
+
+    #[test]
+    fn session_comparison_accepts_windows_startup_v7_and_keeps_v6_v7_incomparable() {
+        let v6 = windows_startup(6);
+        let v7 = windows_startup(7);
+        crate::inventory::compare_startup_inventory_json(&v6, &v7).unwrap();
+        let before_v6 = windows_startup_session(
+            &v6,
+            "0123456789abcdef0123456789abcdef",
+            crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION,
+            6,
+        );
+        let after_v7 = windows_startup_session(
+            &v7,
+            "fedcba9876543210fedcba9876543210",
+            crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION,
+            7,
+        );
+        let result = compare_audit_sessions(
+            &before_v6,
+            &after_v7,
+            &[VerifiedArtifactBytes {
+                kind: ArtifactKind::WindowsStartup,
+                path: "startup.windows.json",
+                bytes: &v6,
+            }],
+            &[VerifiedArtifactBytes {
+                kind: ArtifactKind::WindowsStartup,
+                path: "startup.windows.json",
+                bytes: &v7,
+            }],
+        );
+        assert!(!result.comparable);
+        assert!(result.reason_codes.contains(&"artifact_contract_mismatch"));
+        assert_eq!(
+            result.source_diffs[0].status, "partial",
+            "reason: {:?}",
+            result.source_diffs[0].reason_code
+        );
+        assert_eq!(
+            result.source_diffs[0].comparison.as_ref().unwrap()["counts"]["changed"],
+            0
+        );
+
+        let before_v7 = windows_startup_session(
+            &v7,
+            "0123456789abcdef0123456789abcdef",
+            crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION,
+            7,
+        );
+        let after_v7 = windows_startup_session(
+            &v7,
+            "fedcba9876543210fedcba9876543210",
+            crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION,
+            7,
+        );
+        let result = compare_audit_sessions(
+            &before_v7,
+            &after_v7,
+            &[VerifiedArtifactBytes {
+                kind: ArtifactKind::WindowsStartup,
+                path: "startup.windows.json",
+                bytes: &v7,
+            }],
+            &[VerifiedArtifactBytes {
+                kind: ArtifactKind::WindowsStartup,
+                path: "startup.windows.json",
+                bytes: &v7,
+            }],
+        );
+        assert!(result.comparable, "{:?}", result.reason_codes);
+        assert_eq!(result.source_diffs[0].status, "compared");
     }
 
     #[test]

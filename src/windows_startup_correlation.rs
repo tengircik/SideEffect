@@ -1627,10 +1627,19 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_versions_malformed_fields_and_duplicate_keys_are_rejected() {
+    fn v7_is_accepted_while_unsupported_versions_and_malformed_fields_are_rejected() {
         let mut startup: Value =
             serde_json::from_slice(&startup_bytes(vec![], "complete")).unwrap();
         startup["schema_version"] = Value::from(7);
+        assert!(
+            summarize_windows_startup_behavior(
+                &serde_json::to_vec(&startup).unwrap(),
+                &capture_bytes(vec![], CollectionStatus::Complete, 0)
+            )
+            .is_ok()
+        );
+
+        startup["schema_version"] = Value::from(8);
         assert!(
             summarize_windows_startup_behavior(
                 &serde_json::to_vec(&startup).unwrap(),
