@@ -133,6 +133,27 @@ pub struct EventLoss {
     pub final_snapshot_available: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TraceStatistics {
+    buffer_count: u32,
+    events_lost: u32,
+    log_buffers_lost: u32,
+    real_time_buffers_lost: u32,
+}
+
+impl TraceStatistics {
+    fn into_loss(self, observation: &'static str, final_snapshot_available: bool) -> EventLoss {
+        EventLoss {
+            events_lost: self.events_lost,
+            log_buffers_lost: self.log_buffers_lost,
+            real_time_buffers_lost: self.real_time_buffers_lost,
+            loss_statistics_available: true,
+            observation,
+            final_snapshot_available,
+        }
+    }
+}
+
 impl Default for EventLoss {
     fn default() -> Self {
         Self {
@@ -270,10 +291,16 @@ pub(crate) fn collect_windows_runtime_capture_before_launch(
     };
 
     let stopped = session.stop();
+    let stop_failed = stopped.is_err();
     let end_unix_ms = now_unix_ms()?;
-    let mut diagnostics = Vec::new();
-    if let Err(error) = stopped {
-        diagnostics.push(format!("etw_stop_failed:{error}"));
+    let mut diagnostics = std::mem::take(&mut session.stop_diagnostics);
+    if let Err(error) = &stopped {
+        if !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.starts_with("etw_stop_failed:"))
+        {
+            diagnostics.push(format!("etw_stop_failed:{error}"));
+        }
     }
     let collector = collector
         .lock()
@@ -293,7 +320,7 @@ pub(crate) fn collect_windows_runtime_capture_before_launch(
         event_limit,
         malformed,
         loss.is_complete_and_loss_free(),
-        !diagnostics.is_empty(),
+        stop_failed,
     );
     if event_limit {
         diagnostics.push("event_or_payload_limit_reached".to_owned());
@@ -448,6 +475,7 @@ struct EtwSession {
     buffer_count: u32,
     started_at_unix_ms: u128,
     stopped: bool,
+    stop_diagnostics: Vec<String>,
 }
 
 impl EtwSession {
@@ -512,6 +540,7 @@ impl EtwSession {
                 buffer_count: 0,
                 started_at_unix_ms,
                 stopped: false,
+                stop_diagnostics: Vec::new(),
             }),
             Ok(Err(code)) => {
                 unsafe { StopTraceW(handle, name.as_ptr(), props) };
@@ -536,49 +565,80 @@ impl EtwSession {
         // unavailable even when ETW has stopped the session successfully.
         let mut properties = control_trace_properties_buffer();
         let props = properties.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
-        let query = unsafe {
-            windows_sys::Win32::System::Diagnostics::Etw::ControlTraceW(
-                self.handle,
-                self.name.as_ptr(),
-                props,
-                EVENT_TRACE_CONTROL_QUERY,
-            )
-        };
-        if query == ERROR_SUCCESS {
-            self.buffer_count = unsafe { (*props).NumberOfBuffers };
-            self.loss = Some(EventLoss {
+        let handle = self.handle;
+        let name = self.name.as_ptr();
+        let query = || {
+            let result = unsafe {
+                windows_sys::Win32::System::Diagnostics::Etw::ControlTraceW(
+                    handle,
+                    name,
+                    props,
+                    EVENT_TRACE_CONTROL_QUERY,
+                )
+            };
+            if result != ERROR_SUCCESS {
+                return Err(result);
+            }
+            Ok(TraceStatistics {
+                buffer_count: unsafe { (*props).NumberOfBuffers },
                 events_lost: unsafe { (*props).EventsLost },
                 log_buffers_lost: unsafe { (*props).LogBuffersLost },
                 real_time_buffers_lost: unsafe { (*props).RealTimeBuffersLost },
-                loss_statistics_available: true,
-                observation: "pre_stop_query",
-                final_snapshot_available: false,
-            });
+            })
+        };
+        let stop = || {
+            let result = unsafe { StopTraceW(handle, name, props) };
+            if result != ERROR_SUCCESS {
+                return Err(result);
+            }
+            Ok(TraceStatistics {
+                buffer_count: unsafe { (*props).NumberOfBuffers },
+                events_lost: unsafe { (*props).EventsLost },
+                log_buffers_lost: unsafe { (*props).LogBuffersLost },
+                real_time_buffers_lost: unsafe { (*props).RealTimeBuffersLost },
+            })
+        };
+        self.stop_with(query, stop)
+    }
+
+    fn stop_with(
+        &mut self,
+        query: impl FnOnce() -> Result<TraceStatistics, u32>,
+        stop: impl FnOnce() -> Result<TraceStatistics, u32>,
+    ) -> Result<(), String> {
+        if self.stopped {
+            return Ok(());
         }
-        let stopped = unsafe { StopTraceW(self.handle, self.name.as_ptr(), props) };
-        if stopped != ERROR_SUCCESS {
-            return Err(format!(
-                "ControlTrace(STOP) failed with Windows error {stopped}"
-            ));
+        match query() {
+            Ok(statistics) => {
+                self.buffer_count = statistics.buffer_count;
+                self.loss = Some(statistics.into_loss("pre_stop_query", false));
+            }
+            Err(error) => {
+                self.loss = Some(EventLoss::default());
+                self.stop_diagnostics
+                    .push(format!("etw_pre_stop_query_failed:{error}"));
+            }
         }
+        let statistics = match stop() {
+            Ok(statistics) => statistics,
+            Err(error) => {
+                self.stop_diagnostics
+                    .push(format!("etw_stop_failed:{error}"));
+                return Err(format!(
+                    "ControlTrace(STOP) failed with Windows error {error}"
+                ));
+            }
+        };
         self.stopped = true;
-        self.loss = Some(EventLoss {
-            events_lost: unsafe { (*props).EventsLost },
-            log_buffers_lost: unsafe { (*props).LogBuffersLost },
-            real_time_buffers_lost: unsafe { (*props).RealTimeBuffersLost },
-            loss_statistics_available: true,
-            observation: "stop_response",
-            final_snapshot_available: true,
-        });
+        self.buffer_count = statistics.buffer_count;
+        self.loss = Some(statistics.into_loss("stop_response", true));
         if let Some(consumer) = self.consumer.take() {
             let result = consumer
                 .join()
                 .map_err(|_| "ETW consumer thread panicked".to_owned())?;
             validate_process_trace_result(result)?;
         }
-        // STOP succeeded and supplied final counters. QUERY failure is
-        // therefore not fatal to this final loss snapshot.
-        let _ = query;
         Ok(())
     }
 }
@@ -918,6 +978,34 @@ mod tests {
     use super::*;
     use crate::event::{EvidenceReference, SourceCompleteness, from_windows_etw};
 
+    fn test_session() -> EtwSession {
+        EtwSession {
+            handle: CONTROLTRACE_HANDLE { Value: 0 },
+            consumer: None,
+            name: Vec::new(),
+            loss: None,
+            buffer_count: 0,
+            started_at_unix_ms: 0,
+            stopped: false,
+            stop_diagnostics: Vec::new(),
+        }
+    }
+
+    fn stop_test_status(
+        session: &EtwSession,
+        stop_result: &Result<(), String>,
+    ) -> CollectionStatus {
+        let loss = session.loss.as_ref().cloned().unwrap_or_default();
+        let stop_failed = stop_result.is_err();
+        collection_status(
+            false,
+            false,
+            false,
+            loss.is_complete_and_loss_free(),
+            stop_failed,
+        )
+    }
+
     fn ipv4_typegroup1_payload(process_id: u32) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&process_id.to_le_bytes());
@@ -1103,6 +1191,83 @@ mod tests {
         assert!(zero.is_complete_and_loss_free());
         assert!(!lost.is_complete_and_loss_free());
         assert!(!pre_stop.is_complete_and_loss_free());
+    }
+
+    #[test]
+    fn stop_query_failure_is_diagnostic_but_final_stop_snapshot_remains_complete() {
+        let mut session = test_session();
+        let result = session.stop_with(
+            || Err(ERROR_ACCESS_DENIED),
+            || Ok(TraceStatistics::default()),
+        );
+
+        assert!(result.is_ok(), "STOP still returned final ETW counters");
+        assert_eq!(
+            session.stop_diagnostics,
+            [format!("etw_pre_stop_query_failed:{ERROR_ACCESS_DENIED}")]
+        );
+        let loss = session.loss.as_ref().unwrap();
+        assert_eq!(loss.observation, "stop_response");
+        assert!(loss.loss_statistics_available);
+        assert!(loss.final_snapshot_available);
+        assert!(!loss.has_losses());
+        assert_eq!(
+            stop_test_status(&session, &result),
+            CollectionStatus::Complete
+        );
+    }
+
+    #[test]
+    fn stop_failure_keeps_pre_stop_statistics_nonfinal_and_capture_partial() {
+        let mut session = test_session();
+        let result = session.stop_with(
+            || {
+                Ok(TraceStatistics {
+                    buffer_count: 8,
+                    ..TraceStatistics::default()
+                })
+            },
+            || Err(ERROR_ACCESS_DENIED),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(session.buffer_count, 8);
+        let loss = session.loss.as_ref().unwrap();
+        assert_eq!(loss.observation, "pre_stop_query");
+        assert!(loss.loss_statistics_available);
+        assert!(!loss.final_snapshot_available);
+        assert_eq!(
+            session.stop_diagnostics,
+            [format!("etw_stop_failed:{ERROR_ACCESS_DENIED}")]
+        );
+        assert_eq!(
+            stop_test_status(&session, &result),
+            CollectionStatus::Partial
+        );
+        session.stopped = true;
+    }
+
+    #[test]
+    fn failed_query_and_stop_leave_final_loss_statistics_unknown_and_partial() {
+        let mut session = test_session();
+        let result = session.stop_with(|| Err(ERROR_ACCESS_DENIED), || Err(ERROR_ACCESS_DENIED));
+
+        assert!(result.is_err());
+        let loss = session.loss.as_ref().unwrap();
+        assert!(!loss.loss_statistics_available);
+        assert!(!loss.final_snapshot_available);
+        assert_eq!(
+            session.stop_diagnostics,
+            [
+                format!("etw_pre_stop_query_failed:{ERROR_ACCESS_DENIED}"),
+                format!("etw_stop_failed:{ERROR_ACCESS_DENIED}"),
+            ]
+        );
+        assert_eq!(
+            stop_test_status(&session, &result),
+            CollectionStatus::Partial
+        );
+        session.stopped = true;
     }
 
     #[test]
