@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "evaluate_local_model_explain.py"
@@ -80,6 +81,8 @@ def _result(corpus: dict[str, Any], digest: str, version: int) -> dict[str, Any]
         for row in results["cases"]:
             case = next(item for item in corpus["cases"] if item["id"] == row["case_id"])
             row["preview_request_sha256"] = "c" * 64
+            row["review_packet_sha256"] = "d" * 64
+            row["run_case_input_sha256"] = "e" * 64
             target_digest = evaluation._review_target_sha256(row, case["question"], digest)
             row["review_target_sha256"] = target_digest
             selected_ids = row["response"]["evidence_ids"]
@@ -87,6 +90,8 @@ def _result(corpus: dict[str, Any], digest: str, version: int) -> dict[str, Any]
                 {
                     "review_target_sha256": target_digest,
                     "preview_request_sha256": row["preview_request_sha256"],
+                    "review_packet_sha256": row["review_packet_sha256"],
+                    "run_case_input_sha256": row["run_case_input_sha256"],
                     "reviewer_id": reviewer_id,
                     "blind_to_model_identity": True,
                     "independence_attested": True,
@@ -264,11 +269,39 @@ class ExplainEvaluatorV3HumanReviewTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.corpus, cls.digest = evaluation.load_corpus()
 
-    def _validate(self, results: dict[str, Any]) -> dict[str, Any]:
+    def _validate(self, results: dict[str, Any], packet_mutator=None, directory_mutator=None) -> dict[str, Any]:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "results.json"
+            packet_directory = Path(directory) / "packets"
+            packet_directory.mkdir()
+            for row in results.get("cases", []):
+                if not row.get("human_reviews"):
+                    continue
+                case = next(item for item in self.corpus["cases"] if item["id"] == row["case_id"])
+                packet = {
+                    "schema": "sideeffect.local_model_explain_blind_review_packet", "schema_version": 1,
+                    "corpus_sha256": self.digest, "case_id": row["case_id"], "question": case["question"],
+                    "preview_schema": "sideeffect.local_model_explanation_preview", "preview_schema_version": 3,
+                    "deterministic_abstain_reason": None, "system_prompt": "synthetic", "prompt": "{}",
+                    "output_schema": {}, "evidence_summary": {},
+                    "response": {**row["response"], "abstain_reason": None},
+                    "preview_request_sha256": row["preview_request_sha256"],
+                    "review_target_sha256": row["review_target_sha256"],
+                    "run_case_input_sha256": row["run_case_input_sha256"],
+                }
+                packet["packet_sha256"] = evaluation._canonical_sha256(packet)
+                if row.get("review_packet_sha256") == "d" * 64:
+                    row["review_packet_sha256"] = packet["packet_sha256"]
+                for review in row["human_reviews"]:
+                    if review.get("review_packet_sha256") == "d" * 64:
+                        review["review_packet_sha256"] = packet["packet_sha256"]
+                if packet_mutator is not None:
+                    packet_mutator(packet, row)
+                (packet_directory / f"{row['case_id']}.json").write_text(json.dumps(packet), encoding="utf-8")
+            if directory_mutator is not None:
+                directory_mutator(packet_directory)
             path.write_text(json.dumps(results), encoding="utf-8")
-            return evaluation._validate_results(path, self.corpus, self.digest)
+            return evaluation._validate_results(path, self.corpus, self.digest, packet_directory)
 
     def test_v3_reports_blinded_peer_agreement_and_reviewed_inference_counts(self) -> None:
         results = _result(self.corpus, self.digest, version=3)
@@ -368,6 +401,8 @@ class ExplainEvaluatorV3HumanReviewTests(unittest.TestCase):
             ("unknown review field", lambda row: row["human_reviews"][0].update(private_note="unexpected")),
             ("review digest mismatch", lambda row: row["human_reviews"][0].update(review_target_sha256="0" * 64)),
             ("preview digest mismatch", lambda row: row["human_reviews"][0].update(preview_request_sha256="0" * 64)),
+            ("packet binding mismatch", lambda row: row["human_reviews"][0].update(review_packet_sha256="0" * 64)),
+            ("missing packet binding", lambda row: row.pop("review_packet_sha256")),
             ("duplicate reviewer", lambda row: row["human_reviews"].__setitem__(1, dict(row["human_reviews"][0]))),
             ("unblinded false type", lambda row: row["human_reviews"][0].update(blind_to_model_identity="yes")),
             ("unsupported label", lambda row: row["human_reviews"][0]["selected_evidence_judgments"][0].update(
@@ -389,12 +424,39 @@ class ExplainEvaluatorV3HumanReviewTests(unittest.TestCase):
         with self.assertRaisesRegex(evaluation.ContractError, "review target digest mismatch"):
             self._validate(results)
 
+    def test_v3_rejects_tampered_or_mismatched_packet_files(self) -> None:
+        results = _result(self.corpus, self.digest, version=3)
+        with self.assertRaisesRegex(evaluation.ContractError, "tampering detected"):
+            self._validate(results, lambda packet, row: packet.update(question="altered without hash update"))
+
+        results = _result(self.corpus, self.digest, version=3)
+        def alter_and_rehash(packet, row):
+            packet["question"] = "altered and rehashed packet"
+            packet["packet_sha256"] = evaluation._canonical_sha256({key: value for key, value in packet.items() if key != "packet_sha256"})
+        with self.assertRaisesRegex(evaluation.ContractError, "corpus or question mismatch"):
+            self._validate(results, alter_and_rehash)
+
+        for name, mutate in (
+            ("missing", lambda directory: (directory / "exec-success-name.json").unlink()),
+            ("unknown", lambda directory: (directory / "unknown-case.json").write_text("{}", encoding="utf-8")),
+            ("duplicate", lambda directory: (directory / "duplicate.json").write_bytes((directory / "exec-success-name.json").read_bytes())),
+        ):
+            with self.subTest(name=name):
+                results = _result(self.corpus, self.digest, version=3)
+                with self.assertRaises(evaluation.ContractError):
+                    self._validate(results, directory_mutator=mutate)
+
         results = _result(self.corpus, self.digest, version=3)
         row = next(item for item in results["cases"] if item["case_id"] == "exec-success-name")
         row["source_parse_status"] = "partial"
         row["response"]["selection_status"] = "partial_selection"
         with self.assertRaisesRegex(evaluation.ContractError, "review target digest mismatch"):
             self._validate(results)
+
+        results = _result(self.corpus, self.digest, version=3)
+        with patch.object(evaluation, "MAX_REVIEW_PACKET_TOTAL_BYTES", 1):
+            with self.assertRaisesRegex(evaluation.ContractError, "aggregate byte limit"):
+                self._validate(results)
 
         results = _result(self.corpus, self.digest, version=3)
         row = next(item for item in results["cases"] if item["case_id"] == "exec-success-name")

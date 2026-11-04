@@ -123,7 +123,7 @@ class ExplainReviewPacketTests(unittest.TestCase):
             "schema", "schema_version", "corpus_sha256", "case_id", "question",
             "preview_schema", "preview_schema_version", "deterministic_abstain_reason",
             "system_prompt", "prompt", "output_schema", "evidence_summary", "response",
-            "preview_request_sha256", "review_target_sha256",
+            "preview_request_sha256", "review_target_sha256", "run_case_input_sha256", "packet_sha256",
         })
         encoded = json.dumps(packet, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         self.assertIn("é.txt", encoded)

@@ -9,6 +9,7 @@ from an authentic capture.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -64,6 +65,11 @@ def _bounded_json_string(value: Any, label: str, limit: int) -> str:
     _require(isinstance(value, str), f"{label} must be a string")
     _require(len(value.encode("utf-8")) <= limit, f"{label} exceeds {limit} UTF-8 bytes")
     return value
+
+
+def _canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _source_rows(prompt: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -174,6 +180,18 @@ def prepare_packet(
     expected_target_digest = evaluator._review_target_sha256(result_row, case["question"], corpus_digest)
     _require(result_target_digest == expected_target_digest, "results review-target digest is invalid")
 
+    # Bind the exact identity-bearing inputs without putting them in the blind
+    # packet. The packet hash then commits to every allowlisted review field.
+    run_case_input_sha256 = _canonical_sha256({
+        "schema": "sideeffect.local_model_explain_review_input_binding",
+        "schema_version": 1,
+        "run": results["run"],
+        "case_id": case_id,
+        "corpus_sha256": corpus_digest,
+        "result_row": result_row,
+        "preview": preview,
+        "analysis": analysis,
+    })
     packet = {
         "schema": "sideeffect.local_model_explain_blind_review_packet",
         "schema_version": 1,
@@ -190,7 +208,9 @@ def prepare_packet(
         "response": response,
         "preview_request_sha256": request_digest,
         "review_target_sha256": result_target_digest,
+        "run_case_input_sha256": run_case_input_sha256,
     }
+    packet["packet_sha256"] = _canonical_sha256(packet)
     return packet
 
 

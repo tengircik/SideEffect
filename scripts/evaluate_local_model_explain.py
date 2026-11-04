@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 import stat
 import sys
@@ -29,6 +30,7 @@ MAX_CORPUS_BYTES = 128 * 1024
 MAX_FIXTURE_BYTES = 64 * 1024
 MAX_CASES = 128
 MAX_RESULTS_BYTES = 16 * 1024 * 1024
+MAX_REVIEW_PACKET_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_CASE_ID_BYTES = 96
 MAX_QUESTION_BYTES = 2048
 MAX_STATEMENT_BYTES = 512
@@ -63,8 +65,10 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _decode_json(raw: bytes, label: str) -> Any:
+    def reject_constant(value: str) -> None:
+        raise ContractError(f"{label} contains invalid JSON constant {value}")
     try:
-        return json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object, parse_constant=reject_constant)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ContractError(f"{label} is not strict UTF-8 JSON: {error}") from error
 
@@ -74,10 +78,11 @@ def _require(condition: bool, message: str) -> None:
         raise ContractError(message)
 
 
-def _exact_keys(value: Any, required: set[str], label: str) -> dict[str, Any]:
+def _exact_keys(value: Any, required: set[str], label: str, optional_keys: set[str] | None = None) -> dict[str, Any]:
     _require(isinstance(value, dict), f"{label} must be an object")
     actual = set(value)
-    _require(actual == required, f"{label} keys must be exactly {sorted(required)}")
+    optional = optional_keys or set()
+    _require(required.issubset(actual) and actual.issubset(required | optional), f"{label} keys must contain {sorted(required)} and no unknown keys")
     return value
 
 
@@ -116,6 +121,75 @@ def _review_target_sha256(row: dict[str, Any], question: str, corpus_digest: str
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+def _canonical_sha256(value: Any) -> str:
+    canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _bounded_packet_paths(directory: Path) -> list[Path]:
+    try:
+        metadata = directory.lstat()
+    except OSError as error:
+        raise ContractError(f"cannot inspect review packet directory: {error}") from error
+    _require(stat.S_ISDIR(metadata.st_mode), "review packet path must be a directory, not a symlink")
+    paths: list[Path] = []
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                _require(len(paths) < MAX_CASES, "review packet directory exceeds the case limit")
+                _require(entry.name.endswith(".json") and entry.is_file(follow_symlinks=False),
+                         "review packet directory may contain only regular .json packet files")
+                paths.append(Path(entry.path))
+    except OSError as error:
+        raise ContractError(f"cannot read review packet directory: {error}") from error
+    return sorted(paths, key=lambda path: path.name)
+
+
+def _verify_review_packets(directory: Path, rows: list[dict[str, Any]], corpus: dict[str, Any], corpus_digest: str) -> None:
+    reviewed = {row["case_id"]: row for row in rows if row["human_reviews"]}
+    packet_paths = _bounded_packet_paths(directory)
+    packets: dict[str, dict[str, Any]] = {}
+    total_packet_bytes = 0
+    for path in packet_paths:
+        raw = _read_regular_file(path, MAX_RESULTS_BYTES, "review packet")
+        total_packet_bytes += len(raw)
+        _require(total_packet_bytes <= MAX_REVIEW_PACKET_TOTAL_BYTES, "review packet directory exceeds the aggregate byte limit")
+        packet = _decode_json(raw, "review packet")
+        _require(isinstance(packet, dict), "review packet must be an object")
+        case_id = packet.get("case_id")
+        _require(isinstance(case_id, str), "review packet has no case_id")
+        _require(case_id not in packets, f"duplicate review packet for case {case_id}")
+        _require(case_id in reviewed, f"unknown or unreviewed case packet: {case_id}")
+        packets[case_id] = packet
+    _require(set(packets) == set(reviewed), "review packet directory is incomplete or contains unknown packets")
+    corpus_by_id = {case["id"]: case for case in corpus["cases"]}
+    packet_keys = {
+        "schema", "schema_version", "corpus_sha256", "case_id", "question", "preview_schema",
+        "preview_schema_version", "deterministic_abstain_reason", "system_prompt", "prompt",
+        "output_schema", "evidence_summary", "response", "preview_request_sha256",
+        "review_target_sha256", "run_case_input_sha256", "packet_sha256",
+    }
+    for case_id, row in reviewed.items():
+        packet = packets[case_id]
+        _require(set(packet) == packet_keys, f"review packet keys are incomplete or unknown for case {case_id}")
+        _require(packet["schema"] == "sideeffect.local_model_explain_blind_review_packet" and packet["schema_version"] == 1,
+                 f"unsupported review packet contract for case {case_id}")
+        claimed_packet_hash = packet["packet_sha256"]
+        unhashed_packet = dict(packet)
+        del unhashed_packet["packet_sha256"]
+        _require(isinstance(claimed_packet_hash, str) and re.fullmatch(r"[0-9a-f]{64}", claimed_packet_hash) is not None,
+                 f"invalid packet hash for case {case_id}")
+        _require(claimed_packet_hash == _canonical_sha256(unhashed_packet), f"review packet tampering detected for case {case_id}")
+        _require(packet["corpus_sha256"] == corpus_digest and packet["question"] == corpus_by_id[case_id]["question"],
+                 f"review packet corpus or question mismatch for case {case_id}")
+        _require(packet["preview_request_sha256"] == row["preview_request_sha256"], f"review packet preview mismatch for case {case_id}")
+        _require(packet["review_target_sha256"] == row["review_target_sha256"], f"review packet target mismatch for case {case_id}")
+        _require(packet["response"] == {"selection_status": row["response"]["selection_status"], "evidence_ids": row["response"]["evidence_ids"], "abstain_reason": packet["response"].get("abstain_reason")},
+                 f"review packet selector response mismatch for case {case_id}")
+        _require(packet["packet_sha256"] == row.get("review_packet_sha256") and packet["run_case_input_sha256"] == row.get("run_case_input_sha256"),
+                 f"review packet row binding mismatch for case {case_id}")
 
 
 def _read_regular_file(path: Path, limit: int, label: str) -> bytes:
@@ -627,7 +701,7 @@ def _validate_results_v2(
 
 
 def _validate_results_v3(
-    results: dict[str, Any], corpus: dict[str, Any], corpus_digest: str
+    results: dict[str, Any], corpus: dict[str, Any], corpus_digest: str, review_packet_directory: Path | None = None
 ) -> dict[str, Any]:
     result_keys = set(results)
     _require(result_keys in (
@@ -639,7 +713,6 @@ def _validate_results_v3(
     _require(results["corpus_sha256"] == corpus_digest, "results corpus digest does not match the pinned development corpus")
     rows = results["cases"]
     _require(isinstance(rows, list) and len(rows) <= len(corpus["cases"]), "results cases must be a bounded array")
-
     # Reuse the unchanged v2 selector validator. V3 adds annotations only; it
     # must not alter the frozen corpus, selector criteria, or v2 report.
     selector_results = dict(results)
@@ -654,15 +727,22 @@ def _validate_results_v3(
                 "source_parse_status", "backend_used", "available_evidence", "latency_ms", "human_reviews",
             },
             f"results.cases[{index}]",
+            optional_keys={"review_packet_sha256", "run_case_input_sha256"},
         )
+        _require(("review_packet_sha256" in row) == ("run_case_input_sha256" in row), "review packet bindings must be supplied together")
         selector_results["cases"].append({
             key: value for key, value in row.items()
-            if key not in {"human_reviews", "review_target_sha256", "preview_request_sha256"}
+            if key not in {"human_reviews", "review_target_sha256", "preview_request_sha256", "review_packet_sha256", "run_case_input_sha256"}
         })
 
     # Validate all model-controlled selector fields before using their values
     # in human-review validation or set operations.
     report = _validate_results_v2(selector_results, corpus, corpus_digest)
+    if any(row["human_reviews"] for row in rows):
+        _require(review_packet_directory is not None, "reviewed results require --review-packets with the exact packet directory")
+        _verify_review_packets(review_packet_directory, rows, corpus, corpus_digest)
+    elif review_packet_directory is not None:
+        _require(not _bounded_packet_paths(review_packet_directory), "review packet directory contains packets without annotations")
     review_target_digests = {row["case_id"]: row["review_target_sha256"] for row in rows}
     preview_request_digests = {row["case_id"]: row["preview_request_sha256"] for row in rows}
     corpus_by_id = {case["id"]: case for case in corpus["cases"]}
@@ -686,6 +766,12 @@ def _validate_results_v3(
             f"human_reviews must be a bounded array in case {case_id}",
         )
         by_reviewer: dict[str, dict[str, Any]] = {}
+        if reviews:
+            _require("review_packet_sha256" in row, f"review annotations lack an immutable packet binding in case {case_id}")
+            for binding_name in ("review_packet_sha256", "run_case_input_sha256"):
+                binding = row[binding_name]
+                _require(isinstance(binding, str) and re.fullmatch(r"[0-9a-f]{64}", binding) is not None,
+                         f"{binding_name} must be 64 lowercase hexadecimal characters in case {case_id}")
         selected_ids = row["response"].get("evidence_ids") if isinstance(row["response"], dict) else None
         _require(isinstance(selected_ids, list), f"selector response is malformed in case {case_id}")
         selected_set = set(selected_ids)
@@ -695,6 +781,7 @@ def _validate_results_v3(
                 review,
                 {
                     "reviewer_id", "review_target_sha256", "preview_request_sha256",
+                    "review_packet_sha256", "run_case_input_sha256",
                     "blind_to_model_identity", "independence_attested",
                     "answerability", "required_evidence_labels", "selected_evidence_judgments",
                 },
@@ -720,6 +807,8 @@ def _validate_results_v3(
                 reviewer_preview_digest == preview_digest,
                 f"reviewer preview digest mismatch in case {case_id}",
             )
+            for binding_name in ("review_packet_sha256", "run_case_input_sha256"):
+                _require(review[binding_name] == row[binding_name], f"reviewer {binding_name} mismatch in case {case_id}")
             reviewer_id = _bounded_string(review["reviewer_id"], f"reviewer_id in case {case_id}", MAX_REVIEWER_ID_BYTES)
             _require(REVIEWER_ID_PATTERN.fullmatch(reviewer_id) is not None, f"reviewer_id has an invalid format in case {case_id}")
             _require(reviewer_id not in by_reviewer, f"duplicate reviewer_id in case {case_id}")
@@ -870,6 +959,8 @@ def _validate_results_v3(
             "case_id": case_id,
             "review_target_sha256": review_target_digests.get(case_id),
             "preview_request_sha256": preview_request_digests.get(case_id),
+            "review_packet_sha256": next((row.get("review_packet_sha256") for row in rows if row.get("case_id") == case_id), None),
+            "run_case_input_sha256": next((row.get("run_case_input_sha256") for row in rows if row.get("case_id") == case_id), None),
             "reviewer_count": len(reviews),
             "answerability_agreement_rate": (
                 sum(left["answerability"] == right["answerability"] for left, right in pairs) / len(pairs)
@@ -894,6 +985,14 @@ def _validate_results_v3(
     report["human_review_gate_reviewer_id_count"] = len(complete_reviewers)
     report["self_attested_full_review_completion_reviewer_id_count"] = len(complete_reviewers)
     report["human_review_identity_or_independence_verified_automatically"] = False
+    report["reviewer_identity_status"] = "UNVERIFIED"
+    report["reviewer_independence_status"] = "UNVERIFIED"
+    report["reviewer_blinding_status"] = "UNVERIFIED"
+    report["review_input_origin_status"] = "UNVERIFIED"
+    packet_validation_ran = any(row["human_reviews"] for row in rows)
+    report["packet_binding_consistency_verified_automatically"] = packet_validation_ran
+    report["packet_binding_validation_status"] = "VERIFIED_AGAINST_SUPPLIED_FILES" if packet_validation_ran else "UNVERIFIED_NO_REVIEW_PACKETS"
+    report["packet_hash_authenticates_origin"] = False
     report["human_review_is_model_quality_gate"] = False
     report["selector_answerability_agreement_is_diagnostic"] = True
     report["selector_answerability_agreement_has_pass_threshold"] = False
@@ -903,7 +1002,7 @@ def _validate_results_v3(
     return report
 
 
-def _validate_results(results_path: Path, corpus: dict[str, Any], corpus_digest: str) -> dict[str, Any]:
+def _validate_results(results_path: Path, corpus: dict[str, Any], corpus_digest: str, review_packet_directory: Path | None = None) -> dict[str, Any]:
     raw = _read_regular_file(results_path, MAX_RESULTS_BYTES, "pre-recorded results")
     results = _decode_json(raw, "pre-recorded results")
     _require(isinstance(results, dict), "results must be an object")
@@ -913,7 +1012,7 @@ def _validate_results(results_path: Path, corpus: dict[str, Any], corpus_digest:
     if version == 2:
         return _validate_results_v2(results, corpus, corpus_digest)
     if version == 3:
-        return _validate_results_v3(results, corpus, corpus_digest)
+        return _validate_results_v3(results, corpus, corpus_digest, review_packet_directory)
     raise ContractError("unsupported results version")
 
 
@@ -921,13 +1020,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check-corpus", action="store_true", help="validate corpus schema, limits, permutation fixtures, and pinned digests")
     parser.add_argument("--results", type=Path, help="structurally inspect a pre-recorded response set; never runs inference")
+    parser.add_argument("--review-packets", type=Path, help="directory containing the exact allowlisted packet JSON files for every annotated v3 case")
     args = parser.parse_args()
     if not args.check_corpus and args.results is None:
         parser.error("select --check-corpus and/or provide --results")
     try:
         corpus, digest = load_corpus()
         if args.results is not None:
-            report = _validate_results(args.results, corpus, digest)
+            report = _validate_results(args.results, corpus, digest, args.review_packets)
             print(json.dumps(report, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
         else:
             print(json.dumps({
