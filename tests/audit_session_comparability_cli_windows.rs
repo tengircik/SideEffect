@@ -129,6 +129,78 @@ fn write_msix_artifact(session: &Path, bytes: &[u8]) {
     write_manifest(session, &value);
 }
 
+fn software_document(subkey: &str, display_name: &str, version: &str, publisher: &str) -> Vec<u8> {
+    fn utf16_units_hex(text: &str) -> String {
+        let mut output = String::with_capacity(text.encode_utf16().count() * 4);
+        for unit in text.encode_utf16() {
+            write!(&mut output, "{unit:04x}").unwrap();
+        }
+        output
+    }
+    fn utf16le_hex(text: &str) -> String {
+        let mut output = String::with_capacity(text.encode_utf16().count() * 4);
+        for unit in text.encode_utf16() {
+            for byte in unit.to_le_bytes() {
+                write!(&mut output, "{byte:02x}").unwrap();
+            }
+        }
+        output
+    }
+
+    let registry_key = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
+    serde_json::to_vec(&json!({
+        "schema":"sideeffect.windows_software_inventory","schema_version":1,
+        "platform":"windows","scope":"current_user_and_accessible_machine_uninstall_registry_entries",
+        "capture_started_at_unix_ms":1,"capture_ended_at_unix_ms":2,"status":"complete",
+        "sources":[
+            {"id":"current_user_native_uninstall","status":"complete","registrations_seen":1,
+                "hive":"HKEY_CURRENT_USER","registry_key":registry_key,"registry_view":"native","diagnostics":[]},
+            {"id":"current_user_32_uninstall","status":"complete","registrations_seen":0,
+                "hive":"HKEY_CURRENT_USER","registry_key":registry_key,"registry_view":"wow64_32","diagnostics":[]},
+            {"id":"local_machine_64_uninstall","status":"complete","registrations_seen":0,
+                "hive":"HKEY_LOCAL_MACHINE","registry_key":registry_key,"registry_view":"wow64_64","diagnostics":[]},
+            {"id":"local_machine_32_uninstall","status":"complete","registrations_seen":0,
+                "hive":"HKEY_LOCAL_MACHINE","registry_key":registry_key,"registry_view":"wow64_32","diagnostics":[]}
+        ],
+        "registrations":[{
+            "registry_subkey":subkey,"registry_subkey_utf16_hex":utf16_units_hex(subkey),
+            "display_name":display_name,"values":[
+                {"name":"DisplayName","registry_type":1,"type_name":"REG_SZ","text":display_name,"raw_data_hex":utf16le_hex(display_name)},
+                {"name":"DisplayVersion","registry_type":1,"type_name":"REG_SZ","text":version,"raw_data_hex":utf16le_hex(version)},
+                {"name":"Publisher","registry_type":1,"type_name":"REG_SZ","text":publisher,"raw_data_hex":utf16le_hex(publisher)},
+                {"name":"UninstallString","registry_type":1,"type_name":"REG_SZ",
+                    "text":"C:\\Users\\PrivateUser\\AppData\\Local\\Programs\\SensitiveSuite\\uninstall.exe --token private-value",
+                    "raw_data_hex":utf16le_hex("C:\\Users\\PrivateUser\\AppData\\Local\\Programs\\SensitiveSuite\\uninstall.exe --token private-value")}
+            ],
+            "evidence":{"source":"RegEnumKeyExW/RegQueryValueExW","hive":"HKEY_CURRENT_USER",
+                "registry_view":"native","registry_key":registry_key,"registration_index":0,"registry_subkey":subkey}
+        }]
+    })).unwrap()
+}
+
+fn write_software_artifact(session: &Path, bytes: &[u8]) {
+    fs::write(session.join("software.windows.json"), bytes).unwrap();
+    let mut value = manifest(session);
+    let source = value["sources"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|source| source["role"] == "packages")
+        .unwrap();
+    source["status"] = json!("complete");
+    source["artifacts"][0]["byte_length"] = json!(bytes.len());
+    source["artifacts"][0]["sha256"] = json!(format!("{:x}", sha2::Sha256::digest(bytes)));
+    let coverage_source = value["coverage_manifest"]["sources"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|source| source["role"] == "packages")
+        .unwrap();
+    coverage_source["status"] = json!("observed");
+    value["status"] = json!("complete");
+    write_manifest(session, &value);
+}
+
 fn msix_row(ordinal: usize, version: u16) -> Value {
     fn exact(text: &str) -> Value {
         let mut utf16_hex = String::with_capacity(text.encode_utf16().count() * 4);
@@ -283,6 +355,95 @@ fn compare_sessions_emits_private_app_paths_change_evidence_and_v11_contract() {
         delta["before"]["evidence"]["source_id"],
         "current_user_native_app_paths"
     );
+}
+
+#[test]
+fn compare_sessions_compares_verified_windows_software_registration_facts() {
+    let root = TestDirectory::new();
+    let before = audit(&root.0, "software-before");
+    let after = audit(&root.0, "software-after");
+    let subkey = "Vendor\\SensitiveSuite_InstallRegistration";
+    let before_bytes = software_document(subkey, "Sensitive Suite", "1.0.0", "Example Vendor");
+    let after_bytes = software_document(
+        subkey,
+        "Sensitive Suite Pro",
+        "2.0.0",
+        "Example Vendor Ltd.",
+    );
+    write_software_artifact(&before, &before_bytes);
+    write_software_artifact(&after, &after_bytes);
+
+    for (session, bytes) in [(&before, &before_bytes), (&after, &after_bytes)] {
+        let artifact = &manifest(session)["sources"][0]["artifacts"][0];
+        assert_eq!(artifact["path"], "software.windows.json");
+        assert_eq!(artifact["schema"], "sideeffect.windows_software_inventory");
+        assert_eq!(artifact["schema_version"], 1);
+        assert_eq!(artifact["byte_length"], bytes.len());
+        assert_eq!(
+            artifact["sha256"],
+            format!("{:x}", sha2::Sha256::digest(bytes))
+        );
+    }
+
+    let output = compare(&before, &after);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let serialized = String::from_utf8_lossy(&output.stdout);
+    assert!(serialized.contains("Sensitive Suite"));
+    assert!(serialized.contains("2.0.0"));
+    assert!(serialized.contains("Example Vendor Ltd."));
+    assert!(!serialized.contains("PrivateUser"));
+    assert!(!serialized.contains("uninstall.exe"));
+    assert!(!serialized.contains("private-value"));
+    assert!(!serialized.contains("raw_data_hex"));
+
+    let value = report(&output);
+    let source = value["source_diffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["role"] == "packages")
+        .unwrap();
+    assert_eq!(source["status"], "compared");
+    assert_eq!(
+        source["before_artifacts"][0]["path"],
+        "software.windows.json"
+    );
+    assert_eq!(
+        source["before_artifacts"][0]["sha256"],
+        format!("{:x}", sha2::Sha256::digest(&before_bytes))
+    );
+    assert_eq!(
+        source["after_artifacts"][0]["sha256"],
+        format!("{:x}", sha2::Sha256::digest(&after_bytes))
+    );
+    let delta = &source["comparison"]["deltas"][0];
+    assert_eq!(delta["kind"], "changed");
+    assert_eq!(
+        delta["changed_fields"],
+        json!(["display_name", "display_version", "publisher"])
+    );
+    assert_eq!(delta["identity"]["registry_subkey"], subkey);
+    assert_eq!(delta["before"]["display_name"], "Sensitive Suite");
+    assert_eq!(delta["before"]["display_version"], "1.0.0");
+    assert_eq!(delta["before"]["publisher"], "Example Vendor");
+    assert_eq!(delta["after"]["display_name"], "Sensitive Suite Pro");
+    assert_eq!(delta["after"]["display_version"], "2.0.0");
+    assert_eq!(delta["after"]["publisher"], "Example Vendor Ltd.");
+    assert_eq!(
+        delta["before"]["evidence"]["source_id"],
+        "current_user_native_uninstall"
+    );
+    assert_eq!(delta["before"]["evidence"]["registration_index"], 0);
+    assert_eq!(
+        delta["after"]["evidence"]["source_id"],
+        "current_user_native_uninstall"
+    );
+    assert_eq!(delta["after"]["evidence"]["registration_index"], 0);
 }
 
 #[test]
