@@ -126,7 +126,7 @@ def _preview_evidence(
         expected_observation = evaluator._supported_tcp_send_observation(event)
         if expected_observation is not None:
             evaluator._require(decode_status == "decoded_and_sidecar_matched"
-                               and row.get("payload_observation") == expected_observation["observation"],
+                               and row.get("payload_observation") == expected_observation,
                                "supported ETW payload did not reproduce its exact sidecar observation")
             evaluator._require(row.get("payload_observation") is not None
                                and reported_identity.get("verification_status") ==

@@ -280,6 +280,31 @@ fn inspect_json_preserves_capture_claim_and_disclaims_authenticity() {
 }
 
 #[test]
+fn inspect_accepts_pinned_windows_etw_explanation_fixture_with_rust_fingerprint() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/local_model_windows_etw_explain_v1/network-then-unknown.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["inspect", "--format", "json", "--windows-runtime"])
+        .arg(path)
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["schema"], "sideeffect.windows_runtime_inspection");
+    assert_eq!(document["representation_fingerprint_verified"], true);
+    assert_eq!(
+        document["capture"]["capture_profile"],
+        "synthetic_etw_fixture"
+    );
+}
+
+#[test]
 fn inspect_text_uses_terminal_safe_output_and_partial_exit_status() {
     let path = std::env::temp_dir().join(format!(
         "sideeffect-windows-runtime-inspect-text-{}-{}.json",

@@ -446,3 +446,69 @@ fn windows_runtime_preview_and_confirmed_selector_use_source_specific_contract()
     assert_eq!(analysis["backend_used"], "not_run");
     assert_eq!(analysis["interpretation"]["selection_status"], "abstained");
 }
+
+#[test]
+fn pinned_synthetic_etw_corpus_fixture_passes_model_preview_parser() {
+    let model = SelectedTestModel::new("explanation");
+    let fixture_directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/local_model_windows_etw_explain_v1");
+    for (fixture_name, expected_capture_sha, network_evidence_id) in [
+        (
+            "network-then-unknown.json",
+            "6a319f7108bf702f29f8e2bf9aa27448a4d8ba752fccacaa483869f3a86af6c0",
+            "W00001",
+        ),
+        (
+            "unknown-then-network.json",
+            "a8c56c3c81476afb8ea7086ae942df3162de616efeebf393bd283903eeebe80e",
+            "W00002",
+        ),
+    ] {
+        let output = model
+            .command()
+            .args([
+                "model-explain-preview",
+                "--question",
+                "Which decoded network observation is present?",
+                "--backend",
+                "cpu",
+                "--windows-runtime",
+            ])
+            .arg(fixture_directory.join(fixture_name))
+            .output()
+            .unwrap();
+
+        assert!(
+            matches!(output.status.code(), Some(0) | Some(2)),
+            "fixture {fixture_name}, status {:?}, stderr: {}; stdout: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let preview: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            preview["schema"],
+            "sideeffect.local_model_windows_runtime_explanation_preview"
+        );
+        assert_eq!(
+            preview["evidence_summary"]["capture_sha256"],
+            expected_capture_sha
+        );
+        assert_eq!(preview["evidence_summary"]["event_count"], 2);
+        let prompt: serde_json::Value =
+            serde_json::from_str(preview["prompt"].as_str().unwrap()).unwrap();
+        let rows = prompt["observed_windows_etw_events"].as_array().unwrap();
+        let network = rows
+            .iter()
+            .find(|row| row["evidence_id"] == network_evidence_id)
+            .unwrap();
+        assert_eq!(
+            network["payload_decode_status"],
+            "decoded_and_sidecar_matched"
+        );
+        assert_eq!(
+            network["payload_observation"]["observation"]["activity"]["observation"]["sequence_number"],
+            99
+        );
+    }
+}

@@ -29,7 +29,7 @@ events = capture["events"]
 rows = []
 for index, event in enumerate(events):
     decoded = event["observation_decoding"] is not None and event["observation_decoding"]["status"] == "decoded"
-    payload = event["observation_decoding"]["observation"] if decoded else None
+    payload = event["observation_decoding"] if decoded else None
     decode_status = ("decoded_and_sidecar_matched" if decoded else
                      "unsupported_or_malformed_raw_payload" if event["payload_decoding"] is None else
                      "process_payload_requires_live_tdh_schema")
@@ -91,7 +91,7 @@ def _load_linux_evaluator():
 def _rehash_capture(capture: dict) -> bytes:
     capture = copy.deepcopy(capture)
     capture["document_sha256"] = ""
-    canonical = json.dumps(capture, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    canonical = evaluation.canonical_capture_bytes(capture)
     capture["document_sha256"] = hashlib.sha256(canonical).hexdigest()
     return json.dumps(capture, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
@@ -113,7 +113,7 @@ def _preview(capture: dict, question: str = "Which decoded network observation i
             "header_context": {"process_id": event["header_process_id"], "thread_id": event["header_thread_id"],
                                "semantics": "event_header_context_only_no_ownership_or_causation"},
             "payload_decode_status": decode_status,
-            "payload_observation": event["observation_decoding"]["observation"] if decoded else None,
+            "payload_observation": event["observation_decoding"] if decoded else None,
             "evidence": {"capture_sha256": capture["document_sha256"], "record_ordinal": index + 1,
                          "json_pointer": f"/events/{index}",
                          "raw_payload_sha256": hashlib.sha256(bytes.fromhex(event["raw_payload_hex"])).hexdigest()},
@@ -139,6 +139,28 @@ class WindowsEtwCorpusTests(unittest.TestCase):
         self.assertEqual(self.corpus["label_review_status"], "unreviewed_labels_not_semantically_validated")
         self.assertEqual(len(self.corpus["permutation_groups"]), 1)
         self.assertEqual(len(self.corpus["cases"]), 4)
+
+    def test_capture_fingerprint_matches_rust_serde_order_independent_of_input_keys(self) -> None:
+        raw = self.fixture_path.read_bytes()
+        capture = evaluation.decode_json(raw, "fixture")
+
+        def reverse_object_keys(value):
+            if isinstance(value, dict):
+                return {key: reverse_object_keys(item) for key, item in reversed(list(value.items()))}
+            if isinstance(value, list):
+                return [reverse_object_keys(item) for item in value]
+            return value
+
+        self.assertEqual(
+            hashlib.sha256(evaluation.canonical_capture_bytes(capture)).hexdigest(),
+            capture["document_sha256"],
+        )
+        reordered = reverse_object_keys(copy.deepcopy(capture))
+        self.assertEqual(
+            hashlib.sha256(evaluation.canonical_capture_bytes(reordered)).hexdigest(),
+            capture["document_sha256"],
+        )
+        evaluation.validate_capture_document(reordered)
 
     def test_supported_payload_sidecar_is_redecoded_and_mismatch_rejected(self) -> None:
         modified = copy.deepcopy(self.capture)
@@ -183,6 +205,9 @@ class WindowsEtwCorpusTests(unittest.TestCase):
         self.assertEqual(prompt["user_question"], question)
         self.assertEqual(parse_status, "partial")
         self.assertEqual(set(allowed), {"W00001", "W00002"})
+        self.assertEqual(allowed["W00001"]["payload_decode_status"], "decoded_and_sidecar_matched")
+        self.assertEqual(allowed["W00001"]["payload_observation"],
+                         self.capture["events"][0]["observation_decoding"])
         self.assertTrue(all(row["semantic_labels"] == [] for row in available))
 
     def test_unsupported_process_payload_stays_unknown_and_mismatched_status_rejected(self) -> None:
@@ -193,6 +218,16 @@ class WindowsEtwCorpusTests(unittest.TestCase):
         broken = json.loads(preview["prompt"])
         broken["observed_windows_etw_events"][0]["payload_decode_status"] = "raw_payload_sidecar_mismatch"
         preview["prompt"] = json.dumps(broken)
+        with self.assertRaisesRegex(evaluation.ContractError, "supported ETW payload"):
+            runner._preview_evidence(preview, preview["question"], self.capture)
+
+    def test_runner_requires_exact_decoded_sidecar_wrapper(self) -> None:
+        preview = _preview(self.capture)
+        prompt = json.loads(preview["prompt"])
+        network = prompt["observed_windows_etw_events"][0]
+        self.assertEqual(network["payload_observation"], self.capture["events"][0]["observation_decoding"])
+        network["payload_observation"]["diagnostic"] = "synthetic wrapper alteration"
+        preview["prompt"] = json.dumps(prompt)
         with self.assertRaisesRegex(evaluation.ContractError, "supported ETW payload"):
             runner._preview_evidence(preview, preview["question"], self.capture)
 

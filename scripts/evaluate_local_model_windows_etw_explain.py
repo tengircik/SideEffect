@@ -18,13 +18,13 @@ import struct
 import sys
 import unicodedata
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
 CORPUS_PATH = ROOT / "tests" / "fixtures" / "local_model_windows_etw_explain_v1" / "corpus.json"
 FIXTURE_DIRECTORY = CORPUS_PATH.parent
-EXPECTED_CORPUS_SHA256 = "fe0b208231aac3f89dfd1d919c63cc78a58baea2f7cdafa20ce880041c2d44cb"
+EXPECTED_CORPUS_SHA256 = "a30b2d59e996dfe85a55773d1c965d80d7c983151dd44c2469857bff923ab6b3"
 MAX_CORPUS_BYTES = 128 * 1024
 MAX_FIXTURE_BYTES = 512 * 1024
 MAX_CAPTURE_EVENTS = 16
@@ -116,6 +116,76 @@ _EVENT_KEYS = {
     "timestamp_qpc", "raw_payload_hex", "payload_decoding", "observation_decoding",
 }
 
+# These orders mirror the Rust serde struct declarations in
+# `src/windows_runtime.rs`. `observation_decoding` is the one dynamic
+# `serde_json::Value` in the capture; serde_json's default map representation
+# sorts those object keys lexicographically, unlike Python's insertion-ordered
+# dictionaries. The fingerprint is over the Rust serialization, not the input
+# JSON's formatting or key order.
+_CAPTURE_FIELD_ORDER = (
+    "schema", "schema_version", "platform", "capture_profile", "collection_status",
+    "capture_completeness", "started_at_unix_ms", "ended_at_unix_ms",
+    "requested_duration_seconds", "stop_reason", "target", "session", "limits",
+    "event_loss", "document_sha256", "events", "diagnostics",
+)
+_TARGET_FIELD_ORDER = ("process_id", "exit_code", "status_available")
+_SESSION_FIELD_ORDER = (
+    "name", "provider", "scope", "buffer_size_kb_requested", "minimum_buffers_requested",
+    "maximum_buffers_requested", "buffer_count_reported", "provider_process_id_header_semantics",
+)
+_LIMITS_FIELD_ORDER = (
+    "maximum_duration_seconds", "maximum_events", "maximum_total_payload_bytes",
+    "maximum_payload_bytes_per_event", "maximum_document_bytes",
+)
+_EVENT_LOSS_FIELD_ORDER = (
+    "events_lost", "log_buffers_lost", "real_time_buffers_lost", "loss_statistics_available",
+    "observation", "final_snapshot_available",
+)
+_EVENT_FIELD_ORDER = (
+    "record_ordinal", "provider_guid", "event_id", "event_version", "opcode", "event_kind",
+    "header_process_id", "header_thread_id", "header_flags", "timestamp_qpc", "raw_payload_hex",
+    "payload_decoding", "observation_decoding",
+)
+_PROCESS_DECODING_FIELD_ORDER = (
+    "status", "schema_name", "schema_version", "pointer_size_bytes", "process_id",
+    "parent_process_id", "image_file_name", "diagnostic",
+)
+
+
+def _ordered_fields(value: dict[str, Any], order: Sequence[str]) -> dict[str, Any]:
+    return {key: value[key] for key in order}
+
+
+def _sort_json_value(value: Any) -> Any:
+    """Match serde_json::Value's default lexicographic object-key order."""
+    if isinstance(value, dict):
+        return {key: _sort_json_value(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_sort_json_value(item) for item in value]
+    return value
+
+
+def canonical_capture_bytes(capture: dict[str, Any]) -> bytes:
+    """Serialize the capture in the exact field/map order used by Rust serde."""
+    canonical = _ordered_fields(capture, _CAPTURE_FIELD_ORDER)
+    canonical["document_sha256"] = ""
+    canonical["target"] = _ordered_fields(capture["target"], _TARGET_FIELD_ORDER)
+    canonical["session"] = _ordered_fields(capture["session"], _SESSION_FIELD_ORDER)
+    canonical["limits"] = _ordered_fields(capture["limits"], _LIMITS_FIELD_ORDER)
+    canonical["event_loss"] = _ordered_fields(capture["event_loss"], _EVENT_LOSS_FIELD_ORDER)
+    events = []
+    for event in capture["events"]:
+        canonical_event = _ordered_fields(event, _EVENT_FIELD_ORDER)
+        if canonical_event["payload_decoding"] is not None:
+            canonical_event["payload_decoding"] = _ordered_fields(
+                canonical_event["payload_decoding"], _PROCESS_DECODING_FIELD_ORDER
+            )
+        if canonical_event["observation_decoding"] is not None:
+            canonical_event["observation_decoding"] = _sort_json_value(canonical_event["observation_decoding"])
+        events.append(canonical_event)
+    canonical["events"] = events
+    return json.dumps(canonical, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
 
 def _supported_tcp_send_observation(event: dict[str, Any]) -> dict[str, Any] | None:
     """Recompute the one supported synthetic TCP/IPv4 Send layout used here."""
@@ -129,15 +199,18 @@ def _supported_tcp_send_observation(event: dict[str, Any]) -> dict[str, Any] | N
     ):
         return None
     raw_hex = event["raw_payload_hex"]
-    if len(raw_hex) != 64 or not re.fullmatch(r"[0-9a-f]{64}", raw_hex):
+    if len(raw_hex) != 80 or not re.fullmatch(r"[0-9a-f]{80}", raw_hex):
         raise ContractError("supported TCP/IPv4 fixture payload has an invalid bounded layout")
     payload = bytes.fromhex(raw_hex)
     process_id, packet_size = struct.unpack_from("<II", payload, 0)
     destination = str(ipaddress.IPv4Address(payload[8:12]))
     source = str(ipaddress.IPv4Address(payload[12:16]))
     destination_port, source_port = struct.unpack_from(">HH", payload, 16)
-    sequence_number = struct.unpack_from("<I", payload, 20)[0]
-    connection_id = struct.unpack_from("<Q", payload, 24)[0]
+    # The opcode-10 send record includes start/end times before sequence and
+    # connection IDs; these fields are present in the payload but not exposed
+    # by the product's current observation schema.
+    sequence_number = struct.unpack_from("<I", payload, 28)[0]
+    connection_id = struct.unpack_from("<Q", payload, 32)[0]
     return {
         "status": "decoded",
         "diagnostic": None,
@@ -281,9 +354,7 @@ def validate_capture_document(capture: Any) -> None:
     claimed_digest = capture["document_sha256"]
     _require(isinstance(claimed_digest, str) and SHA256_PATTERN.fullmatch(claimed_digest) is not None,
              "invalid Windows capture document digest")
-    unhashed = dict(capture)
-    unhashed["document_sha256"] = ""
-    canonical = json.dumps(unhashed, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    canonical = canonical_capture_bytes(capture)
     _require(hashlib.sha256(canonical).hexdigest() == claimed_digest, "Windows capture document fingerprint mismatch")
 
 
