@@ -121,6 +121,8 @@ sideeffect.exe inspect --format text --session .\session
 
 The bounded ETW window records selected process, file, and network event families. Controlling the Windows Kernel Logger requires an already-administrative token; SideEffect never elevates automatically.
 
+`sideeffect.exe associated-behavior .\startup.windows.json .\runtime.windows.json` can compare a saved Windows startup inventory with a validated ETW capture. It checks exact drive-rooted strings from scheduled-task Exec actions, `REG_SZ` Run/RunOnce values whose raw UTF-16 sidecars strictly agree with the display text (missing or inconsistent sidecars leave that row unmatched and the result partial), and SCM service `binary_path` rows against decoded process-start image paths. The candidate report retains source evidence and event ordinals; it does not establish a launch, cause, or complete coverage. Arguments, expandable values, relative/device paths, and other string variants are not interpreted or normalized.
+
 An existing validated ETW v3 capture can be reviewed with the experimental local evidence selector:
 
 ```powershell

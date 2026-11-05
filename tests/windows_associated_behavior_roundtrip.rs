@@ -88,7 +88,7 @@ fn synthetic_runtime_capture() -> Vec<u8> {
 }
 
 #[test]
-fn native_startup_v7_output_is_accepted_by_windows_associated_behavior_v1() {
+fn native_startup_v7_output_is_accepted_by_windows_associated_behavior_v2() {
     // This exercises the native startup serializer and offline adapter only.
     // The ETW input is synthetic and does not validate a live provider or capture.
     let temp = Temp::new();
@@ -138,7 +138,7 @@ fn native_startup_v7_output_is_accepted_by_windows_associated_behavior_v1() {
         report["schema"],
         "sideeffect.windows_associated_behavior_summary"
     );
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(
         report["platform_adapter"],
         "windows_startup_inventory_v4_v5_v6_or_v7_windows_runtime_capture_v3"

@@ -190,9 +190,37 @@ fn cli_dispatches_windows_inputs_to_the_exact_path_candidate_adapter() {
         "capture_ended_at_unix_ms": 11,
         "status": "complete",
         "sources": [],
-        "registry_entries": [],
+        "registry_entries": [{
+            "registry_key": "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            "hive": "HKEY_CURRENT_USER",
+            "registry_view": "native",
+            "trigger": "user_logon",
+            "value_name": "SyntheticRun",
+            "value_type": "REG_SZ",
+            "command": r"C:\Apps\worker.exe",
+            "command_utf16_hex": "0043003a005c0041007000700073005c0077006f0072006b00650072002e006500780065",
+            "evidence": {
+                "source": "RegEnumValueW",
+                "hive": "HKEY_CURRENT_USER",
+                "registry_view": "native",
+                "registry_key": "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                "value_index": 5,
+                "value_name": "SyntheticRun",
+                "registry_type": 1
+            }
+        }],
         "folder_entries": [],
-        "service_entries": [],
+        "service_entries": [{
+            "service_name": "SyntheticService",
+            "display_name": "Synthetic service",
+            "start_type": "automatic",
+            "start_type_code": 2,
+            "binary_path": r"C:\Apps\worker.exe",
+            "evidence": {
+                "source": "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW",
+                "service_index": 0
+            }
+        }],
         "scheduled_task_entries": [],
         "scheduled_task_actions": [{
             "task_path": "\\Synthetic\\Task",
@@ -303,11 +331,30 @@ fn cli_dispatches_windows_inputs_to_the_exact_path_candidate_adapter() {
         report["schema"],
         "sideeffect.windows_associated_behavior_summary"
     );
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["algorithm"]["version"], 2);
+    assert_eq!(
+        report["algorithm"]["id"],
+        "windows_startup_source_process_image_exact_path"
+    );
     assert_eq!(report["association_status"], "candidate_match");
     assert_eq!(report["status"], "partial");
     assert_eq!(
         report["associations"][0]["startup_evidence"][0]["task_index"],
         4
+    );
+    assert_eq!(
+        report["associations"][0]["registry_evidence"][0]["value_index"],
+        5
+    );
+    assert_eq!(
+        report["associations"][0]["service_evidence"][0]["service_index"],
+        0
+    );
+    assert!(
+        report["associations"][0]["multiple_startup_references"]
+            .as_bool()
+            .unwrap()
     );
     assert_eq!(
         report["associations"][0]["runtime_evidence"][0]["record_ordinal"],
