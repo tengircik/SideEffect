@@ -1371,15 +1371,14 @@ fn validate_inventory_row(
             {
                 return Err(format!("{label} has inconsistent registry row evidence"));
             }
-            let source_view_supported = match (
-                object.get("hive").and_then(Value::as_str),
-                object.get("registry_view").and_then(Value::as_str),
-            ) {
+            if !matches!(
+                (
+                    object.get("hive").and_then(Value::as_str),
+                    object.get("registry_view").and_then(Value::as_str),
+                ),
                 (Some("HKEY_CURRENT_USER"), Some("native" | "wow64_32"))
-                | (Some("HKEY_LOCAL_MACHINE"), Some("wow64_32" | "wow64_64")) => true,
-                _ => false,
-            };
-            if !source_view_supported {
+                    | (Some("HKEY_LOCAL_MACHINE"), Some("wow64_32" | "wow64_64"))
+            ) {
                 return Err(format!(
                     "{label} has an unsupported registry hive/view pair"
                 ));
@@ -1792,10 +1791,13 @@ mod tests {
     }
 
     fn utf16_hex(value: &str) -> String {
-        value
-            .encode_utf16()
-            .map(|unit| format!("{unit:04x}"))
-            .collect()
+        use std::fmt::Write as _;
+
+        let mut hex = String::with_capacity(value.encode_utf16().count().saturating_mul(4));
+        for unit in value.encode_utf16() {
+            write!(&mut hex, "{unit:04x}").unwrap();
+        }
+        hex
     }
 
     fn service_entry(binary_path: Option<&str>, service_index: usize) -> Value {
