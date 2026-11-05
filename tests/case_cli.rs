@@ -56,6 +56,7 @@ fn case_help_describes_the_partial_workflow_and_integrity_boundary() {
     assert!(help.contains("sideeffect case add-entry"));
     assert!(help.contains("sideeffect case add-note"));
     assert!(help.contains("sideeffect case add-evidence"));
+    assert!(help.contains("sideeffect case show"));
     assert!(help.contains("sideeffect case resolve"));
     assert!(help.contains("--format json|text|html"));
     assert!(help.contains("not producer authenticity"));
@@ -81,6 +82,156 @@ fn case_help_describes_the_partial_workflow_and_integrity_boundary() {
     assert!(evidence_help.contains("--evidence-file LOCATORS.json"));
     assert!(evidence_help.contains("64 KiB"));
     assert!(evidence_help.contains("does not validate the analyst's interpretation"));
+
+    let show_help = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["help", "case", "show"])
+        .output()
+        .unwrap();
+    assert!(show_help.status.success());
+    let show_help = String::from_utf8(show_help.stdout).unwrap();
+    assert!(show_help.contains("investigation_case_summary v1"));
+    assert!(show_help.contains("not_resolved"));
+    assert!(show_help.contains("No session directories are required"));
+}
+
+fn summary_case(schema_version: u64) -> Value {
+    let mut case = serde_json::json!({
+        "schema": "sideeffect.investigation_case",
+        "schema_version": schema_version,
+        "case_id": "case-01",
+        "title": "<b>Review</b>\u{1b}[2J\u{202e}",
+        "sessions": [{
+            "session_id": "0123456789abcdef0123456789abcdef",
+            "platform": "linux",
+            "manifest_schema_version": 1,
+            "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }],
+        "entries": [{
+            "id": "N001",
+            "kind": "note",
+            "authorship": "analyst_supplied_unverified",
+            "text": "PRIVATE_NOTE_TEXT_MUST_NOT_APPEAR",
+            "evidence": [{
+                "kind": "selected_root_entry",
+                "session_id": "0123456789abcdef0123456789abcdef",
+                "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "artifact_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "entry_ordinal": 0
+            }]
+        }]
+    });
+    if schema_version == 2 {
+        case["lifecycle"] = serde_json::json!({
+            "status": "in_review",
+            "revision": 4,
+            "previous_case_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        });
+    }
+    case
+}
+
+fn run_case_show(case_path: &PathBuf, format: Option<&str>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sideeffect"));
+    command.args(["case", "show", "--case"]).arg(case_path);
+    if let Some(format) = format {
+        command.args(["--format", format]);
+    }
+    command.output().unwrap()
+}
+
+#[test]
+fn case_show_summarizes_v2_without_sessions_or_private_entry_content() {
+    let directory = TestDirectory::new();
+    let case_path = directory.0.join("summary.case.json");
+    fs::write(&case_path, serde_json::to_vec(&summary_case(2)).unwrap()).unwrap();
+
+    let output = run_case_show(&case_path, None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["schema"], "sideeffect.investigation_case_summary");
+    assert_eq!(summary["schema_version"], 1);
+    assert_eq!(summary["case_schema_version"], 2);
+    assert_eq!(summary["status"], "in_review");
+    assert_eq!(summary["revision"], 4);
+    assert_eq!(summary["parent_case_digest_present"], true);
+    assert_eq!(summary["evidence_state"], "not_resolved");
+    assert_eq!(
+        summary["session_bindings"][0]["session_id"],
+        "0123456789abcdef0123456789abcdef"
+    );
+    assert_eq!(summary["entries"][0]["kind"], "note");
+    assert_eq!(
+        summary["entries"][0]["authorship"],
+        "analyst_supplied_unverified"
+    );
+    assert_eq!(
+        summary["entries"][0]["text_bytes"],
+        "PRIVATE_NOTE_TEXT_MUST_NOT_APPEAR".len()
+    );
+    assert_eq!(summary["entries"][0]["evidence_locator_count"], 1);
+    assert_eq!(summary["entries"][0]["evidence_state"], "not_resolved");
+    let json = String::from_utf8(output.stdout).unwrap();
+    assert!(!json.contains("PRIVATE_NOTE_TEXT_MUST_NOT_APPEAR"));
+    assert!(!json.contains("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+}
+
+#[test]
+fn case_show_preserves_v1_untracked_semantics_and_escapes_terminal_controls() {
+    let directory = TestDirectory::new();
+    let case_path = directory.0.join("legacy.case.json");
+    fs::write(&case_path, serde_json::to_vec(&summary_case(1)).unwrap()).unwrap();
+
+    let output = run_case_show(&case_path, Some("text"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.is_ascii());
+    assert!(text.contains("Status: untracked"));
+    assert!(text.contains("Revision: not recorded (schema v1)"));
+    assert!(text.contains("Parent case digest presence: not recorded (schema v1)"));
+    assert!(text.contains("Evidence state: not_resolved"));
+    assert!(text.contains("<b>Review</b>"));
+    assert!(text.contains("\\u{1b}[2J"));
+    assert!(text.contains("\\u{202e}"));
+    assert!(!text.contains('\u{1b}'));
+    assert!(!text.contains('\u{202e}'));
+    assert!(!text.contains("PRIVATE_NOTE_TEXT_MUST_NOT_APPEAR"));
+    assert!(!text.contains("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+}
+
+#[test]
+fn case_show_rejects_malformed_oversized_and_unknown_schema_without_stdout() {
+    let directory = TestDirectory::new();
+    let path = directory.0.join("input.case.json");
+    for bytes in [
+        b"{not json}".to_vec(),
+        {
+            let mut unknown = summary_case(2);
+            unknown["unexpected"] = serde_json::json!(true);
+            serde_json::to_vec(&unknown).unwrap()
+        },
+        {
+            let mut unsupported = summary_case(2);
+            unsupported["schema_version"] = serde_json::json!(99);
+            serde_json::to_vec(&unsupported).unwrap()
+        },
+        vec![b' '; sideeffect::case::MAX_CASE_BYTES + 1],
+    ] {
+        fs::write(&path, bytes).unwrap();
+        let output = run_case_show(&path, None);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("PRIVATE_NOTE_TEXT_MUST_NOT_APPEAR")
+        );
+    }
 }
 
 fn run_case_add_evidence(

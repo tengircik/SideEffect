@@ -318,6 +318,13 @@ For process snapshots, use `sideeffect inventory processes --output ./before.jso
 
 ### Keep evidence in a local investigation case
 
+Inspect a case without resolving evidence or opening session directories:
+
+```sh
+sideeffect case show --case ./review.case.json --format text
+```
+
+The default JSON output uses `sideeffect.investigation_case_summary` v1; `--format text` emits an ASCII-safe terminal summary. Both formats show case metadata, declared session bindings, entry kinds/authorship/text byte lengths, and locator counts, but omit analyst-written text and raw evidence rows. Evidence is marked `not_resolved`. This bounded read-only command validates locator shapes and internal bindings within the case document, but does not open sessions or resolve locators against artifacts. It makes no authenticity or claim assessment.
 Create a private schema-v2 draft from one or more verified sessions on the same native platform:
 
 ```sh

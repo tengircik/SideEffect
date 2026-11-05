@@ -93,6 +93,7 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect case add-entry --case <v2.json> --entry <entry.json> --output <new-v2.json> --session <session-directory>...\n\
        sideeffect case add-note --case <v2.json> --id <entry-id> --text-file <note.txt> --output <new-v2.json> --session <session-directory>...\n\
        sideeffect case add-evidence --case <v2.json> --id <entry-id> --kind note|assertion --text-file <text.txt> --evidence-file <locators.json> --output <new-v2.json> --session <session-directory>...\n\
+       sideeffect case show --case <case.json> [--format json|text]\n\
        sideeffect case resolve [--format json|text|html] [--redact case-text|artifact-paths|source-records|evidence-identifiers]... [--preview-redaction | --output <new-report.html>] --case <case.json> --session <session-directory>...\n\
        sideeffect model-preview --question <question> <strace-trace-file>\n\
        sideeffect model-analyze --question <question> [--runtime <llama-cli>] --confirm-sha256 <preview-digest> <strace-trace-file>\n\
@@ -1933,7 +1934,10 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect compare-sessions BEFORE_SESSION_DIR AFTER_SESSION_DIR\nVerifies both local audit sessions, reports metadata comparability, and compares bounded item-level inventory and runtime evidence from verified artifacts. Per-source status and evidence references remain visible; missing, partial, unsupported, or incompatible sources do not become empty results. This is not an exhaustive history or coverage claim, and it does not establish causation or event absence. Incomparable or partial results exit with status 2 and include stable reason codes."
         }
         "case" => {
-            "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case migrate --case V1_CASE.json --status draft|open --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case set-status --case V2_CASE.json --status draft|open|in_review|closed|cancelled --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-entry --case V2_CASE.json --entry ENTRY.json --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-note --case V2_CASE.json --id ENTRY_ID --text-file NOTE.txt --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-evidence --case V2_CASE.json --id ENTRY_ID --kind note|assertion --text-file TEXT.txt --evidence-file LOCATORS.json --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case resolve [--format json|text|html] [--output NEW_REPORT.html] [--redact GROUP...] [--preview-redaction] --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nCreates a private schema-v2 draft, explicitly migrates a schema-v1 case with a user-selected initial status, applies validated lifecycle transitions, appends analyst-authored entries or bounded text-file note/assertion conveniences with optional source locators to a draft/open v2 case, or resolves evidence against supplied verified sessions. Note text is labeled analyst_supplied_unverified. Each update writes a new private file and never replaces an existing file. Closed and cancelled cases are terminal. Case-authored assertions remain unverified; lifecycle status is an analyst workflow label. Hash checks establish byte consistency, not producer authenticity or capture completeness. JSON output may contain sensitive local evidence. HTML redaction groups are explicit whole-field omissions; preview reports omission counts plus renderer-known retained/omitted field and record counts for four fixed groups, without scanning content or writing a report. Retained source records may contain arbitrary strings, arguments, or payloads; this is not a secret scan and does not make sharing safe. Incomplete, partial, or unknown source status remains visible and exits with status 2."
+            "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case migrate --case V1_CASE.json --status draft|open --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case set-status --case V2_CASE.json --status draft|open|in_review|closed|cancelled --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-entry --case V2_CASE.json --entry ENTRY.json --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-note --case V2_CASE.json --id ENTRY_ID --text-file NOTE.txt --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-evidence --case V2_CASE.json --id ENTRY_ID --kind note|assertion --text-file TEXT.txt --evidence-file LOCATORS.json --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case show --case CASE.json [--format json|text]\n       sideeffect case resolve [--format json|text|html] [--output NEW_REPORT.html] [--redact GROUP...] [--preview-redaction] --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nReads a bounded case summary with `case show` without sessions; it omits analyst text and raw evidence rows and marks all evidence not_resolved. Other operations create a private schema-v2 draft, explicitly migrate a schema-v1 case with a user-selected initial status, applies validated lifecycle transitions, appends analyst-authored entries or bounded text-file note/assertion conveniences with optional source locators to a draft/open v2 case, or resolves evidence against supplied verified sessions. Note text is labeled analyst_supplied_unverified. Each update writes a new private file and never replaces an existing file. Closed and cancelled cases are terminal. Case-authored assertions remain unverified; lifecycle status is an analyst workflow label. Hash checks establish byte consistency, not producer authenticity or capture completeness. JSON output may contain sensitive local evidence. HTML redaction groups are explicit whole-field omissions; preview reports omission counts plus renderer-known retained/omitted field and record counts for four fixed groups, without scanning content or writing a report. Retained source records may contain arbitrary strings, arguments, or payloads; this is not a secret scan and does not make sharing safe. Incomplete, partial, or unknown source status remains visible and exits with status 2."
+        }
+        "case show" => {
+            "Usage: sideeffect case show --case CASE.json [--format json|text]\nReads one regular case file bounded to 2 MiB and validates its strict v1/v2 schema. No session directories are required. JSON is the default and uses the sideeffect.investigation_case_summary v1 contract; text is ASCII-safe for terminal display. Shows case-declared bindings and metadata, but never note/assertion text or raw evidence rows. Evidence is always marked not_resolved: the case schema checks locator structure and internal bindings, but this command does not open sessions or resolve locators against artifacts. It makes no authenticity or analyst-claim assessment and performs no writes."
         }
         "case init" => {
             "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\nCreates an empty schema-v2 draft bound to the exact manifests of supplied verified sessions. It does not add findings or evidence locators. Revision 1 has no parent digest. The output is private and never overwrites an existing file."
@@ -2503,12 +2507,212 @@ fn case_command(operation: &OsString, arguments: &[OsString]) -> Result<ExitCode
         Some("add-entry") => case_add_entry_command(arguments),
         Some("add-note") => case_add_note_command(arguments),
         Some("add-evidence") => case_add_evidence_command(arguments),
+        Some("show") => case_show_command(arguments),
         Some("resolve") => case_resolve_command(arguments),
         _ => Err(
-            "case command must be 'init', 'migrate', 'set-status', 'add-entry', 'add-note', 'add-evidence', or 'resolve'"
+            "case command must be 'init', 'migrate', 'set-status', 'add-entry', 'add-note', 'add-evidence', 'show', or 'resolve'"
                 .to_owned(),
         ),
     }
+}
+
+#[derive(Serialize)]
+struct CaseSummaryDocument<'a> {
+    schema: &'static str,
+    schema_version: u32,
+    case_schema_version: u32,
+    case_id: &'a str,
+    title: &'a str,
+    status: &'static str,
+    revision: Option<u64>,
+    parent_case_digest_present: Option<bool>,
+    session_bindings: Vec<CaseSummaryBinding<'a>>,
+    entries: Vec<CaseSummaryEntry<'a>>,
+    evidence_state: &'static str,
+    disclosure: &'static str,
+}
+
+#[derive(Serialize)]
+struct CaseSummaryBinding<'a> {
+    session_id: &'a str,
+    platform: &'static str,
+    manifest_schema_version: u32,
+    manifest_sha256: &'a str,
+}
+
+#[derive(Serialize)]
+struct CaseSummaryEntry<'a> {
+    id: &'a str,
+    kind: &'static str,
+    authorship: &'a str,
+    text_bytes: usize,
+    evidence_locator_count: usize,
+    evidence_state: &'static str,
+}
+
+fn case_show_command(arguments: &[OsString]) -> Result<ExitCode, String> {
+    let mut case_path: Option<&OsString> = None;
+    let mut output_format = "json";
+    let mut format_seen = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        let flag = &arguments[index];
+        let value = arguments.get(index + 1).ok_or_else(|| {
+            format!(
+                "case show option {} requires a value",
+                terminal_safe_text(&flag.to_string_lossy())
+            )
+        })?;
+        match flag.to_str() {
+            Some("--case") if case_path.replace(value).is_none() => {}
+            Some("--case") => return Err("duplicate case show --case option".to_owned()),
+            Some("--format") if !format_seen => {
+                output_format = value
+                    .to_str()
+                    .ok_or("case show --format must be json or text")?;
+                if !matches!(output_format, "json" | "text") {
+                    return Err("case show --format must be json or text".to_owned());
+                }
+                format_seen = true;
+            }
+            Some("--format") => return Err("duplicate case show --format option".to_owned()),
+            _ => {
+                return Err(format!(
+                    "unknown case show option {}",
+                    terminal_safe_text(&flag.to_string_lossy())
+                ));
+            }
+        }
+        index += 2;
+    }
+
+    let case_path = case_path.ok_or("case show requires --case CASE.json")?;
+    let case_bytes = read_input_file(
+        Path::new(case_path),
+        sideeffect::case::MAX_CASE_BYTES,
+        "case",
+    )?;
+    let case = sideeffect::case::InvestigationCase::from_json(&case_bytes)?;
+    let (status, revision, parent_case_digest_present) = match &case.lifecycle {
+        Some(lifecycle) => (
+            lifecycle.status.as_str(),
+            Some(lifecycle.revision),
+            Some(lifecycle.previous_case_sha256.is_some()),
+        ),
+        None => ("untracked", None, None),
+    };
+    let summary = CaseSummaryDocument {
+        schema: "sideeffect.investigation_case_summary",
+        schema_version: 1,
+        case_schema_version: case.schema_version,
+        case_id: &case.case_id,
+        title: &case.title,
+        status,
+        revision,
+        parent_case_digest_present,
+        session_bindings: case
+            .sessions
+            .iter()
+            .map(|session| CaseSummaryBinding {
+                session_id: &session.session_id,
+                platform: match session.platform {
+                    sideeffect::case::CasePlatform::Linux => "linux",
+                    sideeffect::case::CasePlatform::Windows => "windows",
+                },
+                manifest_schema_version: session.manifest_schema_version,
+                manifest_sha256: &session.manifest_sha256,
+            })
+            .collect(),
+        entries: case
+            .entries
+            .iter()
+            .map(|entry| CaseSummaryEntry {
+                id: &entry.id,
+                kind: match entry.kind {
+                    sideeffect::case::CaseEntryKind::Note => "note",
+                    sideeffect::case::CaseEntryKind::Assertion => "assertion",
+                },
+                authorship: &entry.authorship,
+                text_bytes: entry.text.len(),
+                evidence_locator_count: entry.evidence.len(),
+                evidence_state: "not_resolved",
+            })
+            .collect(),
+        evidence_state: "not_resolved",
+        disclosure: "Case-declared bindings and locator structure are validated within the case document, but sessions are not opened and locators are not resolved against artifacts; authorship and assertions are not authenticated or assessed.",
+    };
+
+    if output_format == "json" {
+        write_json(&summary, "investigation case summary")?;
+    } else {
+        let mut text = CappedBuffer::new(MAX_REPORT_BYTES);
+        render_case_summary_text(&summary, &mut text).map_err(|_| {
+            format!("case summary text exceeds the {MAX_REPORT_BYTES} byte output limit")
+        })?;
+        text.write_all(b"\n").map_err(|_| {
+            format!("case summary text exceeds the {MAX_REPORT_BYTES} byte output limit")
+        })?;
+        write_buffer(&text, "investigation case summary text")?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn render_case_summary_text(
+    summary: &CaseSummaryDocument<'_>,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    writeln!(
+        output,
+        "Investigation case summary (v{})",
+        summary.schema_version
+    )?;
+    writeln!(
+        output,
+        "Case schema version: {}",
+        summary.case_schema_version
+    )?;
+    writeln!(output, "Case ID: {}", terminal_safe_text(summary.case_id))?;
+    writeln!(output, "Title: {}", terminal_safe_text(summary.title))?;
+    writeln!(output, "Status: {}", summary.status)?;
+    match summary.revision {
+        Some(revision) => writeln!(output, "Revision: {revision}")?,
+        None => writeln!(output, "Revision: not recorded (schema v1)")?,
+    }
+    match summary.parent_case_digest_present {
+        Some(present) => writeln!(output, "Parent case digest present: {present}")?,
+        None => writeln!(
+            output,
+            "Parent case digest presence: not recorded (schema v1)"
+        )?,
+    }
+    writeln!(output, "Evidence state: not_resolved")?;
+    writeln!(output, "Session bindings (case-declared; not verified):")?;
+    for binding in &summary.session_bindings {
+        writeln!(
+            output,
+            "- session={} platform={} manifest_schema_version={} manifest_sha256={}",
+            terminal_safe_text(binding.session_id),
+            binding.platform,
+            binding.manifest_schema_version,
+            terminal_safe_text(binding.manifest_sha256)
+        )?;
+    }
+    writeln!(output, "Entries:")?;
+    if summary.entries.is_empty() {
+        writeln!(output, "- (none)")?;
+    }
+    for entry in &summary.entries {
+        writeln!(
+            output,
+            "- id={} kind={} authorship={} text_bytes={} evidence_locator_count={} evidence_state=not_resolved",
+            terminal_safe_text(entry.id),
+            entry.kind,
+            terminal_safe_text(entry.authorship),
+            entry.text_bytes,
+            entry.evidence_locator_count
+        )?;
+    }
+    writeln!(output, "{}", summary.disclosure)
 }
 
 fn case_add_entry_command(arguments: &[OsString]) -> Result<ExitCode, String> {
