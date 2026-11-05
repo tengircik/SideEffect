@@ -53,6 +53,13 @@ fn focused_help_covers_command_and_nested_inventory_topics() {
     assert!(events_help.contains("events --trace TRACE"));
     assert!(events_help.contains("writes JSON only"));
 
+    let graph = run(&["help", "graph"]);
+    assert!(graph.status.success());
+    let graph_help = String::from_utf8_lossy(&graph.stdout);
+    assert!(graph_help.contains("--format json|text|html"));
+    assert!(graph_help.contains("--output REPORT.html"));
+    assert!(graph_help.contains("restrictive CSP"));
+
     let diff = run(&["help", "diff"]);
     assert!(diff.status.success());
     let diff_help = String::from_utf8_lossy(&diff.stdout);

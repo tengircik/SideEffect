@@ -1,6 +1,7 @@
 mod audit_session_text;
 mod case_html;
 mod case_text;
+mod event_graph_html;
 mod event_graph_text;
 mod html;
 mod inspect_text;
@@ -19,6 +20,7 @@ pub use case_html::{
 };
 pub use case_text::MAX_CASE_TEXT_BYTES;
 pub use case_text::write_case_text;
+pub use event_graph_html::{MAX_EVENT_GRAPH_HTML_BYTES, write_event_graph_html};
 pub use event_graph_text::{MAX_EVENT_GRAPH_TEXT_BYTES, write_event_graph_text};
 pub use html::write_html_diff;
 pub use inspect_text::{write_trace_evidence_text, write_trace_text};

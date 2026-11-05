@@ -466,6 +466,126 @@ fn graph_text_preserves_selected_context_and_json_default() {
 }
 
 #[test]
+fn graph_html_is_offline_bounded_private_and_no_clobber() {
+    let trace = TempTrace::with_contents(
+        b"1700000000.000001 openat(AT_FDCWD, \"/tmp/<graph>\", O_RDONLY) = 3\nnot a recognized trace row\n",
+    );
+    let report = std::env::temp_dir().join(format!(
+        "sideeffect-events-graph-html-{}-{}.html",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--trace"])
+        .arg(&trace.0)
+        .args(["--format", "html", "--output"])
+        .arg(&report)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Offline event graph HTML report written")
+    );
+    let html = fs::read_to_string(&report).unwrap();
+    assert!(html.contains("Content-Security-Policy"));
+    assert!(html.contains("default-src 'none'"));
+    assert!(html.contains("script-src 'none'"));
+    assert!(html.contains("Skip to report content"));
+    assert!(html.contains("Source completeness"));
+    assert!(html.contains("unsupported_source_row"));
+    assert!(html.contains("partial"));
+    assert!(html.contains("raw_trace_record"));
+    assert!(html.contains("&lt;graph&gt;"));
+    assert!(!html.contains("<script"));
+    assert!(!html.contains("https://"));
+
+    let existing = b"preserve-existing-report";
+    fs::write(&report, existing).unwrap();
+    let rejected = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--trace"])
+        .arg(&trace.0)
+        .args(["--format", "html", "--output"])
+        .arg(&report)
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert_eq!(fs::read(&report).unwrap(), existing);
+    fs::remove_file(report).unwrap();
+
+    let empty_report = std::env::temp_dir().join(format!(
+        "sideeffect-events-graph-html-empty-{}-{}.html",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let empty = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--trace"])
+        .arg(&trace.0)
+        .args([
+            "--event-kind",
+            "not-present",
+            "--format",
+            "html",
+            "--output",
+        ])
+        .arg(&empty_report)
+        .output()
+        .unwrap();
+    assert_eq!(empty.status.code(), Some(2));
+    let empty_html = fs::read_to_string(&empty_report).unwrap();
+    assert!(empty_html.contains("No nodes were selected by these filters"));
+    assert!(empty_html.contains("does not establish absence"));
+    fs::remove_file(empty_report).unwrap();
+
+    let missing_output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--trace"])
+        .arg(&trace.0)
+        .args(["--format", "html"])
+        .output()
+        .unwrap();
+    assert_eq!(missing_output.status.code(), Some(1));
+    let invalid_output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--trace"])
+        .arg(&trace.0)
+        .args(["--format", "text", "--output", "ignored.html"])
+        .output()
+        .unwrap();
+    assert_eq!(invalid_output.status.code(), Some(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn graph_html_rejects_symlink_destination_without_changing_target() {
+    let trace = TempTrace::with_contents(b"1700000000.000001 close(3) = 0\n");
+    let target = std::env::temp_dir().join(format!(
+        "sideeffect-events-graph-link-target-{}-{}.html",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let link = target.with_extension("link.html");
+    fs::write(&target, b"protected target").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--trace"])
+        .arg(&trace.0)
+        .args(["--format", "html", "--output"])
+        .arg(&link)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(fs::read(&target).unwrap(), b"protected target");
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    fs::remove_file(link).unwrap();
+    fs::remove_file(target).unwrap();
+}
+
+#[test]
 fn graph_process_observation_filter_selects_source_local_context_and_links() {
     let trace = TempTrace::with_contents(
         b"[pid 123] 1700000000.000001 openat(AT_FDCWD, \"/tmp/one\", O_RDONLY) = 3\n[pid 456] 1700000000.000002 close(4) = 0\n",

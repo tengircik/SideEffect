@@ -293,6 +293,7 @@ fn inspect_text_uses_terminal_safe_output_and_partial_exit_status() {
         .output()
         .unwrap();
     fs::remove_file(path).unwrap();
+
     assert_eq!(output.status.code(), Some(2));
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("Event evidence ID: 1"));
@@ -743,7 +744,24 @@ fn graph_windows_runtime_keeps_pid_context_separate_from_process_instance() {
         .args(["--event-kind", "process_start", "--format", "text"])
         .output()
         .unwrap();
-    fs::remove_file(path).unwrap();
+    let html_path = std::env::temp_dir().join(format!(
+        "sideeffect-windows-graph-{}-{}.html",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let html_output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--windows-runtime"])
+        .arg(&path)
+        .args([
+            "--event-kind",
+            "process_start",
+            "--format",
+            "html",
+            "--output",
+        ])
+        .arg(&html_path)
+        .output()
+        .unwrap();
 
     assert_eq!(output.status.code(), Some(2));
     let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -790,6 +808,30 @@ fn graph_windows_runtime_keeps_pid_context_separate_from_process_instance() {
     assert!(text.contains("relationship_kind=windows_payload_parent_to_child_instance"));
     assert!(text.contains("resolution=parent_instance_unresolved"));
     assert!(text.contains("role=windows_process_start_payload status=observed"));
+
+    let html = fs::read_to_string(&html_path).unwrap();
+    fs::write(&html_path, b"preserve existing html").unwrap();
+    let existing_rejected = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--windows-runtime"])
+        .arg(&path)
+        .args(["--format", "html", "--output"])
+        .arg(&html_path)
+        .output()
+        .unwrap();
+    assert_eq!(existing_rejected.status.code(), Some(1));
+    let preserved = fs::read(&html_path).unwrap();
+    fs::remove_file(path).unwrap();
+    fs::remove_file(html_path).unwrap();
+    assert_eq!(html_output.status.code(), Some(2));
+    assert!(html_output.stdout.is_empty());
+    assert!(html.contains("default-src 'none'"));
+    assert!(html.contains("Source completeness"));
+    assert!(html.contains("windows_etw_record ordinal=1"));
+    assert!(html.contains("parent_instance_unresolved"));
+    assert!(html.contains("process_start"));
+    assert!(!html.contains("<script"));
+    assert!(!html.contains("https://"));
+    assert_eq!(preserved, b"preserve existing html");
 }
 
 #[cfg(windows)]
@@ -1320,6 +1362,7 @@ fn events_windows_runtime_closes_matching_process_instance_with_end_evidence() {
 fn events_windows_runtime_loss_and_partial_source_remain_partial() {
     let (path, output) = with_events_input(&fixture(CollectionStatus::Partial));
     fs::remove_file(path).unwrap();
+
     assert_eq!(output.status.code(), Some(2));
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["source_state"]["completeness"], "partial");
