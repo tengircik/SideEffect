@@ -162,7 +162,8 @@ fn timeline_process_observation_filters_by_local_link_and_preserves_evidence() {
 #[test]
 fn timeline_text_is_terminal_safe_preserves_source_references_and_keeps_json_default() {
     let malicious_trace =
-        format!("123 1700000000.000001 openat(AT_FDCWD, \"/tmp/\x1b[31m\\u202e\", O_RDONLY) = 4\n");
+        "123 1700000000.000001 openat(AT_FDCWD, \"/tmp/\x1b[31m\\u202e\", O_RDONLY) = 4\n"
+            .to_string();
     let trace = TempTrace::with_contents(malicious_trace.as_bytes());
     let json_default = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .args(["timeline", "--trace"])
