@@ -2,7 +2,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -54,9 +54,275 @@ fn case_help_describes_the_partial_workflow_and_integrity_boundary() {
     assert!(help.contains("sideeffect case migrate"));
     assert!(help.contains("sideeffect case set-status"));
     assert!(help.contains("sideeffect case add-entry"));
+    assert!(help.contains("sideeffect case add-note"));
     assert!(help.contains("sideeffect case resolve"));
     assert!(help.contains("not producer authenticity"));
     assert!(help.contains("sensitive local evidence"));
+
+    let note_help = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("help")
+        .arg("case")
+        .arg("add-note")
+        .output()
+        .unwrap();
+    assert!(note_help.status.success());
+    let note_help = String::from_utf8(note_help.stdout).unwrap();
+    assert!(note_help.contains("--text-file NOTE.txt"));
+    assert!(note_help.contains("analyst_supplied_unverified"));
+}
+
+fn run_case_add_note(
+    case_path: &PathBuf,
+    note_path: &PathBuf,
+    output_path: &PathBuf,
+    sessions: &[PathBuf],
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sideeffect"));
+    command
+        .arg("case")
+        .arg("add-note")
+        .arg("--case")
+        .arg(case_path)
+        .arg("--id")
+        .arg("N001")
+        .arg("--text-file")
+        .arg(note_path)
+        .arg("--output")
+        .arg(output_path);
+    for session in sessions {
+        command.arg("--session").arg(session);
+    }
+    command.output().unwrap()
+}
+
+#[test]
+fn case_add_note_reads_bounded_text_and_publishes_verified_private_revision() {
+    let directory = TestDirectory::new();
+    let session = directory.0.join("session");
+    let audit = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&session)
+        .arg("--packages")
+        .output()
+        .unwrap();
+    assert!(audit.status.success() || audit.status.code() == Some(2));
+
+    let other_session = directory.0.join("other-session");
+    let other_audit = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&other_session)
+        .arg("--packages")
+        .output()
+        .unwrap();
+    assert!(other_audit.status.success() || other_audit.status.code() == Some(2));
+
+    let case_path = directory.0.join("review.case.json");
+    let init = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("init")
+        .arg("--output")
+        .arg(&case_path)
+        .arg("--title")
+        .arg("Case note CLI test")
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(init.status.success() || init.status.code() == Some(2));
+    let original_case = fs::read(&case_path).unwrap();
+
+    let note_text = "Analyst note: <script>alert('inert')</script>";
+    let note_path = directory.0.join("note.txt");
+    fs::write(&note_path, note_text.as_bytes()).unwrap();
+    let updated_path = directory.0.join("review-with-note.case.json");
+    let added = run_case_add_note(
+        &case_path,
+        &note_path,
+        &updated_path,
+        std::slice::from_ref(&session),
+    );
+    assert!(
+        added.status.success() || added.status.code() == Some(2),
+        "case add-note failed: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&added.stderr).contains(note_text));
+    let inline_output = directory.0.join("inline-note.case.json");
+    let inline = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("add-note")
+        .arg("--case")
+        .arg(&case_path)
+        .arg("--id")
+        .arg("N002")
+        .arg("--text")
+        .arg(note_text)
+        .arg("--output")
+        .arg(&inline_output)
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(!inline.status.success());
+    assert!(!String::from_utf8_lossy(&inline.stderr).contains(note_text));
+    assert!(!inline_output.exists());
+    assert_eq!(fs::read(&case_path).unwrap(), original_case);
+
+    let updated_bytes = fs::read(&updated_path).unwrap();
+    let updated: Value = serde_json::from_slice(&updated_bytes).unwrap();
+    assert_eq!(updated["schema_version"], 2);
+    assert_eq!(updated["lifecycle"]["revision"], 2);
+    assert_eq!(
+        updated["lifecycle"]["previous_case_sha256"],
+        format!("{:x}", Sha256::digest(&original_case))
+    );
+    assert_eq!(updated["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(updated["entries"][0]["id"], "N001");
+    assert_eq!(updated["entries"][0]["kind"], "note");
+    assert_eq!(
+        updated["entries"][0]["authorship"],
+        "analyst_supplied_unverified"
+    );
+    assert_eq!(updated["entries"][0]["text"], note_text);
+    assert_eq!(updated["entries"][0]["evidence"], serde_json::json!([]));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&updated_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    let duplicate_path = directory.0.join("duplicate.case.json");
+    let duplicate = run_case_add_note(
+        &updated_path,
+        &note_path,
+        &duplicate_path,
+        std::slice::from_ref(&session),
+    );
+    assert!(!duplicate.status.success());
+    assert!(!duplicate_path.exists());
+
+    let existing_path = directory.0.join("existing.case.json");
+    let sentinel = b"existing destination must remain untouched";
+    fs::write(&existing_path, sentinel).unwrap();
+    let existing = run_case_add_note(
+        &case_path,
+        &note_path,
+        &existing_path,
+        std::slice::from_ref(&session),
+    );
+    assert!(!existing.status.success());
+    assert_eq!(fs::read(&existing_path).unwrap(), sentinel);
+
+    let mut v1_case: Value = serde_json::from_slice(&original_case).unwrap();
+    v1_case["schema_version"] = serde_json::json!(1);
+    v1_case.as_object_mut().unwrap().remove("lifecycle");
+    let v1_path = directory.0.join("legacy.case.json");
+    let v1_bytes = serde_json::to_vec(&v1_case).unwrap();
+    fs::write(&v1_path, &v1_bytes).unwrap();
+    let v1_output = directory.0.join("v1-output.case.json");
+    let v1_result = run_case_add_note(
+        &v1_path,
+        &note_path,
+        &v1_output,
+        std::slice::from_ref(&session),
+    );
+    assert!(!v1_result.status.success());
+    assert_eq!(fs::read(&v1_path).unwrap(), v1_bytes);
+    assert!(!v1_output.exists());
+
+    let cancelled_path = directory.0.join("cancelled.case.json");
+    let cancelled = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("set-status")
+        .arg("--case")
+        .arg(&case_path)
+        .arg("--status")
+        .arg("cancelled")
+        .arg("--output")
+        .arg(&cancelled_path)
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(cancelled.status.success() || cancelled.status.code() == Some(2));
+    let terminal_output = directory.0.join("terminal-output.case.json");
+    let terminal = run_case_add_note(
+        &cancelled_path,
+        &note_path,
+        &terminal_output,
+        std::slice::from_ref(&session),
+    );
+    assert!(!terminal.status.success());
+    assert!(!terminal_output.exists());
+
+    let missing_session_output = directory.0.join("missing-session.case.json");
+    let missing_session = run_case_add_note(&case_path, &note_path, &missing_session_output, &[]);
+    assert!(!missing_session.status.success());
+    assert!(!missing_session_output.exists());
+
+    let mismatched_output = directory.0.join("mismatched-session.case.json");
+    let mismatched = run_case_add_note(
+        &case_path,
+        &note_path,
+        &mismatched_output,
+        std::slice::from_ref(&other_session),
+    );
+    assert!(!mismatched.status.success());
+    assert!(!mismatched_output.exists());
+
+    for (label, bytes) in [
+        ("invalid-utf8", vec![0xff, 0xfe]),
+        ("nul", b"note\0text".to_vec()),
+        ("empty", Vec::new()),
+        ("whitespace", b" \n\t".to_vec()),
+        (
+            "oversized",
+            vec![b'x'; sideeffect::case::MAX_ENTRY_TEXT_BYTES + 1],
+        ),
+    ] {
+        let invalid_note = directory.0.join(format!("{label}.txt"));
+        fs::write(&invalid_note, &bytes).unwrap();
+        let invalid_output = directory.0.join(format!("{label}.case.json"));
+        let result = run_case_add_note(
+            &case_path,
+            &invalid_note,
+            &invalid_output,
+            std::slice::from_ref(&session),
+        );
+        assert!(!result.status.success(), "{label} note input was accepted");
+        if !bytes.is_empty() {
+            let rejected_text = String::from_utf8_lossy(&bytes);
+            assert!(!String::from_utf8_lossy(&result.stderr).contains(rejected_text.as_ref()));
+        }
+        assert!(
+            !invalid_output.exists(),
+            "{label} input created an output case"
+        );
+    }
+
+    let resolved_html = directory.0.join("note.html");
+    let html_result = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("resolve")
+        .arg("--format")
+        .arg("html")
+        .arg("--output")
+        .arg(&resolved_html)
+        .arg("--case")
+        .arg(&updated_path)
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(html_result.status.success() || html_result.status.code() == Some(2));
+    let html = String::from_utf8(fs::read(&resolved_html).unwrap()).unwrap();
+    assert!(html.contains("Analyst note: &lt;script&gt;alert(&#39;inert&#39;)&lt;/script&gt;"));
+    assert!(!html.contains("Analyst note: <script>"));
 }
 
 #[test]

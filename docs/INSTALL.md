@@ -273,7 +273,19 @@ On Windows PowerShell:
 sideeffect.exe case init --output .\review.case.json --title "Review selected behavior" --session .\audit-session
 ```
 
-Repeat `--session` to bind up to 16 sessions. To add one note or assertion without editing the case file directly, provide a bounded entry JSON object, pass every bound session for strict verification, and write a new private revision:
+Repeat `--session` to bind up to 16 sessions. For a plain analyst note, place its text in a UTF-8 file and use `case add-note`. The command accepts no inline note text, rejects empty, invalid UTF-8, NUL-containing, or larger-than-16-KiB files, does not echo the note content, and writes a new private revision after verifying every bound session:
+
+```sh
+sideeffect case add-note --case ./review.case.json --id N001 --text-file ./note.txt --output ./review-with-note.case.json --session ./audit-session
+```
+
+```powershell
+sideeffect.exe case add-note --case .\review.case.json --id N001 --text-file .\note.txt --output .\review-with-note.case.json --session .\audit-session
+```
+
+The note is stored as an existing schema-v2 `note` entry with `authorship=analyst_supplied_unverified` and no evidence locators. It is analyst-authored text, not a verified observation or assertion.
+
+The generic JSON entry interface remains available for manually structured notes and assertions. A note entry can be supplied as bounded JSON, with every bound session passed for strict verification:
 
 ```json
 {"id":"N001","kind":"note","authorship":"analyst_supplied_unverified","text":"Review this observation","evidence":[]}
@@ -283,7 +295,7 @@ Repeat `--session` to bind up to 16 sessions. To add one note or assertion witho
 sideeffect case add-entry --case ./review.case.json --entry ./note.json --output ./review-with-note.case.json --session ./audit-session
 ```
 
-For assertions, include exact evidence locators copied from the session artifacts. Assertions require evidence references and stay labeled analyst-supplied and unverified. Entries can be added only in `draft` or `open` status. The command checks the supplied sessions and referenced artifacts, increments the branch-local revision, and writes a new private file without replacing the source.
+For assertions, include exact evidence locators copied from the session artifacts. Assertions require evidence references and stay labeled analyst-supplied and unverified. Entries can be added only in `draft` or `open` status. Both authoring commands check the supplied sessions and referenced artifacts, increment the branch-local revision, and write a new private file without replacing the source.
 
 Use `case set-status` to move between workflow states. Allowed transitions are `draft` to `open` or `cancelled`, `open` to `in_review`, `closed`, or `cancelled`, and `in_review` to `open`, `closed`, or `cancelled`. `closed` and `cancelled` are terminal. Status is an analyst workflow label; it does not indicate evidence quality or completeness. Every transition rechecks the bound sessions and evidence locators and writes a new no-clobber file:
 

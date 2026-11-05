@@ -322,7 +322,13 @@ Create a private schema-v2 draft from one or more verified sessions on the same 
 sideeffect case init --output ./review.case.json --title "Review selected behavior" --session ./audit-session
 ```
 
-On Windows, use `sideeffect.exe` and PowerShell paths. Repeat `--session` for additional sessions (up to 16). The case stores each session ID and SHA-256 of its exact manifest bytes. Add one note or assertion by preparing a bounded entry JSON file and writing a new case revision:
+On Windows, use `sideeffect.exe` and PowerShell paths. Repeat `--session` for additional sessions (up to 16). The case stores each session ID and SHA-256 of its exact manifest bytes. For a plain note, put the UTF-8 text in a file and add it without editing the case JSON:
+
+```sh
+sideeffect case add-note --case ./review.case.json --id N001 --text-file ./note.txt --output ./review-with-note.case.json --session ./audit-session
+```
+
+The file is capped at 16 KiB and must be valid, non-empty UTF-8 without NUL. Its text is stored as an existing schema-v2 `note` entry with `analyst_supplied_unverified` authorship and no evidence locators. It is analyst-authored text, not a verified observation. The command does not accept inline note text or echo the file contents. For assertions and manually structured notes, use the bounded entry JSON interface:
 
 ```json
 {
@@ -364,7 +370,7 @@ For a private, static HTML review report with links from each entry to its resol
 sideeffect case resolve --format html --output ./review.html --case ./review.case.json --session ./audit-session
 ```
 
-The default command writes bounded JSON; HTML is static, offline, size-bounded, private, and never overwrites an existing file. Both formats retain case status/revision and source/session status. Exit status `2` means some source or capture remains partial or unknown. Manifest, artifact, and parent-case hashes establish byte consistency; they do not authenticate who produced the evidence or prove an assertion, and the parent hash does not prevent forks or rewrites. Entry authoring is one JSON entry at a time; there is no interactive editor or role-specific report set yet. Reports can contain sensitive paths, arguments, and event payloads; keep them local and review before sharing.
+The default command writes bounded JSON; HTML is static, offline, size-bounded, private, and never overwrites an existing file. Both formats retain case status/revision and source/session status. Exit status `2` means some source or capture remains partial or unknown. Manifest, artifact, and parent-case hashes establish byte consistency; they do not authenticate who produced the evidence or prove an assertion, and the parent hash does not prevent forks or rewrites. Entry authoring remains one entry at a time, with a dedicated text-file interface for notes; there is no interactive editor or role-specific report set yet. Reports can contain sensitive paths, arguments, and event payloads; keep them local and review before sharing.
 
 To preview exact whole-field omissions for an HTML export, select one or more groups. The preview prints only group names and affected field-occurrence counts and writes no report; rerun without `--preview-redaction` to write a separate redacted report:
 

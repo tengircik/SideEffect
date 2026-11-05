@@ -91,6 +91,7 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect case migrate --case <v1.json> --status draft|open --output <v2.json> --session <session-directory>...\n\
        sideeffect case set-status --case <v2.json> --status <status> --output <new-v2.json> --session <session-directory>...\n\
        sideeffect case add-entry --case <v2.json> --entry <entry.json> --output <new-v2.json> --session <session-directory>...\n\
+       sideeffect case add-note --case <v2.json> --id <entry-id> --text-file <note.txt> --output <new-v2.json> --session <session-directory>...\n\
        sideeffect case resolve [--format json|html] [--redact case-text|artifact-paths|source-records|evidence-identifiers]... [--preview-redaction | --output <new-report.html>] --case <case.json> --session <session-directory>...\n\
        sideeffect model-preview --question <question> <strace-trace-file>\n\
        sideeffect model-analyze --question <question> [--runtime <llama-cli>] --confirm-sha256 <preview-digest> <strace-trace-file>\n\
@@ -1953,7 +1954,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect compare-sessions BEFORE_SESSION_DIR AFTER_SESSION_DIR\nVerifies both local audit sessions, reports metadata comparability, and compares bounded item-level inventory and runtime evidence from verified artifacts. Per-source status and evidence references remain visible; missing, partial, unsupported, or incompatible sources do not become empty results. This is not an exhaustive history or coverage claim, and it does not establish causation or event absence. Incomparable or partial results exit with status 2 and include stable reason codes."
         }
         "case" => {
-            "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case migrate --case V1_CASE.json --status draft|open --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case set-status --case V2_CASE.json --status draft|open|in_review|closed|cancelled --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-entry --case V2_CASE.json --entry ENTRY.json --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case resolve [--format json|html] [--output NEW_REPORT.html] [--redact GROUP...] [--preview-redaction] --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nCreates a private schema-v2 draft, explicitly migrates a schema-v1 case with a user-selected initial status, applies validated lifecycle transitions, appends one analyst-authored entry to a draft/open v2 case, or resolves evidence against supplied verified sessions. Each update writes a new private file and never replaces an existing file. Closed and cancelled cases are terminal. Case-authored assertions remain unverified; lifecycle status is an analyst workflow label. Hash checks establish byte consistency, not producer authenticity or capture completeness. JSON output may contain sensitive local evidence. HTML redaction groups are explicit whole-field omissions; preview reports counts only. Redaction does not scan text for sensitive substrings or make an export safe to share. Incomplete, partial, or unknown source status remains visible and exits with status 2."
+            "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case migrate --case V1_CASE.json --status draft|open --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case set-status --case V2_CASE.json --status draft|open|in_review|closed|cancelled --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-entry --case V2_CASE.json --entry ENTRY.json --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-note --case V2_CASE.json --id ENTRY_ID --text-file NOTE.txt --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case resolve [--format json|html] [--output NEW_REPORT.html] [--redact GROUP...] [--preview-redaction] --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nCreates a private schema-v2 draft, explicitly migrates a schema-v1 case with a user-selected initial status, applies validated lifecycle transitions, appends analyst-authored entries or a bounded text-file note to a draft/open v2 case, or resolves evidence against supplied verified sessions. Note text is labeled analyst_supplied_unverified. Each update writes a new private file and never replaces an existing file. Closed and cancelled cases are terminal. Case-authored assertions remain unverified; lifecycle status is an analyst workflow label. Hash checks establish byte consistency, not producer authenticity or capture completeness. JSON output may contain sensitive local evidence. HTML redaction groups are explicit whole-field omissions; preview reports counts only. Redaction does not scan text for sensitive substrings or make an export safe to share. Incomplete, partial, or unknown source status remains visible and exits with status 2."
         }
         "case init" => {
             "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\nCreates an empty schema-v2 draft bound to the exact manifests of supplied verified sessions. It does not add findings or evidence locators. Revision 1 has no parent digest. The output is private and never overwrites an existing file."
@@ -1966,6 +1967,9 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         }
         "case add-entry" => {
             "Usage: sideeffect case add-entry --case V2_CASE.json --entry ENTRY.json --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nValidates one bounded note/assertion JSON object and appends it only to a draft/open schema-v2 case after strict verification of all bound sessions and evidence locators. The source case is unchanged; output increments the branch-local revision and never overwrites an existing file. Schema-v1 cases require explicit migration first. Assertions require evidence locators and remain analyst_supplied_unverified."
+        }
+        "case add-note" => {
+            "Usage: sideeffect case add-note --case V2_CASE.json --id ENTRY_ID --text-file NOTE.txt --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nReads one regular UTF-8 text file up to 16 KiB; empty, invalid UTF-8, NUL-containing, or oversized input is rejected. The text file is never echoed in errors or progress output. Adds one note with authorship analyst_supplied_unverified and no evidence locators to a draft/open v2 case after strict verification of every bound session. The source case is unchanged; the output increments the branch-local revision and is private and no-clobber. Schema-v1 cases require explicit migration first."
         }
         "case resolve" => {
             "Usage: sideeffect case resolve [--format json|html] [--redact case-text|artifact-paths|source-records|evidence-identifiers]... [--preview-redaction | --output NEW_REPORT.html] --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nVerifies supplied sessions and resolves each case locator to its exact source record or selected-root entry. HTML is static, offline, bounded, private, and no-clobber. Repeat --redact with exact field groups; --preview-redaction reports only which groups and how many field occurrences would be omitted, and writes no report. A redacted export marks omitted fields. The artifact-paths group matches the exact structured key artifact_path, not path, display_name, or substrings. Group redaction does not detect paths, usernames, secrets, or other substrings in remaining free text and is not a safe-to-share guarantee; inspect the full output. The source case and evidence are unchanged. Session and artifact hashes establish consistency with the supplied manifest, not authenticity. Author-written assertions remain unverified; runtime completeness may remain unknown. Reports can contain sensitive paths, arguments, and raw payloads. Review before sharing."
@@ -2515,9 +2519,10 @@ fn case_command(operation: &OsString, arguments: &[OsString]) -> Result<ExitCode
         Some("migrate") => case_migrate_command(arguments),
         Some("set-status") => case_set_status_command(arguments),
         Some("add-entry") => case_add_entry_command(arguments),
+        Some("add-note") => case_add_note_command(arguments),
         Some("resolve") => case_resolve_command(arguments),
         _ => Err(
-            "case command must be 'init', 'migrate', 'set-status', 'add-entry', or 'resolve'"
+            "case command must be 'init', 'migrate', 'set-status', 'add-entry', 'add-note', or 'resolve'"
                 .to_owned(),
         ),
     }
@@ -2626,6 +2631,119 @@ fn case_add_entry_command(arguments: &[OsString]) -> Result<ExitCode, String> {
     };
     eprintln!(
         "Saved case revision {} with one validated analyst entry to {}. Assertions remain unverified; review sensitive content before sharing.",
+        case.lifecycle
+            .as_ref()
+            .map(|value| value.revision)
+            .unwrap_or_default(),
+        terminal_safe_path(&published)
+    );
+    if incomplete {
+        eprintln!(
+            "Supplied sessions or referenced sources remain partial or unknown; that state was preserved."
+        );
+        Ok(ExitCode::from(2))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+fn case_add_note_command(arguments: &[OsString]) -> Result<ExitCode, String> {
+    let mut case_path: Option<&OsString> = None;
+    let mut entry_id: Option<String> = None;
+    let mut text_path: Option<&OsString> = None;
+    let mut output: Option<&OsString> = None;
+    let mut session_paths: Vec<OsString> = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let flag = &arguments[index];
+        let value = arguments.get(index + 1).ok_or_else(|| {
+            format!(
+                "case add-note option {} requires a value",
+                terminal_safe_text(&flag.to_string_lossy())
+            )
+        })?;
+        match flag.to_str() {
+            Some("--case") if case_path.replace(value).is_none() => {}
+            Some("--id") if entry_id.is_none() => {
+                entry_id = Some(
+                    value
+                        .to_str()
+                        .ok_or("case add-note --id must be valid UTF-8")?
+                        .to_owned(),
+                );
+            }
+            Some("--text-file") if text_path.replace(value).is_none() => {}
+            Some("--output") if output.replace(value).is_none() => {}
+            Some("--session") => session_paths.push(value.clone()),
+            Some("--case") => return Err("duplicate case add-note --case option".to_owned()),
+            Some("--id") => return Err("duplicate case add-note --id option".to_owned()),
+            Some("--text-file") => {
+                return Err("duplicate case add-note --text-file option".to_owned());
+            }
+            Some("--output") => return Err("duplicate case add-note --output option".to_owned()),
+            _ => {
+                return Err(format!(
+                    "unknown case add-note option {}",
+                    terminal_safe_text(&flag.to_string_lossy())
+                ));
+            }
+        }
+        index += 2;
+    }
+
+    let case_path = case_path.ok_or("case add-note requires --case CASE.json")?;
+    let entry_id = entry_id.ok_or("case add-note requires --id ENTRY_ID")?;
+    let text_path = text_path.ok_or("case add-note requires --text-file NOTE.txt")?;
+    let output = output.ok_or("case add-note requires --output NEW_CASE.json")?;
+    validate_case_session_count("case add-note", session_paths.len())?;
+
+    let case_bytes = read_input_file(
+        Path::new(case_path),
+        sideeffect::case::MAX_CASE_BYTES,
+        "case",
+    )?;
+    let mut case = sideeffect::case::InvestigationCase::from_json(&case_bytes)?;
+    if case.schema_version != sideeffect::case::CASE_SCHEMA_VERSION {
+        return Err("case add-note requires schema version 2; migrate the version 1 case with an explicit initial status first".to_owned());
+    }
+    let lifecycle = case.lifecycle.as_ref().expect("validated v2 lifecycle");
+    if !lifecycle.permits_entry() {
+        return Err(format!(
+            "case status {} does not permit entry changes; transition to open first if allowed",
+            lifecycle.status.as_str()
+        ));
+    }
+
+    let note_bytes = read_input_file(
+        Path::new(text_path),
+        sideeffect::case::MAX_ENTRY_TEXT_BYTES,
+        "case note",
+    )?;
+    if note_bytes.is_empty() {
+        return Err("case note file must contain non-empty UTF-8 text without NUL".to_owned());
+    }
+    let note_text = String::from_utf8(note_bytes)
+        .map_err(|_| "case note file must contain valid UTF-8".to_owned())?;
+    if note_text.trim().is_empty() || note_text.contains('\0') {
+        return Err("case note file must contain non-empty UTF-8 text without NUL".to_owned());
+    }
+
+    case.entries.push(sideeffect::case::CaseEntry {
+        id: entry_id,
+        kind: sideeffect::case::CaseEntryKind::Note,
+        authorship: "analyst_supplied_unverified".to_owned(),
+        text: note_text,
+        severity: None,
+        confidence: None,
+        evidence: Vec::new(),
+    });
+    advance_case_revision(&mut case, &case_bytes)?;
+    case.validate()?;
+    let resolved_case = verify_case_against_sessions(&case, &session_paths)?;
+    let incomplete = resolved_case_is_incomplete(&resolved_case);
+    let published = publish_case_file(Path::new(output), &case)?;
+    eprintln!(
+        "Saved case revision {} with one analyst-authored unverified note to {}. Review sensitive content before sharing.",
         case.lifecycle
             .as_ref()
             .map(|value| value.revision)
