@@ -182,8 +182,23 @@ fn configured_runtime_fallback_and_explicit_override_stop_before_runtime_launch(
         .args(["model", "doctor", "--task", "explanation"])
         .output()
         .expect("check stale saved runtime path without launching it");
-    assert_eq!(doctor.status.code(), Some(1));
-    assert!(stderr(&doctor).contains("missing or inaccessible"));
+    assert_eq!(doctor.status.code(), Some(2));
+    let doctor_report: serde_json::Value =
+        serde_json::from_slice(&doctor.stdout).expect("doctor emits its blocked schema-v2 report");
+    assert_eq!(doctor_report["schema_version"], 2);
+    assert_eq!(doctor_report["readiness"], "blocked_or_incomplete");
+    assert_eq!(
+        doctor_report["runtime"]["executable_status"],
+        "not_configured_or_unavailable"
+    );
+    assert!(
+        doctor_report["runtime"]["executable_diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("missing or inaccessible")
+    );
+    assert_eq!(doctor_report["inference_not_run"], true);
+    assert_eq!(doctor_report["weights_not_loaded"], true);
 
     // The explicit path overrides the stale saved path. The digest mismatch
     // again guarantees that the selected file is not started.
