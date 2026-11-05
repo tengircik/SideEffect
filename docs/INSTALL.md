@@ -327,6 +327,12 @@ sideeffect.exe case resolve --format html --output .\review.html --case .\review
 
 The default bounded JSON result includes exact matched source rows; the optional HTML report is static, offline, size-bounded, private, and no-clobber. Both include v2 case status/revision and preserve session/source/parser/loss status. V1 cases show that status is not tracked. Exit status `2` means a source remains partial or unknown. Manifest, artifact, and parent-case hashes establish byte consistency, not producer authenticity, a tamper-proof history, or assertion truth. Resolved output may contain raw trace rows, paths, arguments, analyst text, or ETW payloads represented as hex. Keep it local and review it before sharing. The workflow still has no interactive editor, role-specific reports, or general investigation query engine.
 
+Use `--preview-redaction` with at least one exact `--redact` group to preview an HTML policy without writing a file. It preserves the existing omitted-field counts and adds renderer-known retained/omitted occurrence counts for `case-text`, `artifact-paths`, `source-records`, and `evidence-identifiers`. Counts represent fixed renderer field positions and source-record blocks only; categories may overlap, and the inventory does not inspect content. Retained source records can contain arbitrary strings, arguments, or payloads. This is not a secret scan and does not make a report safe to share; review the complete redacted output.
+
+```powershell
+sideeffect.exe case resolve --format html --redact case-text --preview-redaction --case .\review.case.json --session .\audit-session
+```
+
 ## Build from source
 
 The source repository is public and can be cloned over HTTPS or SSH:

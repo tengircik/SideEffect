@@ -4,7 +4,7 @@ use crate::case_evidence::{ResolvedCase, ResolvedEvidenceFact};
 
 const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; connect-src 'none'; frame-src 'none'; media-src 'none'; script-src 'none'";
 
-/// Exact structured fields that an analyst can omit from a resolved case HTML export.
+/// Exact renderer field groups that an analyst can omit from a resolved case HTML export.
 /// This is deliberately not a substring detector or secret scanner.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CaseHtmlRedactionPolicy {
@@ -17,7 +17,16 @@ pub struct CaseHtmlRedactionPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RedactionPreviewItem {
     pub field_group: &'static str,
+    pub selected_for_redaction: bool,
+    /// The existing redaction-policy omission count. This remains unchanged.
     pub affected_field_occurrences: usize,
+    /// Renderer-known field/record occurrences before applying policy; this is
+    /// not a scan or content taxonomy.
+    pub known_rendered_occurrences: usize,
+    /// Renderer-known occurrences visible under the selected policy.
+    pub retained_rendered_occurrences: usize,
+    /// Known occurrences not visible under the selected policy.
+    pub omitted_rendered_occurrences: usize,
 }
 
 /// Return counts only; preview output intentionally never includes the values being removed.
@@ -25,38 +34,105 @@ pub fn preview_case_html_redactions(
     case: &ResolvedCase,
     policy: CaseHtmlRedactionPolicy,
 ) -> Result<Vec<RedactionPreviewItem>, serde_json::Error> {
-    let mut items = Vec::new();
-    let mut push = |enabled: bool, field_group, affected_field_occurrences| {
-        if enabled {
-            items.push(RedactionPreviewItem {
-                field_group,
-                affected_field_occurrences,
-            });
-        }
-    };
-    push(policy.case_text, "case-text", 1 + case.entries.len());
-    let nested_artifact_paths = if policy.artifact_paths && !policy.source_records {
-        case.facts.iter().try_fold(0usize, |count, fact| {
-            let source_record = serde_json::to_value(&fact.fact)?;
-            Ok::<usize, serde_json::Error>(
-                count + count_exact_named_fields(&source_record, "artifact_path"),
-            )
-        })?
+    let case_text_count = 1 + case.entries.len();
+    let nested_artifact_paths = case.facts.iter().try_fold(0usize, |count, fact| {
+        let source_record = serde_json::to_value(&fact.fact)?;
+        Ok::<usize, serde_json::Error>(
+            count + count_exact_named_fields(&source_record, "artifact_path"),
+        )
+    })?;
+    let artifact_path_count = case.facts.len() + nested_artifact_paths;
+    // Preserve the historical selected-omission count: when source records
+    // are also omitted, only the separate top-level artifact fields belong to
+    // the artifact-path policy's count.
+    let artifact_path_affected = if policy.artifact_paths {
+        case.facts.len()
+            + if policy.source_records {
+                0
+            } else {
+                nested_artifact_paths
+            }
     } else {
         0
     };
-    push(
-        policy.artifact_paths,
-        "artifact-paths",
-        case.facts.len() + nested_artifact_paths,
-    );
-    push(policy.source_records, "source-records", case.facts.len());
-    push(
-        policy.evidence_identifiers,
-        "evidence-identifiers",
-        1 + case.entries.len() + case.sessions.len() * 2 + case.facts.len(),
-    );
-    Ok(items)
+    let artifact_path_retained = if policy.artifact_paths {
+        0
+    } else {
+        case.facts.len()
+            + if policy.source_records {
+                0
+            } else {
+                nested_artifact_paths
+            }
+    };
+    let source_record_count = case.facts.len();
+    let source_records_retained = if policy.source_records {
+        0
+    } else {
+        source_record_count
+    };
+    let evidence_identifier_count =
+        1 + case.entries.len() + case.sessions.len() * 2 + case.facts.len();
+
+    Ok(vec![
+        preview_item(
+            "case-text",
+            policy.case_text,
+            if policy.case_text { case_text_count } else { 0 },
+            case_text_count,
+            if policy.case_text { 0 } else { case_text_count },
+        ),
+        preview_item(
+            "artifact-paths",
+            policy.artifact_paths,
+            artifact_path_affected,
+            artifact_path_count,
+            artifact_path_retained,
+        ),
+        preview_item(
+            "source-records",
+            policy.source_records,
+            if policy.source_records {
+                source_record_count
+            } else {
+                0
+            },
+            source_record_count,
+            source_records_retained,
+        ),
+        preview_item(
+            "evidence-identifiers",
+            policy.evidence_identifiers,
+            if policy.evidence_identifiers {
+                evidence_identifier_count
+            } else {
+                0
+            },
+            evidence_identifier_count,
+            if policy.evidence_identifiers {
+                0
+            } else {
+                evidence_identifier_count
+            },
+        ),
+    ])
+}
+
+fn preview_item(
+    field_group: &'static str,
+    selected_for_redaction: bool,
+    affected_field_occurrences: usize,
+    known_rendered_occurrences: usize,
+    retained_rendered_occurrences: usize,
+) -> RedactionPreviewItem {
+    RedactionPreviewItem {
+        field_group,
+        selected_for_redaction,
+        affected_field_occurrences,
+        known_rendered_occurrences,
+        retained_rendered_occurrences,
+        omitted_rendered_occurrences: known_rendered_occurrences - retained_rendered_occurrences,
+    }
 }
 
 /// Render resolved case evidence as a static offline report.
@@ -475,6 +551,23 @@ mod tests {
                 ("evidence-identifiers", 5),
             ]
         );
+        assert_eq!(
+            preview
+                .iter()
+                .map(|item| (
+                    item.field_group,
+                    item.known_rendered_occurrences,
+                    item.retained_rendered_occurrences,
+                    item.omitted_rendered_occurrences,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("case-text", 2, 0, 2),
+                ("artifact-paths", 2, 0, 2),
+                ("source-records", 1, 0, 1),
+                ("evidence-identifiers", 5, 0, 5),
+            ]
+        );
         let preview_text = format!("{preview:?}");
         assert!(!preview_text.contains("alice"));
         assert!(!preview_text.contains("secret"));
@@ -499,14 +592,34 @@ mod tests {
             ..CaseHtmlRedactionPolicy::default()
         };
         let path_preview = preview_case_html_redactions(&case, artifact_paths_only).unwrap();
-        assert_eq!(path_preview[0].field_group, "artifact-paths");
-        assert_eq!(path_preview[0].affected_field_occurrences, 2);
+        let path_item = path_preview
+            .iter()
+            .find(|item| item.field_group == "artifact-paths")
+            .unwrap();
+        assert_eq!(path_item.affected_field_occurrences, 2);
+        assert_eq!(path_item.known_rendered_occurrences, 2);
+        assert_eq!(path_item.retained_rendered_occurrences, 0);
+        assert_eq!(path_item.omitted_rendered_occurrences, 2);
         let mut path_only_html = Vec::new();
         write_case_html_with_redactions(&case, &mut path_only_html, artifact_paths_only).unwrap();
         let path_only_html = String::from_utf8(path_only_html).unwrap();
         assert!(!path_only_html.contains("root-snapshot.json"));
         assert!(path_only_html.contains("[OMITTED: artifact path]"));
         assert!(path_only_html.contains("alice"));
+
+        let source_records_only = CaseHtmlRedactionPolicy {
+            source_records: true,
+            ..CaseHtmlRedactionPolicy::default()
+        };
+        let source_preview = preview_case_html_redactions(&case, source_records_only).unwrap();
+        let path_item = source_preview
+            .iter()
+            .find(|item| item.field_group == "artifact-paths")
+            .unwrap();
+        assert_eq!(path_item.affected_field_occurrences, 0);
+        assert_eq!(path_item.known_rendered_occurrences, 2);
+        assert_eq!(path_item.retained_rendered_occurrences, 1);
+        assert_eq!(path_item.omitted_rendered_occurrences, 1);
 
         let mut exact_key_fixture = serde_json::json!({
             "artifact_path": "C:/private/artifact.json",

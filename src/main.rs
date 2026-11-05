@@ -1954,7 +1954,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect compare-sessions BEFORE_SESSION_DIR AFTER_SESSION_DIR\nVerifies both local audit sessions, reports metadata comparability, and compares bounded item-level inventory and runtime evidence from verified artifacts. Per-source status and evidence references remain visible; missing, partial, unsupported, or incompatible sources do not become empty results. This is not an exhaustive history or coverage claim, and it does not establish causation or event absence. Incomparable or partial results exit with status 2 and include stable reason codes."
         }
         "case" => {
-            "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case migrate --case V1_CASE.json --status draft|open --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case set-status --case V2_CASE.json --status draft|open|in_review|closed|cancelled --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-entry --case V2_CASE.json --entry ENTRY.json --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-note --case V2_CASE.json --id ENTRY_ID --text-file NOTE.txt --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case resolve [--format json|html] [--output NEW_REPORT.html] [--redact GROUP...] [--preview-redaction] --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nCreates a private schema-v2 draft, explicitly migrates a schema-v1 case with a user-selected initial status, applies validated lifecycle transitions, appends analyst-authored entries or a bounded text-file note to a draft/open v2 case, or resolves evidence against supplied verified sessions. Note text is labeled analyst_supplied_unverified. Each update writes a new private file and never replaces an existing file. Closed and cancelled cases are terminal. Case-authored assertions remain unverified; lifecycle status is an analyst workflow label. Hash checks establish byte consistency, not producer authenticity or capture completeness. JSON output may contain sensitive local evidence. HTML redaction groups are explicit whole-field omissions; preview reports counts only. Redaction does not scan text for sensitive substrings or make an export safe to share. Incomplete, partial, or unknown source status remains visible and exits with status 2."
+            "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case migrate --case V1_CASE.json --status draft|open --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case set-status --case V2_CASE.json --status draft|open|in_review|closed|cancelled --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-entry --case V2_CASE.json --entry ENTRY.json --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-note --case V2_CASE.json --id ENTRY_ID --text-file NOTE.txt --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case resolve [--format json|html] [--output NEW_REPORT.html] [--redact GROUP...] [--preview-redaction] --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nCreates a private schema-v2 draft, explicitly migrates a schema-v1 case with a user-selected initial status, applies validated lifecycle transitions, appends analyst-authored entries or a bounded text-file note to a draft/open v2 case, or resolves evidence against supplied verified sessions. Note text is labeled analyst_supplied_unverified. Each update writes a new private file and never replaces an existing file. Closed and cancelled cases are terminal. Case-authored assertions remain unverified; lifecycle status is an analyst workflow label. Hash checks establish byte consistency, not producer authenticity or capture completeness. JSON output may contain sensitive local evidence. HTML redaction groups are explicit whole-field omissions; preview reports omission counts plus renderer-known retained/omitted field and record counts for four fixed groups, without scanning content or writing a report. Retained source records may contain arbitrary strings, arguments, or payloads; this is not a secret scan and does not make sharing safe. Incomplete, partial, or unknown source status remains visible and exits with status 2."
         }
         "case init" => {
             "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\nCreates an empty schema-v2 draft bound to the exact manifests of supplied verified sessions. It does not add findings or evidence locators. Revision 1 has no parent digest. The output is private and never overwrites an existing file."
@@ -1972,7 +1972,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect case add-note --case V2_CASE.json --id ENTRY_ID --text-file NOTE.txt --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nReads one regular UTF-8 text file up to 16 KiB; empty, invalid UTF-8, NUL-containing, or oversized input is rejected. The text file is never echoed in errors or progress output. Adds one note with authorship analyst_supplied_unverified and no evidence locators to a draft/open v2 case after strict verification of every bound session. The source case is unchanged; the output increments the branch-local revision and is private and no-clobber. Schema-v1 cases require explicit migration first."
         }
         "case resolve" => {
-            "Usage: sideeffect case resolve [--format json|html] [--redact case-text|artifact-paths|source-records|evidence-identifiers]... [--preview-redaction | --output NEW_REPORT.html] --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nVerifies supplied sessions and resolves each case locator to its exact source record or selected-root entry. HTML is static, offline, bounded, private, and no-clobber. Repeat --redact with exact field groups; --preview-redaction reports only which groups and how many field occurrences would be omitted, and writes no report. A redacted export marks omitted fields. The artifact-paths group matches the exact structured key artifact_path, not path, display_name, or substrings. Group redaction does not detect paths, usernames, secrets, or other substrings in remaining free text and is not a safe-to-share guarantee; inspect the full output. The source case and evidence are unchanged. Session and artifact hashes establish consistency with the supplied manifest, not authenticity. Author-written assertions remain unverified; runtime completeness may remain unknown. Reports can contain sensitive paths, arguments, and raw payloads. Review before sharing."
+            "Usage: sideeffect case resolve [--format json|html] [--redact case-text|artifact-paths|source-records|evidence-identifiers]... [--preview-redaction | --output NEW_REPORT.html] --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nVerifies supplied sessions and resolves each case locator to its exact source record or selected-root entry. HTML is static, offline, bounded, private, and no-clobber. Repeat --redact with exact field groups; --preview-redaction preserves the selected groups' omission counts and adds counts of renderer-known retained/omitted field occurrences for case-text, artifact-paths, source-records, and evidence-identifiers. Counts describe fixed renderer fields/record blocks only, not a scan or taxonomy of content; preview writes no report. Retained source records can contain arbitrary strings, arguments, or payloads. This is not a secret scan and does not make sharing safe; inspect the full output. The artifact-paths group matches the exact structured key artifact_path, not path, display_name, or substrings. Group redaction does not detect paths, usernames, secrets, or other substrings in remaining free text. The source case and evidence are unchanged. Session and artifact hashes establish consistency with the supplied manifest, not authenticity. Author-written assertions remain unverified; runtime completeness may remain unknown. Reports can contain sensitive paths, arguments, and raw payloads. Review before sharing."
         }
         "explain" => {
             "Usage: sideeffect explain TRACE\n       sideeffect explain --diff LEFT RIGHT\n       sideeffect explain --inventory-diff BEFORE.json AFTER.json\nCreates bounded deterministic summaries. It does not use a language model."
@@ -3338,16 +3338,40 @@ fn case_resolve_command(arguments: &[OsString]) -> Result<ExitCode, String> {
         });
         if redaction_preview {
             println!("Redaction preview for the resolved case HTML report:");
-            for item in sideeffect::format::preview_case_html_redactions(&resolved, redactions)
-                .map_err(|error| format!("could not preview case HTML redactions: {error}"))?
-            {
+            let preview =
+                sideeffect::format::preview_case_html_redactions(&resolved, redactions)
+                    .map_err(|error| format!("could not preview case HTML redactions: {error}"))?;
+            for item in preview.iter().filter(|item| item.selected_for_redaction) {
                 println!(
                     "  {}: {} field occurrence(s) would be omitted",
                     item.field_group, item.affected_field_occurrences
                 );
             }
             println!(
-                "No report was written. The preview contains counts only; inspect the redacted report before sharing. Selected structured fields are omitted as complete fields; substrings in remaining text are not detected."
+                "Known rendered-field occurrence counts under selected policy (not a content scan):"
+            );
+            for item in &preview {
+                let unit = if item.field_group == "source-records" {
+                    "source-record block(s)"
+                } else {
+                    "field occurrence(s)"
+                };
+                println!(
+                    "  {}: {} retained / {} known renderer {}; {} omitted",
+                    item.field_group,
+                    item.retained_rendered_occurrences,
+                    item.known_rendered_occurrences,
+                    unit,
+                    item.omitted_rendered_occurrences
+                );
+            }
+            if !redactions.source_records {
+                println!(
+                    "Source records remain and can contain arbitrary strings, arguments, or payload. This is not a secret scan and does not make sharing safe."
+                );
+            }
+            println!(
+                "No report was written. The preview contains counts only; inspect the redacted report before sharing. Selected redaction groups omit exact renderer fields; substrings in retained text are not detected."
             );
         } else if output_format == "json" {
             write_json(&resolved, "resolved investigation case")?;

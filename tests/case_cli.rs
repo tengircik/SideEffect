@@ -716,6 +716,7 @@ fn case_cli_initializes_and_resolves_against_a_verified_session_without_overwrit
     assert!(!html.contains("<script>alert(1)</script>"));
     assert!(!html.contains("https://"));
 
+    let redacted_path = directory.0.join("review-redacted.html");
     let redaction_preview = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .arg("case")
         .arg("resolve")
@@ -737,10 +738,24 @@ fn case_cli_initializes_and_resolves_against_a_verified_session_without_overwrit
     );
     let preview_text = String::from_utf8(redaction_preview.stdout).unwrap();
     assert!(preview_text.contains("case-text: 2 field occurrence(s) would be omitted"));
+    assert!(preview_text.contains(
+        "Known rendered-field occurrence counts under selected policy (not a content scan):"
+    ));
+    assert!(
+        preview_text
+            .contains("case-text: 0 retained / 2 known renderer field occurrence(s); 2 omitted")
+    );
+    assert!(preview_text.contains("artifact-paths: "));
+    assert!(preview_text.contains("evidence-identifiers: "));
+    assert!(preview_text.contains("source-records: "));
+    assert!(preview_text.contains(
+        "Source records remain and can contain arbitrary strings, arguments, or payload. This is not a secret scan and does not make sharing safe."
+    ));
+    assert!(preview_text.contains("No report was written."));
+    assert!(!redacted_path.exists());
     assert!(!preview_text.contains("alert(1)"));
     assert!(!preview_text.contains("<script>"));
 
-    let redacted_path = directory.0.join("review-redacted.html");
     let redacted = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .arg("case")
         .arg("resolve")
