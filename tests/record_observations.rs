@@ -539,6 +539,70 @@ fn assert_successful_syscall<'a>(
     record
 }
 
+fn assert_successful_openat_evidence<'a>(
+    document: &'a Value,
+    argument_fragment: &str,
+) -> (&'a Value, &'a Value) {
+    assert_eq!(document["parse_status"], "complete");
+    let records = document["records"]
+        .as_array()
+        .expect("inspect records array");
+    if let Some(record) = records.iter().find(|record| {
+        record["kind"] == "syscall"
+            && record["syscall"] == "openat"
+            && record["raw_arguments"]
+                .as_str()
+                .is_some_and(|arguments| arguments.contains(argument_fragment))
+            && record["raw_result"]
+                .as_str()
+                .is_some_and(|result| !result.starts_with("-1"))
+    }) {
+        return (record, record);
+    }
+
+    let unfinished = records
+        .iter()
+        .find(|record| {
+            record["kind"] == "unfinished_syscall"
+                && record["syscall"] == "openat"
+                && record["raw_arguments"]
+                    .as_str()
+                    .is_some_and(|arguments| arguments.contains(argument_fragment))
+        })
+        .unwrap_or_else(|| panic!("missing openat evidence for {argument_fragment}"));
+    let process_id = unfinished["process_id"]
+        .as_u64()
+        .expect("unfinished openat process ID");
+    let unfinished_line = unfinished["evidence"]["line_number"]
+        .as_u64()
+        .expect("unfinished openat evidence line");
+    let resumed = records
+        .iter()
+        .find(|record| {
+            record["kind"] == "resumed_syscall"
+                && record["syscall"] == "openat"
+                && record["process_id"] == process_id
+                && record["evidence"]["line_number"]
+                    .as_u64()
+                    .is_some_and(|line| line > unfinished_line)
+        })
+        .unwrap_or_else(|| {
+            panic!("split openat evidence for {argument_fragment} lacks a PID-matched resume")
+        });
+    assert!(
+        resumed["raw_result"]
+            .as_str()
+            .is_some_and(|result| !result.starts_with("-1")),
+        "split openat evidence for {argument_fragment} must show a successful result"
+    );
+    for record in [unfinished, resumed] {
+        assert!(record["evidence"]["line_number"].as_u64().is_some());
+        assert!(record["evidence"]["byte_offset"].as_u64().is_some());
+        assert!(record["evidence"]["byte_length"].as_u64().is_some());
+    }
+    (unfinished, resumed)
+}
+
 #[test]
 fn real_strace_capture_inspect_and_diff_observe_file_and_loopback_events() {
     require_tool("strace", &["--version"]);
@@ -899,6 +963,91 @@ fn real_strace_capture_inspect_and_diff_observe_file_and_loopback_events() {
     assert!(
         !temporary_root.exists(),
         "temporary traces and target files must be removed after the test"
+    );
+}
+
+#[test]
+fn real_strace_capture_observes_two_concurrent_child_processes() {
+    require_tool("strace", &["--version"]);
+    require_tool("python3", &["--version"]);
+
+    const SCRIPT: &str = r#"
+import pathlib
+import subprocess
+import sys
+import time
+
+root = pathlib.Path(sys.argv[1])
+release = root / "release.marker"
+child_script = r'''import pathlib, sys, time
+root = pathlib.Path(sys.argv[1])
+name = sys.argv[2]
+(root / (name + ".ready")).write_text("ready", encoding="ascii")
+deadline = time.monotonic() + 10
+while not (root / "release.marker").exists():
+    if time.monotonic() >= deadline:
+        raise SystemExit(91)
+    time.sleep(0.01)
+(root / (name + ".result")).write_text("complete", encoding="ascii")
+'''
+children = [
+    subprocess.Popen([sys.executable, "-c", child_script, str(root), name])
+    for name in ("child-one", "child-two")
+]
+try:
+    deadline = time.monotonic() + 10
+    while not all((root / (name + ".ready")).is_file() for name in ("child-one", "child-two")):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("concurrent child processes did not reach the barrier")
+        time.sleep(0.01)
+    release.write_text("both children ready", encoding="ascii")
+    for child in children:
+        if child.wait(timeout=10) != 0:
+            raise RuntimeError("concurrent child process failed")
+finally:
+    for child in children:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+"#;
+
+    let directory = PrivateTempDirectory::new();
+    let trace_path = directory.path().join("concurrent-children.trace");
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["record", "--trace"])
+        .arg(&trace_path)
+        .args(["--", "python3", "-c", SCRIPT])
+        .arg(directory.path())
+        .output()
+        .expect("launch SideEffect record command for concurrent children");
+
+    assert_success(&output, "record concurrent child processes");
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for marker in ["child-one", "child-two", "release.marker"] {
+        assert!(!stderr.contains(marker), "stderr leaked {marker}: {stderr}");
+    }
+    assert_published_nonempty_trace(&trace_path);
+    assert_eq!(
+        fs::metadata(&trace_path).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "recorded traces should remain private"
+    );
+
+    let trace = inspect_trace(&trace_path);
+    let (_, ready_one) = assert_successful_openat_evidence(&trace, "child-one.ready");
+    let (_, ready_two) = assert_successful_openat_evidence(&trace, "child-two.ready");
+    let (_, released) = assert_successful_openat_evidence(&trace, "release.marker");
+    let (_, result_one) = assert_successful_openat_evidence(&trace, "child-one.result");
+    let (_, result_two) = assert_successful_openat_evidence(&trace, "child-two.result");
+    let line = |record: &Value| record["evidence"]["line_number"].as_u64().unwrap();
+    assert!(
+        line(ready_one) < line(released) && line(ready_two) < line(released),
+        "both children must reach the barrier before the parent releases them"
+    );
+    assert!(
+        line(released) < line(result_one) && line(released) < line(result_two),
+        "both child result writes must follow the shared release marker"
     );
 }
 

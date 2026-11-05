@@ -69,6 +69,9 @@ jobs:
       - name: Run real strace capture integration test
         run: cargo test --locked --test record_observations real_strace_capture_inspect_and_diff_observe_file_and_loopback_events -- --exact
 
+      - name: Run concurrent child-process strace integration test
+        run: cargo test --locked --test record_observations real_strace_capture_observes_two_concurrent_child_processes -- --exact
+
       - name: Run real refused-connect capture integration test
         run: cargo test --locked --test record_observations real_strace_capture_reports_refused_loopback_connection_as_failed_attempt -- --exact
 
