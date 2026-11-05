@@ -6,6 +6,7 @@ use std::fs::File;
 use std::path::Path;
 
 const EXPLANATION_CATALOG_ID: &str = "explanation-qwen3.5-4b-q4-k-m";
+const SMALL_EXPLANATION_CATALOG_ID: &str = "explanation-qwen3.5-0.8b-q4-0";
 
 fn run_setup(model: &SelectedTestModel, runtime_path: Option<&Path>) -> std::process::Output {
     let mut command = model.command();
@@ -57,6 +58,102 @@ fn model_show_reports_catalog_platform_support_and_selection_as_json() {
     );
     assert_eq!(value["selected_for_task"], false);
     assert_eq!(value["recommended_for_accuracy"], false);
+}
+
+#[test]
+fn small_explanation_catalog_entry_is_pinned_and_unqualified() {
+    let model = SelectedTestModel::new("explanation");
+    let output = model
+        .command()
+        .args(["model", "show", SMALL_EXPLANATION_CATALOG_ID])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let entry = &value["catalog_entry"];
+    assert_eq!(entry["id"], SMALL_EXPLANATION_CATALOG_ID);
+    assert_eq!(entry["task"], "explanation");
+    assert_eq!(entry["repository"], "ggml-org/Qwen3.5-0.8B-GGUF");
+    assert_eq!(
+        entry["revision"],
+        "9447f74101aeb4e93621884dfa36ee8effb8831b"
+    );
+    assert_eq!(entry["filename"], "Qwen3.5-0.8B-Q4_0.gguf");
+    assert_eq!(entry["size_bytes"], 563_036_064);
+    assert_eq!(
+        entry["sha256"],
+        "57d1997790d1744fba5b40a7317df71ea5e2acee28c47e78f0cce39c0703f8cf"
+    );
+    assert_eq!(entry["license_id"], "Apache-2.0");
+    assert_eq!(
+        value["license_terms_url"],
+        "https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/95ab6d408b035a1ca532ca6ec09f21071fbf4b22/LICENSE"
+    );
+    assert_eq!(
+        value["task_support"]["platform_scope"],
+        "Linux x86_64 and native Windows"
+    );
+    assert_eq!(
+        value["task_support"]["supported_here"],
+        cfg!(all(target_os = "linux", target_arch = "x86_64")) || cfg!(windows)
+    );
+    assert_eq!(entry["evaluation"], "not_assessed");
+    assert!(
+        entry["evaluation_note"]
+            .as_str()
+            .unwrap()
+            .contains("experimental and unqualified")
+    );
+    assert_eq!(value["recommended_for_accuracy"], false);
+}
+
+#[test]
+fn small_model_setup_requires_license_acceptance_and_never_acquires_runtime() {
+    let model = SelectedTestModel::new("explanation");
+    let output = model
+        .command()
+        .args(["model", "setup", SMALL_EXPLANATION_CATALOG_ID])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("Qwen3.5 0.8B Q4_0 (experimental; not evaluated)"));
+    assert!(stdout.contains("https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/95ab6d408b035a1ca532ca6ec09f21071fbf4b22/LICENSE"));
+    assert!(stdout.contains("Evaluation: not assessed; not recommended"));
+    assert!(stdout.contains("type ACCEPT Apache-2.0"));
+    assert!(stderr.contains("license acceptance was not confirmed"));
+
+    let help = model
+        .command()
+        .args(["help", "model", "setup"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("after explicit typed acceptance"));
+    assert!(help.contains("does not download or execute the runtime"));
+
+    let model_file = model
+        .data_root()
+        .join("models")
+        .join("Qwen3.5-0.8B-Q4_0.gguf");
+    assert!(
+        !model_file.exists(),
+        "license cancellation must precede model download"
+    );
+    let runtime = model
+        .command()
+        .args(["model", "runtime", "show", "explanation"])
+        .output()
+        .unwrap();
+    assert!(runtime.status.success());
+    assert!(String::from_utf8_lossy(&runtime.stdout).contains("not configured"));
 }
 
 #[test]

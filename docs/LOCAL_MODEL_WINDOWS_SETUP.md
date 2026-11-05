@@ -42,6 +42,15 @@ Windows Job Objects limit host process memory to 6 GiB and bound the runtime pro
 
 The catalog's Windows explanation model is `explanation-qwen3.5-4b-q4-k-m`. It is an experimental 2,783,446,368-byte GGUF with Apache-2.0 terms. It failed its development check (4 of 26 synthetic questions answered) and is not recommended for decisions. No catalog model has passed its applicable quality gate.
 
+The catalog also includes `explanation-qwen3.5-0.8b-q4-0`, a smaller experimental workflow-test candidate. Its pinned file is [`Qwen3.5-0.8B-Q4_0.gguf`](https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF/blob/9447f74101aeb4e93621884dfa36ee8effb8831b/Qwen3.5-0.8B-Q4_0.gguf), from `ggml-org/Qwen3.5-0.8B-GGUF` revision `9447f74101aeb4e93621884dfa36ee8effb8831b`, with size 563,036,064 bytes and SHA-256 `57d1997790d1744fba5b40a7317df71ea5e2acee28c47e78f0cce39c0703f8cf`. The source model is `Qwen/Qwen3.5-0.8B`; its pinned Apache-2.0 license file is [here](https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/95ab6d408b035a1ca532ca6ec09f21071fbf4b22/LICENSE). Use `model show` to inspect the entry, or choose `model setup` to download the pinned file after typing the exact license acceptance:
+
+```powershell
+sideeffect.exe model show explanation-qwen3.5-0.8b-q4-0
+sideeffect.exe model setup explanation-qwen3.5-0.8b-q4-0
+```
+
+This entry is `not_assessed`, experimental, unqualified, and not recommended or approved. It has not passed any answer-quality evaluation. The existing runtime pin is unchanged: llama.cpp revision `19cce6919992fdffd92e0ac152caaf1e2b8f254e`. That revision contains the upstream [`qwen35.cpp` model implementation](https://github.com/ggml-org/llama.cpp/blob/19cce6919992fdffd92e0ac152caaf1e2b8f254e/src/models/qwen35.cpp), and SideEffect's explanation path is supported on Linux x86_64 and native Windows. Source-code support is not evidence of successful inference, compatibility with every build, performance, or answer quality. The runtime remains separately user-obtained and is never downloaded by `model setup`.
+
 Inspect the entry and its evaluation note before deciding whether to install it:
 
 ```powershell

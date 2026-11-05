@@ -66,8 +66,8 @@ pub struct CatalogModel {
     pub evaluation_document: &'static str,
 }
 
-/// Pinned local candidates documented in the repository. Every current entry
-/// failed a task-specific quality check and is never marked recommended.
+/// Pinned local candidates documented in the repository. Catalog provenance
+/// is separate from quality; no candidate is recommended or approved.
 pub const CATALOG: &[CatalogModel] = &[
     CatalogModel {
         id: "evidence-qwen2.5-0.5b-q4-0",
@@ -83,6 +83,21 @@ pub const CATALOG: &[CatalogModel] = &[
         evaluation: EvaluationStatus::FailedFrozenGate,
         evaluation_note: "Scored 9/39 answerable selections and false-selected all 12 unanswerable cases; not recommended.",
         evaluation_document: "docs/LOCAL_MODEL_EVALUATION.md",
+    },
+    CatalogModel {
+        id: "explanation-qwen3.5-0.8b-q4-0",
+        name: "Qwen3.5 0.8B Q4_0 (experimental; not evaluated)",
+        task: ModelTask::Explanation,
+        repository: "ggml-org/Qwen3.5-0.8B-GGUF",
+        revision: "9447f74101aeb4e93621884dfa36ee8effb8831b",
+        filename: "Qwen3.5-0.8B-Q4_0.gguf",
+        size_bytes: 563_036_064,
+        sha256: "57d1997790d1744fba5b40a7317df71ea5e2acee28c47e78f0cce39c0703f8cf",
+        license_id: "Apache-2.0",
+        license_url: "https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/95ab6d408b035a1ca532ca6ec09f21071fbf4b22/LICENSE",
+        evaluation: EvaluationStatus::NotAssessed,
+        evaluation_note: "Not evaluated; experimental and unqualified. No recommendation or approval.",
+        evaluation_document: "docs/LOCAL_MODEL_EXPLANATION_EVALUATION.md",
     },
     CatalogModel {
         id: "explanation-qwen3.5-4b-q4-k-m",
