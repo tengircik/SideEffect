@@ -105,7 +105,7 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect query --query <query.json> --session <session-directory> --source runtime|selected_root\n\
        sideeffect model list | show <id> | install <id> | setup <id> [--runtime <existing-file>] | add | select <task> <id> | remove <id>\n\
        sideeffect model runtime set <task> <existing-file> | show [task] | clear <task>\n\
-       sideeffect model doctor --task explanation [--runtime <llama-completion>] [--backend auto|cpu|cuda]\n\
+       sideeffect model doctor --task evidence|explanation|query [--runtime <task-runtime>] [--backend auto|cpu|cuda]\n\
        sideeffect correlate-startup <startup-inventory.json> <strace-trace-file>\n\
        sideeffect associated-behavior <startup-inventory.json> <runtime-evidence-file>\n\
        sideeffect attribute --windows-runtime <capture.json>\n\
@@ -2099,13 +2099,13 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect attribute --windows-runtime CAPTURE.json\nWrites a separate evidence-linked candidate view over a validated Windows ETW v3 capture. Descendant process links require supported process-start payloads and observed active parent IDs. Network association uses the decoded payload process ID. File and disk header PIDs remain context candidates, not ownership. Capture bytes are unchanged. Missing lifecycle data, ambiguity, unsupported records, or reported/unavailable loss is surfaced as partial or unassigned evidence; no causal or absence claims are made."
         }
         "model" => {
-            "Usage: sideeffect model list\n       sideeffect model show ID\n       sideeffect model install ID\n       sideeffect model setup ID [--runtime EXISTING_FILE]\n       sideeffect model add --name NAME --path FILE --for evidence|explanation|query [--license ID]\n       sideeffect model select evidence|explanation|query ID\n       sideeffect model remove ID\n       sideeffect model runtime set evidence|explanation|query EXISTING_FILE\n       sideeffect model runtime show [evidence|explanation|query]\n       sideeffect model runtime clear evidence|explanation|query\n       sideeffect model doctor --task explanation [--runtime LLAMA_COMPLETION] [--backend auto|cpu|cuda]\n\nLists pinned catalog candidates and user-provided models. Catalog evaluation status is shown separately from runtime compatibility. Installing a catalog model requires explicit license acceptance; analysis never downloads weights implicitly. The setup command installs and selects the catalog model for its declared task. An optional --runtime path records an existing runtime for that task without executing or downloading it; for explanation, run model doctor --task explanation to check its reported revision. Runtime configuration stores a per-task path without executing the file; runtime revision checks happen only when doctor or analysis is run. Catalog models still carry their task-specific evaluation warnings, and no model is approved for answer quality. Registering a local model records its size and SHA-256, but does not verify task compatibility, licensing, or quality. Removing a custom registration leaves the model file untouched. Select a model for its task before running a model preview."
+            "Usage: sideeffect model list\n       sideeffect model show ID\n       sideeffect model install ID\n       sideeffect model setup ID [--runtime EXISTING_FILE]\n       sideeffect model add --name NAME --path FILE --for evidence|explanation|query [--license ID]\n       sideeffect model select evidence|explanation|query ID\n       sideeffect model remove ID\n       sideeffect model runtime set evidence|explanation|query EXISTING_FILE\n       sideeffect model runtime show [evidence|explanation|query]\n       sideeffect model runtime clear evidence|explanation|query\n       sideeffect model doctor --task evidence|explanation|query [--runtime TASK_RUNTIME] [--backend auto|cpu|cuda]\n\nLists pinned catalog candidates and user-provided models. Catalog evaluation status is shown separately from runtime compatibility. Installing a catalog model requires explicit license acceptance; analysis never downloads weights implicitly. The setup command installs and selects the model for its declared task. An optional --runtime path records an existing runtime for that task without executing or downloading it; model doctor checks the task-specific runtime contract. Runtime configuration stores a per-task path without executing the file; runtime revision checks happen only when doctor or analysis is run. Evidence and query runtime checks are supported on Linux x86_64; explanation checks are supported on Linux x86_64 and native Windows. Device enumeration applies only to explanation. Doctor does not run inference, load weights, or assess answer quality. Catalog models still carry their task-specific evaluation warnings, and no model is approved for answer quality. Registering a local model records its size and SHA-256, but does not verify task compatibility, licensing, or quality. Removing a custom registration leaves the model file untouched. Select a model for its task before running a model preview."
         }
         "model doctor" => {
-            "Usage: sideeffect model doctor --task explanation [--runtime LLAMA_COMPLETION] [--backend auto|cpu|cuda]\nUses --runtime when supplied, otherwise the configured explanation runtime. It checks the selected model registration and SHA-256, then runs only bounded runtime version and (unless CPU is selected) device-enumeration checks. It does not read a trace, load model weights, or run inference. A reported CUDA device is not proof of successful GPU inference. The selected runtime is executable code and must be trusted separately."
+            "Usage: sideeffect model doctor --task evidence|explanation|query [--runtime TASK_RUNTIME] [--backend auto|cpu|cuda]\nUses --runtime when supplied, otherwise the configured runtime for that task. It checks the selected model registration and SHA-256, then runs the task's bounded runtime version check. Evidence requires the llama.cpp b6000 version prefix; query requires the exact pinned 0.7.0-dev build/commit version; explanation checks the pinned commit and may enumerate devices. Evidence and query are supported only on Linux x86_64. --backend applies only to explanation. The JSON schema v2 report states that inference was not run, weights were not loaded, and this doctor did not assess model quality; catalog evaluation metadata is reported separately. A reported CUDA device is not proof of successful GPU inference. Doctor executes the selected runtime as code; trust it separately."
         }
         "model setup" => {
-            "Usage: sideeffect model setup MODEL_ID [--runtime EXISTING_FILE]\nShows the catalog license and model evaluation status, downloads the exact pinned file after explicit typed acceptance, verifies its size and SHA-256, then selects it for its declared task. Optional --runtime records an already obtained runtime path for that task after setup succeeds; it does not download or execute the runtime. For an explanation setup, run 'sideeffect model doctor --task explanation' to check the configured runtime."
+            "Usage: sideeffect model setup MODEL_ID [--runtime EXISTING_FILE]\nShows the catalog license and model evaluation status, downloads the exact pinned file after explicit typed acceptance, verifies its size and SHA-256, then selects it for its declared task. Optional --runtime records an already obtained runtime path for that task after setup succeeds; it does not download or execute the runtime. Run 'sideeffect model doctor --task TASK' to check the configured task runtime."
         }
         "model list" => {
             "Usage: sideeffect model list\nLists pinned catalog candidates, installation status, task, license, exact size, evaluation status, and selected model per task. Every listed model's SHA-256 is rechecked before use."
@@ -6039,15 +6039,18 @@ fn model_doctor(
     runtime_path: Option<&OsString>,
     backend: Option<&OsString>,
 ) -> Result<ExitCode, String> {
-    if task.to_str() != Some("explanation") {
-        return Err("model doctor currently supports only --task explanation".to_owned());
-    }
-    let runtime_path = resolve_runtime_path(ModelTask::Explanation, runtime_path)?;
+    let task_name = task
+        .to_str()
+        .ok_or_else(|| "model task must be valid UTF-8".to_owned())?;
+    let model_task = parse_model_task(task_name)?;
     let backend_name = match backend {
         None => Some("auto"),
         Some(value) => value.to_str(),
     }
     .ok_or_else(|| "backend must be valid UTF-8".to_owned())?;
+    if model_task != ModelTask::Explanation && backend.is_some() {
+        return Err("--backend is supported only for --task explanation".to_owned());
+    }
     let backend = match backend_name {
         "auto" => sideeffect::local_model_explanation::ExplanationBackendPreference::Auto,
         "cpu" => sideeffect::local_model_explanation::ExplanationBackendPreference::Cpu,
@@ -6055,7 +6058,7 @@ fn model_doctor(
         _ => return Err("backend must be auto, cpu, or cuda".to_owned()),
     };
 
-    let model = match selected_model(ModelTask::Explanation) {
+    let model = match selected_model(model_task) {
         Ok(model) => serde_json::json!({
             "status": "verified",
             "id": model.id,
@@ -6073,26 +6076,69 @@ fn model_doctor(
             "diagnostic": error
         }),
     };
-    let runtime = sideeffect::local_model_explanation_runtime::doctor_explanation_runtime(
-        &runtime_path,
-        backend,
-    );
-    let ready = model["status"] == "verified"
-        && runtime.backend_readiness.starts_with("ready_")
-        && runtime.executable_status == "verified_revision_prefix";
+    let expected_revision = match model_task {
+        ModelTask::EvidenceSelection => sideeffect::local_model::RUNTIME_REVISION,
+        ModelTask::Explanation => sideeffect::local_model_explanation::EXPLANATION_RUNTIME_REVISION,
+        ModelTask::QueryPlan => sideeffect::local_query_plan::LOCAL_QUERY_PLAN_RUNTIME_REVISION,
+    };
+    let expected_version = match model_task {
+        ModelTask::EvidenceSelection => sideeffect::local_model::RUNTIME_VERSION_PREFIX,
+        ModelTask::Explanation => "pinned commit reported by --version",
+        ModelTask::QueryPlan => sideeffect::local_query_plan::LOCAL_QUERY_PLAN_RUNTIME_VERSION,
+    };
+    let supported_here = model_task_supported_here(model_task);
+    let runtime = if !supported_here {
+        serde_json::json!({
+            "runtime_path": null,
+            "expected_source_revision": expected_revision,
+            "expected_version_contract": expected_version,
+            "executable_status": "unsupported_platform",
+            "executable_diagnostic": format!("{} runtime doctor checks are supported on {} only", model_task_label(model_task), model_task_platform(model_task)),
+            "device_check_status": "not_applicable",
+            "device_diagnostic": null,
+            "backend_readiness": "blocked_unsupported_platform",
+            "gpu_inference_status": "not_run"
+        })
+    } else {
+        match resolve_runtime_path(model_task, runtime_path) {
+            Ok(path) => doctor_task_runtime(model_task, &path, backend),
+            Err(error) => serde_json::json!({
+                "runtime_path": null,
+                "expected_source_revision": expected_revision,
+                "expected_version_contract": expected_version,
+                "executable_status": "not_configured_or_unavailable",
+                "executable_diagnostic": error,
+                "device_check_status": if model_task == ModelTask::Explanation && backend != sideeffect::local_model_explanation::ExplanationBackendPreference::Cpu { "not_checked" } else { "not_applicable" },
+                "device_diagnostic": null,
+                "backend_readiness": "blocked_runtime_unavailable",
+                "gpu_inference_status": "not_run"
+            }),
+        }
+    };
+    let runtime_ready = runtime["executable_status"] == "verified_revision_prefix"
+        || runtime["executable_status"] == "verified_version_prefix"
+        || runtime["executable_status"] == "verified_exact_version";
+    let ready = supported_here
+        && model["status"] == "verified"
+        && runtime_ready
+        && runtime["backend_readiness"]
+            .as_str()
+            .is_some_and(|status| status.starts_with("ready_"));
     let report = serde_json::json!({
         "schema": "sideeffect.local_model_doctor",
-        "schema_version": 1,
-        "task": "explanation",
-        "readiness": if ready { "ready_for_an_explicit_inference_run" } else { "blocked_or_incomplete" },
+        "schema_version": 2,
+        "task": model_task_cli_name(model_task),
+        "supported_here": supported_here,
+        "readiness": if ready { "registration_and_runtime_checks_passed" } else { "blocked_or_incomplete" },
         "selected_model": model,
         "runtime": runtime,
-        "inference": "not_run",
-        "model_weights_loaded_for_inference": false,
+        "inference_not_run": true,
+        "weights_not_loaded": true,
+        "quality_assessment_performed_by_doctor": false,
         "limitations": [
-            "A runtime revision check identifies only a reported version prefix; it does not authenticate the executable or its loaded libraries.",
-            "CUDA device enumeration does not prove that GPU inference succeeds or measure GPU memory.",
-            "Model registration and hash checks do not establish runtime compatibility or answer quality."
+            "Runtime output identifies only a reported version or commit string; it does not authenticate the executable or its loaded libraries.",
+            "Device enumeration is performed only for explanation and does not prove successful GPU inference or measure GPU memory.",
+            "Model registration and hash checks do not establish runtime compatibility or answer quality. Doctor does not load weights or run inference."
         ]
     });
     write_json(&report, "local model doctor report")?;
@@ -6100,6 +6146,183 @@ fn model_doctor(
         ExitCode::SUCCESS
     } else {
         ExitCode::from(2)
+    })
+}
+
+fn doctor_task_runtime(
+    task: ModelTask,
+    runtime_path: &std::path::Path,
+    backend: sideeffect::local_model_explanation::ExplanationBackendPreference,
+) -> serde_json::Value {
+    match task {
+        ModelTask::Explanation => {
+            let runtime = sideeffect::local_model_explanation_runtime::doctor_explanation_runtime(
+                runtime_path,
+                backend,
+            );
+            let device_check_status = if backend
+                == sideeffect::local_model_explanation::ExplanationBackendPreference::Cpu
+            {
+                "not_applicable_cpu_requested"
+            } else {
+                runtime.cuda_device_status
+            };
+            serde_json::json!({
+                "runtime_path": runtime.runtime_path,
+                "expected_source_revision": runtime.expected_source_revision,
+                "expected_version_contract": "pinned commit reported by --version",
+                "executable_status": runtime.executable_status,
+                "executable_diagnostic": runtime.executable_diagnostic,
+                "requested_backend": runtime.requested_backend,
+                "device_check_status": device_check_status,
+                "device_diagnostic": runtime.device_diagnostic,
+                "backend_readiness": runtime.backend_readiness,
+                "gpu_inference_status": runtime.gpu_inference_status
+            })
+        }
+        ModelTask::EvidenceSelection => doctor_pinned_version_runtime(task, runtime_path),
+        ModelTask::QueryPlan => doctor_pinned_version_runtime(task, runtime_path),
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn doctor_pinned_version_runtime(
+    task: ModelTask,
+    runtime_path: &std::path::Path,
+) -> serde_json::Value {
+    use std::ffi::OsString;
+
+    let expected_revision = match task {
+        ModelTask::EvidenceSelection => sideeffect::local_model::RUNTIME_REVISION,
+        ModelTask::QueryPlan => sideeffect::local_query_plan::LOCAL_QUERY_PLAN_RUNTIME_REVISION,
+        ModelTask::Explanation => unreachable!("explanation has its own runtime doctor"),
+    };
+    let expected_version = match task {
+        ModelTask::EvidenceSelection => sideeffect::local_model::RUNTIME_VERSION_PREFIX,
+        ModelTask::QueryPlan => sideeffect::local_query_plan::LOCAL_QUERY_PLAN_RUNTIME_VERSION,
+        ModelTask::Explanation => unreachable!("explanation has its own runtime doctor"),
+    };
+    let canonical = match runtime_path.canonicalize() {
+        Ok(path) => path,
+        Err(_) => {
+            return serde_json::json!({
+                "runtime_path": runtime_path.to_string_lossy(),
+                "expected_source_revision": expected_revision,
+                "expected_version_contract": expected_version,
+                "executable_status": "unavailable",
+                "executable_diagnostic": "runtime path is missing or inaccessible",
+                "device_check_status": "not_applicable",
+                "device_diagnostic": null,
+                "backend_readiness": "blocked_runtime_unavailable",
+                "gpu_inference_status": "not_run"
+            });
+        }
+    };
+    if !std::fs::metadata(&canonical).is_ok_and(|metadata| metadata.is_file()) {
+        return serde_json::json!({
+            "runtime_path": canonical.to_string_lossy(),
+            "expected_source_revision": expected_revision,
+            "expected_version_contract": expected_version,
+            "executable_status": "unavailable",
+            "executable_diagnostic": "runtime path is not a regular file",
+            "device_check_status": "not_applicable",
+            "device_diagnostic": null,
+            "backend_readiness": "blocked_runtime_unavailable",
+            "gpu_inference_status": "not_run"
+        });
+    }
+
+    let output = sideeffect::local_model_runtime::run_bounded(
+        &canonical,
+        &[OsString::from("--version")],
+        None,
+        10,
+        16 * 1024,
+    );
+    let (status, diagnostic) = match output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout.bytes);
+            let stderr = String::from_utf8_lossy(&output.stderr.bytes);
+            let reported = stdout.lines().chain(stderr.lines()).any(|line| match task {
+                ModelTask::EvidenceSelection => line.starts_with(expected_version),
+                ModelTask::QueryPlan => {
+                    line.trim().strip_prefix("version: ").unwrap_or(line.trim()) == expected_version
+                }
+                ModelTask::Explanation => false,
+            });
+            let status = match task {
+                ModelTask::EvidenceSelection => "verified_version_prefix",
+                ModelTask::QueryPlan => "verified_exact_version",
+                ModelTask::Explanation => unreachable!("explanation has its own runtime doctor"),
+            };
+            if output.status.success()
+                && !output.stdout.truncated
+                && !output.stderr.truncated
+                && reported
+            {
+                (status, None)
+            } else {
+                (
+                    "version_check_failed",
+                    Some(format!(
+                        "runtime version check failed (successful exit {}, stdout truncated {}, stderr truncated {}, expected contract reported {})",
+                        output.status.success(),
+                        output.stdout.truncated,
+                        output.stderr.truncated,
+                        reported
+                    )),
+                )
+            }
+        }
+        Err(_) => (
+            "version_check_failed",
+            Some("runtime --version check could not complete within the bounded runner".to_owned()),
+        ),
+    };
+    let verified = status == "verified_version_prefix" || status == "verified_exact_version";
+    serde_json::json!({
+        "runtime_path": canonical.to_string_lossy(),
+        "expected_source_revision": expected_revision,
+        "expected_version_contract": expected_version,
+        "executable_status": status,
+        "executable_diagnostic": diagnostic,
+        "device_check_status": "not_applicable",
+        "device_diagnostic": null,
+        "backend_readiness": if verified {
+            "ready_runtime_version_verified"
+        } else {
+            "blocked_runtime_check_failed"
+        },
+        "gpu_inference_status": "not_run"
+    })
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn doctor_pinned_version_runtime(
+    task: ModelTask,
+    runtime_path: &std::path::Path,
+) -> serde_json::Value {
+    let (expected_revision, expected_version) = match task {
+        ModelTask::EvidenceSelection => (
+            sideeffect::local_model::RUNTIME_REVISION,
+            sideeffect::local_model::RUNTIME_VERSION_PREFIX,
+        ),
+        ModelTask::QueryPlan => (
+            sideeffect::local_query_plan::LOCAL_QUERY_PLAN_RUNTIME_REVISION,
+            sideeffect::local_query_plan::LOCAL_QUERY_PLAN_RUNTIME_VERSION,
+        ),
+        ModelTask::Explanation => unreachable!("explanation has its own runtime doctor"),
+    };
+    serde_json::json!({
+        "runtime_path": runtime_path.to_string_lossy(),
+        "expected_source_revision": expected_revision,
+        "expected_version_contract": expected_version,
+        "executable_status": "unsupported_platform",
+        "executable_diagnostic": "runtime check is supported on Linux x86_64 only",
+        "device_check_status": "not_applicable",
+        "device_diagnostic": null,
+        "backend_readiness": "blocked_unsupported_platform",
+        "gpu_inference_status": "not_run"
     })
 }
 
@@ -6403,11 +6626,10 @@ fn model_install(
                 runtime.size_bytes,
                 runtime.sha256
             );
-            if model.task == ModelTask::Explanation {
-                println!(
-                    "Run `sideeffect model doctor --task explanation` to check its reported revision and readiness."
-                );
-            }
+            println!(
+                "Run `sideeffect model doctor --task {}` to check its reported runtime contract and readiness.",
+                model_task_cli_name(model.task)
+            );
         }
     } else {
         println!(

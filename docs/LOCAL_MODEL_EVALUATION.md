@@ -4,6 +4,8 @@
 
 **Reviewed on:** 2026-10-27.
 
+`sideeffect model doctor --task evidence` checks the evidence runtime's reported `version: 6000 (4762ad731)` prefix. The v2 readiness report does not run inference, load weights, or assess quality; evidence device status is `not_applicable`. Runtime checks for evidence selection are supported on Linux x86_64 only. See [the task-wide runtime readiness guide](LOCAL_MODEL_DOCTOR.md) for the separate explanation and query contracts.
+
 ## Historical evidence-selection candidate
 
 - Historical model candidate: `ggml-org/Qwen3-0.6B-GGUF`, file `Qwen3-0.6B-Q4_0.gguf`. It is not a downloadable catalog entry or a positive quality recommendation.

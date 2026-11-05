@@ -1,28 +1,34 @@
-# Local explanation model readiness check
+# Local model runtime readiness checks
 
-`sideeffect model doctor` checks whether an explanation model is selected and its registered file still matches its recorded size and SHA-256. It also checks a user-supplied llama.cpp runtime path against SideEffect's pinned explanation runtime revision. The command does not read a trace, stage model weights for inference, or run inference. Hash validation reads the selected model file to verify its bytes.
+`sideeffect model doctor --task TASK` checks a selected model registration and the runtime contract for `evidence`, `explanation`, or `query`. The report uses `sideeffect.local_model_doctor` schema v2. A successful report uses `readiness: registration_and_runtime_checks_passed`; this means only that the model registration/hash and required runtime checks passed. It does not test model/runtime compatibility or run inference. `inference_not_run`, `weights_not_loaded`, and `quality_assessment_performed_by_doctor: false` remain explicit in every report. The selected-model section may include catalog evaluation metadata; that metadata is not an assessment performed by doctor. A successful status does not establish compatibility, useful answers, or safe behavior.
 
-During catalog model setup, you may pass `--runtime EXISTING_FILE` to register a runtime you already obtained for the model's task. Setup resolves it to a canonical regular file and validates its bounded size and SHA-256 before displaying the catalog license prompt; it does not download or execute the runtime. Once the pinned weights install successfully, setup selects the model and saves the runtime for that same task. For the explanation task, run `model doctor --task explanation` to check the configured revision and readiness. Omitting `--runtime` preserves the separate runtime configuration flow below. You can also configure a runtime independently, inspect saved paths and hashes, or clear one. Configuration hashes a bounded regular file without executing it; it does not install the selected file:
+The task contracts are intentionally separate:
+
+| Task | Supported platform | Runtime check | Device check |
+|---|---|---|---|
+| `evidence` | Linux x86_64 | Successful bounded `--version`; a reported line must start with `version: 6000 (4762ad731)` | `not_applicable` |
+| `explanation` | Linux x86_64 and native Windows | Successful bounded `--version` output must report the pinned commit `19cce6919` | `--list-devices` is checked for `auto`/`cuda`; CPU mode skips enumeration |
+| `query` | Linux x86_64 | Successful bounded `--version`; after optional `version: ` prefix removal, a line must exactly equal `0.7.0-dev (build 11938, commit 19cce6919)` | `not_applicable` |
+
+Evidence/query runtime output is checked only on Linux x86_64. The report does not execute any analysis command, download or build a runtime, install anything, or inspect a trace. Each runtime check is limited to a 10-second subprocess timeout and bounded output. The report records only whether the pinned contract was reported; it does not authenticate the binary, its libraries, or its build environment.
+
+Configure an existing runtime path without executing it, then run the task doctor:
 
 ```sh
-sideeffect model runtime set explanation /path/to/llama-completion
-sideeffect model runtime show [explanation]
-sideeffect model runtime clear explanation
+sideeffect model runtime set evidence /path/to/llama-cli
+sideeffect model doctor --task evidence
+
+sideeffect model runtime set query /path/to/llama-completion
+sideeffect model doctor --task query
 ```
-
-Use `evidence` and `query` for their respective Linux x86_64 commands. `explanation` is available on Linux x86_64 and native Windows. `show` prints the configured path as terminal-safe text and marks files that have gone missing or changed. `clear` removes only the stored path; it leaves the file untouched. Runtime paths can reveal local account or project names.
-
-Run the readiness check before preparing a trace preview:
 
 ```powershell
 sideeffect.exe model runtime set explanation .\path\to\llama-completion.exe
 sideeffect.exe model doctor --task explanation --backend auto
 ```
 
-The same commands are available on Linux x86_64. `model doctor --task explanation` uses the configured runtime path; an explicit `--runtime PATH` overrides it for that command without changing saved configuration. `--backend` may be `auto`, `cpu`, or `cuda`; it defaults to `auto`. CPU mode skips GPU device enumeration. `auto` and `cuda` run the runtime's bounded `--list-devices` check after its version check. The doctor uses the same 10-second timeout and bounded diagnostic output as inference startup checks.
+`--runtime PATH` overrides the configured path for that doctor call without changing saved configuration. `--backend auto|cpu|cuda` is accepted only for `explanation` and defaults to `auto`. For explanation, device enumeration may report a CUDA device, but that does not prove that weights load, GPU inference succeeds, GPU memory is sufficient, or output quality is acceptable. `device_check_status` is `not_applicable` for evidence and query; no GPU detection or offload claim is made for those tasks.
 
-The runtime is executable code. Doctor runs it with `--version` and, except in CPU mode, `--list-devices`; use only a runtime you trust. A reported version prefix is not binary authentication. Before an analysis command uses a configured path, SideEffect rechecks that it still resolves to the saved canonical path and is an existing regular file. The runtime's pinned version check still happens during startup. A reported CUDA device is separate from successful GPU inference. `gpu_inference_status` is always `not_run`, because doctor does not load model weights into the inference runtime. Device presence does not prove that inference will initialize, complete, or fit in available GPU memory.
+The doctor verifies the selected model file against its registered size and SHA-256, which requires reading the local model bytes. Missing selections, paths, unsupported platforms, version mismatches, and failed device checks produce a blocked/incomplete JSON report and exit status `2`. Invalid CLI arguments or report-writing errors exit `1`; exit status `0` means only that registration and required runtime checks passed. A configured runtime path is revalidated against its saved path/hash before use. An explicit override is not bound to a saved runtime hash. The JSON report includes the supplied runtime path, canonicalized when it resolves successfully; it may reveal a username or project directory, so review it before sharing. In either case the doctor executes the selected runtime as the current user; use only a runtime you trust. Hashes are byte-integrity checks, not signatures or proof of publisher identity.
 
-`model-analyze`, `model-explain`, and `model-query` use the configured per-task path when `--runtime` is omitted. Before use, SideEffect re-hashes that runtime (up to 1 GiB) and rejects a missing, changed, or invalid file. Passing `--runtime PATH` keeps working and overrides the saved path for that invocation; this explicit override is not bound to a saved file hash and instead uses the command's existing runtime checks. Each command still requires the exact `--confirm-sha256` from its reviewed preview before runtime inference starts. No path setting or analysis command downloads a runtime or model implicitly. Runtime acquisition remains user-managed, and the selected runtime and its libraries run with the user's permissions. A hash binds the saved configuration to bytes observed at verification time; it is not a signature or proof of publisher identity, and the executable can still change after verification but before launch.
-
-The JSON report has schema `sideeffect.local_model_doctor` v1. Exit status `0` means the selected model file, runtime revision check, and requested backend readiness checks passed. Exit status `2` means one or more prerequisites are missing or unverified. Other command/configuration errors exit `1`. A ready report does not establish model/runtime compatibility or answer quality; all current catalog models remain experimental and not recommended. Continue with `model-explain-preview`, review the exact bounded request, and only then explicitly run inference with the matching digest. See [the Windows explanation setup](LOCAL_MODEL_WINDOWS_SETUP.md) for GPU/runtime limitations and [the evaluation record](LOCAL_MODEL_EXPLANATION_EVALUATION.md) for quality status.
+Model acquisition remains user-managed. `setup` may accept a runtime you already obtained and validate its file metadata without executing it; setup does not download or build runtimes. Analysis commands separately require a reviewed preview digest before inference. All candidate models remain experimental and unqualified. See [model setup](INSTALL.md#optional-local-model-setup), [the evidence evaluation](LOCAL_MODEL_EVALUATION.md), [the explanation evaluation](LOCAL_MODEL_EXPLANATION_EVALUATION.md), and [the query-plan evaluation](LOCAL_QUERY_PLAN_EVALUATION.md).

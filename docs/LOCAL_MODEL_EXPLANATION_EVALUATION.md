@@ -2,6 +2,8 @@
 
 **Status:** experimental development path; not a release endorsement. The original local evidence-selection and query-plan experiments have separate frozen quality gates. This explanation path has a separate, development-only corpus and has not passed a semantic quality gate. The model now selects evidence rows; it does not write explanation prose. Selection quality is still unqualified and must not guide safety, security, permission, or operational decisions.
 
+`sideeffect model doctor --task explanation` uses the pinned commit check and optional device enumeration described in [the task-wide readiness guide](LOCAL_MODEL_DOCTOR.md). A commit match or reported CUDA device does not establish model compatibility, successful inference, GPU-memory sufficiency, or selection quality.
+
 ## Data flow
 
 ### Experimental native Windows ETW input

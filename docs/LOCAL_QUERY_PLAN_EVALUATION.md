@@ -2,6 +2,8 @@
 
 **Status: experimental and not release-approved.** This is a separately gated M8 experiment. No model candidate has passed the frozen v2 usefulness gate. This is not a claim that local model analysis is useful or accurate on real captures. The model-query command is currently implemented only for Linux x86_64; GPU model experiments below were run separately on Windows and do not establish native Windows product support.
 
+`sideeffect model doctor --task query` checks the pinned runtime's exact `0.7.0-dev (build 11938, commit 19cce6919)` version string in a bounded `--version` invocation. The schema-v2 readiness report does not load weights, run inference, or assess query-plan quality. Runtime and query support remain Linux x86_64-only; device status is `not_applicable`. See [the task-wide runtime readiness guide](LOCAL_MODEL_DOCTOR.md).
+
 ## Optional external holdout directory
 
 The evaluator can opt into a caller-supplied holdout directory instead of the repository's public development corpus. This mode accepts only the current strict query-plan v2 corpus contract and requires an exact caller-supplied SHA-256 pin for `holdout-manifest.json`:
