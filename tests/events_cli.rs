@@ -415,6 +415,57 @@ fn graph_event_kind_filter_keeps_related_evidence_and_all_diagnostics() {
 }
 
 #[test]
+fn graph_text_preserves_selected_context_and_json_default() {
+    let trace = TempTrace::with_contents(
+        b"[pid 123] 1700000000.000001 openat(AT_FDCWD, \"/tmp/item\", O_RDONLY) = 3\nnot a recognized trace row\n",
+    );
+    let default_json = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--trace"])
+        .arg(&trace.0)
+        .output()
+        .unwrap();
+    assert_eq!(default_json.status.code(), Some(2));
+    let default_value: serde_json::Value = serde_json::from_slice(&default_json.stdout).unwrap();
+    assert_eq!(default_value["schema"], "sideeffect.event_graph");
+    let explicit_json = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--trace"])
+        .arg(&trace.0)
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(explicit_json.status.code(), default_json.status.code());
+    assert_eq!(explicit_json.stdout, default_json.stdout);
+
+    let text = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--trace"])
+        .arg(&trace.0)
+        .args(["--process-observation", "1", "--format", "text"])
+        .output()
+        .unwrap();
+    assert_eq!(text.status.code(), Some(2));
+    assert!(text.stderr.is_empty());
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.is_ascii());
+    assert!(text.contains("Completeness: partial"));
+    assert!(text.contains("process_observation_id=1"));
+    assert!(text.contains("process observation (source-local, not a PID key): source_local_id=1"));
+    assert!(text.contains("raw_trace_record(line=1,byte=0,length="));
+    assert!(text.contains("role=linux_trace_caller_task_context status=observed"));
+    assert!(text.contains("unsupported_source_row"));
+    assert!(text.contains("Empty selections do not prove absence"));
+
+    let empty = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--trace"])
+        .arg(&trace.0)
+        .args(["--event-kind", "not-present", "--format", "text"])
+        .output()
+        .unwrap();
+    assert_eq!(empty.status.code(), Some(2));
+    let empty = String::from_utf8(empty.stdout).unwrap();
+    assert!(empty.contains("none selected; this does not establish absence"));
+}
+
+#[test]
 fn graph_process_observation_filter_selects_source_local_context_and_links() {
     let trace = TempTrace::with_contents(
         b"[pid 123] 1700000000.000001 openat(AT_FDCWD, \"/tmp/one\", O_RDONLY) = 3\n[pid 456] 1700000000.000002 close(4) = 0\n",

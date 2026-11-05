@@ -737,6 +737,12 @@ fn graph_windows_runtime_keeps_pid_context_separate_from_process_instance() {
         .args(["--event-kind", "process_start"])
         .output()
         .unwrap();
+    let text_output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--windows-runtime"])
+        .arg(&path)
+        .args(["--event-kind", "process_start", "--format", "text"])
+        .output()
+        .unwrap();
     fs::remove_file(path).unwrap();
 
     assert_eq!(output.status.code(), Some(2));
@@ -772,6 +778,18 @@ fn graph_windows_runtime_keeps_pid_context_separate_from_process_instance() {
             && edge["event_link_status"] == "observed"
             && edge["to_node_id"] == instance["id"]
     }));
+    assert_eq!(text_output.status.code(), Some(2));
+    assert!(text_output.stderr.is_empty());
+    let text = String::from_utf8(text_output.stdout).unwrap();
+    assert!(text.is_ascii());
+    assert!(text.contains("Nodes (count=3)"));
+    assert!(text.contains("Edges (count=2)"));
+    assert!(text.contains("process observation (source-local, not a PID key)"));
+    assert!(text.contains("PID context only; no ownership or instance identity is established"));
+    assert!(text.contains("windows_etw_record(ordinal=1,json_pointer=/events/0"));
+    assert!(text.contains("relationship_kind=windows_payload_parent_to_child_instance"));
+    assert!(text.contains("resolution=parent_instance_unresolved"));
+    assert!(text.contains("role=windows_process_start_payload status=observed"));
 }
 
 #[cfg(windows)]
