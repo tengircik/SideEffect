@@ -6190,8 +6190,6 @@ fn doctor_pinned_version_runtime(
     task: ModelTask,
     runtime_path: &std::path::Path,
 ) -> serde_json::Value {
-    use std::ffi::OsString;
-
     let expected_revision = match task {
         ModelTask::EvidenceSelection => sideeffect::local_model::RUNTIME_REVISION,
         ModelTask::QueryPlan => sideeffect::local_query_plan::LOCAL_QUERY_PLAN_RUNTIME_REVISION,
@@ -6232,17 +6230,11 @@ fn doctor_pinned_version_runtime(
         });
     }
 
-    let output = sideeffect::local_model_runtime::run_bounded(
-        &canonical,
-        &[OsString::from("--version")],
-        None,
-        10,
-        16 * 1024,
-    );
+    let output = sideeffect::local_model_doctor::check_runtime_version(&canonical);
     let (status, diagnostic) = match output {
         Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout.bytes);
-            let stderr = String::from_utf8_lossy(&output.stderr.bytes);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
             let reported = stdout.lines().chain(stderr.lines()).any(|line| match task {
                 ModelTask::EvidenceSelection => line.starts_with(expected_version),
                 ModelTask::QueryPlan => {
@@ -6255,29 +6247,19 @@ fn doctor_pinned_version_runtime(
                 ModelTask::QueryPlan => "verified_exact_version",
                 ModelTask::Explanation => unreachable!("explanation has its own runtime doctor"),
             };
-            if output.status.success()
-                && !output.stdout.truncated
-                && !output.stderr.truncated
-                && reported
-            {
+            if output.success && !output.stdout_truncated && !output.stderr_truncated && reported {
                 (status, None)
             } else {
                 (
                     "version_check_failed",
                     Some(format!(
                         "runtime version check failed (successful exit {}, stdout truncated {}, stderr truncated {}, expected contract reported {})",
-                        output.status.success(),
-                        output.stdout.truncated,
-                        output.stderr.truncated,
-                        reported
+                        output.success, output.stdout_truncated, output.stderr_truncated, reported
                     )),
                 )
             }
         }
-        Err(_) => (
-            "version_check_failed",
-            Some("runtime --version check could not complete within the bounded runner".to_owned()),
-        ),
+        Err(error) => ("version_check_failed", Some(error)),
     };
     let verified = status == "verified_version_prefix" || status == "verified_exact_version";
     serde_json::json!({

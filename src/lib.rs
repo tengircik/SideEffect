@@ -18,6 +18,7 @@ pub mod format;
 pub mod inventory;
 pub mod limits;
 pub mod local_model;
+pub mod local_model_doctor;
 pub mod local_model_explanation;
 pub mod local_model_explanation_runtime;
 pub(crate) mod local_model_runtime;
