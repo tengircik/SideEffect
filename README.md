@@ -381,6 +381,8 @@ sideeffect case resolve --format html --redact case-text --redact artifact-paths
 
 These groups omit the named renderer fields as a whole and leave the source case and evidence unchanged. The counts cover only field positions and source-record blocks known to the current renderer; categories can overlap and are not a taxonomy or scan of content. `artifact-paths` also replaces values under the exact structured key `artifact_path` inside source records that remain in the report; unrelated keys such as `path` or `display_name`, and substrings in free text, remain untouched. Retained source records can contain arbitrary strings, arguments, or payloads. This is not a secret scan and does not make sharing safe. Review the complete output before sharing.
 
+When any redaction group is selected, the HTML report includes a counts-only receipt for the selected groups, using the same renderer-known counts shown by the preview. The receipt is structural metadata, not a content or secret scan, and does not make the report safe to share.
+
 `case-text` covers the case title and analyst entry text; `source-records` omits each resolved record block; `evidence-identifiers` omits the case/session identifiers and locator objects. Identifiers inside a retained source record remain unless `source-records` is also selected.
 
 ## What you can do

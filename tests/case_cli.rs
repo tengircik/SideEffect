@@ -712,6 +712,7 @@ fn case_cli_initializes_and_resolves_against_a_verified_session_without_overwrit
     assert!(html.contains("Content-Security-Policy"));
     assert!(html.contains("default-src 'none'"));
     assert!(html.contains("script-src 'none'"));
+    assert!(!html.contains("Redaction receipt"));
     assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;&amp;#x202E;"));
     assert!(!html.contains("<script>alert(1)</script>"));
     assert!(!html.contains("https://"));
@@ -779,6 +780,22 @@ fn case_cli_initializes_and_resolves_against_a_verified_session_without_overwrit
     let redacted_html = fs::read_to_string(&redacted_path).unwrap();
     assert!(redacted_html.contains("Redacted export"));
     assert!(redacted_html.contains("[OMITTED: case text]"));
+    let receipt_start = redacted_html
+        .find("<h2 id=\"redaction-receipt-heading\">")
+        .expect("redacted report should include its receipt");
+    let receipt_end = receipt_start + redacted_html[receipt_start..].find("</section>").unwrap();
+    let receipt = &redacted_html[receipt_start..receipt_end];
+    assert!(receipt.contains("Redaction receipt"));
+    assert!(
+        receipt.contains("case-text: 0 retained / 2 known renderer field occurrence(s); 2 omitted")
+    );
+    assert!(!receipt.contains("artifact-paths:"));
+    assert!(!receipt.contains("source-records:"));
+    assert!(!receipt.contains("evidence-identifiers:"));
+    assert!(receipt.contains("no content or secret scan was performed"));
+    assert!(receipt.contains("does not make this report safe to share"));
+    assert!(!receipt.contains("alert(1)"));
+    assert!(!receipt.contains("<script>"));
     assert!(!redacted_html.contains("alert(1)"));
     assert_eq!(fs::read(&updated_case_path).unwrap(), updated_case_bytes);
 

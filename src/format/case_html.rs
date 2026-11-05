@@ -182,6 +182,10 @@ pub fn write_case_html_with_redactions<W: Write>(
         case.facts.len()
     )?;
 
+    if has_redactions(redactions) {
+        write_redaction_receipt(writer, case, redactions)?;
+    }
+
     writer.write_all(b"<section><h2>Sessions</h2>")?;
     for session in &case.sessions {
         writer.write_all(b"<article class=\"card\"><h3>Session ")?;
@@ -279,6 +283,33 @@ pub fn write_case_html_with_redactions<W: Write>(
         write_fact(index, fact, writer, redactions)?;
     }
     writer.write_all(b"</section>\n</main>\n</body>\n</html>\n")
+}
+
+fn write_redaction_receipt<W: Write>(
+    writer: &mut W,
+    case: &ResolvedCase,
+    policy: CaseHtmlRedactionPolicy,
+) -> io::Result<()> {
+    let inventory = preview_case_html_redactions(case, policy).map_err(io::Error::other)?;
+    writer.write_all(b"<section class=\"card\" aria-labelledby=\"redaction-receipt-heading\"><h2 id=\"redaction-receipt-heading\">Redaction receipt</h2><p>Counts describe renderer-known field occurrences and source-record blocks only. This is structural information; no content or secret scan was performed. It is not a secret scan and does not make this report safe to share.</p><ul>")?;
+    for item in inventory.iter().filter(|item| item.selected_for_redaction) {
+        let unit = if item.field_group == "source-records" {
+            "source-record block(s)"
+        } else {
+            "renderer field occurrence(s)"
+        };
+        writer.write_all(b"<li>")?;
+        write_text(writer, item.field_group)?;
+        write!(
+            writer,
+            ": {} retained / {} known {}; {} omitted</li>",
+            item.retained_rendered_occurrences,
+            item.known_rendered_occurrences,
+            unit,
+            item.omitted_rendered_occurrences
+        )?;
+    }
+    writer.write_all(b"</ul></section>\n")
 }
 
 fn write_fact<W: Write>(
@@ -527,6 +558,7 @@ mod tests {
         assert!(html.contains("id=\"fact-0\""));
         assert!(html.contains("<dt>Case status</dt><dd>in_review</dd>"));
         assert!(html.contains("<dt>Case revision</dt><dd>3</dd>"));
+        assert!(!html.contains("Redaction receipt"));
         assert!(html.contains("Inspect &lt;script&gt;alert(1)&lt;/script&gt; at C:\\Users\\alice; arg=--token secret; endpoint=203.0.113.9&amp;#x202E;"));
         assert!(!html.contains("<script"));
         assert!(!html.contains("<img"));
@@ -578,12 +610,43 @@ mod tests {
         let redacted = String::from_utf8(redacted).unwrap();
         assert!(redacted.contains("Redacted export"));
         assert!(redacted.contains("does not detect sensitive substrings"));
+        let receipt_start = redacted
+            .find("<h2 id=\"redaction-receipt-heading\">")
+            .unwrap();
+        let receipt_end = receipt_start + redacted[receipt_start..].find("</section>").unwrap();
+        let receipt = &redacted[receipt_start..receipt_end];
+        assert!(receipt.contains("Redaction receipt"));
+        assert!(receipt.contains("no content or secret scan was performed"));
+        assert!(receipt.contains("does not make this report safe to share"));
+        for item in preview.iter().filter(|item| item.selected_for_redaction) {
+            let unit = if item.field_group == "source-records" {
+                "source-record block(s)"
+            } else {
+                "renderer field occurrence(s)"
+            };
+            let expected = format!(
+                "{}: {} retained / {} known {}; {} omitted",
+                item.field_group,
+                item.retained_rendered_occurrences,
+                item.known_rendered_occurrences,
+                unit,
+                item.omitted_rendered_occurrences
+            );
+            assert!(
+                receipt.contains(&expected),
+                "missing receipt count: {expected}"
+            );
+        }
+        assert!(!receipt.contains("alice"));
+        assert!(!receipt.contains("arg=--token secret"));
+        assert!(!receipt.contains("203.0.113.9"));
+        assert!(!receipt.contains("root-snapshot.json"));
         assert!(redacted.contains("[OMITTED: case text]"));
         assert!(redacted.contains("[OMITTED: artifact path]"));
         assert!(redacted.contains("[OMITTED: evidence identifier]"));
         assert!(redacted.contains("Source record omitted by the selected redaction policy."));
         assert!(!redacted.contains("alice"));
-        assert!(!redacted.contains("secret"));
+        assert!(!redacted.contains("arg=--token secret"));
         assert!(!redacted.contains("203.0.113.9"));
         assert!(!redacted.contains("root-snapshot.json"));
 
@@ -603,6 +666,19 @@ mod tests {
         let mut path_only_html = Vec::new();
         write_case_html_with_redactions(&case, &mut path_only_html, artifact_paths_only).unwrap();
         let path_only_html = String::from_utf8(path_only_html).unwrap();
+        let receipt_start = path_only_html
+            .find("<h2 id=\"redaction-receipt-heading\">")
+            .unwrap();
+        let receipt_end =
+            receipt_start + path_only_html[receipt_start..].find("</section>").unwrap();
+        let receipt = &path_only_html[receipt_start..receipt_end];
+        assert!(receipt.contains("artifact-paths:"));
+        assert!(!receipt.contains("case-text:"));
+        assert!(!receipt.contains("source-records:"));
+        assert!(!receipt.contains("evidence-identifiers:"));
+        assert!(!receipt.contains("alice"));
+        assert!(!receipt.contains("arg=--token secret"));
+        assert!(!receipt.contains("root-snapshot.json"));
         assert!(!path_only_html.contains("root-snapshot.json"));
         assert!(path_only_html.contains("[OMITTED: artifact path]"));
         assert!(path_only_html.contains("alice"));

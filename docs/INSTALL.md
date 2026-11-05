@@ -329,6 +329,8 @@ The default bounded JSON result includes exact matched source rows; the optional
 
 Use `--preview-redaction` with at least one exact `--redact` group to preview an HTML policy without writing a file. It preserves the existing omitted-field counts and adds renderer-known retained/omitted occurrence counts for `case-text`, `artifact-paths`, `source-records`, and `evidence-identifiers`. Counts represent fixed renderer field positions and source-record blocks only; categories may overlap, and the inventory does not inspect content. Retained source records can contain arbitrary strings, arguments, or payloads. This is not a secret scan and does not make a report safe to share; review the complete redacted output.
 
+Any HTML report written with redaction selected includes a counts-only receipt for those selected groups, matching the preview's renderer-known counts. The receipt is structural metadata only; it does not scan for secrets or make the report safe to share.
+
 ```powershell
 sideeffect.exe case resolve --format html --redact case-text --preview-redaction --case .\review.case.json --session .\audit-session
 ```
