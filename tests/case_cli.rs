@@ -56,6 +56,7 @@ fn case_help_describes_the_partial_workflow_and_integrity_boundary() {
     assert!(help.contains("sideeffect case add-entry"));
     assert!(help.contains("sideeffect case add-note"));
     assert!(help.contains("sideeffect case resolve"));
+    assert!(help.contains("--format json|text|html"));
     assert!(help.contains("not producer authenticity"));
     assert!(help.contains("sensitive local evidence"));
 
@@ -687,6 +688,44 @@ fn case_cli_initializes_and_resolves_against_a_verified_session_without_overwrit
             .unwrap()
             .contains("not producer authenticity")
     );
+
+    let text_summary = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("resolve")
+        .arg("--format")
+        .arg("text")
+        .arg("--case")
+        .arg(&updated_case_path)
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert_eq!(text_summary.status.code(), resolved.status.code());
+    assert!(text_summary.stderr.is_empty());
+    let text_summary = String::from_utf8(text_summary.stdout).unwrap();
+    assert!(text_summary.is_ascii());
+    assert!(text_summary.contains("Lifecycle: draft (revision 2)"));
+    assert!(text_summary.contains("unresolved: no evidence locator is attached"));
+    assert!(text_summary.contains("<script>alert(1)</script>\\u{202e}"));
+    assert!(!text_summary.contains('\u{202e}'));
+    assert!(!text_summary.contains('\u{001b}'));
+    assert!(!text_summary.contains("Usage:"));
+
+    let text_output_option = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("case")
+        .arg("resolve")
+        .arg("--format")
+        .arg("text")
+        .arg("--output")
+        .arg(directory.0.join("must-not-exist.txt"))
+        .arg("--case")
+        .arg(&updated_case_path)
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(!text_output_option.status.success());
+    assert!(text_output_option.stdout.is_empty());
 
     let html_path = directory.0.join("review.html");
     let html = Command::new(env!("CARGO_BIN_EXE_sideeffect"))

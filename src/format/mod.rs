@@ -1,5 +1,6 @@
 mod audit_session_text;
 mod case_html;
+mod case_text;
 mod html;
 mod inspect_text;
 mod summary;
@@ -14,6 +15,8 @@ pub use case_html::{
     CaseHtmlRedactionPolicy, RedactionPreviewItem, preview_case_html_redactions, write_case_html,
     write_case_html_with_redactions,
 };
+pub use case_text::MAX_CASE_TEXT_BYTES;
+pub use case_text::write_case_text;
 pub use html::write_html_diff;
 pub use inspect_text::{write_trace_evidence_text, write_trace_text};
 pub use summary::{RedactedDiffSummary, summarize_diff, write_html_summary};
