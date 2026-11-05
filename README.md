@@ -132,7 +132,26 @@ sideeffect.exe model-explain --question "Which network observation is recorded?"
 
 The ETW preview and result use their own schema versions. The selector can choose only exact preview event IDs. File, network, and disk payload observations appear only when SideEffect re-decodes retained bytes and matches the serialized sidecar; process payload fields are unknown when live TDH metadata is needed. Unsupported event-kind labels are marked as unverified capture metadata: the capture fingerprint detects representation changes but does not authenticate the capture. Event-header PID/TID values are context only. ETW capture completeness remains unknown, and this feature does not pass the local-model quality gate.
 
-Local-model selection remains experimental; no model is approved for decisions. The [evaluation record](docs/LOCAL_MODEL_EXPLANATION_EVALUATION.md) describes the current quality limits and the identity-allowlisted review-packet tool for the Linux synthetic corpus. Native Windows ETW does not yet have a reviewed model-quality corpus.
+Local-model selection remains experimental; no model is approved for decisions. The [evaluation record](docs/LOCAL_MODEL_EXPLANATION_EVALUATION.md) describes the current quality limits and separate Linux/Windows development evaluators. Native Windows ETW has a small development corpus with four cases and two pinned synthetic capture fixtures. It uses a source-specific result schema and `W…` evidence IDs, separate from Linux `E…` IDs. Its labels are unreviewed; the evaluator validates structure and fixture digests but performs no semantic scoring. There is still no independently reviewed or qualified ETW model-quality corpus, and no model or platform is approved.
+
+To check the Windows ETW synthetic corpus without running SideEffect or a model:
+
+```powershell
+py -3 scripts/evaluate_local_model_windows_etw_explain.py --check-corpus
+```
+
+To run the ETW development cases, use the built CLI with an already configured explanation model and trusted local runtime:
+
+```powershell
+py -3 scripts/run_local_model_windows_etw_explain_corpus.py `
+  --sideeffect .\target\release\sideeffect.exe `
+  --backend auto `
+  --timeout-seconds 60 `
+  --output .\private-windows-etw-results.json
+py -3 scripts/evaluate_local_model_windows_etw_explain.py --results .\private-windows-etw-results.json
+```
+
+The runner invokes SideEffect's actual preview and analysis commands for every pinned synthetic capture. Running it performs local model inference; it does not download or install model weights or a runtime. Results preserve the unreviewed-label and development-only status and are not semantic-quality scores or qualification evidence.
 
 ### Adapt runtime evidence into a common event envelope
 
