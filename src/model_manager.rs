@@ -389,7 +389,14 @@ impl ModelRegistry {
             }
         }
         for (task, id) in &self.selected_by_task {
-            if id.len() > 96 || !is_safe_id(id) || !model_supports(task, id, &self.custom_models) {
+            // Custom IDs use the generated `custom-<hex>` grammar. Catalog
+            // IDs are compile-time allowlisted strings and may have a model
+            // version dot; they are compared exactly and never treated as paths.
+            let is_catalog_id = catalog_model(id).is_some();
+            if id.len() > 96
+                || (!is_safe_id(id) && !is_catalog_id)
+                || !model_supports(task, id, &self.custom_models)
+            {
                 return Err("selected model ID is invalid or unsupported for its task".to_owned());
             }
         }
@@ -1725,6 +1732,24 @@ mod selected_model_identity_tests {
                 .unwrap_err()
                 .contains("changed since it was added")
         );
+    }
+
+    #[test]
+    fn dotted_catalog_id_can_be_selected_and_round_tripped_for_its_declared_task() {
+        let id = "explanation-qwen3.5-0.8b-q4-0";
+        let mut registry = ModelRegistry::default();
+        registry.select(ModelTask::Explanation, id).unwrap();
+
+        let encoded = registry.to_json().unwrap();
+        let restored = ModelRegistry::from_json(&encoded).unwrap();
+        assert_eq!(
+            restored
+                .selected_by_task
+                .get(&ModelTask::Explanation)
+                .map(String::as_str),
+            Some(id)
+        );
+        assert!(registry.select(ModelTask::QueryPlan, id).is_err());
     }
 }
 
