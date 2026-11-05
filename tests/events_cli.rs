@@ -160,6 +160,45 @@ fn timeline_process_observation_filters_by_local_link_and_preserves_evidence() {
 }
 
 #[test]
+fn timeline_text_is_terminal_safe_preserves_source_references_and_keeps_json_default() {
+    let malicious_trace =
+        format!("123 1700000000.000001 openat(AT_FDCWD, \"/tmp/\x1b[31m\\u202e\", O_RDONLY) = 4\n");
+    let trace = TempTrace::with_contents(malicious_trace.as_bytes());
+    let json_default = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--trace"])
+        .arg(&trace.0)
+        .output()
+        .unwrap();
+    assert!(json_default.status.success() || json_default.status.code() == Some(2));
+    let json: serde_json::Value = serde_json::from_slice(&json_default.stdout).unwrap();
+    assert_eq!(json["schema"], "sideeffect.event_timeline");
+    let explicit_json = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--trace"])
+        .arg(&trace.0)
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(explicit_json.status.code(), json_default.status.code());
+    assert_eq!(explicit_json.stdout, json_default.stdout);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--trace"])
+        .arg(&trace.0)
+        .args(["--event-kind", "openat", "--format", "text"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), json_default.status.code());
+    assert!(output.stderr.is_empty());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.is_ascii());
+    assert!(text.contains("ordinal=1 timestamp=1700000000.000001"));
+    assert!(text.contains("raw_trace_record(line=1,byte="));
+    assert!(text.contains("timestamps do not establish causality"));
+    assert!(!text.contains('\u{001b}'));
+    assert!(!text.contains('\u{202e}'));
+}
+
+#[test]
 fn timeline_process_observation_rejects_invalid_and_unemitted_ids() {
     let trace = TempTrace::with_contents(b"123 1700000000.000001 close(4) = 0\n");
     for id in ["0", "invalid", "99", "18446744073709551616"] {

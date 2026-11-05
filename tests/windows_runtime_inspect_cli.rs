@@ -479,6 +479,12 @@ fn timeline_windows_process_observation_preserves_candidate_link_and_partial_sta
         .args(["--process-observation", "1"])
         .output()
         .unwrap();
+    let text_output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--windows-runtime"])
+        .arg(&path)
+        .args(["--process-observation", "1", "--format", "text"])
+        .output()
+        .unwrap();
     fs::remove_file(path).unwrap();
 
     assert_eq!(output.status.code(), Some(2));
@@ -525,6 +531,17 @@ fn timeline_windows_process_observation_preserves_candidate_link_and_partial_sta
             .iter()
             .any(|d| d == "synthetic_fixture_partial_source")
     );
+    assert_eq!(text_output.status.code(), Some(2));
+    assert!(text_output.stderr.is_empty());
+    let text = String::from_utf8(text_output.stdout).unwrap();
+    assert!(text.is_ascii());
+    assert!(text.contains("Selected process observation:"));
+    assert!(text.contains("windows_process_instance"));
+    assert!(text.contains("end_evidence=none"));
+    assert!(text.contains("windows_etw_record(ordinal=1,json_pointer=/events/0"));
+    assert!(text.contains("role=windows_process_start_payload status=observed"));
+    assert!(text.contains("raw_process_payload_ids_match"));
+    assert!(text.contains("synthetic_fixture_partial_source"));
 }
 
 #[cfg(windows)]

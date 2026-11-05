@@ -1890,7 +1890,7 @@ fn print_version() {
 
 fn print_usage() {
     println!(
-        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)\n       sideeffect query --query <query.json> --trace <trace> [--format json|text]\n       sideeffect query --query <query.json> --windows-runtime <capture.json> [--format json|text] (native Windows)\n       sideeffect query --query <query.json> --session <session-dir> --source runtime|selected_root [--format json|text]\n       sideeffect graph --trace <strace-trace-file> [--event-kind <kind> | --process-observation <id>]\n       sideeffect graph --windows-runtime <capture.json> [--event-kind <kind> | --process-observation <id>] (native Windows)\n       sideeffect timeline --trace <strace-trace-file> [--event-kind <kind>] [--process-observation <id>]\n       sideeffect timeline --windows-runtime <capture.json> [--event-kind <kind>] [--process-observation <id>] (native Windows)\n\nProvenance:\n       sideeffect provenance keygen <private-key.pk8> <public-key.hex>\n       sideeffect provenance key-check <private-key.pk8> <public-key.hex>\n       sideeffect provenance sign-session <session-dir> --private-key <private-key.pk8> --output <signature.json>\n       sideeffect provenance verify-session <session-dir> --signature <signature.json> --public-key <public-key.hex>"
+        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)\n       sideeffect query --query <query.json> --trace <trace> [--format json|text]\n       sideeffect query --query <query.json> --windows-runtime <capture.json> [--format json|text] (native Windows)\n       sideeffect query --query <query.json> --session <session-dir> --source runtime|selected_root [--format json|text]\n       sideeffect graph --trace <strace-trace-file> [--event-kind <kind> | --process-observation <id>]\n       sideeffect graph --windows-runtime <capture.json> [--event-kind <kind> | --process-observation <id>] (native Windows)\n       sideeffect timeline --trace <strace-trace-file> [--format json|text] [--event-kind <kind>] [--process-observation <id>]\n       sideeffect timeline --windows-runtime <capture.json> [--format json|text] [--event-kind <kind>] [--process-observation <id>] (native Windows)\n\nProvenance:\n       sideeffect provenance keygen <private-key.pk8> <public-key.hex>\n       sideeffect provenance key-check <private-key.pk8> <public-key.hex>\n       sideeffect provenance sign-session <session-dir> --private-key <private-key.pk8> --output <signature.json>\n       sideeffect provenance verify-session <session-dir> --signature <signature.json> --public-key <public-key.hex>"
     );
 }
 
@@ -1936,7 +1936,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect graph --trace TRACE [--event-kind KIND | --process-observation ID]\n       sideeffect graph --windows-runtime CAPTURE.json [--event-kind KIND | --process-observation ID] (native Windows)\nBuilds a bounded source-local graph of event rows, process observations, reported PID context, and evidence-linked relationships. --event-kind selects exact event-kind matches. --process-observation selects a source-local ProcessObservation ID (not a PID or cross-capture ID) and retains events linked to that observation plus its direct process relationships. Retained links preserve their status and basis; diagnostics and source status remain for the full input. An empty event selection is not evidence of absence. PID-only context nodes are kept separate and never merged into process instances. Edges do not establish ownership, causation, or a complete process tree. Partial or unknown source status exits with status 2."
         }
         "timeline" => {
-            "Usage: sideeffect timeline --trace TRACE [--event-kind KIND] [--process-observation ID]\n       sideeffect timeline --windows-runtime CAPTURE.json [--event-kind KIND] [--process-observation ID] (native Windows)\nBuilds a source-local timeline from bounded Linux strace or strictly validated Windows ETW v3 evidence. Items keep their source ordinal, original timestamp representation, and exact raw-record evidence reference; timestamps do not establish causal order. --event-kind matches an exact event kind. --process-observation selects an emitted source-local ProcessObservation.source_local_id (not a PID or cross-capture ID), retains directly linked items and all their source-native links, and includes the selected observation with its evidence and end_evidence even if no item matches. For Linux task observations, evidence is the first observed row, not proof of task start, and end_evidence is an exact prefixed termination row when available. For Linux returned-child-PID observations, evidence is only the caller's syscall result row; no child-start event is asserted. When both filters are supplied, displayed items must match both. Link roles, statuses and bases remain visible. Filters may appear in either order; duplicates or missing values are errors. An empty result or missing link does not prove absence. Unsupported rows remain in diagnostics. Partial or unknown source status exits with status 2."
+            "Usage: sideeffect timeline --trace TRACE [--format json|text] [--event-kind KIND] [--process-observation ID]\n       sideeffect timeline --windows-runtime CAPTURE.json [--format json|text] [--event-kind KIND] [--process-observation ID] (native Windows)\nBuilds a source-local timeline from bounded Linux strace or strictly validated Windows ETW v3 evidence. Items keep their source ordinal, original timestamp representation, and exact raw-record evidence reference; timestamps do not establish causal order. JSON remains the default; --format text writes a bounded ASCII-only terminal summary to stdout, escaping controls, line breaks, and non-ASCII source strings. --event-kind matches an exact event kind. --process-observation selects an emitted source-local ProcessObservation.source_local_id (not a PID or cross-capture ID), retains directly linked items and all their source-native links, and includes the selected observation with its evidence and end_evidence even if no item matches. For Linux task observations, evidence is the first observed row, not proof of task start, and end_evidence is an exact prefixed termination row when available. For Linux returned-child-PID observations, evidence is only the caller's syscall result row; no child-start event is asserted. When both filters are supplied, displayed items must match both. Link roles, statuses and bases remain visible. Filters may appear in either order; duplicates or missing values are errors. An empty result or missing link does not prove absence. Unsupported rows remain in diagnostics. Partial or unknown source status exits with status 2."
         }
         "provenance key-check" => {
             "Usage: sideeffect provenance key-check PRIVATE_KEY.pk8 PUBLIC_KEY.hex\nChecks that a protected Ed25519 private key derives the supplied public key. On a match, prints only that public key's SHA-256 fingerprint. This read-only check establishes pair consistency only; it does not recover keys or verify backup completeness or authenticity."
@@ -4469,6 +4469,7 @@ fn timeline_trace(
     path: &OsString,
     event_kind: Option<&OsString>,
     process_observation_id: Option<&OsString>,
+    output_format: &str,
 ) -> Result<ExitCode, String> {
     let kind = parse_event_kind_filter(event_kind)?;
     let process_observation_id = parse_process_observation_filter(process_observation_id)?;
@@ -4479,7 +4480,7 @@ fn timeline_trace(
     let complete =
         envelope.source_state.completeness == sideeffect::event::SourceCompleteness::Complete;
     let timeline = sideeffect::event::timeline(&envelope, kind, process_observation_id)?;
-    write_json(&timeline, "event timeline")?;
+    write_event_timeline(&timeline, output_format)?;
     Ok(if complete {
         ExitCode::SUCCESS
     } else {
@@ -4491,18 +4492,44 @@ fn timeline_trace_with_filters(
     path: &OsString,
     arguments: &[OsString],
 ) -> Result<ExitCode, String> {
-    let (event_kind, process_observation_id) = parse_timeline_filters(arguments)?;
-    timeline_trace(path, event_kind.as_ref(), process_observation_id.as_ref())
+    let (event_kind, process_observation_id, output_format) = parse_timeline_filters(arguments)?;
+    timeline_trace(
+        path,
+        event_kind.as_ref(),
+        process_observation_id.as_ref(),
+        output_format,
+    )
 }
 
 fn parse_timeline_filters(
     arguments: &[OsString],
-) -> Result<(Option<OsString>, Option<OsString>), String> {
+) -> Result<(Option<OsString>, Option<OsString>, &'static str), String> {
     let mut event_kind = None;
     let mut process_observation_id = None;
+    let mut output_format = "json";
+    let mut format_seen = false;
     let mut index = 0;
     while index < arguments.len() {
         let flag = &arguments[index];
+        if flag == "--format" {
+            if format_seen {
+                return Err("duplicate timeline option --format".to_owned());
+            }
+            let value = arguments
+                .get(index + 1)
+                .ok_or("timeline option --format requires a value")?;
+            if value.to_string_lossy().starts_with("--") {
+                return Err("timeline option --format requires a value".to_owned());
+            }
+            output_format = match value.to_str() {
+                Some("json") => "json",
+                Some("text") => "text",
+                _ => return Err("timeline format must be json or text".to_owned()),
+            };
+            format_seen = true;
+            index += 2;
+            continue;
+        }
         let destination = if flag == "--event-kind" {
             &mut event_kind
         } else if flag == "--process-observation" {
@@ -4534,7 +4561,22 @@ fn parse_timeline_filters(
         *destination = Some(value.clone());
         index += 2;
     }
-    Ok((event_kind, process_observation_id))
+    Ok((event_kind, process_observation_id, output_format))
+}
+
+fn write_event_timeline(
+    timeline: &sideeffect::event::EventTimeline,
+    output_format: &str,
+) -> Result<(), String> {
+    if output_format == "json" {
+        return write_json(timeline, "event timeline");
+    }
+    let mut output = CappedBuffer::new(sideeffect::format::MAX_TIMELINE_TEXT_BYTES);
+    sideeffect::format::write_timeline_text(timeline, &mut output)
+        .map_err(|_| "timeline text exceeds its bounded output limit".to_owned())?;
+    std::io::stdout()
+        .write_all(&output.bytes)
+        .map_err(|_| "could not write bounded timeline text to stdout".to_owned())
 }
 
 #[cfg(windows)]
@@ -4542,6 +4584,7 @@ fn timeline_windows_runtime(
     path: &OsString,
     event_kind: Option<&OsString>,
     process_observation_id: Option<&OsString>,
+    output_format: &str,
 ) -> Result<ExitCode, String> {
     let kind = parse_event_kind_filter(event_kind)?;
     let process_observation_id = parse_process_observation_filter(process_observation_id)?;
@@ -4556,7 +4599,7 @@ fn timeline_windows_runtime(
     let complete =
         envelope.source_state.completeness == sideeffect::event::SourceCompleteness::Complete;
     let timeline = sideeffect::event::timeline(&envelope, kind, process_observation_id)?;
-    write_json(&timeline, "event timeline")?;
+    write_event_timeline(&timeline, output_format)?;
     Ok(if complete {
         ExitCode::SUCCESS
     } else {
@@ -4568,8 +4611,13 @@ fn timeline_windows_runtime_with_filters(
     path: &OsString,
     arguments: &[OsString],
 ) -> Result<ExitCode, String> {
-    let (event_kind, process_observation_id) = parse_timeline_filters(arguments)?;
-    timeline_windows_runtime(path, event_kind.as_ref(), process_observation_id.as_ref())
+    let (event_kind, process_observation_id, output_format) = parse_timeline_filters(arguments)?;
+    timeline_windows_runtime(
+        path,
+        event_kind.as_ref(),
+        process_observation_id.as_ref(),
+        output_format,
+    )
 }
 
 #[cfg(not(windows))]
@@ -4577,6 +4625,7 @@ fn timeline_windows_runtime(
     _path: &OsString,
     _event_kind: Option<&OsString>,
     _process_observation_id: Option<&OsString>,
+    _output_format: &str,
 ) -> Result<ExitCode, String> {
     Err("timeline --windows-runtime is supported only in native Windows builds".to_owned())
 }
