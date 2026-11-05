@@ -50,7 +50,7 @@ fn render(case: &ResolvedCase, output: &mut BoundedOutput) -> io::Result<()> {
             output.raw("    source ")?;
             output.raw(source_role(source.role))?;
             output.raw(" status=")?;
-            output.raw(&source_status(source.status))?;
+            output.raw(source_status(source.status))?;
             output.raw(" diagnostics=")?;
             if source.diagnostic_codes.is_empty() {
                 output.raw("none")?;
@@ -476,7 +476,7 @@ mod tests {
         let root_session_id = "11112222333344445555666677778888".to_owned();
         let duplicate_root_session_id = "99990000aaaabbbbccccddddeeeeffff".to_owned();
         let digest = "a".repeat(64);
-        let locators = vec![
+        let locators = [
             CaseEvidenceLocator::LinuxTraceRecord {
                 session_id: session_id.clone(),
                 manifest_sha256: "a".repeat(64),
