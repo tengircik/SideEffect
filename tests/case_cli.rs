@@ -55,6 +55,7 @@ fn case_help_describes_the_partial_workflow_and_integrity_boundary() {
     assert!(help.contains("sideeffect case set-status"));
     assert!(help.contains("sideeffect case add-entry"));
     assert!(help.contains("sideeffect case add-note"));
+    assert!(help.contains("sideeffect case add-evidence"));
     assert!(help.contains("sideeffect case resolve"));
     assert!(help.contains("--format json|text|html"));
     assert!(help.contains("not producer authenticity"));
@@ -70,6 +71,508 @@ fn case_help_describes_the_partial_workflow_and_integrity_boundary() {
     let note_help = String::from_utf8(note_help.stdout).unwrap();
     assert!(note_help.contains("--text-file NOTE.txt"));
     assert!(note_help.contains("analyst_supplied_unverified"));
+
+    let evidence_help = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["help", "case", "add-evidence"])
+        .output()
+        .unwrap();
+    assert!(evidence_help.status.success());
+    let evidence_help = String::from_utf8(evidence_help.stdout).unwrap();
+    assert!(evidence_help.contains("--evidence-file LOCATORS.json"));
+    assert!(evidence_help.contains("64 KiB"));
+    assert!(evidence_help.contains("does not validate the analyst's interpretation"));
+}
+
+fn run_case_add_evidence(
+    case_path: &PathBuf,
+    entry_id: &str,
+    kind: &str,
+    text_path: &PathBuf,
+    evidence_path: &PathBuf,
+    output_path: &PathBuf,
+    sessions: &[PathBuf],
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sideeffect"));
+    command
+        .args(["case", "add-evidence", "--case"])
+        .arg(case_path)
+        .args(["--id", entry_id, "--kind", kind, "--text-file"])
+        .arg(text_path)
+        .arg("--evidence-file")
+        .arg(evidence_path)
+        .arg("--output")
+        .arg(output_path);
+    for session in sessions {
+        command.arg("--session").arg(session);
+    }
+    command.output().unwrap()
+}
+
+#[test]
+fn case_add_evidence_resolves_selected_root_and_rejects_unsafe_inputs() {
+    let directory = TestDirectory::new();
+    let selected_root = directory.0.join("selected-root");
+    fs::create_dir(&selected_root).unwrap();
+    fs::write(
+        selected_root.join("fixture.txt"),
+        b"synthetic selected-root fixture",
+    )
+    .unwrap();
+
+    let session = directory.0.join("session");
+    let audit = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&session)
+        .arg("--root")
+        .arg(&selected_root)
+        .output()
+        .unwrap();
+    assert!(
+        audit.status.success() || audit.status.code() == Some(2),
+        "audit setup failed: {}",
+        String::from_utf8_lossy(&audit.stderr)
+    );
+
+    let case_path = directory.0.join("case.json");
+    let init = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["case", "init", "--output"])
+        .arg(&case_path)
+        .args(["--title", "Add-evidence CLI test", "--session"])
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "case init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let original_case = fs::read(&case_path).unwrap();
+    let case: Value = serde_json::from_slice(&original_case).unwrap();
+    let manifest_bytes = fs::read(session.join("session.json")).unwrap();
+    let manifest: Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    let selected_root_source = manifest["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["role"] == "selected_root")
+        .expect("selected-root source should be present");
+    let artifact = &selected_root_source["artifacts"][0];
+    let locator = serde_json::json!([{
+        "kind": "selected_root_entry",
+        "session_id": case["sessions"][0]["session_id"],
+        "manifest_sha256": case["sessions"][0]["manifest_sha256"],
+        "artifact_sha256": artifact["sha256"],
+        "entry_ordinal": 0
+    }]);
+    let evidence_path = directory.0.join("locators.json");
+    let locator_bytes = serde_json::to_vec(&locator).unwrap();
+    fs::write(&evidence_path, &locator_bytes).unwrap();
+    let boundary_locator_path = directory.0.join("boundary-locators.json");
+    let mut boundary_locator_bytes = locator_bytes.clone();
+    assert!(boundary_locator_bytes.len() < sideeffect::case::MAX_ENTRY_EVIDENCE_FILE_BYTES);
+    boundary_locator_bytes.resize(sideeffect::case::MAX_ENTRY_EVIDENCE_FILE_BYTES, b' ');
+    fs::write(&boundary_locator_path, boundary_locator_bytes).unwrap();
+    let text_path = directory.0.join("text.txt");
+    let text = "Observed in the selected-root snapshot: <script>inert</script>";
+    fs::write(&text_path, text.as_bytes()).unwrap();
+
+    let boundary_output = directory.0.join("boundary.case.json");
+    let boundary = run_case_add_evidence(
+        &case_path,
+        "B001",
+        "note",
+        &text_path,
+        &boundary_locator_path,
+        &boundary_output,
+        std::slice::from_ref(&session),
+    );
+    assert!(
+        boundary.status.success() || boundary.status.code() == Some(2),
+        "a locator file exactly at the 64 KiB bound was rejected: {}",
+        String::from_utf8_lossy(&boundary.stderr)
+    );
+    let boundary_case: Value =
+        serde_json::from_slice(&fs::read(&boundary_output).unwrap()).unwrap();
+    assert_eq!(boundary_case["entries"][0]["kind"], "note");
+    assert_eq!(boundary_case["entries"][0]["evidence"], locator);
+
+    let empty_locators_path = directory.0.join("empty-locators.json");
+    fs::write(&empty_locators_path, b"[]").unwrap();
+    let empty_note_output = directory.0.join("note-without-locators.case.json");
+    let empty_note = run_case_add_evidence(
+        &case_path,
+        "N001",
+        "note",
+        &text_path,
+        &empty_locators_path,
+        &empty_note_output,
+        std::slice::from_ref(&session),
+    );
+    assert!(
+        empty_note.status.success() || empty_note.status.code() == Some(2),
+        "note with empty locator array failed: {}",
+        String::from_utf8_lossy(&empty_note.stderr)
+    );
+    let empty_note_stderr = String::from_utf8_lossy(&empty_note.stderr);
+    assert!(empty_note_stderr.contains("without source locators"));
+    assert!(!empty_note_stderr.contains("resolved source reference"));
+    let empty_note_case: Value =
+        serde_json::from_slice(&fs::read(&empty_note_output).unwrap()).unwrap();
+    assert_eq!(empty_note_case["entries"][0]["kind"], "note");
+    assert_eq!(
+        empty_note_case["entries"][0]["evidence"],
+        serde_json::json!([])
+    );
+
+    let output_path = directory.0.join("updated.case.json");
+    let added = run_case_add_evidence(
+        &case_path,
+        "A001",
+        "assertion",
+        &text_path,
+        &evidence_path,
+        &output_path,
+        std::slice::from_ref(&session),
+    );
+    assert!(
+        added.status.success() || added.status.code() == Some(2),
+        "case add-evidence failed: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&added.stderr).contains(text));
+    assert_eq!(fs::read(&case_path).unwrap(), original_case);
+    let updated_bytes = fs::read(&output_path).unwrap();
+    let updated: Value = serde_json::from_slice(&updated_bytes).unwrap();
+    assert_eq!(updated["lifecycle"]["revision"], 2);
+    assert_eq!(
+        updated["lifecycle"]["previous_case_sha256"],
+        format!("{:x}", Sha256::digest(&original_case))
+    );
+    assert_eq!(updated["entries"][0]["kind"], "assertion");
+    assert_eq!(
+        updated["entries"][0]["authorship"],
+        "analyst_supplied_unverified"
+    );
+    assert_eq!(updated["entries"][0]["text"], text);
+    assert_eq!(updated["entries"][0]["evidence"], locator);
+
+    let resolved = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["case", "resolve", "--case"])
+        .arg(&output_path)
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert_eq!(resolved.status.code(), added.status.code());
+    let resolved: Value = serde_json::from_slice(&resolved.stdout).unwrap();
+    assert_eq!(resolved["facts"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        resolved["entries"][0]["evidence_fact_indexes"],
+        serde_json::json!([0])
+    );
+
+    let duplicate = run_case_add_evidence(
+        &output_path,
+        "A001",
+        "note",
+        &text_path,
+        &evidence_path,
+        &directory.0.join("duplicate.case.json"),
+        std::slice::from_ref(&session),
+    );
+    assert!(!duplicate.status.success());
+    assert!(!directory.0.join("duplicate.case.json").exists());
+
+    let too_many_locators = serde_json::json!(vec![
+        locator[0].clone();
+        sideeffect::case::MAX_ENTRY_EVIDENCE + 1
+    ]);
+    let too_many_path = directory.0.join("too-many-locators.json");
+    fs::write(
+        &too_many_path,
+        serde_json::to_vec(&too_many_locators).unwrap(),
+    )
+    .unwrap();
+    let too_many_output = directory.0.join("too-many-locators.case.json");
+    let too_many = run_case_add_evidence(
+        &case_path,
+        "A007",
+        "assertion",
+        &text_path,
+        &too_many_path,
+        &too_many_output,
+        std::slice::from_ref(&session),
+    );
+    assert!(!too_many.status.success());
+    assert!(!too_many_output.exists());
+
+    let sentinel_path = directory.0.join("existing.case.json");
+    fs::write(&sentinel_path, b"keep this destination").unwrap();
+    let existing = run_case_add_evidence(
+        &case_path,
+        "A002",
+        "note",
+        &text_path,
+        &evidence_path,
+        &sentinel_path,
+        std::slice::from_ref(&session),
+    );
+    assert!(!existing.status.success());
+    assert_eq!(fs::read(&sentinel_path).unwrap(), b"keep this destination");
+
+    for (label, bytes) in [
+        ("malformed", b"{".to_vec()),
+        ("unknown-tag", br#"[{"kind":"unknown_locator"}]"#.to_vec()),
+        ("empty-assertion", b"[]".to_vec()),
+        (
+            "oversized",
+            vec![b' '; sideeffect::case::MAX_ENTRY_EVIDENCE_FILE_BYTES + 1],
+        ),
+    ] {
+        let path = directory.0.join(format!("{label}-locators.json"));
+        fs::write(&path, bytes).unwrap();
+        let rejected_path = directory.0.join(format!("{label}.case.json"));
+        let result = run_case_add_evidence(
+            &case_path,
+            "A002",
+            "assertion",
+            &text_path,
+            &path,
+            &rejected_path,
+            std::slice::from_ref(&session),
+        );
+        assert!(
+            !result.status.success(),
+            "{label} locator input was accepted"
+        );
+        assert!(!rejected_path.exists(), "{label} wrote a new case");
+    }
+
+    let mut invalid_texts = vec![
+        ("empty", Vec::new()),
+        ("nul", b"a\0b".to_vec()),
+        ("invalid-utf8", vec![0xff]),
+    ];
+    invalid_texts.push((
+        "oversized-text",
+        vec![b'x'; sideeffect::case::MAX_ENTRY_TEXT_BYTES + 1],
+    ));
+    for (label, bytes) in invalid_texts {
+        let path = directory.0.join(format!("{label}.txt"));
+        fs::write(&path, bytes).unwrap();
+        let rejected_path = directory.0.join(format!("{label}.case.json"));
+        let result = run_case_add_evidence(
+            &case_path,
+            "A003",
+            "note",
+            &path,
+            &evidence_path,
+            &rejected_path,
+            std::slice::from_ref(&session),
+        );
+        assert!(!result.status.success(), "{label} text was accepted");
+        assert!(!rejected_path.exists(), "{label} wrote a new case");
+        assert!(!String::from_utf8_lossy(&result.stderr).contains("Observed in the selected-root"));
+    }
+
+    let unresolved: Value = serde_json::json!([{
+        "kind": "selected_root_entry",
+        "session_id": case["sessions"][0]["session_id"],
+        "manifest_sha256": case["sessions"][0]["manifest_sha256"],
+        "artifact_sha256": artifact["sha256"],
+        "entry_ordinal": 9999
+    }]);
+    let unresolved_path = directory.0.join("unresolved.json");
+    fs::write(&unresolved_path, serde_json::to_vec(&unresolved).unwrap()).unwrap();
+    let unresolved_output = directory.0.join("unresolved.case.json");
+    let unresolved_result = run_case_add_evidence(
+        &case_path,
+        "A004",
+        "note",
+        &text_path,
+        &unresolved_path,
+        &unresolved_output,
+        std::slice::from_ref(&session),
+    );
+    assert!(!unresolved_result.status.success());
+    assert!(!unresolved_output.exists());
+    assert_eq!(fs::read(&case_path).unwrap(), original_case);
+
+    let other_root = directory.0.join("other-root");
+    fs::create_dir(&other_root).unwrap();
+    fs::write(other_root.join("other.txt"), b"different session fixture").unwrap();
+    let other_session = directory.0.join("other-session");
+    let other_audit = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&other_session)
+        .arg("--root")
+        .arg(&other_root)
+        .output()
+        .unwrap();
+    assert!(other_audit.status.success() || other_audit.status.code() == Some(2));
+    let mismatched_output = directory.0.join("mismatched.case.json");
+    let mismatched = run_case_add_evidence(
+        &case_path,
+        "A005",
+        "note",
+        &text_path,
+        &evidence_path,
+        &mismatched_output,
+        std::slice::from_ref(&other_session),
+    );
+    assert!(!mismatched.status.success());
+    assert!(!mismatched_output.exists());
+    let missing_output = directory.0.join("missing-session.case.json");
+    let missing_session = run_case_add_evidence(
+        &case_path,
+        "A006",
+        "note",
+        &text_path,
+        &evidence_path,
+        &missing_output,
+        &[],
+    );
+    assert!(!missing_session.status.success());
+    assert!(!missing_output.exists());
+
+    let mut legacy: Value = serde_json::from_slice(&original_case).unwrap();
+    legacy["schema_version"] = serde_json::json!(1);
+    legacy.as_object_mut().unwrap().remove("lifecycle");
+    let legacy_path = directory.0.join("legacy.case.json");
+    fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let legacy_output = directory.0.join("legacy-updated.case.json");
+    let legacy_result = run_case_add_evidence(
+        &legacy_path,
+        "A008",
+        "note",
+        &text_path,
+        &evidence_path,
+        &legacy_output,
+        std::slice::from_ref(&session),
+    );
+    assert!(!legacy_result.status.success());
+    assert!(!legacy_output.exists());
+
+    let cancelled_path = directory.0.join("cancelled.case.json");
+    let cancelled = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["case", "set-status", "--case"])
+        .arg(&case_path)
+        .args(["--status", "cancelled", "--output"])
+        .arg(&cancelled_path)
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(cancelled.status.success() || cancelled.status.code() == Some(2));
+    let terminal_output = directory.0.join("terminal.case.json");
+    let terminal = run_case_add_evidence(
+        &cancelled_path,
+        "A009",
+        "note",
+        &text_path,
+        &evidence_path,
+        &terminal_output,
+        std::slice::from_ref(&session),
+    );
+    assert!(!terminal.status.success());
+    assert!(!terminal_output.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn case_add_evidence_resolves_a_real_linux_strace_session_locator() {
+    let directory = TestDirectory::new();
+    let session = directory.0.join("strace-session");
+    let audit = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&session)
+        .args(["--runtime-duration-seconds", "2", "--", "/bin/true"])
+        .output()
+        .unwrap();
+    assert!(
+        audit.status.success() || audit.status.code() == Some(2),
+        "Linux strace session setup failed: {}",
+        String::from_utf8_lossy(&audit.stderr)
+    );
+    let trace = fs::read(session.join("trace.strace")).unwrap();
+    let parsed = sideeffect::trace::strace::parse_trace_bytes(
+        &trace,
+        sideeffect::limits::ParseLimits::default(),
+    )
+    .unwrap();
+    let record = parsed
+        .records
+        .first()
+        .expect("strace should retain a source record");
+    let manifest_bytes = fs::read(session.join("session.json")).unwrap();
+    let manifest: Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    let case_path = directory.0.join("linux-case.json");
+    let init = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["case", "init", "--output"])
+        .arg(&case_path)
+        .args(["--title", "Linux trace locator test", "--session"])
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert!(init.status.success() || init.status.code() == Some(2));
+    let case_bytes = fs::read(&case_path).unwrap();
+    let case: Value = serde_json::from_slice(&case_bytes).unwrap();
+    let source = manifest["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["role"] == "runtime")
+        .unwrap();
+    let artifact = source["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["path"] == "trace.strace")
+        .unwrap();
+    let locator = serde_json::json!([{
+        "kind":"linux_trace_record",
+        "session_id":case["sessions"][0]["session_id"],
+        "manifest_sha256":case["sessions"][0]["manifest_sha256"],
+        "artifact_sha256":artifact["sha256"],
+        "line_number":record.evidence.line_number,
+        "byte_offset":record.evidence.byte_offset,
+        "byte_length":record.evidence.byte_length
+    }]);
+    let evidence_path = directory.0.join("linux-locators.json");
+    fs::write(&evidence_path, serde_json::to_vec(&locator).unwrap()).unwrap();
+    let text_path = directory.0.join("linux-text.txt");
+    fs::write(&text_path, b"Observed in one captured trace record").unwrap();
+    let output_path = directory.0.join("linux-updated.case.json");
+    let added = run_case_add_evidence(
+        &case_path,
+        "L001",
+        "assertion",
+        &text_path,
+        &evidence_path,
+        &output_path,
+        std::slice::from_ref(&session),
+    );
+    assert!(
+        added.status.success() || added.status.code() == Some(2),
+        "Linux trace locator add failed: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    assert_eq!(fs::read(&case_path).unwrap(), case_bytes);
+    let updated: Value = serde_json::from_slice(&fs::read(&output_path).unwrap()).unwrap();
+    assert_eq!(updated["entries"][0]["evidence"], locator);
+    let resolved = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["case", "resolve", "--case"])
+        .arg(&output_path)
+        .arg("--session")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert_eq!(resolved.status.code(), added.status.code());
+    let resolved: Value = serde_json::from_slice(&resolved.stdout).unwrap();
+    assert_eq!(resolved["facts"].as_array().unwrap().len(), 1);
 }
 
 fn run_case_add_note(

@@ -17,6 +17,9 @@ pub const MAX_CASE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CASE_SESSIONS: usize = 16;
 pub const MAX_CASE_ENTRIES: usize = 1_000;
 pub const MAX_ENTRY_EVIDENCE: usize = 64;
+/// Standalone locator input is capped well below the 2 MiB case document limit.
+/// This fixed budget bounds parser allocation before decoding at most 64 locators.
+pub const MAX_ENTRY_EVIDENCE_FILE_BYTES: usize = 64 * 1024;
 pub const MAX_CASE_ID_BYTES: usize = 64;
 pub const MAX_SESSION_ID_BYTES: usize = 32;
 pub const MAX_TITLE_BYTES: usize = 512;

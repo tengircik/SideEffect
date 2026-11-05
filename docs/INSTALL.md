@@ -285,6 +285,18 @@ sideeffect.exe case add-note --case .\review.case.json --id N001 --text-file .\n
 
 The note is stored as an existing schema-v2 `note` entry with `authorship=analyst_supplied_unverified` and no evidence locators. It is analyst-authored text, not a verified observation or assertion.
 
+To add a note or assertion with references without writing a full entry JSON object, place analyst text in a separate UTF-8 file and put optional exact locator objects from the same session evidence in a strict JSON array:
+
+```sh
+sideeffect case add-evidence --case ./review.case.json --id A001 --kind assertion --text-file ./assertion.txt --evidence-file ./locators.json --output ./review-with-evidence.case.json --session ./audit-session
+```
+
+```powershell
+sideeffect.exe case add-evidence --case .\review.case.json --id A001 --kind assertion --text-file .\assertion.txt --evidence-file .\locators.json --output .\review-with-evidence.case.json --session .\audit-session
+```
+
+The text file is limited to 16 KiB, must be non-empty UTF-8 without NUL, and is not echoed. The locator file is capped at 64 KiB and 64 typed entries; unknown fields/tags, malformed JSON, and over-limit input are rejected. Assertions need at least one locator; notes may use an empty array or include references. Copy locators from source evidence; do not hand-invent hashes, offsets, ordinals, pointers, or digests. Every supplied exact locator is resolved against all supplied verified sessions before publishing. Missing/mismatched sessions or unresolved rows fail without a new file. If an exact row resolves but its source is partial or unknown, the revision is published with that state retained and command status `2`. A reference identifies a source row and does not validate the analyst's interpretation. Both entry kinds remain `analyst_supplied_unverified`.
+
 The generic JSON entry interface remains available for manually structured notes and assertions. A note entry can be supplied as bounded JSON, with every bound session passed for strict verification:
 
 ```json
@@ -295,7 +307,7 @@ The generic JSON entry interface remains available for manually structured notes
 sideeffect case add-entry --case ./review.case.json --entry ./note.json --output ./review-with-note.case.json --session ./audit-session
 ```
 
-For assertions, include exact evidence locators copied from the session artifacts. Assertions require evidence references and stay labeled analyst-supplied and unverified. Entries can be added only in `draft` or `open` status. Both authoring commands check the supplied sessions and referenced artifacts, increment the branch-local revision, and write a new private file without replacing the source.
+For assertions, include exact evidence locators copied from the session artifacts. Assertions require evidence references and stay labeled analyst-supplied and unverified. Entries can be added only in `draft` or `open` status. All entry commands check the supplied sessions and referenced artifacts, increment the branch-local revision, and write a new private file without replacing the source.
 
 Use `case set-status` to move between workflow states. Allowed transitions are `draft` to `open` or `cancelled`, `open` to `in_review`, `closed`, or `cancelled`, and `in_review` to `open`, `closed`, or `cancelled`. `closed` and `cancelled` are terminal. Status is an analyst workflow label; it does not indicate evidence quality or completeness. Every transition rechecks the bound sessions and evidence locators and writes a new no-clobber file:
 
