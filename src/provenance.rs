@@ -52,6 +52,22 @@ pub struct TrustedKey {
     pub label: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TrustRotationOutcome {
+    Completed {
+        old_key_id: String,
+        replacement: TrustedKey,
+    },
+    ReplacementTrustedPriorRetained {
+        old_key_id: String,
+        replacement: TrustedKey,
+    },
+    ReplacementTrustedPriorStateUnknown {
+        old_key_id: String,
+        replacement: TrustedKey,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TrustStoreMarker {
@@ -331,6 +347,85 @@ pub fn import_trusted_key_text(
 ) -> Result<TrustedKey, ProvenanceError> {
     let public_key = decode_hex(public_key_text, 32).ok_or(ProvenanceError::InvalidKey)?;
     import_trusted_key(store, &public_key, label)
+}
+
+/// Add a replacement key before retiring the old local trust decision.
+///
+/// The caller must obtain explicit confirmation naming both fingerprints before
+/// calling this function. If retiring the prior record fails after the
+/// replacement has been imported, the outcome reports whether both keys are
+/// still trusted or whether the prior key's state could not be verified. The
+/// replacement is never rolled back in that case.
+pub fn rotate_trusted_key(
+    store: &Path,
+    old_key_id: &str,
+    replacement_public_key_text: &[u8],
+    replacement_label: &str,
+) -> Result<TrustRotationOutcome, ProvenanceError> {
+    validate_trusted_key_id(old_key_id)?;
+    validate_trust_label(replacement_label)?;
+    let replacement_public_key =
+        decode_hex(replacement_public_key_text, 32).ok_or(ProvenanceError::InvalidKey)?;
+    let replacement_key_id = encode_hex(&Sha256::digest(&replacement_public_key));
+    if replacement_key_id == old_key_id {
+        return Err(ProvenanceError::InvalidInput(
+            "replacement key must differ from the prior key",
+        ));
+    }
+
+    let existing = list_trusted_keys(store)?;
+    if !existing.iter().any(|key| key.key_id == old_key_id) {
+        return Err(ProvenanceError::UnknownTrustedKey(old_key_id.to_owned()));
+    }
+    if existing.iter().any(|key| key.key_id == replacement_key_id) {
+        return Err(ProvenanceError::InvalidInput(
+            "replacement key is already present in the trust store",
+        ));
+    }
+
+    let replacement = import_trusted_key(store, &replacement_public_key, replacement_label)?;
+    match remove_trusted_key(store, old_key_id) {
+        Ok(()) => Ok(TrustRotationOutcome::Completed {
+            old_key_id: old_key_id.to_owned(),
+            replacement,
+        }),
+        Err(_) => Ok(classify_post_retirement_failure(
+            old_key_id,
+            replacement,
+            list_trusted_keys(store).ok(),
+        )),
+    }
+}
+
+fn classify_post_retirement_failure(
+    old_key_id: &str,
+    replacement: TrustedKey,
+    current_keys: Option<Vec<TrustedKey>>,
+) -> TrustRotationOutcome {
+    match current_keys {
+        Some(keys)
+            if keys.iter().any(|key| key.key_id == replacement.key_id)
+                && keys.iter().any(|key| key.key_id == old_key_id) =>
+        {
+            TrustRotationOutcome::ReplacementTrustedPriorRetained {
+                old_key_id: old_key_id.to_owned(),
+                replacement,
+            }
+        }
+        Some(keys)
+            if keys.iter().any(|key| key.key_id == replacement.key_id)
+                && !keys.iter().any(|key| key.key_id == old_key_id) =>
+        {
+            TrustRotationOutcome::Completed {
+                old_key_id: old_key_id.to_owned(),
+                replacement,
+            }
+        }
+        _ => TrustRotationOutcome::ReplacementTrustedPriorStateUnknown {
+            old_key_id: old_key_id.to_owned(),
+            replacement,
+        },
+    }
 }
 
 pub fn public_key_id(public_key_text: &[u8]) -> Result<String, ProvenanceError> {
@@ -779,9 +874,10 @@ fn hex_nibble(value: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Ed25519KeyPair, ProvenanceError, SignatureEnvelope, SystemRandom, check_keypair,
-        generate_keypair, import_trusted_key, import_trusted_key_text, list_trusted_keys,
-        public_key_id, remove_trusted_key, sign_manifest, verify_manifest,
+        Ed25519KeyPair, ProvenanceError, SignatureEnvelope, SystemRandom, TrustRotationOutcome,
+        TrustedKey, check_keypair, classify_post_retirement_failure, generate_keypair,
+        import_trusted_key, import_trusted_key_text, list_trusted_keys, public_key_id,
+        remove_trusted_key, sign_manifest, verify_manifest,
         verify_manifest_with_public_key_and_trust_store, verify_manifest_with_trust_store,
     };
     use ring::signature::KeyPair;
@@ -1166,5 +1262,37 @@ mod tests {
         let public_text = std::fs::read_to_string(&other_public).unwrap();
         assert!(!error.to_string().contains(public_text.as_str()));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_rotation_retirement_reports_both_trusted_or_unknown_store_state() {
+        let prior = TrustedKey {
+            key_id: "a".repeat(64),
+            label: "prior".to_owned(),
+        };
+        let replacement = TrustedKey {
+            key_id: "b".repeat(64),
+            label: "replacement".to_owned(),
+        };
+        let both_trusted = classify_post_retirement_failure(
+            &prior.key_id,
+            replacement.clone(),
+            Some(vec![prior.clone(), replacement.clone()]),
+        );
+        assert_eq!(
+            both_trusted,
+            TrustRotationOutcome::ReplacementTrustedPriorRetained {
+                old_key_id: prior.key_id.clone(),
+                replacement: replacement.clone(),
+            }
+        );
+        let unreadable = classify_post_retirement_failure(&prior.key_id, replacement.clone(), None);
+        assert_eq!(
+            unreadable,
+            TrustRotationOutcome::ReplacementTrustedPriorStateUnknown {
+                old_key_id: prior.key_id,
+                replacement,
+            }
+        );
     }
 }

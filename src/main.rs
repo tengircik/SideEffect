@@ -194,6 +194,24 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         {
             provenance_trust_import(public_path, store_path, label)
         }
+        [
+            command,
+            trust,
+            operation,
+            old_key_id,
+            public_path,
+            store_flag,
+            store_path,
+            label_flag,
+            label,
+        ] if command == "provenance"
+            && trust == "trust"
+            && operation == "rotate"
+            && store_flag == "--trust-store"
+            && label_flag == "--label" =>
+        {
+            provenance_trust_rotate(old_key_id, public_path, store_path, label)
+        }
         [command, trust, operation, store_flag, store_path]
             if command == "provenance"
                 && trust == "trust"
@@ -1922,7 +1940,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect provenance key-check PRIVATE_KEY.pk8 PUBLIC_KEY.hex\nChecks that a protected Ed25519 private key derives the supplied public key. On a match, prints only that public key's SHA-256 fingerprint. This read-only check establishes pair consistency only; it does not recover keys or verify backup completeness or authenticity."
         }
         "provenance" => {
-            "Usage: sideeffect provenance keygen PRIVATE_KEY.pk8 PUBLIC_KEY.hex\n       sideeffect provenance key-check PRIVATE_KEY.pk8 PUBLIC_KEY.hex\n       sideeffect provenance sign-session SESSION_DIR --private-key PRIVATE_KEY.pk8 --output SIGNATURE.json\n       sideeffect provenance verify-session SESSION_DIR --signature SIGNATURE.json --public-key PUBLIC_KEY.hex [--trust-store DIR]\n       sideeffect provenance verify-session SESSION_DIR --signature SIGNATURE.json --trust-store DIR\n       sideeffect provenance trust import PUBLIC_KEY.hex --trust-store DIR --label LABEL\n       sideeffect provenance trust list --trust-store DIR\n       sideeffect provenance trust remove KEY_ID --trust-store DIR\nCreates Ed25519 keys explicitly, checks a supplied private/public key pair without changing either file, signs the exact validated session.json bytes into a detached envelope, or verifies cryptographic validity offline. Trust is an explicit local user decision about a public key; a local label is not verified signer identity. Imports require typing the displayed key fingerprint. Trust stores are selected explicitly and are protected for the current user. Signatures do not establish collector honesty or capture completeness."
+            "Usage: sideeffect provenance keygen PRIVATE_KEY.pk8 PUBLIC_KEY.hex\n       sideeffect provenance key-check PRIVATE_KEY.pk8 PUBLIC_KEY.hex\n       sideeffect provenance sign-session SESSION_DIR --private-key PRIVATE_KEY.pk8 --output SIGNATURE.json\n       sideeffect provenance verify-session SESSION_DIR --signature SIGNATURE.json --public-key PUBLIC_KEY.hex [--trust-store DIR]\n       sideeffect provenance verify-session SESSION_DIR --signature SIGNATURE.json --trust-store DIR\n       sideeffect provenance trust import PUBLIC_KEY.hex --trust-store DIR --label LABEL\n       sideeffect provenance trust rotate OLD_KEY_ID NEW_PUBLIC_KEY.hex --trust-store DIR --label LABEL\n       sideeffect provenance trust list --trust-store DIR\n       sideeffect provenance trust remove KEY_ID --trust-store DIR\nCreates Ed25519 keys explicitly, checks a supplied private/public key pair without changing either file, signs the exact validated session.json bytes into a detached envelope, or verifies cryptographic validity offline. Trust is an explicit local user decision about a public key; a local label is not verified signer identity. Imports require typing the displayed key fingerprint. Rotation requires exact confirmation naming both fingerprints, adds the replacement before retiring the prior local trust decision, and never changes private-key files. Trust stores are selected explicitly and are protected for the current user. Signatures do not establish collector honesty or capture completeness."
         }
         "diff" => {
             "Usage: sideeffect diff [--format json|text] LEFT RIGHT\n       sideeffect diff --format html --output REPORT.html LEFT RIGHT\n       sideeffect diff --bundles [--format json|text] LEFT_DIR RIGHT_DIR\n       sideeffect diff --windows-runtime [--format json|text] BEFORE.json AFTER.json\n       sideeffect diff --format html --output REPORT.html --windows-runtime BEFORE.json AFTER.json (native Windows)\nCompares complete parsed strace observations or validated Windows ETW captures. Windows summary v2 preserves category counts, compares exact normalized record multisets, and labels unique supported changed identities as candidates with source references. One-sided observations are not removals or additions; capture completeness remains unknown, and no causal or system-level absence claims are made. Windows HTML uses the protected current-user publisher and a static offline report. Input and report data may be sensitive."
@@ -2341,6 +2359,99 @@ fn provenance_trust_import(
     Ok(ExitCode::SUCCESS)
 }
 
+fn provenance_trust_rotate(
+    old_key_id: &OsString,
+    replacement_public_path: &OsString,
+    store_path: &OsString,
+    label: &OsString,
+) -> Result<ExitCode, String> {
+    let old_key_id = old_key_id
+        .to_str()
+        .ok_or_else(|| "prior key ID must be valid UTF-8".to_owned())?;
+    sideeffect::provenance::validate_trusted_key_id(old_key_id)
+        .map_err(|error| format!("invalid prior key ID: {error}"))?;
+    let label = label
+        .to_str()
+        .ok_or_else(|| "trust label must be valid UTF-8".to_owned())?;
+    sideeffect::provenance::validate_trust_label(label)
+        .map_err(|error| format!("invalid trust label: {error}"))?;
+    let replacement_public =
+        sideeffect::provenance::load_public_key(Path::new(replacement_public_path))
+            .map_err(|error| format!("could not read replacement public key: {error}"))?;
+    let replacement_key_id = sideeffect::provenance::public_key_id(&replacement_public)
+        .map_err(|error| format!("could not identify replacement public key: {error}"))?;
+    let trusted_keys = sideeffect::provenance::list_trusted_keys(Path::new(store_path))
+        .map_err(|error| format!("could not read trust store: {error}"))?;
+    if !trusted_keys.iter().any(|key| key.key_id == old_key_id) {
+        return Err(format!(
+            "prior key {old_key_id} is not in the selected trust store"
+        ));
+    }
+    if replacement_key_id == old_key_id {
+        return Err("replacement key must differ from the prior key".to_owned());
+    }
+    if trusted_keys
+        .iter()
+        .any(|key| key.key_id == replacement_key_id)
+    {
+        return Err("replacement key is already present in the trust store".to_owned());
+    }
+    println!("Prior key fingerprint: {old_key_id}");
+    println!("Replacement key fingerprint: {replacement_key_id}");
+    println!("The replacement will be trusted before the prior local trust is removed.");
+    if let Err(error) = confirm_provenance_action_with_limit(
+        &format!("rotate {old_key_id} to {replacement_key_id}"),
+        "trust rotation cancelled",
+        160,
+    ) {
+        if error == "trust rotation cancelled" {
+            println!("Rotation cancelled; the prior trust store is unchanged.");
+            return Err("trust rotation cancelled".to_owned());
+        }
+        return Err(error);
+    }
+
+    match sideeffect::provenance::rotate_trusted_key(
+        Path::new(store_path),
+        old_key_id,
+        &replacement_public,
+        label,
+    )
+    .map_err(|error| format!("could not rotate provenance trust: {error}"))?
+    {
+        sideeffect::provenance::TrustRotationOutcome::Completed {
+            old_key_id,
+            replacement,
+        } => {
+            println!(
+                "Rotation complete: replacement {} is trusted as '{}'; prior key {} is no longer trusted in this store.",
+                replacement.key_id, replacement.label, old_key_id
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        sideeffect::provenance::TrustRotationOutcome::ReplacementTrustedPriorRetained {
+            old_key_id,
+            replacement,
+        } => {
+            println!(
+                "Rotation incomplete: replacement {} is trusted as '{}', but prior key {} could not be retired; both keys remain trusted.",
+                replacement.key_id, replacement.label, old_key_id
+            );
+            Ok(ExitCode::from(2))
+        }
+        sideeffect::provenance::TrustRotationOutcome::ReplacementTrustedPriorStateUnknown {
+            old_key_id,
+            replacement,
+        } => {
+            println!(
+                "Rotation state uncertain: replacement {} is trusted as '{}', but the prior key {} could not be checked after retirement failed. Inspect the selected trust store before retrying.",
+                replacement.key_id, replacement.label, old_key_id
+            );
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
 fn provenance_trust_list(store_path: &OsString) -> Result<ExitCode, String> {
     let keys = sideeffect::provenance::list_trusted_keys(Path::new(store_path))
         .map_err(|error| format!("could not read trust store: {error}"))?;
@@ -2369,14 +2480,21 @@ fn provenance_trust_remove(key_id: &OsString, store_path: &OsString) -> Result<E
 }
 
 fn confirm_provenance_action(expected: &str, cancelled: &str) -> Result<(), String> {
-    const MAX_CONFIRMATION_BYTES: usize = 128;
+    confirm_provenance_action_with_limit(expected, cancelled, 128)
+}
+
+fn confirm_provenance_action_with_limit(
+    expected: &str,
+    cancelled: &str,
+    max_confirmation_bytes: usize,
+) -> Result<(), String> {
     print!("Type '{expected}' to continue: ");
     io::stdout()
         .flush()
         .map_err(|error| format!("could not write confirmation prompt: {error}"))?;
     let stdin = io::stdin();
     let mut input = stdin.lock();
-    let mut bytes = Vec::with_capacity(MAX_CONFIRMATION_BYTES);
+    let mut bytes = Vec::with_capacity(max_confirmation_bytes);
     loop {
         let (consumed, newline) = {
             let buffer = input
@@ -2385,7 +2503,7 @@ fn confirm_provenance_action(expected: &str, cancelled: &str) -> Result<(), Stri
             if buffer.is_empty() {
                 return Err("confirmation must end with a newline".to_owned());
             }
-            let remaining = MAX_CONFIRMATION_BYTES
+            let remaining = max_confirmation_bytes
                 .saturating_add(1)
                 .saturating_sub(bytes.len());
             let inspected = buffer.len().min(remaining);
@@ -2394,15 +2512,19 @@ fn confirm_provenance_action(expected: &str, cancelled: &str) -> Result<(), Stri
                 None => (inspected, None),
             }
         };
-        if bytes.len().saturating_add(consumed) > MAX_CONFIRMATION_BYTES + 1 {
-            return Err("confirmation line exceeds its size limit".to_owned());
+        if bytes.len().saturating_add(consumed) > max_confirmation_bytes + 1 {
+            return Err(format!(
+                "confirmation line exceeds its size limit ({max_confirmation_bytes} bytes)"
+            ));
         }
         let buffer = input
             .fill_buf()
             .map_err(|error| format!("could not read confirmation: {error}"))?;
         if let Some(position) = newline {
-            if bytes.len().saturating_add(position) > MAX_CONFIRMATION_BYTES {
-                return Err("confirmation line exceeds its size limit".to_owned());
+            if bytes.len().saturating_add(position) > max_confirmation_bytes {
+                return Err(format!(
+                    "confirmation line exceeds its size limit ({max_confirmation_bytes} bytes)"
+                ));
             }
             bytes.extend_from_slice(&buffer[..position]);
             input.consume(consumed);
@@ -2410,8 +2532,10 @@ fn confirm_provenance_action(expected: &str, cancelled: &str) -> Result<(), Stri
         }
         bytes.extend_from_slice(&buffer[..consumed]);
         input.consume(consumed);
-        if bytes.len() > MAX_CONFIRMATION_BYTES {
-            return Err("confirmation line exceeds its size limit".to_owned());
+        if bytes.len() > max_confirmation_bytes {
+            return Err(format!(
+                "confirmation line exceeds its size limit ({max_confirmation_bytes} bytes)"
+            ));
         }
     }
     if bytes.last() == Some(&b'\r') {

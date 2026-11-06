@@ -186,6 +186,136 @@ fn provenance_key_check_cli_is_read_only_and_does_not_disclose_private_material(
 }
 
 #[test]
+fn provenance_trust_rotation_requires_both_fingerprints_and_preserves_old_until_confirmed() {
+    let temp = TestDirectory::new();
+    let (old_private, old_public) = generate_pair(&temp.0, "rotation-old");
+    let (new_private, new_public) = generate_pair(&temp.0, "rotation-new");
+    let old_private_bytes = fs::read(&old_private).unwrap();
+    let new_private_bytes = fs::read(&new_private).unwrap();
+    let old_public_bytes = fs::read(&old_public).unwrap();
+    let new_public_bytes = fs::read(&new_public).unwrap();
+    let old_id = sideeffect::provenance::public_key_id(&old_public_bytes).unwrap();
+    let new_id = sideeffect::provenance::public_key_id(&new_public_bytes).unwrap();
+    let trust_store = temp.0.join("rotation-trust-store");
+    sideeffect::provenance::import_trusted_key_text(
+        &trust_store,
+        &old_public_bytes,
+        "prior signing key",
+    )
+    .unwrap();
+
+    let invoke = |confirmation: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sideeffect"));
+        command
+            .arg("provenance")
+            .arg("trust")
+            .arg("rotate")
+            .arg(&old_id)
+            .arg(&new_public)
+            .arg("--trust-store")
+            .arg(&trust_store)
+            .arg("--label")
+            .arg("replacement signing key")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(confirmation.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    let cancelled = invoke("no, keep the old key\n");
+    assert_eq!(cancelled.status.code(), Some(1));
+    let cancelled_text = String::from_utf8_lossy(&cancelled.stdout);
+    assert!(cancelled_text.contains(&old_id));
+    assert!(cancelled_text.contains(&new_id));
+    assert!(cancelled_text.contains("Rotation cancelled; the prior trust store is unchanged."));
+    assert_eq!(
+        sideeffect::provenance::list_trusted_keys(&trust_store).unwrap(),
+        vec![sideeffect::provenance::TrustedKey {
+            key_id: old_id.clone(),
+            label: "prior signing key".to_owned(),
+        }]
+    );
+
+    let completed = invoke(&format!("rotate {old_id} to {new_id}\n"));
+    assert!(
+        completed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    assert!(String::from_utf8_lossy(&completed.stdout).contains("Rotation complete"));
+    assert!(String::from_utf8_lossy(&completed.stdout).contains(&old_id));
+    assert!(String::from_utf8_lossy(&completed.stdout).contains(&new_id));
+    assert_eq!(
+        sideeffect::provenance::list_trusted_keys(&trust_store).unwrap(),
+        vec![sideeffect::provenance::TrustedKey {
+            key_id: new_id,
+            label: "replacement signing key".to_owned(),
+        }]
+    );
+    assert_eq!(fs::read(&old_private).unwrap(), old_private_bytes);
+    assert_eq!(fs::read(&new_private).unwrap(), new_private_bytes);
+    assert_eq!(fs::read(&old_public).unwrap(), old_public_bytes);
+
+    let help = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["help", "provenance"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains(
+        "provenance trust rotate OLD_KEY_ID NEW_PUBLIC_KEY.hex --trust-store DIR --label LABEL"
+    ));
+}
+
+#[test]
+fn provenance_trust_rotation_rejects_existing_replacement_without_mutation() {
+    let temp = TestDirectory::new();
+    let (_old_private, old_public) = generate_pair(&temp.0, "rotation-old-duplicate");
+    let (_new_private, new_public) = generate_pair(&temp.0, "rotation-new-duplicate");
+    let old_public_bytes = fs::read(&old_public).unwrap();
+    let new_public_bytes = fs::read(&new_public).unwrap();
+    let old_id = sideeffect::provenance::public_key_id(&old_public_bytes).unwrap();
+    let trust_store = temp.0.join("rotation-duplicate-store");
+    sideeffect::provenance::import_trusted_key_text(&trust_store, &old_public_bytes, "old")
+        .unwrap();
+    sideeffect::provenance::import_trusted_key_text(
+        &trust_store,
+        &new_public_bytes,
+        "already trusted",
+    )
+    .unwrap();
+    let before = sideeffect::provenance::list_trusted_keys(&trust_store).unwrap();
+
+    let rejected = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("provenance")
+        .arg("trust")
+        .arg("rotate")
+        .arg(&old_id)
+        .arg(&new_public)
+        .arg("--trust-store")
+        .arg(&trust_store)
+        .arg("--label")
+        .arg("replacement")
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("replacement key is already present")
+    );
+    assert_eq!(
+        sideeffect::provenance::list_trusted_keys(&trust_store).unwrap(),
+        before
+    );
+}
+
+#[test]
 fn session_signature_cli_round_trip_and_detects_manifest_byte_changes() {
     let temp = TestDirectory::new();
     let session = temp.0.join("session");
