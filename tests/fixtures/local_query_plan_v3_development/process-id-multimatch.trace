@@ -1,0 +1,30 @@
+11001 openat(AT_FDCWD, "/tmp/se-v3/pid/01/one", O_RDONLY) = 3
+11001 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
+11002 openat(AT_FDCWD, "/tmp/se-v3/pid/02/one", O_RDONLY) = 3
+11002 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
+11003 openat(AT_FDCWD, "/tmp/se-v3/pid/03/one", O_RDONLY) = 3
+11003 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
+11004 openat(AT_FDCWD, "/tmp/se-v3/pid/04/one", O_RDONLY) = 3
+11004 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
+11005 openat(AT_FDCWD, "/tmp/se-v3/pid/05/one", O_RDONLY) = 3
+11005 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
+11006 openat(AT_FDCWD, "/tmp/se-v3/pid/06/one", O_RDONLY) = 3
+11006 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
+11007 openat(AT_FDCWD, "/tmp/se-v3/pid/07/one", O_RDONLY) = 3
+11007 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
+11008 openat(AT_FDCWD, "/tmp/se-v3/pid/08/one", O_RDONLY) = 3
+11008 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
+11009 openat(AT_FDCWD, "/tmp/se-v3/pid/09/one", O_RDONLY) = 3
+11009 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
+11010 openat(AT_FDCWD, "/tmp/se-v3/pid/10/one", O_RDONLY) = 3
+11010 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
+11011 openat(AT_FDCWD, "/tmp/se-v3/pid/11/one", O_RDONLY) = 3
+11011 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
+11012 openat(AT_FDCWD, "/tmp/se-v3/pid/12/one", O_RDONLY) = 3
+11012 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
+11013 openat(AT_FDCWD, "/tmp/se-v3/pid/13/one", O_RDONLY) = 3
+11013 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
+11014 openat(AT_FDCWD, "/tmp/se-v3/pid/14/one", O_RDONLY) = 3
+11014 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
+11015 openat(AT_FDCWD, "/tmp/se-v3/pid/15/one", O_RDONLY) = 3
+11015 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
