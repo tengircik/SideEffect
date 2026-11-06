@@ -131,6 +131,47 @@ jobs:
         run: |
           ./target/release/sideeffect --help
           ./target/release/sideeffect --version
+
+      - name: Measure bounded native Linux trace performance
+        run: |
+          python3 scripts/trace_scale_benchmark.py \
+            --sideeffect target/release/sideeffect \
+            --profile getpid --sizes 1000,10000 \
+            --runs 2 --warmups 0 \
+            --output "$RUNNER_TEMP/trace-scale-ci.json" \
+            > "$RUNNER_TEMP/trace-scale-stdout.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = json.loads(Path(os.environ["RUNNER_TEMP"], "trace-scale-ci.json").read_text())
+          failed = [case["requested_records"] for case in report["matrix"]
+                    if case.get("status") != "measured"]
+          if failed:
+              raise SystemExit(f"benchmark did not completely measure requested sizes: {failed}")
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a", encoding="utf-8") as stream:
+              stream.write("\n### Bounded Linux trace performance sample\n\n")
+              stream.write("Native Ubuntu 24.04 hosted runner; generated local `getpid` workload; two measured captures per size, no warm-up. This is a reproducibility smoke sample, not a general performance claim.\n\n")
+              stream.write("| Requested rows | Run | Parsed rows | Trace bytes | Capture wall (s) | Capture child CPU (s) | Capture sampled peak process-group RSS (bytes) | Inspect JSON bytes | Inspect wall (s) | Inspect child CPU (s) | Inspect sampled peak process-group RSS (bytes) |\n")
+              stream.write("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+              for case in report["matrix"]:
+                  for index, run in enumerate(case.get("runs", []), 1):
+                      capture = run.get("capture", {})
+                      inspect = run.get("inspect", {})
+                      capture_cpu = capture.get("child_cpu_seconds", {})
+                      inspect_cpu = inspect.get("child_cpu_seconds", {})
+                      stream.write(
+                          f"| {case['requested_records']} | {index} | {inspect.get('parsed_records', '—')} "
+                          f"| {capture.get('trace_bytes', '—')} | {capture.get('wall_seconds', '—')} "
+                          f"| {capture_cpu.get('user', 0) + capture_cpu.get('system', 0):.6f} "
+                          f"| {capture.get('sampled_peak_process_group_rss_bytes', '—')} "
+                          f"| {inspect.get('json_bytes', '—')} | {inspect.get('wall_seconds', '—')} "
+                          f"| {inspect_cpu.get('user', 0) + inspect_cpu.get('system', 0):.6f} "
+                          f"| {inspect.get('sampled_peak_process_group_rss_bytes', '—')} |\n"
+                      )
+          PY
       - name: Smoke-check Cargo installation
         run: |
           cargo install --locked --path . --root "$RUNNER_TEMP/sideeffect-install"
