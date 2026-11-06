@@ -24,10 +24,10 @@ OUTCOMES = {"success", "failure", "in_progress", "unknown"}
 ERRNOS = {"EACCES", "ENOENT", "ECONNREFUSED", "EINPROGRESS"}
 ABSTAIN_REASONS = {"ambiguous", "unsupported_scope", "insufficient_evidence"}
 ABSTAIN_CLASS_REASONS = {
-    "ambiguous": "ambiguous",
-    "unsupported": "unsupported_scope",
-    "insufficient": "insufficient_evidence",
-    "adversarial": "ambiguous",
+    "ambiguous": {"ambiguous"},
+    "unsupported": {"unsupported_scope"},
+    "insufficient": {"insufficient_evidence"},
+    "adversarial": {"ambiguous", "unsupported_scope"},
 }
 CASE_KEYS = {
     "id", "intent_group", "source_order_group", "class", "behavior", "question",
@@ -294,7 +294,7 @@ def validate_data(data: Any, base_dir: Path, corpus_size: int | None = None) -> 
                 _fail(f"{case_id}: abstention requires an abstain class and empty support")
             if evaluation_fixture != ABSTENTION_CONTEXT_FIXTURE:
                 _fail(f"{case_id}: abstention must use the shared evaluation context fixture")
-            if plan["abstain_reason"] != ABSTAIN_CLASS_REASONS[case["class"]]:
+            if plan["abstain_reason"] not in ABSTAIN_CLASS_REASONS[case["class"]]:
                 _fail(f"{case_id}: abstain reason does not match its class")
             if case["fixture"] is not None or case["target_line"] is not None or case["expected_match_count"] is not None:
                 _fail(f"{case_id}: abstention must not carry a fixture, target row, or match count")

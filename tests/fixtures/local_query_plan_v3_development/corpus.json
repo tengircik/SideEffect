@@ -4088,7 +4088,7 @@
       "source_order_group": null,
       "class": "insufficient",
       "behavior": "must_abstain",
-      "question": "Which result succeeded?",
+      "question": "Which specific result are you referring to?",
       "fixture": null,
       "evaluation_fixture": "abstention-context.trace",
       "target_line": null,
@@ -4240,7 +4240,7 @@
       "expected_match_count": null,
       "expected_plan": {
         "decision": "abstain",
-        "abstain_reason": "ambiguous",
+        "abstain_reason": "unsupported_scope",
         "entity": null,
         "filters": {
           "syscall": null,
@@ -4269,7 +4269,7 @@
       "expected_match_count": null,
       "expected_plan": {
         "decision": "abstain",
-        "abstain_reason": "ambiguous",
+        "abstain_reason": "unsupported_scope",
         "entity": null,
         "filters": {
           "syscall": null,
@@ -4327,7 +4327,7 @@
       "expected_match_count": null,
       "expected_plan": {
         "decision": "abstain",
-        "abstain_reason": "ambiguous",
+        "abstain_reason": "unsupported_scope",
         "entity": null,
         "filters": {
           "syscall": null,
@@ -4356,7 +4356,7 @@
       "expected_match_count": null,
       "expected_plan": {
         "decision": "abstain",
-        "abstain_reason": "ambiguous",
+        "abstain_reason": "unsupported_scope",
         "entity": null,
         "filters": {
           "syscall": null,
@@ -4385,7 +4385,7 @@
       "expected_match_count": null,
       "expected_plan": {
         "decision": "abstain",
-        "abstain_reason": "ambiguous",
+        "abstain_reason": "unsupported_scope",
         "entity": null,
         "filters": {
           "syscall": null,
@@ -4414,7 +4414,7 @@
       "expected_match_count": null,
       "expected_plan": {
         "decision": "abstain",
-        "abstain_reason": "ambiguous",
+        "abstain_reason": "unsupported_scope",
         "entity": null,
         "filters": {
           "syscall": null,
@@ -4443,7 +4443,7 @@
       "expected_match_count": null,
       "expected_plan": {
         "decision": "abstain",
-        "abstain_reason": "ambiguous",
+        "abstain_reason": "unsupported_scope",
         "entity": null,
         "filters": {
           "syscall": null,
@@ -4472,7 +4472,7 @@
       "expected_match_count": null,
       "expected_plan": {
         "decision": "abstain",
-        "abstain_reason": "ambiguous",
+        "abstain_reason": "unsupported_scope",
         "entity": null,
         "filters": {
           "syscall": null,

@@ -216,9 +216,18 @@ class CorpusValidatorTests(unittest.TestCase):
     def test_rejects_abstain_reason_mismatched_to_class(self) -> None:
         data = load_data()
         case = next(row for row in data["cases"] if row["id"] == "abstain_adversarial_01")
-        case["expected_plan"]["abstain_reason"] = "unsupported_scope"
+        case["expected_plan"]["abstain_reason"] = "insufficient_evidence"
         with self.assertRaisesRegex(validator.CorpusError, "abstain reason does not match its class"):
             validator.validate_data(data, ROOT)
+
+    def test_adversarial_abstentions_allow_ambiguous_and_unsupported_scope(self) -> None:
+        data = load_data()
+        reasons = {
+            case["expected_plan"]["abstain_reason"]
+            for case in data["cases"] if case["class"] == "adversarial"
+        }
+        self.assertEqual(reasons, {"ambiguous", "unsupported_scope"})
+        self.assertEqual(validator.validate_data(data, ROOT)["must_abstain"], 40)
 
 
 if __name__ == "__main__":
