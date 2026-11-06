@@ -28,6 +28,7 @@ From the repository root:
 python tests/fixtures/local_query_plan_v3_development/generate_corpus.py
 python tests/fixtures/local_query_plan_v3_development/validate_corpus.py
 python -m unittest discover -s tests/fixtures/local_query_plan_v3_development -p 'test_*.py' -v
+python -m unittest scripts.test_evaluate_local_query_plan_v3 -v
 ```
 
-The generator only writes files in this directory. Validation uses Python's standard library and does not load or run a model. The tests exercise grounding, strict plan schema and enum rejection, hashes, bounds, unique IDs/templates, and permutation-group invariants.
+The generator only writes files in this directory. Corpus validation and both test suites use Python's standard library and do not load or run a model. The evaluator tests use a mocked CLI boundary; they do not validate a built SideEffect binary or runtime capture. To validate previews through a built Linux CLI, use `scripts/evaluate_local_query_plan_v3.py --sideeffect PATH --model PATH --expected-model-sha256 SHA256 --preview-only`; this registers the model only in a temporary local registry and runs no inference. A full run additionally requires `--runtime PATH --expected-runtime-sha256 SHA256` and executes local CPU inference. Both modes produce development diagnostics only, not model qualification.

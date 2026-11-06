@@ -109,6 +109,12 @@ jobs:
           python3 tests/test_local_model_explain_review_packet.py
           python3 tests/test_run_local_model_explain_corpus.py
 
+      - name: Validate local query-plan v3 development contracts
+        run: |
+          python3 tests/fixtures/local_query_plan_v3_development/validate_corpus.py
+          python3 -m unittest discover -s tests/fixtures/local_query_plan_v3_development -p 'test_*.py' -v
+          python3 scripts/test_evaluate_local_query_plan_v3.py
+
       - name: Test Linux release archive smoke validator
         run: python3 tests/test_smoke_linux_release_archive.py
 
