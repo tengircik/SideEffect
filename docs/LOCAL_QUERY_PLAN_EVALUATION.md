@@ -1,8 +1,18 @@
 # Local query-plan evaluation
 
-**Status: experimental and not release-approved.** This is a separately gated M8 experiment. No model candidate has passed the frozen v2 usefulness gate. This is not a claim that local model analysis is useful or accurate on real captures. The model-query command is currently implemented only for Linux x86_64; GPU model experiments below were run separately on Windows and do not establish native Windows product support.
+**Status: experimental and not release-approved.** This is a separately gated M8 experiment. No model candidate has passed the frozen v2 usefulness gate. A 2026-11-06 question-to-oracle audit also found that this gate is not valid for model approval until its expected plans are corrected in a new corpus. This is not a claim that local model analysis is useful or accurate on real captures. The model-query command is currently implemented only for Linux x86_64; GPU model experiments below were run separately on Windows and do not establish native Windows product support.
 
 `sideeffect model doctor --task query` checks the pinned runtime's exact `0.7.0-dev (build 11938, commit 19cce6919)` version string in a bounded `--version` invocation. The schema-v2 readiness report does not load weights, run inference, or assess query-plan quality. Runtime and query support remain Linux x86_64-only; device status is `not_applicable`. See [the task-wide runtime readiness guide](LOCAL_MODEL_DOCTOR.md).
+
+## Frozen v2 question-to-oracle audit (2026-11-06)
+
+A read-only audit compared the expected selectors for all 70 answerable cases with what the model actually receives: the question plus the fixed scope/schema in `src/local_query_plan.rs`. Queryable trace facts are kept in the local preview and are not included in the model prompt. The review found **30/70 fully inferable expected plans, 36/70 partly inferable plans, and 4/70 plans with selectors not inferable from the question**. The 30 must-abstain cases have no expected selectors and remain abstention cases.
+
+Examples of missing expected values include `lookup_01` (the question does not distinguish `openat2` from other supported calls), `lookup_11` (it does not distinguish `execveat` from `execve`), `lookup_21` (it names an index lock but not the expected exact path), and `lookup_41` (it names a session record but not its expected full path). Some partially inferable cases require an unstated exact path, syscall variant, or errno where a directly supported outcome is sufficient. This means a model that follows the prompt's instruction not to infer missing values can be marked wrong for failing to reproduce a trace-specific selector it never received.
+
+The 20 source-order rows represent only five query intents (four variants per intent), or 28.6% of the answerable set. The 50 lookup rows reuse ten task patterns across five fixture scenarios, so the aggregate weights those intents repeatedly rather than sampling 70 independent language intents. The registered permutation gate also counts each repeated intent four times.
+
+This was a single internal AI-assisted read-only review, not an independent human or third-party qualification review. Keep the existing corpus SHA, thresholds, and historical result reports unchanged, but treat their scores as diagnostics only; they cannot approve a model. Before another qualification run, create a versioned replacement corpus whose expected selectors are entailed by the question or a documented question-only synonym map, separately review question/label consistency, and score permutation variants at the intent-group level. Preserve a genuinely hidden external holdout for the final frozen candidate. Do not tune against this public v2 corpus or silently edit its labels.
 
 ## Optional external holdout directory
 
