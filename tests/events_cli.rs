@@ -321,6 +321,90 @@ fn timeline_rejects_duplicate_and_malformed_filter_options() {
 }
 
 #[test]
+fn timeline_html_requires_output_and_publishes_without_clobbering() {
+    let trace = TempTrace::with_contents(b"1700000000.000001 openat(AT_FDCWD, \"/tmp/<timeline>\", O_RDONLY) = 3\nnot a recognized trace row\n");
+    let report = std::env::temp_dir().join(format!(
+        "sideeffect-events-timeline-html-{}-{}.html",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--trace"])
+        .arg(&trace.0)
+        .args(["--format", "html", "--output"])
+        .arg(&report)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Offline event timeline HTML report written")
+    );
+    let html = fs::read_to_string(&report).unwrap();
+    assert!(html.contains("Content-Security-Policy"));
+    assert!(html.contains("&lt;timeline&gt;"));
+    assert!(!html.contains("<script"));
+    assert!(!html.contains("https://"));
+
+    let existing = b"keep this report";
+    fs::write(&report, existing).unwrap();
+    let rejected = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--trace"])
+        .arg(&trace.0)
+        .args(["--format", "html", "--output"])
+        .arg(&report)
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(1));
+    assert_eq!(fs::read(&report).unwrap(), existing);
+    fs::remove_file(report).unwrap();
+
+    for (args, expected) in [
+        (
+            vec!["--format", "html"],
+            "timeline --format html requires --output",
+        ),
+        (
+            vec!["--format"],
+            "timeline option --format requires a value",
+        ),
+        (
+            vec!["--format", "json", "--format", "text"],
+            "duplicate timeline option --format",
+        ),
+        (
+            vec!["--output", "report.html"],
+            "timeline --output is valid only with --format html",
+        ),
+        (
+            vec!["--format", "text", "--output", "report.html"],
+            "timeline --output is valid only with --format html",
+        ),
+        (
+            vec!["--format", "html", "--output"],
+            "timeline option --output requires a value",
+        ),
+        (
+            vec![
+                "--format", "html", "--output", "one.html", "--output", "two.html",
+            ],
+            "duplicate timeline option --output",
+        ),
+    ] {
+        let invalid = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+            .args(["timeline", "--trace"])
+            .arg(&trace.0)
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(invalid.status.code(), Some(1));
+        assert!(invalid.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&invalid.stderr).contains(expected));
+    }
+}
+
+#[test]
 fn timeline_unknown_option_escapes_terminal_control_characters() {
     let trace = TempTrace::with_contents(b"123 1700000000.000001 close(4) = 0\n");
     let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
