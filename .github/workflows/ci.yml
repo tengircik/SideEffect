@@ -317,8 +317,10 @@ jobs:
           }
           Write-Output "ETW acceptance runner token is administrative: $($identity.Name)"
 
-      - name: Run live ETW acceptance
-        run: cargo test --locked --test windows_runtime_etw_integration -- --ignored --exact captures_process_file_and_loopback_network_observations_and_reports_loss_state
+      - name: Run Windows Server 2022/2025 ETW acceptance and diagnostic sample
+        env:
+          SIDEEFFECT_ETW_DIAGNOSTIC_SAMPLE: windows_server_hosted_ci
+        run: cargo test --locked --test windows_runtime_etw_integration -- --ignored --exact captures_process_file_and_loopback_network_observations_and_reports_loss_state --nocapture
 
       - name: Build CLI
         run: cargo build --locked --bin sideeffect

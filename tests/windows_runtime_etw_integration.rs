@@ -57,6 +57,7 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
         }
     });
     let fixture_executable = std::env::current_exe().unwrap();
+    let record_started = Instant::now();
     let command = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .args(["record", "--windows-etw", output.to_str().unwrap()])
         .args([
@@ -73,6 +74,7 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
         .env("SIDEEFFECT_ETW_FIXTURE_PORT", port.to_string())
         .output()
         .unwrap();
+    let record_command_elapsed_ms = record_started.elapsed().as_millis();
     stop_server.store(true, Ordering::Relaxed);
     assert!(
         server.join().unwrap(),
@@ -86,7 +88,8 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
         "ETW acceptance failed (this host may lack permission to control NT Kernel Logger): {}",
         String::from_utf8_lossy(&command.stderr)
     );
-    let document: Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+    let capture_bytes = fs::read(&output).unwrap();
+    let document: Value = serde_json::from_slice(&capture_bytes).unwrap();
     assert_eq!(document["schema"], "sideeffect.windows_runtime_capture");
     assert_eq!(document["schema_version"], 3);
     assert_eq!(document["capture_completeness"], "unknown");
@@ -341,6 +344,40 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
                 && edge["basis"] == link["basis"]
                 && edge["evidence"][0] == link["event"]
         }));
+    }
+    if std::env::var("SIDEEFFECT_ETW_DIAGNOSTIC_SAMPLE")
+        .is_ok_and(|value| value == "windows_server_hosted_ci")
+    {
+        let loss = &document["event_loss"];
+        let capture_window_ms = document["ended_at_unix_ms"]
+            .as_u64()
+            .expect("capture end timestamp is an unsigned millisecond count")
+            .saturating_sub(
+                document["started_at_unix_ms"]
+                    .as_u64()
+                    .expect("capture start timestamp is an unsigned millisecond count"),
+            );
+        let diagnostic_sample = serde_json::json!({
+            "scope": "windows_server_2022_2025_hosted_ci",
+            "sample": "single_synthetic_live_etw_fixture",
+            "record_command_elapsed_ms": record_command_elapsed_ms,
+            "capture_window_ms": capture_window_ms,
+            "retained_event_count": events.len(),
+            "serialized_capture_size_bytes": capture_bytes.len(),
+            "events_lost": loss["events_lost"]
+                .as_u64()
+                .expect("ETW events-lost counter is present"),
+            "log_buffers_lost": loss["log_buffers_lost"]
+                .as_u64()
+                .expect("ETW log-buffer loss counter is present"),
+            "real_time_buffers_lost": loss["real_time_buffers_lost"]
+                .as_u64()
+                .expect("ETW real-time buffer loss counter is present"),
+        });
+        eprintln!(
+            "SIDEEFFECT_ETW_DIAGNOSTIC_SAMPLE {}",
+            serde_json::to_string(&diagnostic_sample).unwrap()
+        );
     }
     fs::remove_file(fixture_file).unwrap();
     fs::remove_file(output).unwrap();
