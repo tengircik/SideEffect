@@ -362,7 +362,10 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
             "sample": "single_synthetic_live_etw_fixture",
             "record_command_elapsed_ms": record_command_elapsed_ms,
             "capture_window_ms": capture_window_ms,
-            "retained_event_count": events.len(),
+            "retained_event_count": document["events"]
+                .as_array()
+                .expect("capture event list is an array")
+                .len(),
             "serialized_capture_size_bytes": capture_bytes.len(),
             "events_lost": loss["events_lost"]
                 .as_u64()
