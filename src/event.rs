@@ -758,7 +758,7 @@ pub fn graph_with_windows_startup_candidates(
             summary.inputs.runtime_capture.source_status.as_str(),
             "complete" | "partial"
         )
-        || (summary.association_status == "candidate_match") != !summary.associations.is_empty()
+        || (summary.association_status == "candidate_match") == summary.associations.is_empty()
         || summary.algorithm.id != "windows_startup_source_process_image_exact_path"
         || summary.algorithm.basis != "exact_equality_of_drive_rooted_windows_path_strings"
     {
