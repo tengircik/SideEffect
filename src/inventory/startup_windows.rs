@@ -34,6 +34,7 @@ const ERROR_PROC_NOT_FOUND: u32 = 127;
 const ERROR_MORE_DATA: u32 = 234;
 const ERROR_NO_MORE_ITEMS: u32 = 259;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+const ERROR_INVALID_LEVEL: u32 = 124;
 const REG_SZ: u32 = 1;
 const REG_EXPAND_SZ: u32 = 2;
 const KEY_READ: u32 = 0x0002_0019;
@@ -49,6 +50,7 @@ const MAX_AGGREGATE_PATH_UNITS: usize = 4 * 1024 * 1024;
 const MAX_SCAN_DURATION_MS: u128 = 10_000;
 const MAX_SERVICE_ENUM_BYTES: usize = 256 * 1024;
 const MAX_SERVICE_CONFIG_BYTES: usize = 64 * 1024;
+const MAX_SERVICE_CONFIG2_BYTES: usize = 8 * 1024;
 const MAX_AGGREGATE_SERVICE_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SERVICE_ENTRIES: usize = 8_192;
 const MAX_SERVICE_STRING_UNITS: usize = 32_768;
@@ -67,6 +69,7 @@ const MAX_TASK_DIAGNOSTICS: usize = 256;
 const SC_MANAGER_CONNECT: u32 = 0x0001;
 const SC_MANAGER_ENUMERATE_SERVICE: u32 = 0x0004;
 const SERVICE_QUERY_CONFIG: u32 = 0x0001;
+const SERVICE_CONFIG_DELAYED_AUTO_START_INFO: u32 = 3;
 const SC_ENUM_PROCESS_INFO: u32 = 0;
 const SERVICE_DRIVER: u32 = 0x0000_000b;
 const SERVICE_WIN32: u32 = 0x0000_0030;
@@ -121,6 +124,11 @@ struct QueryServiceConfigW {
     dependencies: *mut u16,
     service_start_name: *mut u16,
     display_name: *mut u16,
+}
+
+#[repr(C)]
+struct ServiceDelayedAutoStartInfo {
+    delayed_auto_start: i32,
 }
 
 #[repr(C)]
@@ -186,6 +194,13 @@ unsafe extern "system" {
     fn QueryServiceConfigW(
         service: Handle,
         config: *mut QueryServiceConfigW,
+        buffer_size: u32,
+        bytes_needed: *mut u32,
+    ) -> i32;
+    fn QueryServiceConfig2W(
+        service: Handle,
+        info_level: u32,
+        config: *mut u8,
         buffer_size: u32,
         bytes_needed: *mut u32,
     ) -> i32;
@@ -455,7 +470,16 @@ pub struct WindowsServiceStartupEntry {
     pub startup_state: super::startup_state::StartupRowState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_observation: Option<WindowsServiceObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delayed_auto_start: Option<WindowsDelayedAutoStart>,
     pub evidence: WindowsServiceStartupEvidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WindowsDelayedAutoStart {
+    Observed { value: bool },
+    Unknown { diagnostic_code: &'static str },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -842,23 +866,29 @@ fn now_ms() -> u128 {
 }
 
 pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
-    collect_windows_startup_with_contract(true, 7, true)
+    collect_windows_startup_with_contract(true, 8, true, true)
 }
 
 /// Session schema v9 pins startup artifacts to v5.
 pub(crate) fn collect_windows_startup_v5() -> WindowsStartupInventoryDocument {
-    collect_windows_startup_with_contract(false, 5, false)
+    collect_windows_startup_with_contract(false, 5, false, false)
 }
 
 /// Session schemas v10-v11 retain the standalone startup v6 contract.
 pub(crate) fn collect_windows_startup_v6() -> WindowsStartupInventoryDocument {
-    collect_windows_startup_with_contract(true, 6, false)
+    collect_windows_startup_with_contract(true, 6, false, false)
+}
+
+/// Session schema v12 retains the standalone startup v7 contract.
+pub(crate) fn collect_windows_startup_v7() -> WindowsStartupInventoryDocument {
+    collect_windows_startup_with_contract(true, 7, true, false)
 }
 
 fn collect_windows_startup_with_contract(
     include_wmi: bool,
     schema_version: u32,
     include_service_observation: bool,
+    include_delayed_auto_start: bool,
 ) -> WindowsStartupInventoryDocument {
     let started_at = now_ms();
     let started = Instant::now();
@@ -936,8 +966,11 @@ fn collect_windows_startup_with_contract(
         sources.push(result);
     }
 
-    let (service_source, services) =
-        collect_service_start_configuration(started, include_service_observation);
+    let (service_source, services) = collect_service_start_configuration(
+        started,
+        include_service_observation,
+        include_delayed_auto_start,
+    );
     sources.push(service_source);
     service_entries.extend(services);
     let (task_source, tasks, task_actions) = collect_scheduled_task_triggers(started);
@@ -962,7 +995,9 @@ fn collect_windows_startup_with_contract(
         schema: "sideeffect.windows_startup_inventory",
         schema_version,
         platform: "windows",
-        scope: if include_wmi {
+        scope: if include_delayed_auto_start {
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+        } else if include_wmi {
             "current_user_and_accessible_machine_run_keys_startup_folders_services_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
         } else {
             "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks"
@@ -1000,9 +1035,71 @@ enum ServiceStringError {
     MalformedUtf16,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DelayedAutoStartQueryError {
+    Api(u32),
+    InvalidResponse,
+    ByteBudgetExceeded,
+}
+
+fn query_delayed_auto_start_config(
+    mut query: impl FnMut(*mut u8, u32, *mut u32) -> Result<(), u32>,
+    aggregate_config_bytes: &mut usize,
+) -> Result<bool, DelayedAutoStartQueryError> {
+    let expected_bytes = std::mem::size_of::<ServiceDelayedAutoStartInfo>();
+    let mut required_bytes = 0u32;
+    match query(null_mut(), 0, &mut required_bytes) {
+        Err(ERROR_INSUFFICIENT_BUFFER) => {}
+        Err(error) => return Err(DelayedAutoStartQueryError::Api(error)),
+        Ok(()) => return Err(DelayedAutoStartQueryError::InvalidResponse),
+    }
+    let required_bytes = required_bytes as usize;
+    if required_bytes != expected_bytes || required_bytes > MAX_SERVICE_CONFIG2_BYTES {
+        return Err(DelayedAutoStartQueryError::InvalidResponse);
+    }
+    if aggregate_config_bytes.saturating_add(required_bytes) > MAX_AGGREGATE_SERVICE_CONFIG_BYTES {
+        return Err(DelayedAutoStartQueryError::ByteBudgetExceeded);
+    }
+    *aggregate_config_bytes += required_bytes;
+    let word_count = required_bytes.div_ceil(std::mem::size_of::<u64>());
+    let mut buffer = vec![0u64; word_count];
+    let mut actual_bytes = 0u32;
+    query(
+        buffer.as_mut_ptr().cast(),
+        required_bytes as u32,
+        &mut actual_bytes,
+    )
+    .map_err(DelayedAutoStartQueryError::Api)?;
+    if actual_bytes as usize != expected_bytes {
+        return Err(DelayedAutoStartQueryError::InvalidResponse);
+    }
+    let raw =
+        unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<ServiceDelayedAutoStartInfo>()) };
+    Ok(raw.delayed_auto_start != 0)
+}
+
+fn delayed_auto_start_error_code(error: DelayedAutoStartQueryError) -> &'static str {
+    match error {
+        DelayedAutoStartQueryError::Api(ERROR_INVALID_LEVEL) => {
+            "service_delayed_auto_start_unsupported"
+        }
+        DelayedAutoStartQueryError::Api(ERROR_ACCESS_DENIED) => {
+            "service_delayed_auto_start_access_denied"
+        }
+        DelayedAutoStartQueryError::Api(_) => "service_delayed_auto_start_query_failed",
+        DelayedAutoStartQueryError::InvalidResponse => {
+            "service_delayed_auto_start_response_invalid"
+        }
+        DelayedAutoStartQueryError::ByteBudgetExceeded => {
+            "service_delayed_auto_start_budget_exceeded"
+        }
+    }
+}
+
 fn collect_service_start_configuration(
     started: Instant,
     include_service_observation: bool,
+    include_delayed_auto_start: bool,
 ) -> (WindowsStartupSource, Vec<WindowsServiceStartupEntry>) {
     let mut diagnostics = Vec::new();
     let mut entries = Vec::new();
@@ -1332,6 +1429,62 @@ fn collect_service_start_configuration(
                 break;
             }
             aggregate_string_units += extra_units;
+            let delayed_auto_start = if include_delayed_auto_start {
+                let observation = if elapsed(started) {
+                    status = WindowsStartupStatus::Partial;
+                    enumeration_finished = true;
+                    let code = "service_delayed_auto_start_deadline_exceeded";
+                    push_service_diagnostic(
+                        &mut diagnostics,
+                        diagnostic(
+                            code,
+                            Some(enumerated),
+                            "The startup inventory deadline was reached before this service's delayed-auto-start setting could be queried.",
+                        ),
+                    );
+                    WindowsDelayedAutoStart::Unknown {
+                        diagnostic_code: code,
+                    }
+                } else {
+                    let mut query = |buffer: *mut u8, size: u32, needed: *mut u32| {
+                        let success = unsafe {
+                            QueryServiceConfig2W(
+                                service.0,
+                                SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
+                                buffer,
+                                size,
+                                needed,
+                            )
+                        } != 0;
+                        if success {
+                            Ok(())
+                        } else {
+                            Err(unsafe { GetLastError() })
+                        }
+                    };
+                    match query_delayed_auto_start_config(&mut query, &mut aggregate_config_bytes) {
+                        Ok(value) => WindowsDelayedAutoStart::Observed { value },
+                        Err(error) => {
+                            status = WindowsStartupStatus::Partial;
+                            let code = delayed_auto_start_error_code(error);
+                            let message = "Windows could not establish this service's delayed-auto-start setting; the field remains unknown.";
+                            let diagnostic = match error {
+                                DelayedAutoStartQueryError::Api(win32_error) => {
+                                    diagnostic_win32(code, Some(enumerated), message, win32_error)
+                                }
+                                _ => diagnostic(code, Some(enumerated), message),
+                            };
+                            push_service_diagnostic(&mut diagnostics, diagnostic);
+                            WindowsDelayedAutoStart::Unknown {
+                                diagnostic_code: code,
+                            }
+                        }
+                    }
+                };
+                Some(observation)
+            } else {
+                None
+            };
             entries.push(WindowsServiceStartupEntry {
                 service_name: name,
                 display_name: display,
@@ -1342,12 +1495,20 @@ fn collect_service_start_configuration(
                 startup_state: super::startup_state::StartupRowState::configured_present(),
                 service_observation: include_service_observation
                     .then(|| WindowsServiceObservation::from_scm_state(item.status.current_state)),
+                delayed_auto_start,
                 evidence: WindowsServiceStartupEvidence {
-                    source: "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW",
+                    source: if include_delayed_auto_start {
+                        "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W"
+                    } else {
+                        "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW"
+                    },
                     service_index: enumerated,
                 },
             });
             enumerated += 1;
+            if enumeration_finished {
+                break;
+            }
         }
         if enumeration_finished {
             break;
@@ -3549,6 +3710,141 @@ mod tests {
         assert_eq!(service_start_type(SERVICE_DEMAND_START), "manual");
         assert_eq!(service_start_type(SERVICE_DISABLED), "disabled");
         assert_eq!(service_start_type(99), "unknown");
+    }
+
+    #[test]
+    fn delayed_auto_start_query_observes_true_and_false_values() {
+        for (raw_value, expected) in [(1_i32, true), (0_i32, false)] {
+            let encoded = raw_value.to_ne_bytes();
+            let mut call = 0;
+            let mut aggregate = 0;
+            let observed = query_delayed_auto_start_config(
+                |buffer, size, needed| {
+                    call += 1;
+                    if size == 0 {
+                        unsafe {
+                            *needed = std::mem::size_of::<ServiceDelayedAutoStartInfo>() as u32
+                        };
+                        Err(ERROR_INSUFFICIENT_BUFFER)
+                    } else {
+                        assert_eq!(size as usize, encoded.len());
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(encoded.as_ptr(), buffer, encoded.len());
+                            *needed = encoded.len() as u32;
+                        }
+                        Ok(())
+                    }
+                },
+                &mut aggregate,
+            )
+            .expect("bounded delayed-auto-start query fixture should decode");
+            assert_eq!(observed, expected);
+            assert_eq!(call, 2);
+            assert_eq!(aggregate, encoded.len());
+            assert_eq!(
+                serde_json::to_value(WindowsDelayedAutoStart::Observed { value: observed })
+                    .unwrap(),
+                serde_json::json!({"status":"observed","value":expected})
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_auto_start_query_keeps_errors_and_limits_unknown() {
+        let mut aggregate = 0;
+        let access_denied = query_delayed_auto_start_config(
+            |_buffer, _size, _needed| Err(ERROR_ACCESS_DENIED),
+            &mut aggregate,
+        );
+        assert_eq!(
+            access_denied,
+            Err(DelayedAutoStartQueryError::Api(ERROR_ACCESS_DENIED))
+        );
+        let unknown = WindowsDelayedAutoStart::Unknown {
+            diagnostic_code: delayed_auto_start_error_code(DelayedAutoStartQueryError::Api(
+                ERROR_ACCESS_DENIED,
+            )),
+        };
+        assert_eq!(
+            serde_json::to_value(unknown).unwrap(),
+            serde_json::json!({
+                "status":"unknown",
+                "diagnostic_code":"service_delayed_auto_start_access_denied"
+            })
+        );
+
+        let mut oversized_aggregate = MAX_AGGREGATE_SERVICE_CONFIG_BYTES;
+        let over_budget = query_delayed_auto_start_config(
+            |_buffer, size, needed| {
+                if size == 0 {
+                    unsafe { *needed = std::mem::size_of::<ServiceDelayedAutoStartInfo>() as u32 };
+                    Err(ERROR_INSUFFICIENT_BUFFER)
+                } else {
+                    panic!("over-budget configuration must not allocate or query a buffer")
+                }
+            },
+            &mut oversized_aggregate,
+        );
+        assert_eq!(
+            over_budget,
+            Err(DelayedAutoStartQueryError::ByteBudgetExceeded)
+        );
+    }
+
+    #[test]
+    fn delayed_auto_start_query_rejects_bad_sizes_and_second_call_failures() {
+        let mut aggregate = 0;
+        let malformed_required_size = query_delayed_auto_start_config(
+            |_buffer, size, needed| {
+                if size == 0 {
+                    unsafe { *needed = 1 };
+                    Err(ERROR_INSUFFICIENT_BUFFER)
+                } else {
+                    panic!("invalid required size must not allocate a buffer")
+                }
+            },
+            &mut aggregate,
+        );
+        assert_eq!(
+            malformed_required_size,
+            Err(DelayedAutoStartQueryError::InvalidResponse)
+        );
+
+        let mut calls = 0;
+        let second_call_failure = query_delayed_auto_start_config(
+            |_buffer, size, needed| {
+                calls += 1;
+                if size == 0 {
+                    unsafe { *needed = std::mem::size_of::<ServiceDelayedAutoStartInfo>() as u32 };
+                    Err(ERROR_INSUFFICIENT_BUFFER)
+                } else {
+                    Err(ERROR_ACCESS_DENIED)
+                }
+            },
+            &mut aggregate,
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(
+            second_call_failure,
+            Err(DelayedAutoStartQueryError::Api(ERROR_ACCESS_DENIED))
+        );
+
+        let actual_size_mismatch = query_delayed_auto_start_config(
+            |_buffer, size, needed| {
+                if size == 0 {
+                    unsafe { *needed = std::mem::size_of::<ServiceDelayedAutoStartInfo>() as u32 };
+                    Err(ERROR_INSUFFICIENT_BUFFER)
+                } else {
+                    unsafe { *needed = size - 1 };
+                    Ok(())
+                }
+            },
+            &mut aggregate,
+        );
+        assert_eq!(
+            actual_size_mismatch,
+            Err(DelayedAutoStartQueryError::InvalidResponse)
+        );
     }
 
     #[test]

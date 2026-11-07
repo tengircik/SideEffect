@@ -349,12 +349,14 @@ fn validate(v: &Value, k: Kind) -> Result<(), StartupDiffError> {
         Kind::Windows => (
             WINDOWS,
             "windows",
-            if windows_has_wmi {
+            if windows_has_wmi && version >= 8 {
+                "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+            } else if windows_has_wmi {
                 "current_user_and_accessible_machine_run_keys_startup_folders_services_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
             } else {
                 "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks"
             },
-            &[4_u64, 5, 6, 7][..],
+            &[4_u64, 5, 6, 7, 8][..],
         ),
     };
     if text(v, "schema")? != schema || !versions.contains(&version) {
@@ -764,6 +766,35 @@ fn validate_service_observation(value: &Value) -> Result<(), StartupDiffError> {
     Ok(())
 }
 
+fn validate_delayed_auto_start(value: &Value) -> Result<(), StartupDiffError> {
+    match text(value, "status")? {
+        "observed" => {
+            keys(value, &["status", "value"])?;
+            let _ = value
+                .get("value")
+                .and_then(Value::as_bool)
+                .ok_or(StartupDiffError::MalformedInput)?;
+        }
+        "unknown" => {
+            keys(value, &["status", "diagnostic_code"])?;
+            let diagnostic = text(value, "diagnostic_code")?;
+            if !matches!(
+                diagnostic,
+                "service_delayed_auto_start_unsupported"
+                    | "service_delayed_auto_start_access_denied"
+                    | "service_delayed_auto_start_query_failed"
+                    | "service_delayed_auto_start_response_invalid"
+                    | "service_delayed_auto_start_budget_exceeded"
+                    | "service_delayed_auto_start_deadline_exceeded"
+            ) {
+                return Err(StartupDiffError::MalformedInput);
+            }
+        }
+        _ => return Err(StartupDiffError::MalformedInput),
+    }
+    Ok(())
+}
+
 fn validate_state_evidence(value: &Value) -> Result<(), StartupDiffError> {
     keys(
         value,
@@ -1063,6 +1094,7 @@ fn validate_windows(v: &Value, version: u64) -> Result<(), StartupDiffError> {
     let has_states = version >= 5;
     let has_wmi = windows_has_wmi_contract(v, version);
     let has_service_observation = version >= 7;
+    let has_delayed_auto_start = version >= 8;
     let mut all = vec![
         ("sources", 8192usize),
         ("registry_entries", 8192),
@@ -1296,12 +1328,18 @@ fn validate_windows(v: &Value, version: u64) -> Result<(), StartupDiffError> {
         if has_service_observation {
             fields.push("service_observation");
         }
+        if has_delayed_auto_start {
+            fields.push("delayed_auto_start");
+        }
         startup_row_keys(e, &fields, has_states)?;
         if has_states {
             validate_startup_state(&e["startup_state"])?;
         }
         if has_service_observation {
             validate_service_observation(&e["service_observation"])?;
+        }
+        if has_delayed_auto_start {
+            validate_delayed_auto_start(&e["delayed_auto_start"])?;
         }
         for f in [
             "service_name",
@@ -1315,7 +1353,12 @@ fn validate_windows(v: &Value, version: u64) -> Result<(), StartupDiffError> {
         let ev = e.get("evidence").ok_or(StartupDiffError::MalformedInput)?;
         keys(ev, &["source", "service_index"])?;
         check_str(ev, "source", 256)?;
-        if text(ev, "source")? != "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW" {
+        let expected_source = if has_delayed_auto_start {
+            "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W"
+        } else {
+            "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW"
+        };
+        if text(ev, "source")? != expected_source {
             return Err(StartupDiffError::MalformedInput);
         }
         let _ = num(ev, "service_index")?;
@@ -1570,6 +1613,15 @@ fn compare(l: &Value, r: &Value, k: Kind) -> Result<StartupInventoryDiff, Startu
     } else {
         false
     };
+    let delayed_auto_start_incomparable = if k == Kind::Windows {
+        let before_version = num(l, "schema_version")?;
+        let after_version = num(r, "schema_version")?;
+        let has_services =
+            !arr(l, "service_entries")?.is_empty() || !arr(r, "service_entries")?.is_empty();
+        has_services && (before_version >= 8) != (after_version >= 8)
+    } else {
+        false
+    };
     let (mut a, mut b, mut complete, mut lossy) = if k == Kind::Linux {
         (
             linux_rows(l)?,
@@ -1579,13 +1631,21 @@ fn compare(l: &Value, r: &Value, k: Kind) -> Result<StartupInventoryDiff, Startu
         )
     } else {
         (
-            windows_rows(l, !service_state_incomparable)?,
-            windows_rows(r, !service_state_incomparable)?,
+            windows_rows(
+                l,
+                !service_state_incomparable,
+                !delayed_auto_start_incomparable,
+            )?,
+            windows_rows(
+                r,
+                !service_state_incomparable,
+                !delayed_auto_start_incomparable,
+            )?,
             windows_complete(l) && windows_complete(r),
             0usize,
         )
     };
-    if service_state_incomparable {
+    if service_state_incomparable || delayed_auto_start_incomparable {
         complete = false;
     }
     if k == Kind::Linux {
@@ -1619,6 +1679,9 @@ fn compare(l: &Value, r: &Value, k: Kind) -> Result<StartupInventoryDiff, Startu
     if k == Kind::Windows {
         if service_state_incomparable {
             diagnostics.insert("service-state observations are not present on both snapshots");
+        }
+        if delayed_auto_start_incomparable {
+            diagnostics.insert("delayed-auto-start configuration is not present on both snapshots");
         }
         let unkeyed = [l, r]
             .into_iter()
@@ -1877,6 +1940,7 @@ fn registry_source_complete(v: &Value, entry: &Value) -> bool {
 fn windows_rows(
     v: &Value,
     compare_service_observation: bool,
+    compare_delayed_auto_start: bool,
 ) -> Result<Vec<Row>, StartupDiffError> {
     let mut rows = Vec::new();
     for (i, e) in arr(v, "registry_entries")?.iter().enumerate() {
@@ -1937,6 +2001,15 @@ fn windows_rows(
         );
         if compare_service_observation && num(v, "schema_version")? >= 7 {
             facts.push(("service_observation", value(&e["service_observation"])));
+        }
+        if compare_delayed_auto_start
+            && num(v, "schema_version")? >= 8
+            && e["delayed_auto_start"]["status"] == "observed"
+        {
+            facts.push((
+                "delayed_auto_start",
+                value(&e["delayed_auto_start"]["value"]),
+            ));
         }
         rows.push(Row {
             category: "service_configuration",
@@ -2165,6 +2238,19 @@ mod tests {
         value
     }
 
+    fn windows_v8() -> Value {
+        let mut value = windows_v7();
+        value["schema_version"] = json!(8);
+        value["scope"] = json!(
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+        );
+        value["sources"].as_array_mut().unwrap().push(json!({"id":"wmi_permanent_event_subscriptions","status":"complete","entries_seen":0,"location_path":"ROOT\\subscription","diagnostics":[]}));
+        value["wmi_event_filters"] = json!([]);
+        value["wmi_event_consumers"] = json!([]);
+        value["wmi_filter_consumer_bindings"] = json!([]);
+        value
+    }
+
     #[test]
     fn startup_state_contract_requires_direct_evidence_for_known_dimensions() {
         let state = startup_state();
@@ -2270,6 +2356,72 @@ mod tests {
             "status":"known", "state":"running", "raw_state_code":0
         });
         assert!(validate(&snapshot, Kind::Windows).is_err());
+    }
+
+    #[test]
+    fn windows_v8_compares_observed_delayed_auto_start_and_ignores_unknown_values() {
+        let mut before = windows_v8();
+        let mut after = windows_v8();
+        let service = |delayed_auto_start: Value| {
+            json!({
+                "service_name":"EditorService",
+                "display_name":"Editor Service",
+                "start_type":"SERVICE_AUTO_START",
+                "start_type_code":2,
+                "account":"LocalSystem",
+                "binary_path":"C:\\Tools\\editor.exe --service",
+                "startup_state":startup_state(),
+                "service_observation":{"status":"known","state":"running","raw_state_code":4},
+                "delayed_auto_start":delayed_auto_start,
+                "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W","service_index":0}
+            })
+        };
+        before["service_entries"] = json!([service(json!({"status":"observed","value":false}))]);
+        after["service_entries"] = json!([service(json!({"status":"observed","value":true}))]);
+        let report = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
+        assert_eq!(report.counts.changed, 1);
+        assert_eq!(report.deltas[0].changed_fields, ["delayed_auto_start"]);
+
+        after["service_entries"][0]["delayed_auto_start"] = json!({
+            "status":"unknown","diagnostic_code":"service_delayed_auto_start_access_denied"
+        });
+        after["service_entries"][0]["service_observation"] =
+            before["service_entries"][0]["service_observation"].clone();
+        after["sources"][10]["status"] = json!("partial");
+        after["sources"][10]["diagnostics"] =
+            json!([{"code":"service_delayed_auto_start_access_denied"}]);
+        after["status"] = json!("partial");
+        let report = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
+        assert_eq!(report.status, StartupDiffStatus::Partial);
+        assert!(report.deltas.is_empty());
+    }
+
+    #[test]
+    fn mixed_windows_v7_v8_service_snapshots_do_not_compare_delayed_auto_start() {
+        let mut before = windows_v7();
+        let mut after = windows_v8();
+        let mut service = json!({
+            "service_name":"EditorService",
+            "display_name":"Editor Service",
+            "start_type":"SERVICE_AUTO_START",
+            "start_type_code":2,
+            "account":"LocalSystem",
+            "binary_path":"C:\\Tools\\editor.exe --service",
+            "startup_state":startup_state(),
+            "service_observation":{"status":"known","state":"running","raw_state_code":4},
+            "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW","service_index":0}
+        });
+        before["service_entries"] = json!([service.clone()]);
+        service["delayed_auto_start"] = json!({"status":"observed","value":true});
+        service["evidence"]["source"] =
+            json!("EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W");
+        after["service_entries"] = json!([service]);
+        let report = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
+        assert_eq!(report.status, StartupDiffStatus::Partial);
+        assert!(report.deltas.is_empty());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            *diagnostic == "delayed-auto-start configuration is not present on both snapshots"
+        }));
     }
 
     #[test]

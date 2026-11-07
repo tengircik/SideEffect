@@ -33,7 +33,7 @@ fn windows_startup_command_reports_native_startup_sources() {
     let bytes = fs::read(&output).unwrap();
     let document: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(document["schema"], "sideeffect.windows_startup_inventory");
-    assert_eq!(document["schema_version"], 7);
+    assert_eq!(document["schema_version"], 8);
     assert_eq!(document["platform"], "windows");
     match document["status"].as_str().unwrap() {
         "complete" => assert_eq!(first.status.code(), Some(0)),
@@ -45,7 +45,7 @@ fn windows_startup_command_reports_native_startup_sources() {
     }
     assert_eq!(
         document["scope"],
-        "current_user_and_accessible_machine_run_keys_startup_folders_services_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+        "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
     );
     let sources = document["sources"].as_array().unwrap();
     for required in [
@@ -73,6 +73,18 @@ fn windows_startup_command_reports_native_startup_sources() {
         service_source["status"].as_str(),
         Some("complete" | "partial")
     ));
+    assert!(
+        document["service_entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| {
+                matches!(
+                    entry["delayed_auto_start"]["status"].as_str(),
+                    Some("observed" | "unknown")
+                )
+            })
+    );
     assert!(service_source["entries_seen"].as_u64().unwrap() > 0);
     assert!(!document["service_entries"].as_array().unwrap().is_empty());
     for service in document["service_entries"].as_array().unwrap() {

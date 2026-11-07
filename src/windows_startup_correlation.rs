@@ -394,7 +394,7 @@ pub fn summarize_windows_startup_behavior(
             version: 2,
             basis: "exact_equality_of_drive_rooted_windows_path_strings",
         },
-        platform_adapter: "windows_startup_inventory_v4_v5_v6_or_v7_windows_runtime_capture_v3",
+        platform_adapter: "windows_startup_inventory_v4_v5_v6_v7_or_v8_windows_runtime_capture_v3",
         capture_completeness: "unknown",
         status: if partial { "partial" } else { "complete" },
         association_status: if associations.is_empty() {
@@ -470,7 +470,7 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
         .ok_or_else(|| "Windows startup inventory must be a JSON object".to_owned())?;
     let schema_version = object.get("schema_version").and_then(Value::as_u64);
     if object.get("schema").and_then(Value::as_str) != Some(WINDOWS_STARTUP_INVENTORY_SCHEMA)
-        || !matches!(schema_version, Some(4..=7))
+        || !matches!(schema_version, Some(4..=8))
         || object.get("platform").and_then(Value::as_str) != Some("windows")
     {
         return Err("unsupported Windows startup inventory schema or platform".to_owned());
@@ -500,7 +500,9 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
         .filter(|field| object.contains_key(**field))
         .count();
     if schema_version == Some(6) && wmi_field_count != WMI_FIELDS.len()
-        || schema_version == Some(7) && wmi_field_count != 0 && wmi_field_count != WMI_FIELDS.len()
+        || matches!(schema_version, Some(7 | 8))
+            && wmi_field_count != 0
+            && wmi_field_count != WMI_FIELDS.len()
     {
         return Err("Windows startup inventory has an incomplete WMI field set".to_owned());
     }
@@ -553,7 +555,8 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
                 index,
                 entry,
                 schema_version.is_some_and(|v| v >= 5),
-                schema_version == Some(7),
+                schema_version.is_some_and(|v| v >= 7),
+                schema_version == Some(8),
             )?;
         }
     }
@@ -1155,6 +1158,7 @@ fn validate_inventory_row(
     value: &Value,
     has_states: bool,
     has_service_observation: bool,
+    has_delayed_auto_start: bool,
 ) -> Result<(), String> {
     let label = format!("Windows startup inventory {field}[{index}]");
     let object = value
@@ -1224,12 +1228,18 @@ fn validate_inventory_row(
     if field == "service_entries" && has_service_observation {
         required.push("service_observation");
     }
+    if field == "service_entries" && has_delayed_auto_start {
+        required.push("delayed_auto_start");
+    }
     validate_object_fields(object, &required, optional, &label)?;
     if row_has_states {
         validate_startup_state_value(object.get("startup_state"), &label)?;
     }
     if field == "service_entries" && has_service_observation {
         validate_service_observation_value(object.get("service_observation"), &label)?;
+    }
+    if field == "service_entries" && has_delayed_auto_start {
+        validate_delayed_auto_start_value(object.get("delayed_auto_start"), &label)?;
     }
     match field {
         "sources" => {
@@ -1492,9 +1502,12 @@ fn validate_inventory_row(
                 &label,
             )?;
             let evidence = object.get("evidence").and_then(Value::as_object).unwrap();
-            if evidence.get("source").and_then(Value::as_str)
-                != Some("EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW")
-            {
+            let expected_evidence_source = if has_delayed_auto_start {
+                "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W"
+            } else {
+                "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW"
+            };
+            if evidence.get("source").and_then(Value::as_str) != Some(expected_evidence_source) {
                 return Err(format!("{label} has inconsistent SCM service evidence"));
             }
         }
@@ -1578,6 +1591,62 @@ fn validate_service_observation_value(value: Option<&Value>, label: &str) -> Res
         _ => Err(format!(
             "{label}.service_observation state does not match its raw code"
         )),
+    }
+}
+
+fn validate_delayed_auto_start_value(value: Option<&Value>, label: &str) -> Result<(), String> {
+    let status = value
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("status"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{label}.delayed_auto_start.status must be text"))?;
+    let object = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{label}.delayed_auto_start must be an object"))?;
+    let expected_fields: &[&str] = match status {
+        "observed" => &["status", "value"],
+        "unknown" => &["status", "diagnostic_code"],
+        _ => {
+            return Err(format!(
+                "{label}.delayed_auto_start has an unsupported status"
+            ));
+        }
+    };
+    if object.len() != expected_fields.len()
+        || object
+            .keys()
+            .any(|key| !expected_fields.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "{label}.delayed_auto_start has missing or unknown fields"
+        ));
+    }
+    match status {
+        "observed" if object.get("value").and_then(Value::as_bool).is_some() => Ok(()),
+        "unknown" => {
+            let code = object
+                .get("diagnostic_code")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    format!("{label}.delayed_auto_start.diagnostic_code must be text")
+                })?;
+            if matches!(
+                code,
+                "service_delayed_auto_start_unsupported"
+                    | "service_delayed_auto_start_access_denied"
+                    | "service_delayed_auto_start_query_failed"
+                    | "service_delayed_auto_start_response_invalid"
+                    | "service_delayed_auto_start_budget_exceeded"
+                    | "service_delayed_auto_start_deadline_exceeded"
+            ) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{label}.delayed_auto_start has an unsupported diagnostic"
+                ))
+            }
+        }
+        _ => Err(format!("{label}.delayed_auto_start.value must be boolean")),
     }
 }
 
@@ -2109,7 +2178,7 @@ mod tests {
     fn missing_registry_sidecars_are_partial_non_candidates_for_startup_v4_to_v7() {
         let path = r"C:\Apps\worker.exe";
         let runtime = capture_bytes(vec![process_start(path, 1)], CollectionStatus::Complete, 0);
-        for version in 4..=7 {
+        for version in 4..=8 {
             let mut startup: Value =
                 serde_json::from_slice(&startup_bytes(vec![], "complete")).unwrap();
             startup["schema_version"] = Value::from(version);
@@ -2350,7 +2419,7 @@ mod tests {
             .is_ok()
         );
 
-        startup["schema_version"] = Value::from(8);
+        startup["schema_version"] = Value::from(9);
         assert!(
             summarize_windows_startup_behavior(
                 &serde_json::to_vec(&startup).unwrap(),
@@ -2403,6 +2472,36 @@ mod tests {
     }
 
     #[test]
+    fn v8_delayed_auto_start_field_is_validated_but_not_used_as_runtime_causation() {
+        let mut service = service_entry(Some(r"C:\Apps\worker.exe"), 0);
+        service["service_observation"] = serde_json::json!(
+            {"status":"known","state":"running","raw_state_code":4}
+        );
+        service["delayed_auto_start"] = serde_json::json!({"status":"observed","value":true});
+        service["evidence"]["source"] = Value::String(
+            "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W"
+                .to_owned(),
+        );
+        let mut startup: Value =
+            serde_json::from_slice(&startup_bytes(vec![], "complete")).unwrap();
+        startup["schema_version"] = Value::from(8);
+        startup["service_entries"] = Value::Array(vec![service]);
+        let runtime = capture_bytes(vec![], CollectionStatus::Complete, 0);
+        assert!(
+            summarize_windows_startup_behavior(&serde_json::to_vec(&startup).unwrap(), &runtime)
+                .is_ok()
+        );
+
+        startup["service_entries"][0]["delayed_auto_start"] = serde_json::json!({
+            "status":"unknown","diagnostic_code":"untrusted_free_text"
+        });
+        assert!(
+            summarize_windows_startup_behavior(&serde_json::to_vec(&startup).unwrap(), &runtime)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn legacy_v4_startup_inventory_without_row_state_remains_accepted() {
         let mut startup: Value = serde_json::from_slice(&startup_bytes(
             vec![action(Some(r"C:\Apps\worker.exe"), "observed", 0)],
@@ -2422,7 +2521,7 @@ mod tests {
         assert_eq!(summary.association_status, "insufficient_evidence");
         assert_eq!(
             summary.platform_adapter,
-            "windows_startup_inventory_v4_v5_v6_or_v7_windows_runtime_capture_v3"
+            "windows_startup_inventory_v4_v5_v6_v7_or_v8_windows_runtime_capture_v3"
         );
         assert_eq!(
             summary.inputs.startup_inventory.source_format,

@@ -173,14 +173,16 @@ pub use startup_legacy::{
 };
 #[cfg(windows)]
 pub use startup_windows::{
-    WindowsRegistryStartupEntry, WindowsRegistryStartupEvidence, WindowsRegistryView,
-    WindowsScheduledTaskStartupEntry, WindowsScheduledTaskStartupEvidence,
+    WindowsDelayedAutoStart, WindowsRegistryStartupEntry, WindowsRegistryStartupEvidence,
+    WindowsRegistryView, WindowsScheduledTaskStartupEntry, WindowsScheduledTaskStartupEvidence,
     WindowsServiceStartupEntry, WindowsServiceStartupEvidence, WindowsStartupDiagnostic,
     WindowsStartupFolderEntry, WindowsStartupFolderEvidence, WindowsStartupInventoryDocument,
     WindowsStartupSource, WindowsStartupStatus, collect_windows_startup,
 };
 #[cfg(windows)]
-pub(crate) use startup_windows::{collect_windows_startup_v5, collect_windows_startup_v6};
+pub(crate) use startup_windows::{
+    collect_windows_startup_v5, collect_windows_startup_v6, collect_windows_startup_v7,
+};
 #[cfg(windows)]
 pub use startup_wmi::{
     WmiConsumerStatus, WmiEventConsumer, WmiEventFilter, WmiFilterConsumerBinding,

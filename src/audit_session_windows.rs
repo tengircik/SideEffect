@@ -10,7 +10,7 @@ use crate::fingerprint::sha256_hex;
 use crate::inventory::{
     collect_path_executables, collect_windows_app_paths, collect_windows_msix,
     collect_windows_permissions, collect_windows_processes, collect_windows_software,
-    collect_windows_startup_v5, collect_windows_startup_v6,
+    collect_windows_startup_v5, collect_windows_startup_v6, collect_windows_startup_v7,
 };
 use crate::record::publish_private_windows_directory;
 use serde::Serialize;
@@ -249,12 +249,12 @@ pub fn collect_and_publish(
     }
     if options.startup {
         let doc = collect_windows_startup_for_session(
-            crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION,
+            crate::audit_session::AUDIT_SESSION_V13_SCHEMA_VERSION,
         )?;
         let (status, diagnostics) = status_from_serialized(&doc, "status");
         let value = serde_json::to_vec(&doc)
             .map_err(|e| format!("could not serialize startup inventory: {e}"))?;
-        sources.push(source(SourceRole::Startup, "selected Run/RunOnce, Startup folders, services, visible boot/logon scheduled tasks, and local ROOT\\subscription WMI permanent event subscriptions", doc.capture_started_at_unix_ms, doc.capture_ended_at_unix_ms, status, diagnostics, vec![("max_startup_entries", 8192), ("deadline_ms_between_calls", 10000)]));
+        sources.push(source(SourceRole::Startup, "selected Run/RunOnce, Startup folders, services including read-only delayed-auto-start configuration, visible boot/logon scheduled tasks, and local ROOT\\subscription WMI permanent event subscriptions", doc.capture_started_at_unix_ms, doc.capture_ended_at_unix_ms, status, diagnostics, vec![("max_startup_entries", 8192), ("deadline_ms_between_calls", 10000)]));
         artifacts.push(artifact(
             ArtifactKind::WindowsStartup,
             "startup.windows.json",
@@ -849,7 +849,8 @@ fn collect_windows_startup_for_session(
         crate::audit_session::AUDIT_SESSION_V9_SCHEMA_VERSION => Ok(collect_windows_startup_v5()),
         crate::audit_session::AUDIT_SESSION_V10_SCHEMA_VERSION => Ok(collect_windows_startup_v6()),
         crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION => Ok(collect_windows_startup_v6()),
-        crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION => {
+        crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION => Ok(collect_windows_startup_v7()),
+        crate::audit_session::AUDIT_SESSION_V13_SCHEMA_VERSION => {
             Ok(crate::inventory::collect_windows_startup())
         }
         _ => Err("unsupported Windows audit-session schema version".to_owned()),
@@ -858,7 +859,7 @@ fn collect_windows_startup_for_session(
 
 fn session_schema_version(options: &WindowsAuditOptions) -> u32 {
     if options.startup {
-        crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION
+        crate::audit_session::AUDIT_SESSION_V13_SCHEMA_VERSION
     } else if options.app_paths {
         crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION
     } else {
@@ -882,7 +883,7 @@ mod tests {
     };
 
     #[test]
-    fn producer_selects_v12_for_startup_and_v11_for_app_paths_only() {
+    fn producer_selects_v13_for_startup_and_v11_for_app_paths_only() {
         let startup_and_app_paths = WindowsAuditOptions {
             startup: true,
             app_paths: true,
@@ -890,7 +891,7 @@ mod tests {
         };
         assert_eq!(
             session_schema_version(&startup_and_app_paths),
-            crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION
+            crate::audit_session::AUDIT_SESSION_V13_SCHEMA_VERSION
         );
 
         let app_paths_only = WindowsAuditOptions {

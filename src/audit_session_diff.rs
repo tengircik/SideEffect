@@ -233,8 +233,8 @@ fn compare_source_role(
                     && matches!(right_ref.schema_version, 2 | 3)
             }
             ArtifactKind::WindowsStartup => {
-                matches!(left_ref.schema_version, 4..=7)
-                    && matches!(right_ref.schema_version, 4..=7)
+                matches!(left_ref.schema_version, 4..=8)
+                    && matches!(right_ref.schema_version, 4..=8)
             }
             _ => false,
         };
@@ -304,7 +304,8 @@ fn selected_root_scope_extension_compatible(
         AUDIT_SESSION_V9_SCHEMA_VERSION
         | AUDIT_SESSION_V10_SCHEMA_VERSION
         | crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION
-        | crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION => {
+        | crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION
+        | crate::audit_session::AUDIT_SESSION_V13_SCHEMA_VERSION => {
             matches!(
                 scope,
                 SELECTED_ROOT_METADATA_SCOPE | SELECTED_ROOT_HASH_SCOPE
