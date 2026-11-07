@@ -1052,6 +1052,93 @@ finally:
 }
 
 #[test]
+fn real_strace_capture_attributes_file_operations_to_distinct_threads() {
+    // Real-tracer integration prerequisites: Linux x86_64, strace >= 6.8, and python3.
+    require_tool("strace", &["--version"]);
+    require_tool("python3", &["--version"]);
+
+    const SCRIPT: &str = r#"
+import os
+import pathlib
+import sys
+import threading
+
+root = pathlib.Path(sys.argv[1])
+leader_pid = os.getpid()
+(root / "leader.pid").write_text(str(leader_pid), encoding="ascii")
+barrier = threading.Barrier(3)
+errors = []
+
+def write_file(name):
+    try:
+        barrier.wait(timeout=10)
+        (root / name).write_text("written by a worker thread", encoding="ascii")
+    except BaseException as error:
+        errors.append(error)
+
+threads = [
+    threading.Thread(target=write_file, args=(name,))
+    for name in ("thread-one.result", "thread-two.result")
+]
+for thread in threads:
+    thread.start()
+barrier.wait(timeout=10)
+for thread in threads:
+    thread.join(timeout=10)
+    if thread.is_alive():
+        raise TimeoutError("worker thread did not finish")
+if errors:
+    raise errors[0]
+"#;
+
+    let directory = PrivateTempDirectory::new();
+    let trace_path = directory.path().join("thread-file-operations.trace");
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["record", "--trace"])
+        .arg(&trace_path)
+        .args(["--", "python3", "-c", SCRIPT])
+        .arg(directory.path())
+        .output()
+        .expect("launch SideEffect record command for thread file operations");
+
+    assert_success(&output, "record file operations from two threads");
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for marker in ["thread-one.result", "thread-two.result", "leader.pid"] {
+        assert!(!stderr.contains(marker), "stderr leaked {marker}: {stderr}");
+    }
+    assert_published_nonempty_trace(&trace_path);
+
+    let leader_pid: u64 = fs::read_to_string(directory.path().join("leader.pid"))
+        .expect("read selected process ID written by the target")
+        .parse()
+        .expect("parse selected process ID");
+    let trace = inspect_trace(&trace_path);
+    let (_, first) = assert_successful_openat_evidence(&trace, "thread-one.result");
+    let (_, second) = assert_successful_openat_evidence(&trace, "thread-two.result");
+    let first_task = first["process_id"].as_u64().expect("first trace task ID");
+    let second_task = second["process_id"].as_u64().expect("second trace task ID");
+    assert_ne!(
+        first_task, second_task,
+        "worker threads must have distinct trace task IDs"
+    );
+    assert_ne!(
+        first_task, leader_pid,
+        "first file operation must come from a worker thread"
+    );
+    assert_ne!(
+        second_task, leader_pid,
+        "second file operation must come from a worker thread"
+    );
+    for (name, record) in [("thread-one.result", first), ("thread-two.result", second)] {
+        assert!(directory.path().join(name).is_file());
+        assert!(record["evidence"]["line_number"].as_u64().is_some());
+        assert!(record["evidence"]["byte_offset"].as_u64().is_some());
+        assert!(record["evidence"]["byte_length"].as_u64().is_some());
+    }
+}
+
+#[test]
 fn real_strace_capture_reports_refused_loopback_connection_as_failed_attempt() {
     require_tool("strace", &["--version"]);
     require_tool("python3", &["--version"]);
