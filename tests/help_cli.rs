@@ -85,7 +85,10 @@ fn focused_help_covers_command_and_nested_inventory_topics() {
     let startup = run(&["help", "inventory", "startup"]);
     assert!(startup.status.success());
     let startup_help = String::from_utf8_lossy(&startup.stdout);
+    #[cfg(target_os = "linux")]
     assert!(startup_help.contains("configured entry ran"));
+    #[cfg(windows)]
+    assert!(startup_help.contains("trigger fired or a service ran"));
     #[cfg(target_os = "linux")]
     assert!(startup_help.contains("supported Linux"));
     #[cfg(windows)]

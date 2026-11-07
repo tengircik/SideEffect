@@ -35,6 +35,7 @@ const ERROR_MORE_DATA: u32 = 234;
 const ERROR_NO_MORE_ITEMS: u32 = 259;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const ERROR_INVALID_LEVEL: u32 = 124;
+const ERROR_TIMEOUT: u32 = 1460;
 const REG_SZ: u32 = 1;
 const REG_EXPAND_SZ: u32 = 2;
 const KEY_READ: u32 = 0x0002_0019;
@@ -57,6 +58,11 @@ const MAX_SERVICE_STRING_UNITS: usize = 32_768;
 const MAX_AGGREGATE_SERVICE_STRING_UNITS: usize = 4 * 1024 * 1024;
 const MAX_SERVICE_DEPENDENCIES_PER_SERVICE: usize = 4_096;
 const MAX_AGGREGATE_SERVICE_DEPENDENCIES: usize = 65_536;
+const MAX_SERVICE_TRIGGERS_PER_SERVICE: usize = 256;
+const MAX_AGGREGATE_SERVICE_TRIGGERS: usize = 8_192;
+const MAX_SERVICE_TRIGGER_DATA_ITEMS: usize = 64;
+const MAX_SERVICE_TRIGGER_DATA_ITEM_BYTES: usize = 1024;
+const MAX_AGGREGATE_SERVICE_TRIGGER_DATA_BYTES: usize = 1024 * 1024;
 const MAX_SERVICE_DIAGNOSTICS: usize = 256;
 const MAX_TASK_FOLDER_DEPTH: usize = 16;
 const MAX_TASK_FOLDERS: usize = 1_024;
@@ -72,6 +78,7 @@ const SC_MANAGER_CONNECT: u32 = 0x0001;
 const SC_MANAGER_ENUMERATE_SERVICE: u32 = 0x0004;
 const SERVICE_QUERY_CONFIG: u32 = 0x0001;
 const SERVICE_CONFIG_DELAYED_AUTO_START_INFO: u32 = 3;
+const SERVICE_CONFIG_TRIGGER_INFO: u32 = 8;
 const SC_ENUM_PROCESS_INFO: u32 = 0;
 const SERVICE_DRIVER: u32 = 0x0000_000b;
 const SERVICE_WIN32: u32 = 0x0000_0030;
@@ -131,6 +138,29 @@ struct QueryServiceConfigW {
 #[repr(C)]
 struct ServiceDelayedAutoStartInfo {
     delayed_auto_start: i32,
+}
+
+#[repr(C)]
+struct ServiceTriggerInfo {
+    trigger_count: u32,
+    triggers: *mut ServiceTrigger,
+    reserved: *mut c_void,
+}
+
+#[repr(C)]
+struct ServiceTrigger {
+    trigger_type: u32,
+    action: u32,
+    subtype: *mut Guid,
+    data_item_count: u32,
+    data_items: *mut ServiceTriggerDataItem,
+}
+
+#[repr(C)]
+struct ServiceTriggerDataItem {
+    data_type: u32,
+    data_bytes: u32,
+    data: *mut u8,
 }
 
 #[repr(C)]
@@ -478,7 +508,35 @@ pub struct WindowsServiceStartupEntry {
     pub dependencies: Option<WindowsServiceDependencies>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load_order_group: Option<WindowsServiceLoadOrderGroup>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triggers: Option<WindowsServiceTriggers>,
     pub evidence: WindowsServiceStartupEvidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WindowsServiceTriggers {
+    Observed { entries: Vec<WindowsServiceTrigger> },
+    Unknown { diagnostic_code: &'static str },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WindowsServiceTrigger {
+    pub trigger_index: usize,
+    pub trigger_type_code: u32,
+    pub trigger_type: &'static str,
+    pub action_code: u32,
+    pub action: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtype_guid: Option<String>,
+    pub data_items: Vec<WindowsServiceTriggerDataItem>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WindowsServiceTriggerDataItem {
+    pub data_type_code: u32,
+    pub data_type: &'static str,
+    pub data_hex: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -896,27 +954,32 @@ fn now_ms() -> u128 {
 }
 
 pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
-    collect_windows_startup_with_contract(true, 9, true, true, true)
+    collect_windows_startup_with_contract(true, 10, true, true, true, true)
 }
 
 /// Session schema v9 pins startup artifacts to v5.
 pub(crate) fn collect_windows_startup_v5() -> WindowsStartupInventoryDocument {
-    collect_windows_startup_with_contract(false, 5, false, false, false)
+    collect_windows_startup_with_contract(false, 5, false, false, false, false)
 }
 
 /// Session schemas v10-v11 retain the standalone startup v6 contract.
 pub(crate) fn collect_windows_startup_v6() -> WindowsStartupInventoryDocument {
-    collect_windows_startup_with_contract(true, 6, false, false, false)
+    collect_windows_startup_with_contract(true, 6, false, false, false, false)
 }
 
 /// Session schema v12 retains the standalone startup v7 contract.
 pub(crate) fn collect_windows_startup_v7() -> WindowsStartupInventoryDocument {
-    collect_windows_startup_with_contract(true, 7, true, false, false)
+    collect_windows_startup_with_contract(true, 7, true, false, false, false)
 }
 
 /// Session schema v13 retains the standalone startup v8 contract.
 pub(crate) fn collect_windows_startup_v8() -> WindowsStartupInventoryDocument {
-    collect_windows_startup_with_contract(true, 8, true, true, false)
+    collect_windows_startup_with_contract(true, 8, true, true, false, false)
+}
+
+/// Session schema v14 pins startup artifacts to v9.
+pub(crate) fn collect_windows_startup_v9() -> WindowsStartupInventoryDocument {
+    collect_windows_startup_with_contract(true, 9, true, true, true, false)
 }
 
 fn collect_windows_startup_with_contract(
@@ -925,6 +988,7 @@ fn collect_windows_startup_with_contract(
     include_service_observation: bool,
     include_delayed_auto_start: bool,
     include_service_dependencies: bool,
+    include_service_triggers: bool,
 ) -> WindowsStartupInventoryDocument {
     let started_at = now_ms();
     let started = Instant::now();
@@ -1007,6 +1071,7 @@ fn collect_windows_startup_with_contract(
         include_service_observation,
         include_delayed_auto_start,
         include_service_dependencies,
+        include_service_triggers,
     );
     sources.push(service_source);
     service_entries.extend(services);
@@ -1032,7 +1097,9 @@ fn collect_windows_startup_with_contract(
         schema: "sideeffect.windows_startup_inventory",
         schema_version,
         platform: "windows",
-        scope: if include_service_dependencies {
+        scope: if include_service_triggers {
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_load_order_group_and_trigger_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+        } else if include_service_dependencies {
             "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_and_load_order_group_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
         } else if include_delayed_auto_start {
             "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
@@ -1089,6 +1156,262 @@ enum DelayedAutoStartQueryError {
     Api(u32),
     InvalidResponse,
     ByteBudgetExceeded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceTriggerQueryError {
+    Api(u32),
+    InvalidResponse,
+    ByteBudgetExceeded,
+    CountLimitExceeded,
+}
+
+fn query_service_triggers(
+    mut query: impl FnMut(*mut u8, u32, *mut u32) -> Result<(), u32>,
+    aggregate_config_bytes: &mut usize,
+    aggregate_data_bytes: &mut usize,
+    aggregate_trigger_count: &mut usize,
+) -> Result<Vec<WindowsServiceTrigger>, ServiceTriggerQueryError> {
+    let mut required_bytes = 0u32;
+    match query(null_mut(), 0, &mut required_bytes) {
+        Err(ERROR_INSUFFICIENT_BUFFER) => {}
+        Err(error) => return Err(ServiceTriggerQueryError::Api(error)),
+        Ok(()) => return Err(ServiceTriggerQueryError::InvalidResponse),
+    }
+    let required_bytes = required_bytes as usize;
+    if required_bytes < std::mem::size_of::<ServiceTriggerInfo>()
+        || required_bytes > MAX_SERVICE_CONFIG2_BYTES
+    {
+        return Err(ServiceTriggerQueryError::InvalidResponse);
+    }
+    if aggregate_config_bytes.saturating_add(required_bytes) > MAX_AGGREGATE_SERVICE_CONFIG_BYTES {
+        return Err(ServiceTriggerQueryError::ByteBudgetExceeded);
+    }
+    *aggregate_config_bytes += required_bytes;
+    let word_count = required_bytes.div_ceil(std::mem::size_of::<u64>());
+    let mut buffer = vec![0u64; word_count];
+    let mut actual_bytes = 0u32;
+    query(
+        buffer.as_mut_ptr().cast(),
+        required_bytes as u32,
+        &mut actual_bytes,
+    )
+    .map_err(ServiceTriggerQueryError::Api)?;
+    let actual_bytes = actual_bytes as usize;
+    if actual_bytes < std::mem::size_of::<ServiceTriggerInfo>() || actual_bytes > required_bytes {
+        return Err(ServiceTriggerQueryError::InvalidResponse);
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), actual_bytes) };
+    parse_service_triggers(bytes, aggregate_data_bytes, aggregate_trigger_count).map_err(|error| {
+        match error {
+            ServiceTriggerParseError::InvalidResponse => ServiceTriggerQueryError::InvalidResponse,
+            ServiceTriggerParseError::CountLimitExceeded => {
+                ServiceTriggerQueryError::CountLimitExceeded
+            }
+            ServiceTriggerParseError::DataBudgetExceeded => {
+                ServiceTriggerQueryError::ByteBudgetExceeded
+            }
+        }
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceTriggerParseError {
+    InvalidResponse,
+    CountLimitExceeded,
+    DataBudgetExceeded,
+}
+
+fn checked_service_buffer_span<T>(
+    base: *const u8,
+    buffer_bytes: usize,
+    value: *const T,
+    count: usize,
+) -> Result<(), ServiceTriggerParseError> {
+    if count == 0 {
+        return if value.is_null() {
+            Ok(())
+        } else {
+            checked_service_buffer_span(base, buffer_bytes, value, 1)
+        };
+    }
+    if value.is_null() {
+        return Err(ServiceTriggerParseError::InvalidResponse);
+    }
+    let Some(byte_length) = std::mem::size_of::<T>().checked_mul(count) else {
+        return Err(ServiceTriggerParseError::InvalidResponse);
+    };
+    let base_address = base as usize;
+    let address = value as usize;
+    let Some(offset) = address.checked_sub(base_address) else {
+        return Err(ServiceTriggerParseError::InvalidResponse);
+    };
+    let Some(end) = offset.checked_add(byte_length) else {
+        return Err(ServiceTriggerParseError::InvalidResponse);
+    };
+    if offset % std::mem::align_of::<T>() != 0 || end > buffer_bytes {
+        return Err(ServiceTriggerParseError::InvalidResponse);
+    }
+    Ok(())
+}
+
+fn parse_service_triggers(
+    bytes: &[u8],
+    aggregate_data_bytes: &mut usize,
+    aggregate_trigger_count: &mut usize,
+) -> Result<Vec<WindowsServiceTrigger>, ServiceTriggerParseError> {
+    if bytes.len() < std::mem::size_of::<ServiceTriggerInfo>() {
+        return Err(ServiceTriggerParseError::InvalidResponse);
+    }
+    let base = bytes.as_ptr();
+    let info = unsafe { std::ptr::read_unaligned(base.cast::<ServiceTriggerInfo>()) };
+    if !info.reserved.is_null() || info.trigger_count as usize > MAX_SERVICE_TRIGGERS_PER_SERVICE {
+        return Err(
+            if info.trigger_count as usize > MAX_SERVICE_TRIGGERS_PER_SERVICE {
+                ServiceTriggerParseError::CountLimitExceeded
+            } else {
+                ServiceTriggerParseError::InvalidResponse
+            },
+        );
+    }
+    let count = info.trigger_count as usize;
+    checked_service_buffer_span(base, bytes.len(), info.triggers, count)?;
+    if aggregate_trigger_count.saturating_add(count) > MAX_AGGREGATE_SERVICE_TRIGGERS {
+        return Err(ServiceTriggerParseError::CountLimitExceeded);
+    }
+    let mut entries = Vec::with_capacity(count);
+    let mut local_data_bytes = 0usize;
+    for index in 0..count {
+        let trigger = unsafe { std::ptr::read_unaligned(info.triggers.add(index)) };
+        if trigger.data_item_count as usize > MAX_SERVICE_TRIGGER_DATA_ITEMS {
+            return Err(ServiceTriggerParseError::CountLimitExceeded);
+        }
+        checked_service_buffer_span(
+            base,
+            bytes.len(),
+            trigger.subtype,
+            usize::from(!trigger.subtype.is_null()),
+        )?;
+        checked_service_buffer_span(
+            base,
+            bytes.len(),
+            trigger.data_items,
+            trigger.data_item_count as usize,
+        )?;
+        let mut data_items = Vec::with_capacity(trigger.data_item_count as usize);
+        for data_index in 0..trigger.data_item_count as usize {
+            let item = unsafe { std::ptr::read_unaligned(trigger.data_items.add(data_index)) };
+            let data_len = item.data_bytes as usize;
+            if data_len > MAX_SERVICE_TRIGGER_DATA_ITEM_BYTES {
+                return Err(ServiceTriggerParseError::DataBudgetExceeded);
+            }
+            checked_service_buffer_span(base, bytes.len(), item.data, data_len)?;
+            local_data_bytes = local_data_bytes.saturating_add(data_len);
+            if aggregate_data_bytes.saturating_add(local_data_bytes)
+                > MAX_AGGREGATE_SERVICE_TRIGGER_DATA_BYTES
+            {
+                return Err(ServiceTriggerParseError::DataBudgetExceeded);
+            }
+            let data = if data_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(item.data, data_len) }
+            };
+            data_items.push(WindowsServiceTriggerDataItem {
+                data_type_code: item.data_type,
+                data_type: service_trigger_data_type(item.data_type),
+                data_hex: bytes_hex(data),
+            });
+        }
+        let subtype_guid = if trigger.subtype.is_null() {
+            None
+        } else {
+            let guid = unsafe { std::ptr::read_unaligned(trigger.subtype) };
+            Some(format_guid(&guid))
+        };
+        entries.push(WindowsServiceTrigger {
+            trigger_index: index,
+            trigger_type_code: trigger.trigger_type,
+            trigger_type: service_trigger_type(trigger.trigger_type),
+            action_code: trigger.action,
+            action: service_trigger_action(trigger.action),
+            subtype_guid,
+            data_items,
+        });
+    }
+    *aggregate_data_bytes = aggregate_data_bytes.saturating_add(local_data_bytes);
+    *aggregate_trigger_count = aggregate_trigger_count.saturating_add(count);
+    Ok(entries)
+}
+
+fn bytes_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn format_guid(guid: &Guid) -> String {
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        guid.data1,
+        guid.data2,
+        guid.data3,
+        guid.data4[0],
+        guid.data4[1],
+        guid.data4[2],
+        guid.data4[3],
+        guid.data4[4],
+        guid.data4[5],
+        guid.data4[6],
+        guid.data4[7]
+    )
+}
+
+fn service_trigger_type(code: u32) -> &'static str {
+    match code {
+        1 => "device_interface_arrival",
+        2 => "ip_address_availability",
+        3 => "domain_join",
+        4 => "firewall_port_event",
+        5 => "group_policy",
+        6 => "network_endpoint",
+        20 => "custom",
+        _ => "unknown",
+    }
+}
+
+fn service_trigger_action(code: u32) -> &'static str {
+    match code {
+        1 => "service_start",
+        2 => "service_stop",
+        _ => "unknown",
+    }
+}
+
+fn service_trigger_data_type(code: u32) -> &'static str {
+    match code {
+        1 => "binary",
+        2 => "string",
+        3 => "level",
+        4 => "keyword_any",
+        5 => "keyword_all",
+        _ => "unknown",
+    }
+}
+
+fn service_trigger_error_code(error: ServiceTriggerQueryError) -> &'static str {
+    match error {
+        ServiceTriggerQueryError::Api(ERROR_INVALID_LEVEL) => "service_trigger_unsupported",
+        ServiceTriggerQueryError::Api(ERROR_ACCESS_DENIED) => "service_trigger_access_denied",
+        ServiceTriggerQueryError::Api(_) => "service_trigger_query_failed",
+        ServiceTriggerQueryError::InvalidResponse => "service_trigger_response_invalid",
+        ServiceTriggerQueryError::ByteBudgetExceeded => "service_trigger_budget_exceeded",
+        ServiceTriggerQueryError::CountLimitExceeded => "service_trigger_count_limit_exceeded",
+    }
 }
 
 fn query_delayed_auto_start_config(
@@ -1150,6 +1473,7 @@ fn collect_service_start_configuration(
     include_service_observation: bool,
     include_delayed_auto_start: bool,
     include_service_dependencies: bool,
+    include_service_triggers: bool,
 ) -> (WindowsStartupSource, Vec<WindowsServiceStartupEntry>) {
     let mut diagnostics = Vec::new();
     let mut entries = Vec::new();
@@ -1157,6 +1481,8 @@ fn collect_service_start_configuration(
     let mut aggregate_config_bytes = 0usize;
     let mut aggregate_string_units = 0usize;
     let mut aggregate_dependency_entries = 0usize;
+    let mut aggregate_trigger_count = 0usize;
+    let mut aggregate_trigger_data_bytes = 0usize;
     let mut enumerated = 0usize;
     let manager = unsafe {
         OpenSCManagerW(
@@ -1636,6 +1962,62 @@ fn collect_service_start_configuration(
             } else {
                 (None, None)
             };
+            let triggers = if include_service_triggers {
+                let result = if elapsed(started) {
+                    Err(ServiceTriggerQueryError::Api(ERROR_TIMEOUT))
+                } else {
+                    let mut query = |buffer: *mut u8, size: u32, needed: *mut u32| {
+                        let success = unsafe {
+                            QueryServiceConfig2W(
+                                service.0,
+                                SERVICE_CONFIG_TRIGGER_INFO,
+                                buffer,
+                                size,
+                                needed,
+                            )
+                        } != 0;
+                        if success {
+                            Ok(())
+                        } else {
+                            Err(unsafe { GetLastError() })
+                        }
+                    };
+                    query_service_triggers(
+                        &mut query,
+                        &mut aggregate_config_bytes,
+                        &mut aggregate_trigger_data_bytes,
+                        &mut aggregate_trigger_count,
+                    )
+                };
+                match result {
+                    Ok(entries) => Some(WindowsServiceTriggers::Observed { entries }),
+                    Err(error) => {
+                        status = WindowsStartupStatus::Partial;
+                        let code = if matches!(error, ServiceTriggerQueryError::Api(ERROR_TIMEOUT))
+                        {
+                            "service_trigger_deadline_exceeded"
+                        } else {
+                            service_trigger_error_code(error)
+                        };
+                        let message = "Windows could not establish this service's trigger configuration; the field remains unknown.";
+                        let diagnostic = match error {
+                            ServiceTriggerQueryError::Api(ERROR_TIMEOUT) => {
+                                diagnostic(code, Some(enumerated), message)
+                            }
+                            ServiceTriggerQueryError::Api(win32_error) => {
+                                diagnostic_win32(code, Some(enumerated), message, win32_error)
+                            }
+                            _ => diagnostic(code, Some(enumerated), message),
+                        };
+                        push_service_diagnostic(&mut diagnostics, diagnostic);
+                        Some(WindowsServiceTriggers::Unknown {
+                            diagnostic_code: code,
+                        })
+                    }
+                }
+            } else {
+                None
+            };
             entries.push(WindowsServiceStartupEntry {
                 service_name: name,
                 display_name: display,
@@ -1649,6 +2031,7 @@ fn collect_service_start_configuration(
                 delayed_auto_start,
                 dependencies,
                 load_order_group,
+                triggers,
                 evidence: WindowsServiceStartupEvidence {
                     source: if include_delayed_auto_start {
                         "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W"
@@ -3990,6 +4373,242 @@ mod tests {
         );
         assert_eq!(FOLDER_IDS[0].0, "user_startup");
         assert_eq!(FOLDER_IDS[1].0, "common_startup");
+    }
+
+    fn aligned_offset<T>(offset: usize) -> usize {
+        let alignment = std::mem::align_of::<T>();
+        offset.div_ceil(alignment) * alignment
+    }
+
+    fn fixture_span() -> (Vec<u64>, usize) {
+        let bytes = vec![0u64; 64];
+        let length = bytes.len() * std::mem::size_of::<u64>();
+        (bytes, length)
+    }
+
+    #[test]
+    fn service_trigger_parser_observes_empty_trigger_list() {
+        let (mut storage, length) = fixture_span();
+        let base = storage.as_mut_ptr().cast::<u8>();
+        unsafe {
+            std::ptr::write_unaligned(
+                base.cast::<ServiceTriggerInfo>(),
+                ServiceTriggerInfo {
+                    trigger_count: 0,
+                    triggers: std::ptr::null_mut(),
+                    reserved: std::ptr::null_mut(),
+                },
+            );
+        }
+        let mut aggregate_data = 0;
+        let mut aggregate_triggers = 0;
+        let parsed = parse_service_triggers(
+            unsafe { std::slice::from_raw_parts(base, length) },
+            &mut aggregate_data,
+            &mut aggregate_triggers,
+        )
+        .unwrap();
+        assert!(parsed.is_empty());
+        assert_eq!(aggregate_data, 0);
+        assert_eq!(aggregate_triggers, 0);
+        assert_eq!(
+            serde_json::to_value(WindowsServiceTriggers::Observed { entries: parsed }).unwrap(),
+            serde_json::json!({"status":"observed","entries":[]})
+        );
+    }
+
+    #[test]
+    fn service_trigger_parser_preserves_unknown_codes_guid_and_raw_data() {
+        let (mut storage, length) = fixture_span();
+        let base = storage.as_mut_ptr().cast::<u8>();
+        let trigger_offset =
+            aligned_offset::<ServiceTriggerInfo>(std::mem::size_of::<ServiceTriggerInfo>());
+        let guid_offset =
+            aligned_offset::<Guid>(trigger_offset + std::mem::size_of::<ServiceTrigger>());
+        let items_offset =
+            aligned_offset::<ServiceTriggerDataItem>(guid_offset + std::mem::size_of::<Guid>());
+        let data_offset = items_offset + std::mem::size_of::<ServiceTriggerDataItem>();
+        let raw = [0x00u8, 0xff, 0x3c];
+        unsafe {
+            std::ptr::write_unaligned(
+                base.cast::<ServiceTriggerInfo>(),
+                ServiceTriggerInfo {
+                    trigger_count: 1,
+                    triggers: base.add(trigger_offset).cast(),
+                    reserved: std::ptr::null_mut(),
+                },
+            );
+            std::ptr::write_unaligned(
+                base.add(trigger_offset).cast::<ServiceTrigger>(),
+                ServiceTrigger {
+                    trigger_type: 999,
+                    action: 888,
+                    subtype: base.add(guid_offset).cast(),
+                    data_item_count: 1,
+                    data_items: base.add(items_offset).cast(),
+                },
+            );
+            std::ptr::write_unaligned(
+                base.add(guid_offset).cast::<Guid>(),
+                Guid {
+                    data1: 0x1234abcd,
+                    data2: 0x5678,
+                    data3: 0x9abc,
+                    data4: [0xde, 0xf0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc],
+                },
+            );
+            std::ptr::write_unaligned(
+                base.add(items_offset).cast::<ServiceTriggerDataItem>(),
+                ServiceTriggerDataItem {
+                    data_type: 777,
+                    data_bytes: raw.len() as u32,
+                    data: base.add(data_offset),
+                },
+            );
+            std::ptr::copy_nonoverlapping(raw.as_ptr(), base.add(data_offset), raw.len());
+        }
+        let mut aggregate_data = 0;
+        let mut aggregate_triggers = 0;
+        let parsed = parse_service_triggers(
+            unsafe { std::slice::from_raw_parts(base, length) },
+            &mut aggregate_data,
+            &mut aggregate_triggers,
+        )
+        .unwrap();
+        assert_eq!(parsed[0].trigger_type_code, 999);
+        assert_eq!(parsed[0].trigger_type, "unknown");
+        assert_eq!(parsed[0].action_code, 888);
+        assert_eq!(parsed[0].action, "unknown");
+        assert_eq!(
+            parsed[0].subtype_guid.as_deref(),
+            Some("1234abcd-5678-9abc-def0-123456789abc")
+        );
+        assert_eq!(parsed[0].data_items[0].data_type_code, 777);
+        assert_eq!(parsed[0].data_items[0].data_type, "unknown");
+        assert_eq!(parsed[0].data_items[0].data_hex, "00ff3c");
+        assert_eq!(aggregate_data, raw.len());
+        assert_eq!(aggregate_triggers, 1);
+
+        unsafe {
+            std::ptr::write_unaligned(
+                base.add(items_offset).cast::<ServiceTriggerDataItem>(),
+                ServiceTriggerDataItem {
+                    data_type: 1,
+                    data_bytes: 1,
+                    data: base.add(length),
+                },
+            );
+        }
+        assert_eq!(
+            parse_service_triggers(
+                unsafe { std::slice::from_raw_parts(base, length) },
+                &mut aggregate_data,
+                &mut aggregate_triggers,
+            ),
+            Err(ServiceTriggerParseError::InvalidResponse)
+        );
+
+        unsafe {
+            std::ptr::write_unaligned(
+                base.add(items_offset).cast::<ServiceTriggerDataItem>(),
+                ServiceTriggerDataItem {
+                    data_type: 1,
+                    data_bytes: (MAX_SERVICE_TRIGGER_DATA_ITEM_BYTES + 1) as u32,
+                    data: base.add(data_offset),
+                },
+            );
+        }
+        assert_eq!(
+            parse_service_triggers(
+                unsafe { std::slice::from_raw_parts(base, length) },
+                &mut aggregate_data,
+                &mut aggregate_triggers,
+            ),
+            Err(ServiceTriggerParseError::DataBudgetExceeded)
+        );
+    }
+
+    #[test]
+    fn service_trigger_parser_rejects_null_outside_and_oversized_pointers_and_counts() {
+        let (mut storage, length) = fixture_span();
+        let base = storage.as_mut_ptr().cast::<u8>();
+        let mut aggregate_data = 0;
+        let mut aggregate_triggers = 0;
+        unsafe {
+            std::ptr::write_unaligned(
+                base.cast::<ServiceTriggerInfo>(),
+                ServiceTriggerInfo {
+                    trigger_count: 0,
+                    triggers: std::ptr::null_mut(),
+                    reserved: base.cast(),
+                },
+            );
+        }
+        assert_eq!(
+            parse_service_triggers(
+                unsafe { std::slice::from_raw_parts(base, length) },
+                &mut aggregate_data,
+                &mut aggregate_triggers,
+            ),
+            Err(ServiceTriggerParseError::InvalidResponse)
+        );
+
+        unsafe {
+            std::ptr::write_unaligned(
+                base.cast::<ServiceTriggerInfo>(),
+                ServiceTriggerInfo {
+                    trigger_count: 1,
+                    triggers: std::ptr::null_mut(),
+                    reserved: std::ptr::null_mut(),
+                },
+            );
+        }
+        assert_eq!(
+            parse_service_triggers(
+                unsafe { std::slice::from_raw_parts(base, length) },
+                &mut aggregate_data,
+                &mut aggregate_triggers,
+            ),
+            Err(ServiceTriggerParseError::InvalidResponse)
+        );
+
+        unsafe {
+            std::ptr::write_unaligned(
+                base.cast::<ServiceTriggerInfo>(),
+                ServiceTriggerInfo {
+                    trigger_count: 1,
+                    triggers: base.add(length).cast(),
+                    reserved: std::ptr::null_mut(),
+                },
+            );
+        }
+        assert_eq!(
+            parse_service_triggers(
+                unsafe { std::slice::from_raw_parts(base, length) },
+                &mut aggregate_data,
+                &mut aggregate_triggers,
+            ),
+            Err(ServiceTriggerParseError::InvalidResponse)
+        );
+
+        unsafe {
+            std::ptr::write_unaligned(
+                base.cast::<ServiceTriggerInfo>(),
+                ServiceTriggerInfo {
+                    trigger_count: (MAX_SERVICE_TRIGGERS_PER_SERVICE + 1) as u32,
+                    triggers: base.add(std::mem::size_of::<ServiceTriggerInfo>()).cast(),
+                    reserved: std::ptr::null_mut(),
+                },
+            );
+        }
+        assert_eq!(
+            parse_service_triggers(
+                unsafe { std::slice::from_raw_parts(base, length) },
+                &mut aggregate_data,
+                &mut aggregate_triggers,
+            ),
+            Err(ServiceTriggerParseError::CountLimitExceeded)
+        );
     }
 
     #[test]

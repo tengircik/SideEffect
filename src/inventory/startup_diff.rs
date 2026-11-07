@@ -359,18 +359,22 @@ fn validate(v: &Value, k: Kind) -> Result<(), StartupDiffError> {
         Kind::Windows => (
             WINDOWS,
             "windows",
-            if windows_has_wmi && version >= 9 {
+            if windows_has_wmi && version >= 10 {
+                "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_load_order_group_and_trigger_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+            } else if windows_has_wmi && version >= 9 {
                 "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_and_load_order_group_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
             } else if windows_has_wmi && version >= 8 {
                 "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
             } else if windows_has_wmi {
                 "current_user_and_accessible_machine_run_keys_startup_folders_services_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+            } else if version >= 10 {
+                "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_load_order_group_and_trigger_configuration_and_current_token_visible_tasks"
             } else if version >= 9 {
                 "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_and_load_order_group_configuration_and_current_token_visible_tasks"
             } else {
                 "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks"
             },
-            &[4_u64, 5, 6, 7, 8, 9][..],
+            &[4_u64, 5, 6, 7, 8, 9, 10][..],
         ),
     };
     if text(v, "schema")? != schema || !versions.contains(&version) {
@@ -536,6 +540,15 @@ fn validate_known_fields(v: &Value) -> Result<(), StartupDiffError> {
         "display_name",
         "dependencies",
         "load_order_group",
+        "triggers",
+        "trigger_type_code",
+        "action_code",
+        "action",
+        "subtype_guid",
+        "data_items",
+        "data_type_code",
+        "data_type",
+        "data_hex",
         "delayed_auto_start",
         "start_type",
         "start_type_code",
@@ -874,6 +887,109 @@ fn validate_service_load_order_group(value: &Value) -> Result<(), StartupDiffErr
     Ok(())
 }
 
+fn validate_service_triggers(value: &Value) -> Result<(), StartupDiffError> {
+    match text(value, "status")? {
+        "observed" => {
+            keys(value, &["status", "entries"])?;
+            let entries = arr(value, "entries")?;
+            if entries.len() > 256 {
+                return Err(StartupDiffError::LimitExceeded);
+            }
+            for entry in entries {
+                keys(
+                    entry,
+                    &[
+                        "trigger_index",
+                        "trigger_type_code",
+                        "trigger_type",
+                        "action_code",
+                        "action",
+                        "subtype_guid",
+                        "data_items",
+                    ],
+                )?;
+                let _ = num(entry, "trigger_index")?;
+                let _ = num(entry, "trigger_type_code")?;
+                let _ = num(entry, "action_code")?;
+                if !matches!(
+                    text(entry, "trigger_type")?,
+                    "device_interface_arrival"
+                        | "ip_address_availability"
+                        | "domain_join"
+                        | "firewall_port_event"
+                        | "group_policy"
+                        | "network_endpoint"
+                        | "custom"
+                        | "unknown"
+                ) || !matches!(
+                    text(entry, "action")?,
+                    "service_start" | "service_stop" | "unknown"
+                ) {
+                    return Err(StartupDiffError::MalformedInput);
+                }
+                if entry
+                    .get("subtype_guid")
+                    .is_some_and(|guid| !guid.is_null())
+                {
+                    let guid = text(entry, "subtype_guid")?;
+                    check_str(entry, "subtype_guid", 36)?;
+                    if guid.len() != 36
+                        || !guid.bytes().enumerate().all(|(i, byte)| {
+                            if [8, 13, 18, 23].contains(&i) {
+                                byte == b'-'
+                            } else {
+                                byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+                            }
+                        })
+                    {
+                        return Err(StartupDiffError::MalformedInput);
+                    }
+                }
+                let data_items = arr(entry, "data_items")?;
+                if data_items.len() > 64 {
+                    return Err(StartupDiffError::LimitExceeded);
+                }
+                for item in data_items {
+                    keys(item, &["data_type_code", "data_type", "data_hex"])?;
+                    let _ = num(item, "data_type_code")?;
+                    if !matches!(
+                        text(item, "data_type")?,
+                        "binary" | "string" | "level" | "keyword_any" | "keyword_all" | "unknown"
+                    ) {
+                        return Err(StartupDiffError::MalformedInput);
+                    }
+                    let hex = text(item, "data_hex")?;
+                    check_str(item, "data_hex", 2 * 1024)?;
+                    if hex.len() % 2 != 0
+                        || !hex
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                    {
+                        return Err(StartupDiffError::MalformedInput);
+                    }
+                }
+            }
+        }
+        "unknown" => {
+            keys(value, &["status", "diagnostic_code"])?;
+            if !matches!(
+                text(value, "diagnostic_code")?,
+                "service_trigger_unsupported"
+                    | "service_trigger_access_denied"
+                    | "service_trigger_query_failed"
+                    | "service_trigger_response_invalid"
+                    | "service_trigger_budget_exceeded"
+                    | "service_trigger_count_limit_exceeded"
+                    | "service_trigger_deadline_exceeded"
+            ) {
+                return Err(StartupDiffError::MalformedInput);
+            }
+        }
+        _ => return Err(StartupDiffError::MalformedInput),
+    }
+    Ok(())
+}
+
 fn validate_state_evidence(value: &Value) -> Result<(), StartupDiffError> {
     keys(
         value,
@@ -1175,6 +1291,7 @@ fn validate_windows(v: &Value, version: u64) -> Result<(), StartupDiffError> {
     let has_service_observation = version >= 7;
     let has_delayed_auto_start = version >= 8;
     let has_service_dependencies = version >= 9;
+    let has_service_triggers = version >= 10;
     let mut all = vec![
         ("sources", 8192usize),
         ("registry_entries", 8192),
@@ -1414,6 +1531,9 @@ fn validate_windows(v: &Value, version: u64) -> Result<(), StartupDiffError> {
         if has_service_dependencies {
             fields.extend(["dependencies", "load_order_group"]);
         }
+        if has_service_triggers {
+            fields.push("triggers");
+        }
         startup_row_keys(e, &fields, has_states)?;
         if has_states {
             validate_startup_state(&e["startup_state"])?;
@@ -1427,6 +1547,9 @@ fn validate_windows(v: &Value, version: u64) -> Result<(), StartupDiffError> {
         if has_service_dependencies {
             validate_service_dependencies(&e["dependencies"])?;
             validate_service_load_order_group(&e["load_order_group"])?;
+        }
+        if has_service_triggers {
+            validate_service_triggers(&e["triggers"])?;
         }
         for f in [
             "service_name",
@@ -1718,6 +1841,15 @@ fn compare(l: &Value, r: &Value, k: Kind) -> Result<StartupInventoryDiff, Startu
     } else {
         false
     };
+    let service_triggers_incomparable = if k == Kind::Windows {
+        let before_version = num(l, "schema_version")?;
+        let after_version = num(r, "schema_version")?;
+        let has_services =
+            !arr(l, "service_entries")?.is_empty() || !arr(r, "service_entries")?.is_empty();
+        has_services && (before_version >= 10) != (after_version >= 10)
+    } else {
+        false
+    };
     let service_dependencies_unknown = k == Kind::Windows
         && [l, r].into_iter().any(|doc| {
             num(doc, "schema_version").is_ok_and(|version| version >= 9)
@@ -1735,6 +1867,22 @@ fn compare(l: &Value, r: &Value, k: Kind) -> Result<StartupInventoryDiff, Startu
         && num(r, "schema_version")? >= 9;
     let service_dependency_presence_comparable =
         !service_dependencies_incomparable && !service_dependencies_unknown;
+    let service_triggers_unknown = k == Kind::Windows
+        && [l, r].into_iter().any(|doc| {
+            num(doc, "schema_version").is_ok_and(|version| version >= 10)
+                && arr(doc, "service_entries").is_ok_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| entry["triggers"]["status"] != "observed")
+                })
+        });
+    let compare_service_triggers = !service_triggers_incomparable
+        && !service_triggers_unknown
+        && k == Kind::Windows
+        && num(l, "schema_version")? >= 10
+        && num(r, "schema_version")? >= 10;
+    let service_trigger_presence_comparable =
+        !service_triggers_incomparable && !service_triggers_unknown;
     let (mut a, mut b, mut complete, mut lossy) = if k == Kind::Linux {
         (
             linux_rows(l)?,
@@ -1750,6 +1898,8 @@ fn compare(l: &Value, r: &Value, k: Kind) -> Result<StartupInventoryDiff, Startu
                 !delayed_auto_start_incomparable,
                 compare_service_dependencies,
                 service_dependency_presence_comparable,
+                compare_service_triggers,
+                service_trigger_presence_comparable,
             )?,
             windows_rows(
                 r,
@@ -1757,6 +1907,8 @@ fn compare(l: &Value, r: &Value, k: Kind) -> Result<StartupInventoryDiff, Startu
                 !delayed_auto_start_incomparable,
                 compare_service_dependencies,
                 service_dependency_presence_comparable,
+                compare_service_triggers,
+                service_trigger_presence_comparable,
             )?,
             windows_complete(l) && windows_complete(r),
             0usize,
@@ -1766,6 +1918,8 @@ fn compare(l: &Value, r: &Value, k: Kind) -> Result<StartupInventoryDiff, Startu
         || delayed_auto_start_incomparable
         || service_dependencies_incomparable
         || service_dependencies_unknown
+        || service_triggers_incomparable
+        || service_triggers_unknown
     {
         complete = false;
     }
@@ -2107,6 +2261,8 @@ fn windows_rows(
     compare_delayed_auto_start: bool,
     compare_service_dependencies: bool,
     service_dependency_presence_comparable: bool,
+    compare_service_triggers: bool,
+    service_trigger_presence_comparable: bool,
 ) -> Result<Vec<Row>, StartupDiffError> {
     let mut rows = Vec::new();
     for (i, e) in arr(v, "registry_entries")?.iter().enumerate() {
@@ -2185,12 +2341,20 @@ fn windows_rows(
             facts.push(("dependencies", value(&e["dependencies"]["entries"])));
             facts.push(("load_order_group", value(&e["load_order_group"]["value"])));
         }
+        if compare_service_triggers
+            && num(v, "schema_version")? >= 10
+            && e["triggers"]["status"] == "observed"
+        {
+            facts.push(("triggers", value(&e["triggers"]["entries"])));
+        }
         rows.push(Row {
             category: "service_configuration",
             key,
             facts,
             refs: vec![ptr("/service_entries", i)],
-            complete: source_complete(v, id) && service_dependency_presence_comparable,
+            complete: source_complete(v, id)
+                && service_dependency_presence_comparable
+                && service_trigger_presence_comparable,
             lossy_identity: false,
         });
     }
@@ -2603,6 +2767,68 @@ mod tests {
             "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_and_load_order_group_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
         );
         value
+    }
+
+    fn windows_v10() -> Value {
+        let mut value = windows_v9();
+        value["schema_version"] = json!(10);
+        value["scope"] = json!(
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_load_order_group_and_trigger_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+        );
+        for service in value["service_entries"].as_array_mut().unwrap() {
+            service["triggers"] = json!({"status":"observed","entries":[]});
+        }
+        value
+    }
+
+    #[test]
+    fn windows_v10_compares_observed_service_triggers_and_suppresses_unknowns() {
+        let mut before = windows_v10();
+        let mut after = windows_v10();
+        let trigger = json!({
+            "trigger_index":0,
+            "trigger_type_code":1,
+            "trigger_type":"device_interface_arrival",
+            "action_code":1,
+            "action":"service_start",
+            "subtype_guid":"1234abcd-5678-9abc-def0-123456789abc",
+            "data_items":[{"data_type_code":2,"data_type":"string","data_hex":"414200"}]
+        });
+        before["service_entries"] = json!([{
+            "service_name":"EditorService","display_name":"Editor Service","start_type":"automatic","start_type_code":2,
+            "account":null,"binary_path":"C:\\Apps\\editor.exe","startup_state":startup_state(),
+            "service_observation":{"status":"known","state":"running","raw_state_code":4},
+            "delayed_auto_start":{"status":"observed","value":false},
+            "dependencies":{"status":"observed","entries":[]},
+            "load_order_group":{"status":"observed","value":null},
+            "triggers":{"status":"observed","entries":[]},
+            "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W","service_index":0}
+        }]);
+        after["service_entries"] = before["service_entries"].clone();
+        after["service_entries"][0]["triggers"]["entries"] = json!([trigger]);
+        let report = compare_startup_inventory_json(
+            &serde_json::to_vec(&before).unwrap(),
+            &serde_json::to_vec(&after).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report.status, StartupDiffStatus::Complete);
+        assert_eq!(report.deltas.len(), 1);
+        assert!(report.deltas[0].changed_fields.contains(&"triggers"));
+        assert_eq!(
+            report.deltas[0].before.as_ref().unwrap().references,
+            ["/service_entries/0"]
+        );
+
+        after["service_entries"][0]["triggers"] = json!({
+            "status":"unknown","diagnostic_code":"service_trigger_access_denied"
+        });
+        let unknown = compare_startup_inventory_json(
+            &serde_json::to_vec(&before).unwrap(),
+            &serde_json::to_vec(&after).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unknown.status, StartupDiffStatus::Partial);
+        assert!(unknown.deltas.is_empty());
     }
 
     #[test]

@@ -394,7 +394,7 @@ pub fn summarize_windows_startup_behavior(
             version: 2,
             basis: "exact_equality_of_drive_rooted_windows_path_strings",
         },
-        platform_adapter: "windows_startup_inventory_v4_v5_v6_v7_v8_or_v9_windows_runtime_capture_v3",
+        platform_adapter: "windows_startup_inventory_v4_v5_v6_v7_v8_v9_or_v10_windows_runtime_capture_v3",
         capture_completeness: "unknown",
         status: if partial { "partial" } else { "complete" },
         association_status: if associations.is_empty() {
@@ -470,7 +470,7 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
         .ok_or_else(|| "Windows startup inventory must be a JSON object".to_owned())?;
     let schema_version = object.get("schema_version").and_then(Value::as_u64);
     if object.get("schema").and_then(Value::as_str) != Some(WINDOWS_STARTUP_INVENTORY_SCHEMA)
-        || !matches!(schema_version, Some(4..=9))
+        || !matches!(schema_version, Some(4..=10))
         || object.get("platform").and_then(Value::as_str) != Some("windows")
     {
         return Err("unsupported Windows startup inventory schema or platform".to_owned());
@@ -550,15 +550,7 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
             ));
         }
         for (index, entry) in entries.iter().enumerate() {
-            validate_inventory_row(
-                field,
-                index,
-                entry,
-                schema_version.is_some_and(|v| v >= 5),
-                schema_version.is_some_and(|v| v >= 7),
-                schema_version.is_some_and(|v| v >= 8),
-                schema_version.is_some_and(|v| v >= 9),
-            )?;
+            validate_inventory_row(field, index, entry, schema_version)?;
         }
     }
     if schema_version == Some(6) || wmi_field_count == WMI_FIELDS.len() {
@@ -1157,11 +1149,15 @@ fn validate_inventory_row(
     field: &str,
     index: usize,
     value: &Value,
-    has_states: bool,
-    has_service_observation: bool,
-    has_delayed_auto_start: bool,
-    has_service_dependencies: bool,
+    schema_version: Option<u64>,
 ) -> Result<(), String> {
+    let schema_version = schema_version
+        .ok_or_else(|| "Windows startup inventory has an invalid schema version".to_owned())?;
+    let has_states = schema_version >= 5;
+    let has_service_observation = schema_version >= 7;
+    let has_delayed_auto_start = schema_version >= 8;
+    let has_service_dependencies = schema_version >= 9;
+    let has_service_triggers = schema_version >= 10;
     let label = format!("Windows startup inventory {field}[{index}]");
     let object = value
         .as_object()
@@ -1236,6 +1232,9 @@ fn validate_inventory_row(
     if field == "service_entries" && has_service_dependencies {
         required.extend(["dependencies", "load_order_group"]);
     }
+    if field == "service_entries" && has_service_triggers {
+        required.push("triggers");
+    }
     validate_object_fields(object, &required, optional, &label)?;
     if row_has_states {
         validate_startup_state_value(object.get("startup_state"), &label)?;
@@ -1249,6 +1248,9 @@ fn validate_inventory_row(
     if field == "service_entries" && has_service_dependencies {
         validate_service_dependencies_value(object.get("dependencies"), &label)?;
         validate_load_order_group_value(object.get("load_order_group"), &label)?;
+    }
+    if field == "service_entries" && has_service_triggers {
+        validate_service_triggers_value(object.get("triggers"), &label)?;
     }
     match field {
         "sources" => {
@@ -1789,6 +1791,167 @@ fn validate_load_order_group_value(value: Option<&Value>, label: &str) -> Result
         _ => Err(format!(
             "{label}.load_order_group has an unsupported status"
         )),
+    }
+}
+
+fn validate_service_triggers_value(value: Option<&Value>, label: &str) -> Result<(), String> {
+    let object = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{label}.triggers must be an object"))?;
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{label}.triggers.status must be text"))?;
+    match status {
+        "observed" => {
+            if object.len() != 2 || !object.contains_key("entries") {
+                return Err(format!("{label}.triggers has missing or unknown fields"));
+            }
+            let entries = object["entries"]
+                .as_array()
+                .ok_or_else(|| format!("{label}.triggers.entries must be an array"))?;
+            if entries.len() > 256 {
+                return Err(format!("{label}.triggers exceeds the trigger limit"));
+            }
+            let mut total_data_bytes = 0usize;
+            for (index, entry) in entries.iter().enumerate() {
+                let entry = entry.as_object().ok_or_else(|| {
+                    format!("{label}.triggers.entries[{index}] must be an object")
+                })?;
+                let required = [
+                    "trigger_index",
+                    "trigger_type_code",
+                    "trigger_type",
+                    "action_code",
+                    "action",
+                    "data_items",
+                ];
+                let optional = ["subtype_guid"];
+                if required.iter().any(|field| !entry.contains_key(*field))
+                    || entry.keys().any(|field| {
+                        !required.contains(&field.as_str()) && !optional.contains(&field.as_str())
+                    })
+                {
+                    return Err(format!(
+                        "{label}.triggers.entries[{index}] has invalid fields"
+                    ));
+                }
+                for field in ["trigger_index", "trigger_type_code", "action_code"] {
+                    unsigned_integer(entry.get(field), &format!("{label}.triggers.{field}"))?;
+                }
+                require_enum(
+                    &entry["trigger_type"],
+                    &[
+                        "device_interface_arrival",
+                        "ip_address_availability",
+                        "domain_join",
+                        "firewall_port_event",
+                        "group_policy",
+                        "network_endpoint",
+                        "custom",
+                        "unknown",
+                    ],
+                    "service trigger type",
+                )?;
+                require_enum(
+                    &entry["action"],
+                    &["service_start", "service_stop", "unknown"],
+                    "service trigger action",
+                )?;
+                if let Some(guid) = entry.get("subtype_guid") {
+                    let guid = guid
+                        .as_str()
+                        .ok_or_else(|| format!("{label}.triggers subtype GUID must be text"))?;
+                    if guid.len() != 36
+                        || !guid.bytes().enumerate().all(|(index, byte)| {
+                            if [8, 13, 18, 23].contains(&index) {
+                                byte == b'-'
+                            } else {
+                                byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+                            }
+                        })
+                    {
+                        return Err(format!("{label}.triggers subtype GUID is invalid"));
+                    }
+                }
+                let items = entry["data_items"].as_array().ok_or_else(|| {
+                    format!("{label}.triggers.entries[{index}].data_items must be an array")
+                })?;
+                if items.len() > 64 {
+                    return Err(format!(
+                        "{label}.triggers data-item count exceeds the limit"
+                    ));
+                }
+                for item in items {
+                    let item = item
+                        .as_object()
+                        .ok_or_else(|| format!("{label}.triggers data item must be an object"))?;
+                    if item.len() != 3
+                        || item.keys().any(|field| {
+                            !["data_type_code", "data_type", "data_hex"].contains(&field.as_str())
+                        })
+                    {
+                        return Err(format!("{label}.triggers data item has invalid fields"));
+                    }
+                    unsigned_integer(item.get("data_type_code"), "service trigger data type")?;
+                    require_enum(
+                        &item["data_type"],
+                        &[
+                            "binary",
+                            "string",
+                            "level",
+                            "keyword_any",
+                            "keyword_all",
+                            "unknown",
+                        ],
+                        "service trigger data type name",
+                    )?;
+                    let hex = item["data_hex"]
+                        .as_str()
+                        .ok_or_else(|| format!("{label}.triggers data hex must be text"))?;
+                    if hex.len() % 2 != 0
+                        || hex.len() > 2 * 1024
+                        || !hex
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                    {
+                        return Err(format!(
+                            "{label}.triggers data hex is invalid or over limit"
+                        ));
+                    }
+                    total_data_bytes = total_data_bytes.saturating_add(hex.len() / 2);
+                    if total_data_bytes > 8 * 1024 {
+                        return Err(format!(
+                            "{label}.triggers data exceeds the per-service byte limit"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        "unknown" => {
+            if object.len() != 2 || !object.contains_key("diagnostic_code") {
+                return Err(format!("{label}.triggers has missing or unknown fields"));
+            }
+            let code = object["diagnostic_code"]
+                .as_str()
+                .ok_or_else(|| format!("{label}.triggers.diagnostic_code must be text"))?;
+            if matches!(
+                code,
+                "service_trigger_unsupported"
+                    | "service_trigger_access_denied"
+                    | "service_trigger_query_failed"
+                    | "service_trigger_response_invalid"
+                    | "service_trigger_budget_exceeded"
+                    | "service_trigger_count_limit_exceeded"
+                    | "service_trigger_deadline_exceeded"
+            ) {
+                Ok(())
+            } else {
+                Err(format!("{label}.triggers has an unsupported diagnostic"))
+            }
+        }
+        _ => Err(format!("{label}.triggers has an unsupported status")),
     }
 }
 
@@ -2561,7 +2724,7 @@ mod tests {
             .is_ok()
         );
 
-        startup["schema_version"] = Value::from(10);
+        startup["schema_version"] = Value::from(11);
         assert!(
             summarize_windows_startup_behavior(
                 &serde_json::to_vec(&startup).unwrap(),
@@ -2663,7 +2826,7 @@ mod tests {
         assert_eq!(summary.association_status, "insufficient_evidence");
         assert_eq!(
             summary.platform_adapter,
-            "windows_startup_inventory_v4_v5_v6_v7_v8_or_v9_windows_runtime_capture_v3"
+            "windows_startup_inventory_v4_v5_v6_v7_v8_v9_or_v10_windows_runtime_capture_v3"
         );
         assert_eq!(
             summary.inputs.startup_inventory.source_format,

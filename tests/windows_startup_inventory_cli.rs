@@ -33,7 +33,7 @@ fn windows_startup_command_reports_native_startup_sources() {
     let bytes = fs::read(&output).unwrap();
     let document: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(document["schema"], "sideeffect.windows_startup_inventory");
-    assert_eq!(document["schema_version"], 9);
+    assert_eq!(document["schema_version"], 10);
     assert_eq!(document["platform"], "windows");
     match document["status"].as_str().unwrap() {
         "complete" => assert_eq!(first.status.code(), Some(0)),
@@ -45,7 +45,7 @@ fn windows_startup_command_reports_native_startup_sources() {
     }
     assert_eq!(
         document["scope"],
-        "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_and_load_order_group_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+        "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_load_order_group_and_trigger_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
     );
     let sources = document["sources"].as_array().unwrap();
     for required in [
@@ -96,6 +96,25 @@ fn windows_startup_command_reports_native_startup_sources() {
             service["load_order_group"]["status"].as_str(),
             Some("observed" | "unknown")
         ));
+        assert!(matches!(
+            service["triggers"]["status"].as_str(),
+            Some("observed" | "unknown")
+        ));
+        if service["triggers"]["status"] == "observed" {
+            for trigger in service["triggers"]["entries"].as_array().unwrap() {
+                assert!(trigger["trigger_index"].is_number());
+                assert!(trigger["trigger_type_code"].is_number());
+                assert!(trigger["trigger_type"].is_string());
+                assert!(trigger["action_code"].is_number());
+                assert!(trigger["action"].is_string());
+                assert!(trigger["subtype_guid"].is_null() || trigger["subtype_guid"].is_string());
+                for item in trigger["data_items"].as_array().unwrap() {
+                    assert!(item["data_type_code"].is_number());
+                    assert!(item["data_type"].is_string());
+                    assert!(item["data_hex"].is_string());
+                }
+            }
+        }
         if service["dependencies"]["status"] == "observed" {
             for dependency in service["dependencies"]["entries"].as_array().unwrap() {
                 assert!(matches!(

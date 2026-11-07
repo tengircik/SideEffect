@@ -182,7 +182,7 @@ pub use startup_windows::{
 #[cfg(windows)]
 pub(crate) use startup_windows::{
     collect_windows_startup_v5, collect_windows_startup_v6, collect_windows_startup_v7,
-    collect_windows_startup_v8,
+    collect_windows_startup_v8, collect_windows_startup_v9,
 };
 #[cfg(windows)]
 pub use startup_wmi::{
