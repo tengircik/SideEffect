@@ -60,6 +60,23 @@ fn render(graph: &EventGraph, output: &mut HtmlBuffer) -> io::Result<()> {
             ),
         )?;
     }
+    if !graph.supplemental_sources.is_empty() {
+        output.raw("<dt>Supplemental inputs</dt><dd><ul>")?;
+        for source in &graph.supplemental_sources {
+            output.raw("<li><code>")?;
+            value(output, &source.schema)?;
+            output.raw("</code> v")?;
+            output.number(source.schema_version)?;
+            output.raw(" status=")?;
+            value(output, &source.status)?;
+            output.raw(" candidate status=")?;
+            value(output, &source.association_status)?;
+            output.raw(" SHA-256=<code>")?;
+            value(output, &source.sha256)?;
+            output.raw("</code></li>")?;
+        }
+        output.raw("</ul></dd>")?;
+    }
     field(
         output,
         "Event-kind filter",
@@ -135,6 +152,10 @@ fn render(graph: &EventGraph, output: &mut HtmlBuffer) -> io::Result<()> {
         field(output, "Basis", &edge.basis)?;
         output.raw("<dt>Evidence references</dt><dd>")?;
         write_evidence_list(output, &edge.evidence)?;
+        if !edge.supplemental_evidence.is_empty() {
+            output.raw("<h4>Startup configuration evidence</h4>")?;
+            write_supplemental_evidence_list(output, &edge.supplemental_evidence)?;
+        }
         output.raw("</dd></dl></article>")?;
     }
     output.raw("</section>\n<section><h2>Graph diagnostics (")?;
@@ -200,6 +221,25 @@ fn write_node(output: &mut HtmlBuffer, index: usize, node: &EventGraphNode) -> i
         output.raw("<dt>Node evidence</dt><dd>")?;
         write_evidence(output, evidence)?;
         output.raw("</dd>")?;
+    }
+    if let Some(evidence) = &node.supplemental_evidence {
+        output.raw("<dt>Startup row evidence</dt><dd>")?;
+        write_supplemental_evidence(output, evidence)?;
+        output.raw("</dd>")?;
+    }
+    if let Some(service) = &node.service_startup_configuration {
+        field_number(output, "Startup service row", service.service_index)?;
+        field(output, "SCM service name", &service.service_name)?;
+        field(
+            output,
+            "Configured SCM binary path (inert configuration)",
+            &service.binary_path,
+        )?;
+        field(
+            output,
+            "Interpretation",
+            "Configured service path only; this does not prove the service launched or caused an observed process.",
+        )?;
     }
     output.raw("</dl>")?;
     if let Some(event) = &node.event {
@@ -360,6 +400,37 @@ fn write_evidence_list(output: &mut HtmlBuffer, evidence: &[EvidenceReference]) 
         output.raw("</li>")?;
     }
     output.raw("</ul>")
+}
+
+fn write_supplemental_evidence_list(
+    output: &mut HtmlBuffer,
+    evidence: &[crate::event::SupplementalArtifactEvidence],
+) -> io::Result<()> {
+    if evidence.is_empty() {
+        return output.raw("No startup evidence reference is attached.");
+    }
+    output.raw("<ul>")?;
+    for item in evidence {
+        output.raw("<li>")?;
+        write_supplemental_evidence(output, item)?;
+        output.raw("</li>")?;
+    }
+    output.raw("</ul>")
+}
+
+fn write_supplemental_evidence(
+    output: &mut HtmlBuffer,
+    evidence: &crate::event::SupplementalArtifactEvidence,
+) -> io::Result<()> {
+    output.raw("<code>artifact_row schema=")?;
+    value(output, &evidence.source_schema)?;
+    output.raw(" version=")?;
+    output.number(evidence.source_schema_version)?;
+    output.raw(" sha256=")?;
+    value(output, &evidence.artifact_sha256)?;
+    output.raw(" json_pointer=")?;
+    value(output, &evidence.json_pointer)?;
+    output.raw("</code>")
 }
 
 fn write_evidence(output: &mut HtmlBuffer, evidence: &EvidenceReference) -> io::Result<()> {
@@ -575,6 +646,7 @@ mod tests {
                 identity_ambiguity_present: false,
             },
             semantics: "source-local event graph",
+            supplemental_sources: Vec::new(),
             nodes: vec![
                 EventGraphNode {
                     id: "event:9".to_owned(),
@@ -608,6 +680,8 @@ mod tests {
                     process_observation: None,
                     reported_process_id: None,
                     context_note: None,
+                    supplemental_evidence: None,
+                    service_startup_configuration: None,
                 },
                 EventGraphNode {
                     id: "pid_context:9".to_owned(),
@@ -618,6 +692,8 @@ mod tests {
                     process_observation: None,
                     reported_process_id: Some(777),
                     context_note: Some("PID context only"),
+                    supplemental_evidence: None,
+                    service_startup_configuration: None,
                 },
             ],
             edges: vec![EventGraphEdge {
@@ -630,6 +706,7 @@ mod tests {
                 event_link_status: Some(EventProcessLinkStatus::ContextCandidate),
                 basis: "synthetic source-row linkage".to_owned(),
                 evidence: vec![evidence],
+                supplemental_evidence: Vec::new(),
             }],
             diagnostics: vec![EventDiagnostic {
                 code: "synthetic_diag".to_owned(),
@@ -689,6 +766,7 @@ mod tests {
                 identity_ambiguity_present: true,
             },
             semantics: "source-local",
+            supplemental_sources: Vec::new(),
             nodes: vec![EventGraphNode {
                 id: "process:2".to_owned(),
                 kind: EventGraphNodeKind::ProcessObservation,
@@ -708,6 +786,8 @@ mod tests {
                 }),
                 reported_process_id: None,
                 context_note: None,
+                supplemental_evidence: None,
+                service_startup_configuration: None,
             }],
             edges: vec![EventGraphEdge {
                 from_node_id: "pid_context:100".to_owned(),
@@ -721,6 +801,7 @@ mod tests {
                 event_link_status: None,
                 basis: "synthetic parent payload".to_owned(),
                 evidence: vec![evidence.clone()],
+                supplemental_evidence: Vec::new(),
             }],
             diagnostics: vec![EventDiagnostic {
                 code: "fixture_diagnostic".to_owned(),

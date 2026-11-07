@@ -749,13 +749,21 @@ On native Windows:
 sideeffect.exe graph --windows-runtime .\runtime.windows.json --event-kind file_io_observation
 ```
 
+To include the startup inventory and show exact service-path candidates to observed process-start events:
+
+```powershell
+sideeffect.exe graph --windows-runtime .\runtime.windows.json --startup .\startup.windows.json --event-kind process_start
+```
+
+The graph links an SCM service row only when its complete drive-rooted `binary_path` string exactly equals a decoded ETW process-start image path. Each candidate edge retains both the runtime record and startup row references. Duplicate rows remain separate; partial input exits `2`. A match does not prove that a trigger fired, that a service launched the process, or that the service caused behavior.
+
 To select a source-local process observation from the graph:
 
 ```sh
 ./target/release/sideeffect graph --trace ./run.trace --process-observation 1
 ```
 
-The same option is available with `graph --windows-runtime` on native Windows. IDs are envelope-local `ProcessObservation.source_local_id` values shown in graph output; they are neither PIDs nor identifiers that can be reused across captures. The filter retains directly linked event rows with their existing link roles, statuses, and bases, plus one-hop process relationships. It does not match unlinked events by PID. If a valid observation has no linked events, the observation node remains in the result; an empty event selection is not evidence that activity was absent. Both filters are recorded in graph schema v4. Diagnostics and completeness still describe the full input. PID-only context nodes stay separate from process observations, and the graph does not imply ownership, causation, or a complete process tree. Linux task epochs are trace-local context segments bounded by exact prefixed termination rows, not process identities or generations.
+The same option is available with `graph --windows-runtime` on native Windows. IDs are envelope-local `ProcessObservation.source_local_id` values shown in graph output; they are neither PIDs nor identifiers that can be reused across captures. The filter retains directly linked event rows with their existing link roles, statuses, and bases, plus one-hop process relationships. It does not match unlinked events by PID. If a valid observation has no linked events, the observation node remains in the result; an empty event selection is not evidence that activity was absent. Filters and optional supplemental startup input are recorded in graph schema v6. Diagnostics and completeness still describe the full input. PID-only context nodes stay separate from process observations, and the graph does not imply ownership, service launch, causation, or a complete process tree. Linux task epochs are trace-local context segments bounded by exact prefixed termination rows, not process identities or generations.
 
 For a source-local timeline over Linux strace evidence, use an exact event-kind filter, a source-local process observation filter, or both:
 

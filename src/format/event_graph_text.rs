@@ -32,6 +32,21 @@ fn render(graph: &EventGraph, output: &mut GraphBuffer) -> io::Result<()> {
         Some(sha256) => output.escaped(sha256)?,
         None => output.raw("unknown")?,
     }
+    if !graph.supplemental_sources.is_empty() {
+        output.raw("\nSupplemental inputs:")?;
+        for source in &graph.supplemental_sources {
+            output.raw(" schema=")?;
+            output.escaped(&source.schema)?;
+            output.raw(" version=")?;
+            output.number(source.schema_version)?;
+            output.raw(" sha256=")?;
+            output.escaped(&source.sha256)?;
+            output.raw(" status=")?;
+            output.escaped(&source.status)?;
+            output.raw(" association_status=")?;
+            output.escaped(&source.association_status)?;
+        }
+    }
     output.raw("\nCompleteness: ")?;
     output.raw(completeness_name(graph.source_state.completeness))?;
     if let Some(loss) = &graph.source_state.loss {
@@ -102,6 +117,27 @@ fn render(graph: &EventGraph, output: &mut GraphBuffer) -> io::Result<()> {
         if let Some(note) = node.context_note {
             output.raw(" warning=")?;
             output.escaped(note)?;
+        }
+        if let Some(service) = &node.service_startup_configuration {
+            output.raw(" service_index=")?;
+            output.number(service.service_index)?;
+            output.raw(" service_name=")?;
+            output.escaped(&service.service_name)?;
+            output.raw(" configured_binary_path=")?;
+            output.escaped(&service.binary_path)?;
+        }
+        if let Some(evidence) = &node.supplemental_evidence {
+            output.raw(" startup_evidence=")?;
+            write_supplemental_evidence(output, evidence)?;
+        }
+        if let Some(service) = &node.service_startup_configuration {
+            output
+                .raw("    SCM startup configuration; no launch or trigger event is inferred.\n")?;
+            output.raw("    service_name=")?;
+            output.escaped(&service.service_name)?;
+            output.raw(" configured_binary_path=")?;
+            output.escaped(&service.binary_path)?;
+            output.raw("\n")?;
         }
         output.raw("\n")?;
         if let Some(event) = &node.event {
@@ -188,6 +224,15 @@ fn render(graph: &EventGraph, output: &mut GraphBuffer) -> io::Result<()> {
                     output.raw(";")?;
                 }
                 write_evidence(output, evidence)?;
+            }
+        }
+        if !edge.supplemental_evidence.is_empty() {
+            output.raw(" startup_evidence=")?;
+            for (index, evidence) in edge.supplemental_evidence.iter().enumerate() {
+                if index > 0 {
+                    output.raw(";")?;
+                }
+                write_supplemental_evidence(output, evidence)?;
             }
         }
         output.raw("\n")?;
@@ -320,6 +365,21 @@ fn write_evidence(output: &mut GraphBuffer, evidence: &EvidenceReference) -> io:
     }
 }
 
+fn write_supplemental_evidence(
+    output: &mut GraphBuffer,
+    evidence: &crate::event::SupplementalArtifactEvidence,
+) -> io::Result<()> {
+    output.raw("artifact_row(schema=")?;
+    output.escaped(&evidence.source_schema)?;
+    output.raw(",version=")?;
+    output.number(evidence.source_schema_version)?;
+    output.raw(",sha256=")?;
+    output.escaped(&evidence.artifact_sha256)?;
+    output.raw(",json_pointer=")?;
+    output.escaped(&evidence.json_pointer)?;
+    output.raw(")")
+}
+
 fn write_optional_number<T: std::fmt::Display + Copy>(
     output: &mut GraphBuffer,
     value: Option<T>,
@@ -425,6 +485,7 @@ mod tests {
                 identity_ambiguity_present: true,
             },
             semantics: "no causal claims",
+            supplemental_sources: Vec::new(),
             nodes: vec![
                 EventGraphNode {
                     id: "event:5".to_owned(),
@@ -452,6 +513,8 @@ mod tests {
                     process_observation: None,
                     reported_process_id: None,
                     context_note: None,
+                    supplemental_evidence: None,
+                    service_startup_configuration: None,
                 },
                 EventGraphNode {
                     id: "pid_context:1".to_owned(),
@@ -462,6 +525,8 @@ mod tests {
                     process_observation: None,
                     reported_process_id: Some(123),
                     context_note: Some("PID context is not merged into a process instance"),
+                    supplemental_evidence: None,
+                    service_startup_configuration: None,
                 },
             ],
             edges: vec![EventGraphEdge {
@@ -474,6 +539,7 @@ mod tests {
                 event_link_status: Some(EventProcessLinkStatus::ContextCandidate),
                 basis: "source row\nonly".to_owned(),
                 evidence: vec![evidence],
+                supplemental_evidence: Vec::new(),
             }],
             diagnostics: vec![EventDiagnostic {
                 code: "unsupported\x1b[2J".to_owned(),
@@ -487,7 +553,7 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.is_ascii());
         assert!(text.contains("Nodes (count=2)"));
-        assert!(text.contains("Graph contract: schema=sideeffect.event_graph version=5"));
+        assert!(text.contains("Graph contract: schema=sideeffect.event_graph version=6"));
         assert!(text.contains("timestamp=12.5\\u{1b}[2J seconds"));
         assert!(text.contains("Edges (count=1)"));
         assert!(text.contains("process_observation_id=1"));
@@ -528,6 +594,7 @@ mod tests {
                 identity_ambiguity_present: true,
             },
             semantics: "source-local only",
+            supplemental_sources: Vec::new(),
             nodes: vec![EventGraphNode {
                 id: "process:1".to_owned(),
                 kind: EventGraphNodeKind::ProcessObservation,
@@ -547,6 +614,8 @@ mod tests {
                 }),
                 reported_process_id: None,
                 context_note: None,
+                supplemental_evidence: None,
+                service_startup_configuration: None,
             }],
             edges: vec![EventGraphEdge {
                 from_node_id: "pid_context:1".to_owned(),
@@ -560,6 +629,7 @@ mod tests {
                 event_link_status: None,
                 basis: "payload\x1b[2J".to_owned(),
                 evidence: vec![evidence.clone()],
+                supplemental_evidence: Vec::new(),
             }],
             diagnostics: vec![EventDiagnostic {
                 code: "synthetic\x1b]0;title".to_owned(),
@@ -602,6 +672,7 @@ mod tests {
                 identity_ambiguity_present: false,
             },
             semantics: "empty selection",
+            supplemental_sources: Vec::new(),
             nodes: Vec::new(),
             edges: Vec::new(),
             diagnostics: Vec::new(),

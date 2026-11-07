@@ -15,7 +15,7 @@ use crate::model::{
 pub const COMMON_EVENT_SCHEMA: &str = "sideeffect.common_event_envelope";
 pub const COMMON_EVENT_SCHEMA_VERSION: u32 = 5;
 pub const EVENT_GRAPH_SCHEMA: &str = "sideeffect.event_graph";
-pub const EVENT_GRAPH_SCHEMA_VERSION: u32 = 5;
+pub const EVENT_GRAPH_SCHEMA_VERSION: u32 = 6;
 pub const EVENT_TIMELINE_SCHEMA: &str = "sideeffect.event_timeline";
 pub const EVENT_TIMELINE_SCHEMA_VERSION: u32 = 5;
 #[cfg(windows)]
@@ -28,6 +28,7 @@ const MAX_COMMON_PROCESS_DIAGNOSTICS: usize = 256;
 const MAX_COMMON_PROCESS_OBSERVATIONS: usize = MAX_COMMON_EVENTS + MAX_COMMON_PROCESS_RELATIONS;
 const MAX_EVENT_GRAPH_NODES: usize = 500_000;
 const MAX_EVENT_GRAPH_EDGES: usize = 200_000;
+const MAX_STARTUP_CANDIDATE_EDGES: usize = 100_000;
 #[cfg(windows)]
 const MAX_ETW_EVENTS: usize = 50_000;
 #[cfg(windows)]
@@ -382,6 +383,9 @@ pub struct EventGraph {
     pub filter: EventGraphFilter,
     pub source: SourceDescriptor,
     pub source_state: SourceState,
+    /// Additional local artifacts used only for explicitly labeled candidate relationships.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub supplemental_sources: Vec<SupplementalGraphSource>,
     pub semantics: &'static str,
     pub nodes: Vec<EventGraphNode>,
     pub edges: Vec<EventGraphEdge>,
@@ -394,6 +398,31 @@ pub enum EventGraphNodeKind {
     Event,
     ProcessObservation,
     ProcessIdContext,
+    ServiceStartupConfiguration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SupplementalGraphSource {
+    pub schema: String,
+    pub schema_version: u32,
+    pub sha256: String,
+    pub status: String,
+    pub association_status: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SupplementalArtifactEvidence {
+    pub source_schema: String,
+    pub source_schema_version: u32,
+    pub artifact_sha256: String,
+    pub json_pointer: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WindowsServiceStartupConfiguration {
+    pub service_index: usize,
+    pub service_name: String,
+    pub binary_path: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -412,6 +441,10 @@ pub struct EventGraphNode {
     pub reported_process_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_note: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supplemental_evidence: Option<SupplementalArtifactEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_startup_configuration: Option<WindowsServiceStartupConfiguration>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -429,6 +462,8 @@ pub struct EventGraphEdge {
     pub event_link_status: Option<EventProcessLinkStatus>,
     pub basis: String,
     pub evidence: Vec<EvidenceReference>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub supplemental_evidence: Vec<SupplementalArtifactEvidence>,
 }
 
 /// Convert already validated source adapters into an evidence-linked graph
@@ -477,6 +512,8 @@ pub fn graph(
             process_observation: None,
             reported_process_id: None,
             context_note: None,
+            supplemental_evidence: None,
+            service_startup_configuration: None,
         });
     }
 
@@ -497,6 +534,8 @@ pub fn graph(
             process_observation: Some(observation.clone()),
             reported_process_id: None,
             context_note: None,
+            supplemental_evidence: None,
+            service_startup_configuration: None,
         });
     }
 
@@ -523,6 +562,8 @@ pub fn graph(
                 process_observation: None,
                 reported_process_id: relationship.reported_from_process_id,
                 context_note: Some("PID context is not merged into a process instance"),
+                supplemental_evidence: None,
+                service_startup_configuration: None,
             });
             id
         };
@@ -536,6 +577,7 @@ pub fn graph(
             event_link_status: None,
             basis: relationship.basis.clone(),
             evidence: relationship.evidence.clone(),
+            supplemental_evidence: Vec::new(),
         });
     }
 
@@ -572,6 +614,8 @@ pub fn graph(
                 process_observation: None,
                 reported_process_id: link.reported_process_id,
                 context_note: Some(context_note),
+                supplemental_evidence: None,
+                service_startup_configuration: None,
             });
             id
         };
@@ -585,6 +629,7 @@ pub fn graph(
             event_link_status: Some(link.status),
             basis: link.basis.clone(),
             evidence: vec![link.event.clone()],
+            supplemental_evidence: Vec::new(),
         });
     }
 
@@ -609,6 +654,7 @@ pub fn graph(
         },
         source: envelope.source.clone(),
         source_state: envelope.source_state.clone(),
+        supplemental_sources: Vec::new(),
         semantics: "Evidence-linked relationships and event context only; edges do not establish ownership, causation, or a complete process tree. Filters select rows represented in this input; no matching event link is not proof of absence",
         nodes,
         edges,
@@ -675,6 +721,212 @@ pub fn graph(
         graph.edges = filtered_edges;
     }
 
+    Ok(graph)
+}
+
+/// Add exact-path Windows SCM startup candidates to an already adapted runtime graph.
+/// The supplied summary must come from the strict Windows startup correlation adapter.
+pub fn graph_with_windows_startup_candidates(
+    mut graph: EventGraph,
+    summary: &crate::windows_startup_correlation::WindowsAssociatedBehaviorSummary,
+) -> Result<EventGraph, String> {
+    let startup_schema_version = summary
+        .inputs
+        .startup_inventory
+        .source_format
+        .strip_prefix("sideeffect.windows_startup_inventory_v")
+        .and_then(|version| version.parse::<u32>().ok());
+    if graph.source.platform != SourcePlatform::Windows
+        || graph.source.schema != "sideeffect.windows_runtime_capture"
+        || graph.source.schema_version != 3
+        || summary.schema != "sideeffect.windows_associated_behavior_summary"
+        || summary.schema_version != 2
+        || summary.inputs.runtime_capture.source_format != "sideeffect.windows_runtime_capture_v3"
+        || !is_sha256_hex(&summary.inputs.runtime_capture.sha256)
+        || startup_schema_version.is_none_or(|version| !(4..=10).contains(&version))
+        || !is_sha256_hex(&summary.inputs.startup_inventory.sha256)
+        || !matches!(summary.status, "complete" | "partial")
+        || !matches!(
+            summary.association_status,
+            "candidate_match" | "insufficient_evidence"
+        )
+        || !matches!(
+            summary.inputs.startup_inventory.source_status.as_str(),
+            "complete" | "partial"
+        )
+        || !matches!(
+            summary.inputs.runtime_capture.source_status.as_str(),
+            "complete" | "partial"
+        )
+        || (summary.association_status == "candidate_match") != !summary.associations.is_empty()
+        || summary.algorithm.id != "windows_startup_source_process_image_exact_path"
+        || summary.algorithm.basis != "exact_equality_of_drive_rooted_windows_path_strings"
+    {
+        return Err(
+            "startup candidate input does not match the Windows runtime graph source".to_owned(),
+        );
+    }
+
+    let mut candidate_edge_count = 0usize;
+    for association in &summary.associations {
+        if association.status != "candidate_match"
+            || association.confidence != "limited_candidate"
+            || association.basis != "exact_equality_of_drive_rooted_windows_path_strings"
+            || association
+                .service_evidence
+                .iter()
+                .any(|service| service.executable_path != association.executable_path)
+            || association.runtime_evidence.iter().any(|runtime| {
+                runtime.image_file_name != association.executable_path
+                    || runtime.capture_sha256 != summary.inputs.runtime_capture.sha256
+            })
+        {
+            return Err(
+                "startup candidate summary contains an unsupported relationship".to_owned(),
+            );
+        }
+        candidate_edge_count = candidate_edge_count.saturating_add(
+            association
+                .service_evidence
+                .len()
+                .saturating_mul(association.runtime_evidence.len()),
+        );
+        if candidate_edge_count > MAX_STARTUP_CANDIDATE_EDGES {
+            return Err("startup candidate graph exceeds its bounded edge limit".to_owned());
+        }
+    }
+
+    graph.supplemental_sources.push(SupplementalGraphSource {
+        schema: summary.inputs.startup_inventory.source_format.clone(),
+        schema_version: startup_schema_version.expect("startup schema version validated above"),
+        sha256: summary.inputs.startup_inventory.sha256.clone(),
+        status: summary.inputs.startup_inventory.source_status.clone(),
+        association_status: summary.association_status.to_owned(),
+    });
+
+    let event_nodes = graph
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            (node.kind == EventGraphNodeKind::Event
+                && node
+                    .event
+                    .as_ref()
+                    .is_some_and(|event| event.event_kind == "process_start"))
+            .then(|| {
+                Some((
+                    node.source_local_ordinal?,
+                    (node.id.clone(), node.evidence.clone()?),
+                ))
+            })
+            .flatten()
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut service_nodes = BTreeMap::<usize, (String, String, String)>::new();
+    let startup_schema = summary.inputs.startup_inventory.source_format.clone();
+    let startup_schema_version = startup_schema_version.expect("startup version was validated");
+    for association in &summary.associations {
+        if !association
+            .runtime_evidence
+            .iter()
+            .any(|runtime| event_nodes.contains_key(&runtime.record_ordinal))
+        {
+            // The caller's event filters may intentionally omit every candidate event.
+            continue;
+        }
+        for service in &association.service_evidence {
+            if let Some((_, service_name, binary_path)) = service_nodes.get(&service.service_index)
+            {
+                if service_name != &service.service_name || binary_path != &service.executable_path
+                {
+                    return Err(
+                        "startup candidate summary reuses a service index inconsistently"
+                            .to_owned(),
+                    );
+                }
+            } else {
+                let node_id = format!("startup_service:{}", service.service_index);
+                let supplemental_evidence = SupplementalArtifactEvidence {
+                    source_schema: startup_schema.clone(),
+                    source_schema_version: startup_schema_version,
+                    artifact_sha256: summary.inputs.startup_inventory.sha256.clone(),
+                    json_pointer: format!("/service_entries/{}", service.service_index),
+                };
+                graph.nodes.push(EventGraphNode {
+                    id: node_id.clone(),
+                    kind: EventGraphNodeKind::ServiceStartupConfiguration,
+                    source_local_ordinal: None,
+                    evidence: None,
+                    event: None,
+                    process_observation: None,
+                    reported_process_id: None,
+                    context_note: Some("Configured SCM path; this does not show that a service launched or caused an event"),
+                    supplemental_evidence: Some(supplemental_evidence),
+                    service_startup_configuration: Some(WindowsServiceStartupConfiguration {
+                        service_index: service.service_index,
+                        service_name: service.service_name.clone(),
+                        binary_path: service.executable_path.clone(),
+                    }),
+                });
+                service_nodes.insert(
+                    service.service_index,
+                    (
+                        node_id,
+                        service.service_name.clone(),
+                        service.executable_path.clone(),
+                    ),
+                );
+            }
+
+            let (service_node_id, _, _) = service_nodes
+                .get(&service.service_index)
+                .expect("service node was just inserted or validated");
+            for runtime in &association.runtime_evidence {
+                let Some((event_node_id, event_evidence)) =
+                    event_nodes.get(&runtime.record_ordinal)
+                else {
+                    // A caller's event filters may intentionally omit this candidate event.
+                    continue;
+                };
+                graph.edges.push(EventGraphEdge {
+                    from_node_id: service_node_id.clone(),
+                    to_node_id: event_node_id.clone(),
+                    kind: "startup_process_candidate",
+                    relationship_kind: None,
+                    relationship_resolution: None,
+                    event_link_role: None,
+                    event_link_status: None,
+                    basis: "Exact equality between the configured SCM binary_path string and the decoded ETW process-start image path; candidate only, no launch or causation claim".to_owned(),
+                    evidence: vec![event_evidence.clone()],
+                    supplemental_evidence: vec![SupplementalArtifactEvidence {
+                        source_schema: startup_schema.clone(),
+                        source_schema_version: startup_schema_version,
+                        artifact_sha256: summary.inputs.startup_inventory.sha256.clone(),
+                        json_pointer: format!("/service_entries/{}", service.service_index),
+                    }],
+                });
+            }
+        }
+    }
+    if graph.nodes.len() > MAX_EVENT_GRAPH_NODES || graph.edges.len() > MAX_EVENT_GRAPH_EDGES {
+        return Err("event graph exceeds its bounded node or edge limit".to_owned());
+    }
+    if summary.status != "complete" {
+        graph.diagnostics.push(EventDiagnostic {
+            code: "startup_candidate_input_partial".to_owned(),
+            message: "Startup or runtime input is partial; candidate links are incomplete and do not establish absence or causation.".to_owned(),
+            source_local_ordinal: None,
+            evidence: None,
+        });
+    }
+    if summary.association_status == "insufficient_evidence" {
+        graph.diagnostics.push(EventDiagnostic {
+            code: "startup_candidate_insufficient_evidence".to_owned(),
+            message: "No exact supported service-path pair was observed; this is not evidence of non-execution.".to_owned(),
+            source_local_ordinal: None,
+            evidence: None,
+        });
+    }
     Ok(graph)
 }
 

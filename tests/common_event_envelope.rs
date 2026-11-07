@@ -608,7 +608,7 @@ fn process_filtered_graph_keeps_selected_observation_when_it_has_no_event_link()
 
     let graph = graph(&envelope, None, Some(1)).unwrap();
     assert_eq!(graph.schema, "sideeffect.event_graph");
-    assert_eq!(graph.schema_version, 5);
+    assert_eq!(graph.schema_version, 6);
     assert_eq!(graph.filter.process_observation_id, Some(1));
     assert!(graph.nodes.iter().any(|node| {
         node.kind == sideeffect::event::EventGraphNodeKind::ProcessObservation

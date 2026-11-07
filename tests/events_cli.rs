@@ -31,6 +31,24 @@ impl Drop for TempTrace {
 }
 
 #[test]
+fn startup_graph_input_is_rejected_for_linux_trace_graphs() {
+    let trace = TempTrace::with_contents(
+        b"1700000000.000001 openat(AT_FDCWD, \"/tmp/item\", O_RDONLY) = 4\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["graph", "--trace"])
+        .arg(&trace.0)
+        .args(["--startup", "startup.json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("graph --startup is supported only with --windows-runtime")
+    );
+}
+
+#[test]
 fn events_trace_writes_versioned_json_in_source_order() {
     let trace = TempTrace::with_contents(
         b"123 1700000000.123456 openat(AT_FDCWD, \"/tmp/item\", O_RDONLY) = 4\n",
@@ -347,7 +365,7 @@ fn graph_trace_keeps_event_process_link_and_source_evidence() {
     assert_eq!(output.status.code(), Some(2));
     let graph: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(graph["schema"], "sideeffect.event_graph");
-    assert_eq!(graph["schema_version"], 5);
+    assert_eq!(graph["schema_version"], 6);
     assert_eq!(graph["source_state"]["completeness"], "partial");
     assert!(
         graph["semantics"]
@@ -603,7 +621,7 @@ fn graph_process_observation_filter_selects_source_local_context_and_links() {
         String::from_utf8_lossy(&output.stderr)
     );
     let graph: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(graph["schema_version"], 5);
+    assert_eq!(graph["schema_version"], 6);
     assert_eq!(graph["filter"]["event_kind"], serde_json::Value::Null);
     assert_eq!(graph["filter"]["process_observation_id"], 1);
     assert!(

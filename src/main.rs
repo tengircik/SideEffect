@@ -1888,7 +1888,7 @@ fn print_version() {
 
 fn print_usage() {
     println!(
-        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)\n       sideeffect query --query <query.json> --trace <trace> [--format json|text]\n       sideeffect query --query <query.json> --windows-runtime <capture.json> [--format json|text] (native Windows)\n       sideeffect query --query <query.json> --session <session-dir> --source runtime|selected_root [--format json|text]\n       sideeffect graph --trace <strace-trace-file> [--format json|text|html] [--output <new-report.html>] [--event-kind <kind> | --process-observation <id>]\n       sideeffect graph --windows-runtime <capture.json> [--format json|text|html] [--output <new-report.html>] [--event-kind <kind> | --process-observation <id>] (native Windows)\n       sideeffect timeline --trace <strace-trace-file> [--format json|text] [--event-kind <kind>] [--process-observation <id>]\n       sideeffect timeline --windows-runtime <capture.json> [--format json|text] [--event-kind <kind>] [--process-observation <id>] (native Windows)\n\nProvenance:\n       sideeffect provenance keygen <private-key.pk8> <public-key.hex>\n       sideeffect provenance key-check <private-key.pk8> <public-key.hex>\n       sideeffect provenance sign-session <session-dir> --private-key <private-key.pk8> --output <signature.json>\n       sideeffect provenance verify-session <session-dir> --signature <signature.json> --public-key <public-key.hex>"
+        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)\n       sideeffect query --query <query.json> --trace <trace> [--format json|text]\n       sideeffect query --query <query.json> --windows-runtime <capture.json> [--format json|text] (native Windows)\n       sideeffect query --query <query.json> --session <session-dir> --source runtime|selected_root [--format json|text]\n       sideeffect graph --trace <strace-trace-file> [--format json|text|html] [--output <new-report.html>] [--event-kind <kind> | --process-observation <id>]\n       sideeffect graph --windows-runtime <capture.json> [--startup <startup.json>] [--format json|text|html] [--output <new-report.html>] [--event-kind <kind> | --process-observation <id>] (native Windows)\n       sideeffect timeline --trace <strace-trace-file> [--format json|text] [--event-kind <kind>] [--process-observation <id>]\n       sideeffect timeline --windows-runtime <capture.json> [--format json|text] [--event-kind <kind>] [--process-observation <id>] (native Windows)\n\nProvenance:\n       sideeffect provenance keygen <private-key.pk8> <public-key.hex>\n       sideeffect provenance key-check <private-key.pk8> <public-key.hex>\n       sideeffect provenance sign-session <session-dir> --private-key <private-key.pk8> --output <signature.json>\n       sideeffect provenance verify-session <session-dir> --signature <signature.json> --public-key <public-key.hex>"
     );
 }
 
@@ -1931,7 +1931,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect query --query QUERY.json --trace TRACE [--format json|text]\n       sideeffect query --query QUERY.json --windows-runtime CAPTURE.json [--format json|text] (native Windows)\n       sideeffect query --query QUERY.json --session SESSION_DIR --source runtime|selected_root [--format json|text]\n       sideeffect query --query QUERY.json --session SESSION_DIR --session SESSION_DIR --source runtime|selected_root [--format json|text] (2..16 sessions)\nRuns a versioned, read-only exact-filter query over runtime evidence or selected-root inventory artifacts in explicitly selected verified sessions. Event query schema v2 adds path_exact (exact equality); v3 adds path_prefix (case-sensitive literal string starts_with). Both apply only to observed Linux lexical hints or raw-payload-validated Windows ETW FileIo names. Prefix matching can match sibling spellings such as /tmp/a and /tmp/abc; it does not mean directory containment. Neither filter normalizes, case-folds, resolves, or globs paths; unsupported/pathless rows cannot match, and zero matches do not establish absence. Query schemas v1/v2 remain accepted for their original filters. Other event filters are exact event_kind, operation_kind, syscall outcome, and source-local evidence locators; process_observation_id is supported for one runtime source only. Evidence locators match the complete source-native tuple and are rejected across sessions. Inventory query schema v1 accepts exact native-encoding root_path_hex and entry_name_hex filters; Linux values encode bytes and Windows values encode UTF-16LE. Query JSON is capped at 16 KiB, each path filter at 8 KiB, matching rows at 5,000, multi-session verified artifact bytes at 256 MiB, total work at 10 seconds checked between sessions, and serialized output at 8 MiB. Selected-root v1/v2 documents are strictly validated with 10,000-entry and 8 MiB aggregate encoded-name caps. Results retain session/source status, diagnostics, artifact digests, and direct-child entry ordinals. Missing and partial sources remain not checked or partial. Invalid sessions or malformed documents fail the request. Partial or unknown evidence exits with status 2."
         }
         "graph" => {
-            "Usage: sideeffect graph --trace TRACE [--format json|text|html] [--output REPORT.html] [--event-kind KIND | --process-observation ID]\n       sideeffect graph --windows-runtime CAPTURE.json [--format json|text|html] [--output REPORT.html] [--event-kind KIND | --process-observation ID] (native Windows)\nBuilds a bounded source-local graph of event rows, process observations, reported PID context, and evidence-linked relationships. JSON remains the default; --format text writes an 8 MiB-bounded ASCII-only terminal summary to stdout. --format html requires --output and writes a bounded static offline HTML report without replacing existing files. The report uses a restrictive CSP, has no scripts or external assets, and escapes source values. --event-kind selects exact event-kind matches. --process-observation selects a source-local ProcessObservation ID (not a PID or cross-capture ID) and retains events linked to that observation plus its direct process relationships. Retained links preserve their status and basis; diagnostics and source status remain for the full input. An empty event selection is not evidence of absence. PID-only context nodes are kept separate and never merged into process instances. Edges do not establish ownership, causation, or a complete process tree. Partial or unknown source status exits with status 2."
+            "Usage: sideeffect graph --trace TRACE [--format json|text|html] [--output REPORT.html] [--event-kind KIND | --process-observation ID]\n       sideeffect graph --windows-runtime CAPTURE.json [--startup STARTUP.json] [--format json|text|html] [--output REPORT.html] [--event-kind KIND | --process-observation ID] (native Windows)\nBuilds a bounded source-local graph of event rows, process observations, reported PID context, and evidence-linked relationships. Optional Windows --startup adds exact-path SCM service-to-process-start candidates with references into both inputs; a candidate does not show that a service launched or caused a process. JSON remains the default; --format text writes an 8 MiB-bounded ASCII-only terminal summary to stdout. --format html requires --output and writes a bounded static offline HTML report without replacing existing files. The report uses a restrictive CSP, has no scripts or external assets, and escapes source values. --event-kind selects exact event-kind matches. --process-observation selects a source-local ProcessObservation ID (not a PID or cross-capture ID) and retains events linked to that observation plus its direct process relationships. Retained links preserve their status and basis; diagnostics and source status remain for the full input. An empty event selection is not evidence of absence. PID-only context nodes are kept separate and never merged into process instances. Edges do not establish ownership, causation, or a complete process tree. Partial or unknown source status exits with status 2."
         }
         "timeline" => {
             "Usage: sideeffect timeline --trace TRACE [--format json|text] [--event-kind KIND] [--process-observation ID]\n       sideeffect timeline --windows-runtime CAPTURE.json [--format json|text] [--event-kind KIND] [--process-observation ID] (native Windows)\nBuilds a source-local timeline from bounded Linux strace or strictly validated Windows ETW v3 evidence. Items keep their source ordinal, original timestamp representation, and exact raw-record evidence reference; timestamps do not establish causal order. JSON remains the default; --format text writes a bounded ASCII-only terminal summary to stdout, escaping controls, line breaks, and non-ASCII source strings. --event-kind matches an exact event kind. --process-observation selects an emitted source-local ProcessObservation.source_local_id (not a PID or cross-capture ID), retains directly linked items and all their source-native links, and includes the selected observation with its evidence and end_evidence even if no item matches. For Linux task observations, evidence is the first observed row, not proof of task start, and end_evidence is an exact prefixed termination row when available. For Linux returned-child-PID observations, evidence is only the caller's syscall result row; no child-start event is asserted. When both filters are supplied, displayed items must match both. Link roles, statuses and bases remain visible. Filters may appear in either order; duplicates or missing values are errors. An empty result or missing link does not prove absence. Unsupported rows remain in diagnostics. Partial or unknown source status exits with status 2."
@@ -4914,11 +4914,15 @@ fn graph_trace(
         process_observation_id,
         output_format,
         output_path,
+        None,
     )
 }
 
 fn graph_trace_with_filters(path: &OsString, arguments: &[OsString]) -> Result<ExitCode, String> {
     let options = parse_graph_filters(arguments)?;
+    if options.startup_inventory.is_some() {
+        return Err("graph --startup is supported only with --windows-runtime".to_owned());
+    }
     graph_trace(
         path,
         options.event_kind.as_ref(),
@@ -4931,6 +4935,7 @@ fn graph_trace_with_filters(path: &OsString, arguments: &[OsString]) -> Result<E
 struct GraphCliOptions {
     event_kind: Option<OsString>,
     process_observation_id: Option<OsString>,
+    startup_inventory: Option<OsString>,
     output_format: &'static str,
     output_path: Option<OsString>,
 }
@@ -4938,6 +4943,7 @@ struct GraphCliOptions {
 fn parse_graph_filters(arguments: &[OsString]) -> Result<GraphCliOptions, String> {
     let mut event_kind = None;
     let mut process_observation_id = None;
+    let mut startup_inventory = None;
     let mut output_format = "json";
     let mut format_seen = false;
     let mut output_path = None;
@@ -4976,6 +4982,20 @@ fn parse_graph_filters(arguments: &[OsString]) -> Result<GraphCliOptions, String
                 return Err("graph option --output requires a value".to_owned());
             }
             output_path = Some(value.clone());
+            index += 2;
+            continue;
+        }
+        if flag == "--startup" {
+            if startup_inventory.is_some() {
+                return Err("duplicate graph option --startup".to_owned());
+            }
+            let value = arguments
+                .get(index + 1)
+                .ok_or("graph option --startup requires a value")?;
+            if value.to_string_lossy().starts_with("--") {
+                return Err("graph option --startup requires a value".to_owned());
+            }
+            startup_inventory = Some(value.clone());
             index += 2;
             continue;
         }
@@ -5023,6 +5043,7 @@ fn parse_graph_filters(arguments: &[OsString]) -> Result<GraphCliOptions, String
     Ok(GraphCliOptions {
         event_kind,
         process_observation_id,
+        startup_inventory,
         output_format,
         output_path,
     })
@@ -5031,6 +5052,7 @@ fn parse_graph_filters(arguments: &[OsString]) -> Result<GraphCliOptions, String
 #[cfg(windows)]
 fn graph_windows_runtime(
     path: &OsString,
+    startup_path: Option<&OsString>,
     event_kind: Option<&OsString>,
     process_observation_id: Option<&OsString>,
     output_format: &str,
@@ -5046,12 +5068,29 @@ fn graph_windows_runtime(
     let capture = sideeffect::windows_runtime::inspect_windows_runtime_bytes(&bytes)
         .map_err(|error| format!("Windows runtime graph adaptation failed: {error}"))?;
     let envelope = sideeffect::event::from_windows_runtime_capture(&capture);
+    let startup_summary = if let Some(startup_path) = startup_path {
+        let startup_bytes = read_input_file(
+            Path::new(startup_path),
+            sideeffect::limits::MAX_REPORT_BYTES,
+            "Windows startup inventory",
+        )?;
+        Some(
+            sideeffect::windows_startup_correlation::summarize_windows_startup_behavior(
+                &startup_bytes,
+                &bytes,
+            )
+            .map_err(|error| format!("Windows startup graph correlation failed: {error}"))?,
+        )
+    } else {
+        None
+    };
     write_event_graph(
         &envelope,
         event_kind,
         process_observation_id,
         output_format,
         output_path,
+        startup_summary.as_ref(),
     )
 }
 
@@ -5063,6 +5102,7 @@ fn graph_windows_runtime_with_filters(
     let options = parse_graph_filters(arguments)?;
     graph_windows_runtime(
         path,
+        options.startup_inventory.as_ref(),
         options.event_kind.as_ref(),
         options.process_observation_id.as_ref(),
         options.output_format,
@@ -5073,6 +5113,7 @@ fn graph_windows_runtime_with_filters(
 #[cfg(not(windows))]
 fn graph_windows_runtime(
     _path: &OsString,
+    _startup_path: Option<&OsString>,
     _event_kind: Option<&OsString>,
     _process_observation_id: Option<&OsString>,
     _output_format: &str,
@@ -5089,6 +5130,7 @@ fn graph_windows_runtime_with_filters(
     let options = parse_graph_filters(arguments)?;
     graph_windows_runtime(
         path,
+        options.startup_inventory.as_ref(),
         None,
         None,
         options.output_format,
@@ -5102,10 +5144,17 @@ fn write_event_graph(
     process_observation_id: Option<u64>,
     output_format: &str,
     output_path: Option<&OsString>,
+    startup_summary: Option<
+        &sideeffect::windows_startup_correlation::WindowsAssociatedBehaviorSummary,
+    >,
 ) -> Result<ExitCode, String> {
-    let complete =
+    let mut complete =
         envelope.source_state.completeness == sideeffect::event::SourceCompleteness::Complete;
-    let graph = sideeffect::event::graph(envelope, event_kind, process_observation_id)?;
+    let mut graph = sideeffect::event::graph(envelope, event_kind, process_observation_id)?;
+    if let Some(summary) = startup_summary {
+        graph = sideeffect::event::graph_with_windows_startup_candidates(graph, summary)?;
+        complete &= summary.status == "complete";
+    }
     match output_format {
         "json" => write_json(&graph, "event graph")?,
         "text" => {

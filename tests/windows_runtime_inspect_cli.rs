@@ -791,7 +791,7 @@ fn graph_windows_runtime_keeps_pid_context_separate_from_process_instance() {
     assert_eq!(output.status.code(), Some(2));
     let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(graph["schema"], "sideeffect.event_graph");
-    assert_eq!(graph["schema_version"], 5);
+    assert_eq!(graph["schema_version"], 6);
     assert_eq!(graph["filter"]["event_kind"], "process_start");
     assert_eq!(graph["source_state"]["completeness"], "partial");
     let nodes = graph["nodes"].as_array().unwrap();
@@ -879,7 +879,7 @@ fn graph_process_observation_filter_preserves_candidate_context_and_relationship
 
     assert_eq!(output.status.code(), Some(2));
     let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(graph["schema_version"], 5);
+    assert_eq!(graph["schema_version"], 6);
     assert_eq!(graph["filter"]["event_kind"], Value::Null);
     assert_eq!(graph["filter"]["process_observation_id"], 1);
     assert_eq!(graph["source_state"]["completeness"], "partial");
