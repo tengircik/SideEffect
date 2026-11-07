@@ -25,111 +25,15 @@ use windows_sys::Win32::System::Diagnostics::Etw::{
     SystemTraceControlGuid, WNODE_FLAG_TRACED_GUID,
 };
 
-/// Result of checking a serialized TCP/UDP observation against its retained payload.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum NetworkPayloadCrossCheck {
-    NotNetworkProvider,
-    Matched(u32),
-    Mismatch(u32),
-    Unsupported,
-    Malformed,
-    InvalidProcessId,
-}
-
-pub(crate) struct NetworkPayloadInput<'a> {
-    pub provider_guid: &'a str,
-    pub event_id: u16,
-    pub event_version: u8,
-    pub opcode: u8,
-    pub header_flags: u16,
-    pub event_kind: &'a str,
-    pub raw_payload: &'a [u8],
-    pub serialized_decoding: Option<&'a serde_json::Value>,
-}
-
-/// Re-decode supported classic TCP/UDP records and use only the raw payload's PID.
-pub(crate) fn cross_check_network_payload(
-    input: NetworkPayloadInput<'_>,
-) -> NetworkPayloadCrossCheck {
-    let Some(normalized) = normalize_provider_guid(input.provider_guid) else {
-        return NetworkPayloadCrossCheck::NotNetworkProvider;
-    };
-    let network_provider = matches!(
-        normalized.as_str(),
-        "9a280ac0-c8e0-11d1-84e2-00c04fb998a2" | "bf3a50c5-a9c9-4988-a005-2df0b7c80f80"
-    );
-    if !network_provider {
-        return NetworkPayloadCrossCheck::NotNetworkProvider;
-    }
-    let pointer_width = match input.header_flags {
-        flags
-            if flags & (EVENT_HEADER_FLAG_32_BIT_HEADER as u16) != 0
-                && flags & (EVENT_HEADER_FLAG_64_BIT_HEADER as u16) == 0 =>
-        {
-            Some(PointerWidth::Bits32)
-        }
-        flags
-            if flags & (EVENT_HEADER_FLAG_64_BIT_HEADER as u16) != 0
-                && flags & (EVENT_HEADER_FLAG_32_BIT_HEADER as u16) == 0 =>
-        {
-            Some(PointerWidth::Bits64)
-        }
-        _ => None,
-    };
-    let decoded = decode_classic_event(
-        &normalized,
-        input.event_id,
-        input.event_version,
-        input.opcode,
-        pointer_width,
-        input.raw_payload,
-    );
-    let Some(observation) = decoded.observation.as_ref() else {
-        return if decoded.status == IoDecodeStatus::MalformedPayload {
-            NetworkPayloadCrossCheck::Malformed
-        } else {
-            NetworkPayloadCrossCheck::Unsupported
-        };
-    };
-    let Activity::Network(network) = &observation.activity else {
-        return NetworkPayloadCrossCheck::Unsupported;
-    };
-    let Ok(raw_value) = serde_json::to_value(&decoded) else {
-        return NetworkPayloadCrossCheck::Malformed;
-    };
-    let matches = input.event_kind == "network_observation"
-        && input
-            .serialized_decoding
-            .is_some_and(|serialized| *serialized == raw_value);
-    if network.payload_process_id == 0 {
-        NetworkPayloadCrossCheck::InvalidProcessId
-    } else if matches {
-        NetworkPayloadCrossCheck::Matched(network.payload_process_id)
-    } else {
-        NetworkPayloadCrossCheck::Mismatch(network.payload_process_id)
-    }
-}
-
-fn normalize_provider_guid(value: &str) -> Option<String> {
-    let value = value.trim();
-    let value = if let Some(inner) = value.strip_prefix('{') {
-        inner.strip_suffix('}')?
-    } else {
-        value
-    };
-    (value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| match index {
-            8 | 13 | 18 | 23 => byte == b'-',
-            _ => byte.is_ascii_hexdigit(),
-        }))
-    .then(|| value.to_ascii_lowercase())
-}
-
 #[path = "payload_decode.rs"]
 mod payload_decode;
 use super::windows_io_decode::{
     Activity, DecodeResult as IoDecodeResult, DecodeStatus as IoDecodeStatus, PointerWidth,
     decode_classic_event,
+};
+#[cfg(test)]
+use super::windows_io_decode::{
+    NetworkPayloadCrossCheck, NetworkPayloadInput, cross_check_network_payload,
 };
 use payload_decode::decode_event_payload;
 pub use payload_decode::{DecodeStatus, DecodedProcessPayload};
@@ -140,6 +44,9 @@ pub const MAX_WINDOWS_RUNTIME_DURATION_SECONDS: u64 = 60;
 const MAX_EVENT_RECORDS: usize = 50_000;
 const MAX_EVENT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
+// Keep headroom for the enclosing capture metadata, diagnostics, and final
+// SHA-256 field. Event bodies are measured in their exact serialized form.
+const DOCUMENT_METADATA_RESERVE_BYTES: usize = 64 * 1024;
 const MAX_EVENT_PAYLOAD_LENGTH: usize = 64 * 1024;
 const BUFFER_SIZE_KB: u32 = 16;
 const MINIMUM_BUFFERS: u32 = 8;
@@ -226,6 +133,27 @@ pub struct EventLoss {
     pub final_snapshot_available: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TraceStatistics {
+    buffer_count: u32,
+    events_lost: u32,
+    log_buffers_lost: u32,
+    real_time_buffers_lost: u32,
+}
+
+impl TraceStatistics {
+    fn into_loss(self, observation: &'static str, final_snapshot_available: bool) -> EventLoss {
+        EventLoss {
+            events_lost: self.events_lost,
+            log_buffers_lost: self.log_buffers_lost,
+            real_time_buffers_lost: self.real_time_buffers_lost,
+            loss_statistics_available: true,
+            observation,
+            final_snapshot_available,
+        }
+    }
+}
+
 impl Default for EventLoss {
     fn default() -> Self {
         Self {
@@ -266,6 +194,7 @@ pub struct NativeRuntimeEvent {
 struct Collector {
     events: Vec<NativeRuntimeEventBytes>,
     payload_bytes: usize,
+    serialized_event_bytes: usize,
     limit_reached: bool,
     malformed: bool,
     oversized_payload_events: usize,
@@ -362,10 +291,16 @@ pub(crate) fn collect_windows_runtime_capture_before_launch(
     };
 
     let stopped = session.stop();
+    let stop_failed = stopped.is_err();
     let end_unix_ms = now_unix_ms()?;
-    let mut diagnostics = Vec::new();
-    if let Err(error) = stopped {
-        diagnostics.push(format!("etw_stop_failed:{error}"));
+    let mut diagnostics = std::mem::take(&mut session.stop_diagnostics);
+    if let Err(error) = &stopped {
+        if !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.starts_with("etw_stop_failed:"))
+        {
+            diagnostics.push(format!("etw_stop_failed:{error}"));
+        }
     }
     let collector = collector
         .lock()
@@ -377,27 +312,7 @@ pub(crate) fn collect_windows_runtime_capture_before_launch(
     let unsupported_provider_events = collector.unsupported_provider_events;
     let mut events = Vec::with_capacity(collector.events.len());
     for (index, event) in collector.events.iter().enumerate() {
-        let observation_decoding = event
-            .observation_decoding
-            .as_ref()
-            .map(serde_json::to_value)
-            .transpose()
-            .map_err(|error| format!("could not serialize ETW observation decoding: {error}"))?;
-        events.push(NativeRuntimeEvent {
-            record_ordinal: (index + 1) as u64,
-            provider_guid: event.provider_guid.clone(),
-            event_id: event.event_id,
-            event_version: event.event_version,
-            opcode: event.opcode,
-            event_kind: event.event_kind,
-            header_process_id: event.header_process_id,
-            header_thread_id: event.header_thread_id,
-            header_flags: event.header_flags,
-            timestamp_qpc: event.timestamp_qpc,
-            raw_payload_hex: hex(&event.raw_payload),
-            payload_decoding: event.payload_decoding.clone(),
-            observation_decoding,
-        });
+        events.push(native_runtime_event(event, (index + 1) as u64)?);
     }
     drop(collector);
     let status = collection_status(
@@ -405,7 +320,7 @@ pub(crate) fn collect_windows_runtime_capture_before_launch(
         event_limit,
         malformed,
         loss.is_complete_and_loss_free(),
-        !diagnostics.is_empty(),
+        stop_failed,
     );
     if event_limit {
         diagnostics.push("event_or_payload_limit_reached".to_owned());
@@ -560,6 +475,7 @@ struct EtwSession {
     buffer_count: u32,
     started_at_unix_ms: u128,
     stopped: bool,
+    stop_diagnostics: Vec<String>,
 }
 
 impl EtwSession {
@@ -624,6 +540,7 @@ impl EtwSession {
                 buffer_count: 0,
                 started_at_unix_ms,
                 stopped: false,
+                stop_diagnostics: Vec::new(),
             }),
             Ok(Err(code)) => {
                 unsafe { StopTraceW(handle, name.as_ptr(), props) };
@@ -648,49 +565,80 @@ impl EtwSession {
         // unavailable even when ETW has stopped the session successfully.
         let mut properties = control_trace_properties_buffer();
         let props = properties.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
-        let query = unsafe {
-            windows_sys::Win32::System::Diagnostics::Etw::ControlTraceW(
-                self.handle,
-                self.name.as_ptr(),
-                props,
-                EVENT_TRACE_CONTROL_QUERY,
-            )
-        };
-        if query == ERROR_SUCCESS {
-            self.buffer_count = unsafe { (*props).NumberOfBuffers };
-            self.loss = Some(EventLoss {
+        let handle = self.handle;
+        let name = self.name.as_ptr();
+        let query = || {
+            let result = unsafe {
+                windows_sys::Win32::System::Diagnostics::Etw::ControlTraceW(
+                    handle,
+                    name,
+                    props,
+                    EVENT_TRACE_CONTROL_QUERY,
+                )
+            };
+            if result != ERROR_SUCCESS {
+                return Err(result);
+            }
+            Ok(TraceStatistics {
+                buffer_count: unsafe { (*props).NumberOfBuffers },
                 events_lost: unsafe { (*props).EventsLost },
                 log_buffers_lost: unsafe { (*props).LogBuffersLost },
                 real_time_buffers_lost: unsafe { (*props).RealTimeBuffersLost },
-                loss_statistics_available: true,
-                observation: "pre_stop_query",
-                final_snapshot_available: false,
-            });
+            })
+        };
+        let stop = || {
+            let result = unsafe { StopTraceW(handle, name, props) };
+            if result != ERROR_SUCCESS {
+                return Err(result);
+            }
+            Ok(TraceStatistics {
+                buffer_count: unsafe { (*props).NumberOfBuffers },
+                events_lost: unsafe { (*props).EventsLost },
+                log_buffers_lost: unsafe { (*props).LogBuffersLost },
+                real_time_buffers_lost: unsafe { (*props).RealTimeBuffersLost },
+            })
+        };
+        self.stop_with(query, stop)
+    }
+
+    fn stop_with(
+        &mut self,
+        query: impl FnOnce() -> Result<TraceStatistics, u32>,
+        stop: impl FnOnce() -> Result<TraceStatistics, u32>,
+    ) -> Result<(), String> {
+        if self.stopped {
+            return Ok(());
         }
-        let stopped = unsafe { StopTraceW(self.handle, self.name.as_ptr(), props) };
-        if stopped != ERROR_SUCCESS {
-            return Err(format!(
-                "ControlTrace(STOP) failed with Windows error {stopped}"
-            ));
+        match query() {
+            Ok(statistics) => {
+                self.buffer_count = statistics.buffer_count;
+                self.loss = Some(statistics.into_loss("pre_stop_query", false));
+            }
+            Err(error) => {
+                self.loss = Some(EventLoss::default());
+                self.stop_diagnostics
+                    .push(format!("etw_pre_stop_query_failed:{error}"));
+            }
         }
+        let statistics = match stop() {
+            Ok(statistics) => statistics,
+            Err(error) => {
+                self.stop_diagnostics
+                    .push(format!("etw_stop_failed:{error}"));
+                return Err(format!(
+                    "ControlTrace(STOP) failed with Windows error {error}"
+                ));
+            }
+        };
         self.stopped = true;
-        self.loss = Some(EventLoss {
-            events_lost: unsafe { (*props).EventsLost },
-            log_buffers_lost: unsafe { (*props).LogBuffersLost },
-            real_time_buffers_lost: unsafe { (*props).RealTimeBuffersLost },
-            loss_statistics_available: true,
-            observation: "stop_response",
-            final_snapshot_available: true,
-        });
+        self.buffer_count = statistics.buffer_count;
+        self.loss = Some(statistics.into_loss("stop_response", true));
         if let Some(consumer) = self.consumer.take() {
             let result = consumer
                 .join()
                 .map_err(|_| "ETW consumer thread panicked".to_owned())?;
             validate_process_trace_result(result)?;
         }
-        // STOP succeeded and supplied final counters. QUERY failure is
-        // therefore not fatal to this final loss snapshot.
-        let _ = query;
         Ok(())
     }
 }
@@ -860,6 +808,9 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
 }
 
 fn append_event(state: &mut Collector, event: NativeRuntimeEventBytes) -> bool {
+    if state.limit_reached {
+        return false;
+    }
     let payload_len = event.raw_payload.len();
     if payload_len > MAX_EVENT_PAYLOAD_LENGTH {
         state.malformed = true;
@@ -868,6 +819,35 @@ fn append_event(state: &mut Collector, event: NativeRuntimeEventBytes) -> bool {
     if state.events.len() >= MAX_EVENT_RECORDS
         || state.payload_bytes.saturating_add(payload_len) > MAX_EVENT_PAYLOAD_BYTES
     {
+        state.limit_reached = true;
+        return false;
+    }
+    let projected = match native_runtime_event(&event, (state.events.len() + 1) as u64) {
+        Ok(projected) => projected,
+        Err(_) => {
+            state.malformed = true;
+            return false;
+        }
+    };
+    let projected_bytes = match serde_json::to_vec(&projected) {
+        Ok(serialized) => serialized.len(),
+        Err(_) => {
+            state.malformed = true;
+            return false;
+        }
+    };
+    // The final document contains the event array brackets and one comma for
+    // each previously retained event, followed by bounded capture metadata.
+    // Measure the expanded JSON representation here so decoding and escaping
+    // cannot make a collection pass its independent payload limits but fail
+    // publication later.
+    let projected_document_bytes = state
+        .serialized_event_bytes
+        .saturating_add(projected_bytes)
+        .saturating_add(state.events.len())
+        .saturating_add(2)
+        .saturating_add(DOCUMENT_METADATA_RESERVE_BYTES);
+    if projected_document_bytes > MAX_DOCUMENT_BYTES {
         state.limit_reached = true;
         return false;
     }
@@ -887,8 +867,36 @@ fn append_event(state: &mut Collector, event: NativeRuntimeEventBytes) -> bool {
         return false;
     }
     state.payload_bytes += payload_len;
+    state.serialized_event_bytes += projected_bytes;
     state.events.push(event);
     true
+}
+
+fn native_runtime_event(
+    event: &NativeRuntimeEventBytes,
+    record_ordinal: u64,
+) -> Result<NativeRuntimeEvent, String> {
+    let observation_decoding = event
+        .observation_decoding
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|error| format!("could not serialize ETW observation decoding: {error}"))?;
+    Ok(NativeRuntimeEvent {
+        record_ordinal,
+        provider_guid: event.provider_guid.clone(),
+        event_id: event.event_id,
+        event_version: event.event_version,
+        opcode: event.opcode,
+        event_kind: event.event_kind,
+        header_process_id: event.header_process_id,
+        header_thread_id: event.header_thread_id,
+        header_flags: event.header_flags,
+        timestamp_qpc: event.timestamp_qpc,
+        raw_payload_hex: hex(&event.raw_payload),
+        payload_decoding: event.payload_decoding.clone(),
+        observation_decoding,
+    })
 }
 
 fn etw_start_error(code: u32) -> String {
@@ -969,6 +977,34 @@ fn classify_process_opcode(opcode: u8) -> &'static str {
 mod tests {
     use super::*;
     use crate::event::{EvidenceReference, SourceCompleteness, from_windows_etw};
+
+    fn test_session() -> EtwSession {
+        EtwSession {
+            handle: CONTROLTRACE_HANDLE { Value: 0 },
+            consumer: None,
+            name: Vec::new(),
+            loss: None,
+            buffer_count: 0,
+            started_at_unix_ms: 0,
+            stopped: false,
+            stop_diagnostics: Vec::new(),
+        }
+    }
+
+    fn stop_test_status(
+        session: &EtwSession,
+        stop_result: &Result<(), String>,
+    ) -> CollectionStatus {
+        let loss = session.loss.as_ref().cloned().unwrap_or_default();
+        let stop_failed = stop_result.is_err();
+        collection_status(
+            false,
+            false,
+            false,
+            loss.is_complete_and_loss_free(),
+            stop_failed,
+        )
+    }
 
     fn ipv4_typegroup1_payload(process_id: u32) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -1158,6 +1194,83 @@ mod tests {
     }
 
     #[test]
+    fn stop_query_failure_is_diagnostic_but_final_stop_snapshot_remains_complete() {
+        let mut session = test_session();
+        let result = session.stop_with(
+            || Err(ERROR_ACCESS_DENIED),
+            || Ok(TraceStatistics::default()),
+        );
+
+        assert!(result.is_ok(), "STOP still returned final ETW counters");
+        assert_eq!(
+            session.stop_diagnostics,
+            [format!("etw_pre_stop_query_failed:{ERROR_ACCESS_DENIED}")]
+        );
+        let loss = session.loss.as_ref().unwrap();
+        assert_eq!(loss.observation, "stop_response");
+        assert!(loss.loss_statistics_available);
+        assert!(loss.final_snapshot_available);
+        assert!(!loss.has_losses());
+        assert_eq!(
+            stop_test_status(&session, &result),
+            CollectionStatus::Complete
+        );
+    }
+
+    #[test]
+    fn stop_failure_keeps_pre_stop_statistics_nonfinal_and_capture_partial() {
+        let mut session = test_session();
+        let result = session.stop_with(
+            || {
+                Ok(TraceStatistics {
+                    buffer_count: 8,
+                    ..TraceStatistics::default()
+                })
+            },
+            || Err(ERROR_ACCESS_DENIED),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(session.buffer_count, 8);
+        let loss = session.loss.as_ref().unwrap();
+        assert_eq!(loss.observation, "pre_stop_query");
+        assert!(loss.loss_statistics_available);
+        assert!(!loss.final_snapshot_available);
+        assert_eq!(
+            session.stop_diagnostics,
+            [format!("etw_stop_failed:{ERROR_ACCESS_DENIED}")]
+        );
+        assert_eq!(
+            stop_test_status(&session, &result),
+            CollectionStatus::Partial
+        );
+        session.stopped = true;
+    }
+
+    #[test]
+    fn failed_query_and_stop_leave_final_loss_statistics_unknown_and_partial() {
+        let mut session = test_session();
+        let result = session.stop_with(|| Err(ERROR_ACCESS_DENIED), || Err(ERROR_ACCESS_DENIED));
+
+        assert!(result.is_err());
+        let loss = session.loss.as_ref().unwrap();
+        assert!(!loss.loss_statistics_available);
+        assert!(!loss.final_snapshot_available);
+        assert_eq!(
+            session.stop_diagnostics,
+            [
+                format!("etw_pre_stop_query_failed:{ERROR_ACCESS_DENIED}"),
+                format!("etw_stop_failed:{ERROR_ACCESS_DENIED}"),
+            ]
+        );
+        assert_eq!(
+            stop_test_status(&session, &result),
+            CollectionStatus::Partial
+        );
+        session.stopped = true;
+    }
+
+    #[test]
     fn process_trace_non_success_status_is_not_treated_as_complete() {
         assert!(validate_process_trace_result(ERROR_SUCCESS).is_ok());
         assert!(validate_process_trace_result(1).is_err());
@@ -1203,6 +1316,54 @@ mod tests {
             event(vec![0; MAX_EVENT_PAYLOAD_LENGTH + 1])
         ));
         assert!(state.malformed);
+    }
+
+    #[test]
+    fn serialized_document_budget_accounts_for_decoded_event_expansion() {
+        let expanded_event = || NativeRuntimeEventBytes {
+            provider_guid: "{3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c}".to_owned(),
+            event_id: 1,
+            event_version: 0,
+            opcode: EVENT_TRACE_TYPE_START as u8,
+            event_kind: "process_start",
+            header_process_id: 0,
+            header_thread_id: 0,
+            header_flags: EVENT_HEADER_FLAG_64_BIT_HEADER as u16,
+            timestamp_qpc: 0,
+            raw_payload: vec![7],
+            payload_decoding: Some(DecodedProcessPayload {
+                status: DecodeStatus::Decoded,
+                schema_name: Some("Process_TypeGroup1"),
+                schema_version: Some(3),
+                pointer_size_bytes: Some(8),
+                process_id: Some(42),
+                parent_process_id: Some(1),
+                image_file_name: Some("x".repeat(32 * 1024)),
+                diagnostic: None,
+            }),
+            observation_decoding: None,
+        };
+        let mut state = Collector::default();
+        while append_event(&mut state, expanded_event()) {}
+
+        assert!(state.limit_reached);
+        assert!(!state.events.is_empty());
+        assert!(state.events.len() < MAX_EVENT_RECORDS);
+        assert!(state.payload_bytes < MAX_EVENT_PAYLOAD_BYTES);
+        let retained_event_count = state.events.len();
+        assert!(!append_event(&mut state, expanded_event()));
+        assert_eq!(state.events.len(), retained_event_count);
+        let serialized_events = state
+            .events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| native_runtime_event(event, (index + 1) as u64).unwrap())
+            .collect::<Vec<_>>();
+        let events_array_bytes = serde_json::to_vec(&serialized_events).unwrap().len();
+        assert!(
+            events_array_bytes + DOCUMENT_METADATA_RESERVE_BYTES <= MAX_DOCUMENT_BYTES,
+            "retained event bytes plus reserved metadata must fit the document cap"
+        );
     }
 
     #[test]
@@ -1493,6 +1654,48 @@ mod tests {
         );
         assert_eq!(result.unwrap_err(), "synthetic ETW setup failure");
         assert!(!launched.get());
+    }
+
+    #[test]
+    fn etw_start_failures_are_classified_before_target_launch() {
+        use std::cell::Cell;
+
+        let cases = [
+            (
+                ERROR_ACCESS_DENIED,
+                "NT Kernel Logger control was denied; this capture requires administrative privileges. No elevation was requested and the command was not started.",
+            ),
+            (
+                183,
+                "the NT Kernel Logger session is already in use; no session was changed and the command was not started",
+            ),
+            (
+                1234,
+                "could not start or consume the NT Kernel Logger session (Windows error 1234); the command was not started",
+            ),
+        ];
+
+        for (code, expected_message) in cases {
+            let launched = Cell::new(false);
+            let result = setup_before_target_launch::<(), ()>(
+                || Err(etw_start_error(code)),
+                || Ok(()),
+                |_| {
+                    launched.set(true);
+                    Ok(())
+                },
+            );
+
+            assert_eq!(
+                result.unwrap_err(),
+                expected_message,
+                "Windows error {code}"
+            );
+            assert!(
+                !launched.get(),
+                "target launch callback ran for Windows error {code}"
+            );
+        }
     }
 
     #[test]

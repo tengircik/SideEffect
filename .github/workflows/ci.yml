@@ -29,7 +29,9 @@ jobs:
           cargo install cargo-fuzz --locked --version 0.12.0
 
       - name: Run bounded parser fuzz smoke
-        run: cargo +nightly fuzz run parse_trace_bytes -- -runs=100 -max_len=65536
+        run: |
+          cargo +nightly fuzz run parse_trace_bytes -- -runs=100 -max_len=65536
+          cargo +nightly fuzz run inspect_windows_runtime_bytes -- -runs=100 -max_len=65536
 
   strace-minimum-compatibility:
     name: Linux strace compatibility (Ubuntu 24.04)
@@ -67,6 +69,18 @@ jobs:
       - name: Run real strace capture integration test
         run: cargo test --locked --test record_observations real_strace_capture_inspect_and_diff_observe_file_and_loopback_events -- --exact
 
+      - name: Run concurrent child-process strace integration test
+        run: cargo test --locked --test record_observations real_strace_capture_observes_two_concurrent_child_processes -- --exact
+
+      - name: Run distinct-thread strace integration test
+        run: cargo test --locked --test record_observations real_strace_capture_attributes_file_operations_to_distinct_threads -- --exact
+
+      - name: Run real refused-connect capture integration test
+        run: cargo test --locked --test record_observations real_strace_capture_reports_refused_loopback_connection_as_failed_attempt -- --exact
+
+      - name: Run real strace cancellation and tracee cleanup integration test
+        run: cargo test --locked --test record_observations real_strace_capture_cancellation_discards_partial_trace_and_reaps_tracee -- --exact
+
       - name: Run startup correlation against a real strace capture
         run: cargo test --locked --test startup_correlation_real_strace real_strace_capture_can_match_a_synthetic_literal_startup_row -- --exact
 
@@ -92,6 +106,21 @@ jobs:
       - name: Validate portable agent skill
         run: python3 scripts/validate_agent_skill.py
 
+      - name: Validate local explanation evaluator contracts
+        run: |
+          python3 tests/test_local_model_explain_evaluator.py
+          python3 tests/test_local_model_explain_review_packet.py
+          python3 tests/test_run_local_model_explain_corpus.py
+
+      - name: Validate local query-plan v3 development contracts
+        run: |
+          python3 tests/fixtures/local_query_plan_v3_development/validate_corpus.py
+          python3 -m unittest discover -s tests/fixtures/local_query_plan_v3_development -p 'test_*.py' -v
+          python3 scripts/test_evaluate_local_query_plan_v3.py
+
+      - name: Test Linux release archive smoke validator
+        run: python3 tests/test_smoke_linux_release_archive.py
+
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -111,6 +140,47 @@ jobs:
         run: |
           ./target/release/sideeffect --help
           ./target/release/sideeffect --version
+
+      - name: Measure bounded native Linux trace performance
+        run: |
+          python3 scripts/trace_scale_benchmark.py \
+            --sideeffect target/release/sideeffect \
+            --profile getpid --sizes 1000,10000 \
+            --runs 2 --warmups 0 \
+            --output "$RUNNER_TEMP/trace-scale-ci.json" \
+            > "$RUNNER_TEMP/trace-scale-stdout.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = json.loads(Path(os.environ["RUNNER_TEMP"], "trace-scale-ci.json").read_text())
+          failed = [case["requested_records"] for case in report["matrix"]
+                    if case.get("status") != "measured"]
+          if failed:
+              raise SystemExit(f"benchmark did not completely measure requested sizes: {failed}")
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a", encoding="utf-8") as stream:
+              stream.write("\n### Bounded Linux trace performance sample\n\n")
+              stream.write("Native Ubuntu 24.04 hosted runner; generated local `getpid` workload; two measured captures per size, no warm-up. This is a reproducibility smoke sample, not a general performance claim.\n\n")
+              stream.write("| Requested rows | Run | Parsed rows | Trace bytes | Capture wall (s) | Capture child CPU (s) | Capture sampled peak process-group RSS (bytes) | Inspect JSON bytes | Inspect wall (s) | Inspect child CPU (s) | Inspect sampled peak process-group RSS (bytes) |\n")
+              stream.write("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+              for case in report["matrix"]:
+                  for index, run in enumerate(case.get("runs", []), 1):
+                      capture = run.get("capture", {})
+                      inspect = run.get("inspect", {})
+                      capture_cpu = capture.get("child_cpu_seconds", {})
+                      inspect_cpu = inspect.get("child_cpu_seconds", {})
+                      stream.write(
+                          f"| {case['requested_records']} | {index} | {inspect.get('parsed_records', '—')} "
+                          f"| {capture.get('trace_bytes', '—')} | {capture.get('wall_seconds', '—')} "
+                          f"| {capture_cpu.get('user', 0) + capture_cpu.get('system', 0):.6f} "
+                          f"| {capture.get('sampled_peak_process_group_rss_bytes', '—')} "
+                          f"| {inspect.get('json_bytes', '—')} | {inspect.get('wall_seconds', '—')} "
+                          f"| {inspect_cpu.get('user', 0) + inspect_cpu.get('system', 0):.6f} "
+                          f"| {inspect.get('sampled_peak_process_group_rss_bytes', '—')} |\n"
+                      )
+          PY
       - name: Smoke-check Cargo installation
         run: |
           cargo install --locked --path . --root "$RUNNER_TEMP/sideeffect-install"
@@ -219,6 +289,15 @@ jobs:
       - name: Install Rust components
         run: rustup component add rustfmt clippy
 
+      - name: Validate local explanation evaluator contracts
+        shell: pwsh
+        run: |
+          py -3 tests/test_local_model_explain_evaluator.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          py -3 tests/test_local_model_explain_review_packet.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          py -3 tests/test_run_local_model_explain_corpus.py
+
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -238,8 +317,10 @@ jobs:
           }
           Write-Output "ETW acceptance runner token is administrative: $($identity.Name)"
 
-      - name: Run live ETW acceptance
-        run: cargo test --locked --test windows_runtime_etw_integration -- --ignored --exact captures_process_file_and_loopback_network_observations_and_reports_loss_state
+      - name: Run Windows Server 2022/2025 ETW acceptance and diagnostic sample
+        env:
+          SIDEEFFECT_ETW_DIAGNOSTIC_SAMPLE: windows_server_hosted_ci
+        run: cargo test --locked --test windows_runtime_etw_integration -- --ignored --exact captures_process_file_and_loopback_network_observations_and_reports_loss_state --nocapture
 
       - name: Build CLI
         run: cargo build --locked --bin sideeffect

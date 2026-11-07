@@ -115,9 +115,6 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      attestations: write
-      artifact-metadata: write
-      id-token: write
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -147,6 +144,16 @@ jobs:
           tar -C "$RUNNER_TEMP" -czf "${package}.tar.gz" "$package"
           tar -tzf "${package}.tar.gz"
 
+      - name: Validate and smoke-check assembled Linux archive
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 scripts/smoke_linux_release_archive.py \
+            --archive "sideeffect-${RELEASE_TAG}-linux-x86_64.tar.gz" \
+            --version "${RELEASE_TAG#v}" \
+            --temp-dir "$RUNNER_TEMP"
+
       - name: Assemble source archive
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -155,11 +162,6 @@ jobs:
           package="sideeffect-${RELEASE_TAG}-source"
           git archive --format=tar.gz --prefix="${package}/" "$GITHUB_SHA" > "${package}.tar.gz"
           tar -tzf "${package}.tar.gz" >/dev/null
-
-      - name: Attest Linux and source archive provenance
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: sideeffect-${{ github.ref_name }}-*.tar.gz
 
       - name: Upload Linux archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -178,9 +180,6 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      attestations: write
-      artifact-metadata: write
-      id-token: write
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -213,11 +212,6 @@ jobs:
             throw "Release archive is missing or empty"
           }
 
-      - name: Attest Windows archive provenance
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: sideeffect-${{ github.ref_name }}-windows-x86_64.zip
-
       - name: Upload Windows archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -226,9 +220,42 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  attest-release-assets:
+    name: Attest smoke-tested release assets
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      attestations: write
+      artifact-metadata: write
+      id-token: write
+    steps:
+      - name: Download release archives from build jobs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "*-x86_64"
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify exact archive set before attestation
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          test -s "release-assets/sideeffect-${RELEASE_TAG}-linux-x86_64.tar.gz"
+          test -s "release-assets/sideeffect-${RELEASE_TAG}-source.tar.gz"
+          test -s "release-assets/sideeffect-${RELEASE_TAG}-windows-x86_64.zip"
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 3
+
+      - name: Attest Linux, source, and Windows archive provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release-assets/sideeffect-${{ github.ref_name }}-linux-x86_64.tar.gz,release-assets/sideeffect-${{ github.ref_name }}-source.tar.gz,release-assets/sideeffect-${{ github.ref_name }}-windows-x86_64.zip
+
   publish:
     name: Publish GitHub release
-    needs: [preflight, ci, dependency-audit, license-notices, build-linux, build-windows]
+    needs: [preflight, ci, dependency-audit, license-notices, build-linux, build-windows, attest-release-assets]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

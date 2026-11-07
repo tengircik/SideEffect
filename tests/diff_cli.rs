@@ -94,7 +94,7 @@ fn diff_command_emits_versioned_json_with_evidence_references() {
         String::from_utf8_lossy(&output.stderr)
     );
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(document["schema_version"], 3);
+    assert_eq!(document["schema_version"], 4);
     assert_eq!(
         document["left_source_sha256"],
         "d75a97b3058387a94ca085ed28ab08826671f305be8c70e947df902de553ca9d"
@@ -113,7 +113,7 @@ fn diff_command_emits_versioned_json_with_evidence_references() {
         document["matching_policy"]["display_only_fields"][0],
         "lexical_path_hint"
     );
-    let changed_open = document["changes"]
+    let changed_open = document["normalized_changes"]
         .as_array()
         .unwrap()
         .iter()
@@ -127,8 +127,8 @@ fn diff_command_emits_versioned_json_with_evidence_references() {
         changed_open["after_lexical_path_hint"]["path"],
         "/tmp/config.json"
     );
-    assert_eq!(document["changes"].as_array().unwrap().len(), 4);
-    let changed_open = document["changes"]
+    assert_eq!(document["normalized_changes"].as_array().unwrap().len(), 4);
+    let changed_open = document["normalized_changes"]
         .as_array()
         .unwrap()
         .iter()
@@ -136,6 +136,21 @@ fn diff_command_emits_versioned_json_with_evidence_references() {
         .unwrap();
     assert_eq!(changed_open["before"][0]["line_number"], 2);
     assert_eq!(changed_open["after"][0]["line_number"], 2);
+    assert!(!document["raw_line_deltas"].as_array().unwrap().is_empty());
+    assert!(document["raw_line_deltas"][0].get("raw_line").is_none());
+    assert_eq!(document["semantic_changes"].as_array().unwrap().len(), 4);
+    let semantic_open = document["semantic_changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| {
+            change["kind"] == "changed" && change["record_class"] == "file_syscall_record"
+        })
+        .unwrap();
+    assert_eq!(semantic_open["before"], changed_open["before"]);
+    assert_eq!(semantic_open["after"], changed_open["after"]);
+    assert_eq!(semantic_open["before_outcome"], "success");
+    assert_eq!(semantic_open["after_outcome"], "failure");
 }
 
 #[test]
@@ -177,6 +192,9 @@ fn text_format_escapes_terminal_controls_and_non_ascii_trace_data() {
     assert!(text.contains("\\u{1B}[31m"));
     assert!(text.contains("\\u{202E}"));
     assert!(text.contains("\\u{E9}"));
+    assert!(text.contains("Exact raw-line multiset deltas"));
+    assert!(text.contains("Normalized parsed-record view"));
+    assert!(text.contains("Conservative semantic annotations"));
 }
 
 #[cfg(target_os = "linux")]

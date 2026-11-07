@@ -1602,7 +1602,10 @@ mod windows_tests {
     #[test]
     fn bounded_runner_executes_direct_argv_and_returns_capped_output() {
         let current_test_executable = std::env::current_exe().expect("locate test executable");
-        let arguments = [OsString::from("--list")];
+        let arguments = [
+            OsString::from("bounded_runner_executes_direct_argv_and_returns_capped_output"),
+            OsString::from("--list"),
+        ];
         let output = run_bounded_windows(
             &current_test_executable,
             &arguments,

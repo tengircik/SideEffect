@@ -4,6 +4,9 @@
 //! This module never expands environment strings, parses command lines, or
 //! launches entries.
 
+use super::startup_wmi::{
+    WmiEventConsumer, WmiEventFilter, WmiFilterConsumerBinding, collect_wmi_startup,
+};
 use serde::Serialize;
 use std::ffi::{OsStr, c_void};
 use std::fs;
@@ -31,6 +34,8 @@ const ERROR_PROC_NOT_FOUND: u32 = 127;
 const ERROR_MORE_DATA: u32 = 234;
 const ERROR_NO_MORE_ITEMS: u32 = 259;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+const ERROR_INVALID_LEVEL: u32 = 124;
+const ERROR_TIMEOUT: u32 = 1460;
 const REG_SZ: u32 = 1;
 const REG_EXPAND_SZ: u32 = 2;
 const KEY_READ: u32 = 0x0002_0019;
@@ -46,10 +51,18 @@ const MAX_AGGREGATE_PATH_UNITS: usize = 4 * 1024 * 1024;
 const MAX_SCAN_DURATION_MS: u128 = 10_000;
 const MAX_SERVICE_ENUM_BYTES: usize = 256 * 1024;
 const MAX_SERVICE_CONFIG_BYTES: usize = 64 * 1024;
+const MAX_SERVICE_CONFIG2_BYTES: usize = 8 * 1024;
 const MAX_AGGREGATE_SERVICE_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SERVICE_ENTRIES: usize = 8_192;
 const MAX_SERVICE_STRING_UNITS: usize = 32_768;
 const MAX_AGGREGATE_SERVICE_STRING_UNITS: usize = 4 * 1024 * 1024;
+const MAX_SERVICE_DEPENDENCIES_PER_SERVICE: usize = 4_096;
+const MAX_AGGREGATE_SERVICE_DEPENDENCIES: usize = 65_536;
+const MAX_SERVICE_TRIGGERS_PER_SERVICE: usize = 256;
+const MAX_AGGREGATE_SERVICE_TRIGGERS: usize = 8_192;
+const MAX_SERVICE_TRIGGER_DATA_ITEMS: usize = 64;
+const MAX_SERVICE_TRIGGER_DATA_ITEM_BYTES: usize = 1024;
+const MAX_AGGREGATE_SERVICE_TRIGGER_DATA_BYTES: usize = 1024 * 1024;
 const MAX_SERVICE_DIAGNOSTICS: usize = 256;
 const MAX_TASK_FOLDER_DEPTH: usize = 16;
 const MAX_TASK_FOLDERS: usize = 1_024;
@@ -64,6 +77,8 @@ const MAX_TASK_DIAGNOSTICS: usize = 256;
 const SC_MANAGER_CONNECT: u32 = 0x0001;
 const SC_MANAGER_ENUMERATE_SERVICE: u32 = 0x0004;
 const SERVICE_QUERY_CONFIG: u32 = 0x0001;
+const SERVICE_CONFIG_DELAYED_AUTO_START_INFO: u32 = 3;
+const SERVICE_CONFIG_TRIGGER_INFO: u32 = 8;
 const SC_ENUM_PROCESS_INFO: u32 = 0;
 const SERVICE_DRIVER: u32 = 0x0000_000b;
 const SERVICE_WIN32: u32 = 0x0000_0030;
@@ -74,6 +89,13 @@ const SERVICE_SYSTEM_START: u32 = 1;
 const SERVICE_AUTO_START: u32 = 2;
 const SERVICE_DEMAND_START: u32 = 3;
 const SERVICE_DISABLED: u32 = 4;
+const SERVICE_STOPPED: u32 = 1;
+const SERVICE_START_PENDING: u32 = 2;
+const SERVICE_STOP_PENDING: u32 = 3;
+const SERVICE_RUNNING: u32 = 4;
+const SERVICE_CONTINUE_PENDING: u32 = 5;
+const SERVICE_PAUSE_PENDING: u32 = 6;
+const SERVICE_PAUSED: u32 = 7;
 const KF_FLAG_DONT_VERIFY: u32 = 0x0000_4000;
 const REGISTRY_ROOT_CURRENT_USER: isize = -2_147_483_647;
 const REGISTRY_ROOT_LOCAL_MACHINE: isize = -2_147_483_646;
@@ -111,6 +133,34 @@ struct QueryServiceConfigW {
     dependencies: *mut u16,
     service_start_name: *mut u16,
     display_name: *mut u16,
+}
+
+#[repr(C)]
+struct ServiceDelayedAutoStartInfo {
+    delayed_auto_start: i32,
+}
+
+#[repr(C)]
+struct ServiceTriggerInfo {
+    trigger_count: u32,
+    triggers: *mut ServiceTrigger,
+    reserved: *mut c_void,
+}
+
+#[repr(C)]
+struct ServiceTrigger {
+    trigger_type: u32,
+    action: u32,
+    subtype: *mut Guid,
+    data_item_count: u32,
+    data_items: *mut ServiceTriggerDataItem,
+}
+
+#[repr(C)]
+struct ServiceTriggerDataItem {
+    data_type: u32,
+    data_bytes: u32,
+    data: *mut u8,
 }
 
 #[repr(C)]
@@ -176,6 +226,13 @@ unsafe extern "system" {
     fn QueryServiceConfigW(
         service: Handle,
         config: *mut QueryServiceConfigW,
+        buffer_size: u32,
+        bytes_needed: *mut u32,
+    ) -> i32;
+    fn QueryServiceConfig2W(
+        service: Handle,
+        info_level: u32,
+        config: *mut u8,
         buffer_size: u32,
         bytes_needed: *mut u32,
     ) -> i32;
@@ -398,6 +455,7 @@ pub struct WindowsRegistryStartupEntry {
     pub command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_utf16_hex: Option<String>,
+    pub startup_state: super::startup_state::StartupRowState,
     pub evidence: WindowsRegistryStartupEvidence,
 }
 
@@ -419,6 +477,7 @@ pub struct WindowsStartupFolderEntry {
     pub display_path: String,
     pub path_utf16_hex: String,
     pub kind: &'static str,
+    pub startup_state: super::startup_state::StartupRowState,
     pub evidence: WindowsStartupFolderEvidence,
 }
 
@@ -440,7 +499,120 @@ pub struct WindowsServiceStartupEntry {
     pub account: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binary_path: Option<String>,
+    pub startup_state: super::startup_state::StartupRowState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_observation: Option<WindowsServiceObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delayed_auto_start: Option<WindowsDelayedAutoStart>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependencies: Option<WindowsServiceDependencies>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_order_group: Option<WindowsServiceLoadOrderGroup>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triggers: Option<WindowsServiceTriggers>,
     pub evidence: WindowsServiceStartupEvidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WindowsServiceTriggers {
+    Observed { entries: Vec<WindowsServiceTrigger> },
+    Unknown { diagnostic_code: &'static str },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WindowsServiceTrigger {
+    pub trigger_index: usize,
+    pub trigger_type_code: u32,
+    pub trigger_type: &'static str,
+    pub action_code: u32,
+    pub action: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtype_guid: Option<String>,
+    pub data_items: Vec<WindowsServiceTriggerDataItem>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WindowsServiceTriggerDataItem {
+    pub data_type_code: u32,
+    pub data_type: &'static str,
+    pub data_hex: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WindowsServiceDependency {
+    pub kind: &'static str,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WindowsServiceDependencies {
+    Observed {
+        entries: Vec<WindowsServiceDependency>,
+    },
+    Unknown {
+        diagnostic_code: &'static str,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WindowsServiceLoadOrderGroup {
+    Observed { value: Option<String> },
+    Unknown { diagnostic_code: &'static str },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WindowsDelayedAutoStart {
+    Observed { value: bool },
+    Unknown { diagnostic_code: &'static str },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsServiceState {
+    Stopped,
+    StartPending,
+    StopPending,
+    Running,
+    ContinuePending,
+    PausePending,
+    Paused,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WindowsServiceObservation {
+    Known {
+        state: WindowsServiceState,
+        raw_state_code: u32,
+    },
+    Unknown {
+        raw_state_code: u32,
+    },
+}
+
+impl WindowsServiceObservation {
+    fn from_scm_state(raw_state_code: u32) -> Self {
+        let state = match raw_state_code {
+            SERVICE_STOPPED => WindowsServiceState::Stopped,
+            SERVICE_START_PENDING => WindowsServiceState::StartPending,
+            SERVICE_STOP_PENDING => WindowsServiceState::StopPending,
+            SERVICE_RUNNING => WindowsServiceState::Running,
+            SERVICE_CONTINUE_PENDING => WindowsServiceState::ContinuePending,
+            SERVICE_PAUSE_PENDING => WindowsServiceState::PausePending,
+            SERVICE_PAUSED => WindowsServiceState::Paused,
+            _ => {
+                return Self::Unknown { raw_state_code };
+            }
+        };
+        Self::Known {
+            state,
+            raw_state_code,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -457,6 +629,7 @@ pub struct WindowsScheduledTaskStartupEntry {
     pub trigger_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logon_user: Option<String>,
+    pub startup_state: super::startup_state::StartupRowState,
     pub evidence: WindowsScheduledTaskStartupEvidence,
 }
 
@@ -488,6 +661,7 @@ pub struct WindowsScheduledTaskAction {
     pub arguments: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<String>,
+    pub startup_state: super::startup_state::StartupRowState,
     pub evidence: WindowsScheduledTaskActionEvidence,
 }
 
@@ -544,6 +718,12 @@ pub struct WindowsStartupInventoryDocument {
     pub service_entries: Vec<WindowsServiceStartupEntry>,
     pub scheduled_task_entries: Vec<WindowsScheduledTaskStartupEntry>,
     pub scheduled_task_actions: Vec<WindowsScheduledTaskAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wmi_event_filters: Option<Vec<WmiEventFilter>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wmi_event_consumers: Option<Vec<WmiEventConsumer>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wmi_filter_consumer_bindings: Option<Vec<WmiFilterConsumerBinding>>,
 }
 
 #[derive(Clone, Copy)]
@@ -774,6 +954,42 @@ fn now_ms() -> u128 {
 }
 
 pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
+    collect_windows_startup_with_contract(true, 10, true, true, true, true)
+}
+
+/// Session schema v9 pins startup artifacts to v5.
+pub(crate) fn collect_windows_startup_v5() -> WindowsStartupInventoryDocument {
+    collect_windows_startup_with_contract(false, 5, false, false, false, false)
+}
+
+/// Session schemas v10-v11 retain the standalone startup v6 contract.
+pub(crate) fn collect_windows_startup_v6() -> WindowsStartupInventoryDocument {
+    collect_windows_startup_with_contract(true, 6, false, false, false, false)
+}
+
+/// Session schema v12 retains the standalone startup v7 contract.
+pub(crate) fn collect_windows_startup_v7() -> WindowsStartupInventoryDocument {
+    collect_windows_startup_with_contract(true, 7, true, false, false, false)
+}
+
+/// Session schema v13 retains the standalone startup v8 contract.
+pub(crate) fn collect_windows_startup_v8() -> WindowsStartupInventoryDocument {
+    collect_windows_startup_with_contract(true, 8, true, true, false, false)
+}
+
+/// Session schema v14 pins startup artifacts to v9.
+pub(crate) fn collect_windows_startup_v9() -> WindowsStartupInventoryDocument {
+    collect_windows_startup_with_contract(true, 9, true, true, true, false)
+}
+
+fn collect_windows_startup_with_contract(
+    include_wmi: bool,
+    schema_version: u32,
+    include_service_observation: bool,
+    include_delayed_auto_start: bool,
+    include_service_dependencies: bool,
+    include_service_triggers: bool,
+) -> WindowsStartupInventoryDocument {
     let started_at = now_ms();
     let started = Instant::now();
     let mut sources = Vec::new();
@@ -850,13 +1066,23 @@ pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
         sources.push(result);
     }
 
-    let (service_source, services) = collect_service_start_configuration(started);
+    let (service_source, services) = collect_service_start_configuration(
+        started,
+        include_service_observation,
+        include_delayed_auto_start,
+        include_service_dependencies,
+        include_service_triggers,
+    );
     sources.push(service_source);
     service_entries.extend(services);
     let (task_source, tasks, task_actions) = collect_scheduled_task_triggers(started);
     sources.push(task_source);
     scheduled_task_entries.extend(tasks);
     let scheduled_task_actions = task_actions;
+    let wmi = include_wmi.then(|| collect_wmi_startup(started));
+    if let Some(wmi) = &wmi {
+        sources.push(wmi.source.clone());
+    }
     let status = if sources.iter().any(|source| {
         !matches!(
             source.status,
@@ -869,9 +1095,19 @@ pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
     };
     WindowsStartupInventoryDocument {
         schema: "sideeffect.windows_startup_inventory",
-        schema_version: 4,
+        schema_version,
         platform: "windows",
-        scope: "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks",
+        scope: if include_service_triggers {
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_load_order_group_and_trigger_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+        } else if include_service_dependencies {
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_and_load_order_group_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+        } else if include_delayed_auto_start {
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+        } else if include_wmi {
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+        } else {
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks"
+        },
         capture_started_at_unix_ms: started_at,
         capture_ended_at_unix_ms: now_ms(),
         status,
@@ -881,6 +1117,9 @@ pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
         service_entries,
         scheduled_task_entries,
         scheduled_task_actions,
+        wmi_event_filters: wmi.as_ref().map(|wmi| wmi.filters.clone()),
+        wmi_event_consumers: wmi.as_ref().map(|wmi| wmi.consumers.clone()),
+        wmi_filter_consumer_bindings: wmi.as_ref().map(|wmi| wmi.bindings.clone()),
     }
 }
 
@@ -902,14 +1141,348 @@ enum ServiceStringError {
     MalformedUtf16,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceMultiSzError {
+    OutsideBuffer,
+    Misaligned,
+    Unterminated,
+    OverLimit,
+    MalformedUtf16,
+    EmptyDependency,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DelayedAutoStartQueryError {
+    Api(u32),
+    InvalidResponse,
+    ByteBudgetExceeded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceTriggerQueryError {
+    Api(u32),
+    InvalidResponse,
+    ByteBudgetExceeded,
+    CountLimitExceeded,
+}
+
+fn query_service_triggers(
+    mut query: impl FnMut(*mut u8, u32, *mut u32) -> Result<(), u32>,
+    aggregate_config_bytes: &mut usize,
+    aggregate_data_bytes: &mut usize,
+    aggregate_trigger_count: &mut usize,
+) -> Result<Vec<WindowsServiceTrigger>, ServiceTriggerQueryError> {
+    let mut required_bytes = 0u32;
+    match query(null_mut(), 0, &mut required_bytes) {
+        Err(ERROR_INSUFFICIENT_BUFFER) => {}
+        Err(error) => return Err(ServiceTriggerQueryError::Api(error)),
+        Ok(()) => return Err(ServiceTriggerQueryError::InvalidResponse),
+    }
+    let required_bytes = required_bytes as usize;
+    if required_bytes < std::mem::size_of::<ServiceTriggerInfo>()
+        || required_bytes > MAX_SERVICE_CONFIG2_BYTES
+    {
+        return Err(ServiceTriggerQueryError::InvalidResponse);
+    }
+    if aggregate_config_bytes.saturating_add(required_bytes) > MAX_AGGREGATE_SERVICE_CONFIG_BYTES {
+        return Err(ServiceTriggerQueryError::ByteBudgetExceeded);
+    }
+    *aggregate_config_bytes += required_bytes;
+    let word_count = required_bytes.div_ceil(std::mem::size_of::<u64>());
+    let mut buffer = vec![0u64; word_count];
+    let mut actual_bytes = 0u32;
+    query(
+        buffer.as_mut_ptr().cast(),
+        required_bytes as u32,
+        &mut actual_bytes,
+    )
+    .map_err(ServiceTriggerQueryError::Api)?;
+    let actual_bytes = actual_bytes as usize;
+    if actual_bytes < std::mem::size_of::<ServiceTriggerInfo>() || actual_bytes > required_bytes {
+        return Err(ServiceTriggerQueryError::InvalidResponse);
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), actual_bytes) };
+    parse_service_triggers(bytes, aggregate_data_bytes, aggregate_trigger_count).map_err(|error| {
+        match error {
+            ServiceTriggerParseError::InvalidResponse => ServiceTriggerQueryError::InvalidResponse,
+            ServiceTriggerParseError::CountLimitExceeded => {
+                ServiceTriggerQueryError::CountLimitExceeded
+            }
+            ServiceTriggerParseError::DataBudgetExceeded => {
+                ServiceTriggerQueryError::ByteBudgetExceeded
+            }
+        }
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceTriggerParseError {
+    InvalidResponse,
+    CountLimitExceeded,
+    DataBudgetExceeded,
+}
+
+fn checked_service_buffer_span<T>(
+    base: *const u8,
+    buffer_bytes: usize,
+    value: *const T,
+    count: usize,
+) -> Result<(), ServiceTriggerParseError> {
+    if count == 0 {
+        return if value.is_null() {
+            Ok(())
+        } else {
+            checked_service_buffer_span(base, buffer_bytes, value, 1)
+        };
+    }
+    if value.is_null() {
+        return Err(ServiceTriggerParseError::InvalidResponse);
+    }
+    let Some(byte_length) = std::mem::size_of::<T>().checked_mul(count) else {
+        return Err(ServiceTriggerParseError::InvalidResponse);
+    };
+    let base_address = base as usize;
+    let address = value as usize;
+    let Some(offset) = address.checked_sub(base_address) else {
+        return Err(ServiceTriggerParseError::InvalidResponse);
+    };
+    let Some(end) = offset.checked_add(byte_length) else {
+        return Err(ServiceTriggerParseError::InvalidResponse);
+    };
+    if offset % std::mem::align_of::<T>() != 0 || end > buffer_bytes {
+        return Err(ServiceTriggerParseError::InvalidResponse);
+    }
+    Ok(())
+}
+
+fn parse_service_triggers(
+    bytes: &[u8],
+    aggregate_data_bytes: &mut usize,
+    aggregate_trigger_count: &mut usize,
+) -> Result<Vec<WindowsServiceTrigger>, ServiceTriggerParseError> {
+    if bytes.len() < std::mem::size_of::<ServiceTriggerInfo>() {
+        return Err(ServiceTriggerParseError::InvalidResponse);
+    }
+    let base = bytes.as_ptr();
+    let info = unsafe { std::ptr::read_unaligned(base.cast::<ServiceTriggerInfo>()) };
+    if !info.reserved.is_null() || info.trigger_count as usize > MAX_SERVICE_TRIGGERS_PER_SERVICE {
+        return Err(
+            if info.trigger_count as usize > MAX_SERVICE_TRIGGERS_PER_SERVICE {
+                ServiceTriggerParseError::CountLimitExceeded
+            } else {
+                ServiceTriggerParseError::InvalidResponse
+            },
+        );
+    }
+    let count = info.trigger_count as usize;
+    checked_service_buffer_span(base, bytes.len(), info.triggers, count)?;
+    if aggregate_trigger_count.saturating_add(count) > MAX_AGGREGATE_SERVICE_TRIGGERS {
+        return Err(ServiceTriggerParseError::CountLimitExceeded);
+    }
+    let mut entries = Vec::with_capacity(count);
+    let mut local_data_bytes = 0usize;
+    for index in 0..count {
+        let trigger = unsafe { std::ptr::read_unaligned(info.triggers.add(index)) };
+        if trigger.data_item_count as usize > MAX_SERVICE_TRIGGER_DATA_ITEMS {
+            return Err(ServiceTriggerParseError::CountLimitExceeded);
+        }
+        checked_service_buffer_span(
+            base,
+            bytes.len(),
+            trigger.subtype,
+            usize::from(!trigger.subtype.is_null()),
+        )?;
+        checked_service_buffer_span(
+            base,
+            bytes.len(),
+            trigger.data_items,
+            trigger.data_item_count as usize,
+        )?;
+        let mut data_items = Vec::with_capacity(trigger.data_item_count as usize);
+        for data_index in 0..trigger.data_item_count as usize {
+            let item = unsafe { std::ptr::read_unaligned(trigger.data_items.add(data_index)) };
+            let data_len = item.data_bytes as usize;
+            if data_len > MAX_SERVICE_TRIGGER_DATA_ITEM_BYTES {
+                return Err(ServiceTriggerParseError::DataBudgetExceeded);
+            }
+            checked_service_buffer_span(base, bytes.len(), item.data, data_len)?;
+            local_data_bytes = local_data_bytes.saturating_add(data_len);
+            if aggregate_data_bytes.saturating_add(local_data_bytes)
+                > MAX_AGGREGATE_SERVICE_TRIGGER_DATA_BYTES
+            {
+                return Err(ServiceTriggerParseError::DataBudgetExceeded);
+            }
+            let data = if data_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(item.data, data_len) }
+            };
+            data_items.push(WindowsServiceTriggerDataItem {
+                data_type_code: item.data_type,
+                data_type: service_trigger_data_type(item.data_type),
+                data_hex: bytes_hex(data),
+            });
+        }
+        let subtype_guid = if trigger.subtype.is_null() {
+            None
+        } else {
+            let guid = unsafe { std::ptr::read_unaligned(trigger.subtype) };
+            Some(format_guid(&guid))
+        };
+        entries.push(WindowsServiceTrigger {
+            trigger_index: index,
+            trigger_type_code: trigger.trigger_type,
+            trigger_type: service_trigger_type(trigger.trigger_type),
+            action_code: trigger.action,
+            action: service_trigger_action(trigger.action),
+            subtype_guid,
+            data_items,
+        });
+    }
+    *aggregate_data_bytes = aggregate_data_bytes.saturating_add(local_data_bytes);
+    *aggregate_trigger_count = aggregate_trigger_count.saturating_add(count);
+    Ok(entries)
+}
+
+fn bytes_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn format_guid(guid: &Guid) -> String {
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        guid.data1,
+        guid.data2,
+        guid.data3,
+        guid.data4[0],
+        guid.data4[1],
+        guid.data4[2],
+        guid.data4[3],
+        guid.data4[4],
+        guid.data4[5],
+        guid.data4[6],
+        guid.data4[7]
+    )
+}
+
+fn service_trigger_type(code: u32) -> &'static str {
+    match code {
+        1 => "device_interface_arrival",
+        2 => "ip_address_availability",
+        3 => "domain_join",
+        4 => "firewall_port_event",
+        5 => "group_policy",
+        6 => "network_endpoint",
+        20 => "custom",
+        _ => "unknown",
+    }
+}
+
+fn service_trigger_action(code: u32) -> &'static str {
+    match code {
+        1 => "service_start",
+        2 => "service_stop",
+        _ => "unknown",
+    }
+}
+
+fn service_trigger_data_type(code: u32) -> &'static str {
+    match code {
+        1 => "binary",
+        2 => "string",
+        3 => "level",
+        4 => "keyword_any",
+        5 => "keyword_all",
+        _ => "unknown",
+    }
+}
+
+fn service_trigger_error_code(error: ServiceTriggerQueryError) -> &'static str {
+    match error {
+        ServiceTriggerQueryError::Api(ERROR_INVALID_LEVEL) => "service_trigger_unsupported",
+        ServiceTriggerQueryError::Api(ERROR_ACCESS_DENIED) => "service_trigger_access_denied",
+        ServiceTriggerQueryError::Api(_) => "service_trigger_query_failed",
+        ServiceTriggerQueryError::InvalidResponse => "service_trigger_response_invalid",
+        ServiceTriggerQueryError::ByteBudgetExceeded => "service_trigger_budget_exceeded",
+        ServiceTriggerQueryError::CountLimitExceeded => "service_trigger_count_limit_exceeded",
+    }
+}
+
+fn query_delayed_auto_start_config(
+    mut query: impl FnMut(*mut u8, u32, *mut u32) -> Result<(), u32>,
+    aggregate_config_bytes: &mut usize,
+) -> Result<bool, DelayedAutoStartQueryError> {
+    let expected_bytes = std::mem::size_of::<ServiceDelayedAutoStartInfo>();
+    let mut required_bytes = 0u32;
+    match query(null_mut(), 0, &mut required_bytes) {
+        Err(ERROR_INSUFFICIENT_BUFFER) => {}
+        Err(error) => return Err(DelayedAutoStartQueryError::Api(error)),
+        Ok(()) => return Err(DelayedAutoStartQueryError::InvalidResponse),
+    }
+    let required_bytes = required_bytes as usize;
+    if required_bytes != expected_bytes || required_bytes > MAX_SERVICE_CONFIG2_BYTES {
+        return Err(DelayedAutoStartQueryError::InvalidResponse);
+    }
+    if aggregate_config_bytes.saturating_add(required_bytes) > MAX_AGGREGATE_SERVICE_CONFIG_BYTES {
+        return Err(DelayedAutoStartQueryError::ByteBudgetExceeded);
+    }
+    *aggregate_config_bytes += required_bytes;
+    let word_count = required_bytes.div_ceil(std::mem::size_of::<u64>());
+    let mut buffer = vec![0u64; word_count];
+    let mut actual_bytes = 0u32;
+    query(
+        buffer.as_mut_ptr().cast(),
+        required_bytes as u32,
+        &mut actual_bytes,
+    )
+    .map_err(DelayedAutoStartQueryError::Api)?;
+    if actual_bytes as usize != expected_bytes {
+        return Err(DelayedAutoStartQueryError::InvalidResponse);
+    }
+    let raw =
+        unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<ServiceDelayedAutoStartInfo>()) };
+    Ok(raw.delayed_auto_start != 0)
+}
+
+fn delayed_auto_start_error_code(error: DelayedAutoStartQueryError) -> &'static str {
+    match error {
+        DelayedAutoStartQueryError::Api(ERROR_INVALID_LEVEL) => {
+            "service_delayed_auto_start_unsupported"
+        }
+        DelayedAutoStartQueryError::Api(ERROR_ACCESS_DENIED) => {
+            "service_delayed_auto_start_access_denied"
+        }
+        DelayedAutoStartQueryError::Api(_) => "service_delayed_auto_start_query_failed",
+        DelayedAutoStartQueryError::InvalidResponse => {
+            "service_delayed_auto_start_response_invalid"
+        }
+        DelayedAutoStartQueryError::ByteBudgetExceeded => {
+            "service_delayed_auto_start_budget_exceeded"
+        }
+    }
+}
+
 fn collect_service_start_configuration(
     started: Instant,
+    include_service_observation: bool,
+    include_delayed_auto_start: bool,
+    include_service_dependencies: bool,
+    include_service_triggers: bool,
 ) -> (WindowsStartupSource, Vec<WindowsServiceStartupEntry>) {
     let mut diagnostics = Vec::new();
     let mut entries = Vec::new();
     let mut status = WindowsStartupStatus::Complete;
     let mut aggregate_config_bytes = 0usize;
     let mut aggregate_string_units = 0usize;
+    let mut aggregate_dependency_entries = 0usize;
+    let mut aggregate_trigger_count = 0usize;
+    let mut aggregate_trigger_data_bytes = 0usize;
     let mut enumerated = 0usize;
     let manager = unsafe {
         OpenSCManagerW(
@@ -1183,6 +1756,9 @@ fn collect_service_start_configuration(
                 enumerated += 1;
                 continue;
             }
+            // QueryServiceConfigW documents `pcbBytesNeeded` for the
+            // insufficient-buffer case. The first call supplied the bounded
+            // required size; use that allocated span for every returned pointer.
             aggregate_config_bytes += config_bytes;
             let config_base = config_buffer.as_ptr().cast::<u8>();
             let config = unsafe { &*config_buffer.as_ptr().cast::<QueryServiceConfigW>() };
@@ -1233,6 +1809,215 @@ fn collect_service_start_configuration(
                 break;
             }
             aggregate_string_units += extra_units;
+            let delayed_auto_start = if include_delayed_auto_start {
+                let observation = if elapsed(started) {
+                    status = WindowsStartupStatus::Partial;
+                    enumeration_finished = true;
+                    let code = "service_delayed_auto_start_deadline_exceeded";
+                    push_service_diagnostic(
+                        &mut diagnostics,
+                        diagnostic(
+                            code,
+                            Some(enumerated),
+                            "The startup inventory deadline was reached before this service's delayed-auto-start setting could be queried.",
+                        ),
+                    );
+                    WindowsDelayedAutoStart::Unknown {
+                        diagnostic_code: code,
+                    }
+                } else {
+                    let mut query = |buffer: *mut u8, size: u32, needed: *mut u32| {
+                        let success = unsafe {
+                            QueryServiceConfig2W(
+                                service.0,
+                                SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
+                                buffer,
+                                size,
+                                needed,
+                            )
+                        } != 0;
+                        if success {
+                            Ok(())
+                        } else {
+                            Err(unsafe { GetLastError() })
+                        }
+                    };
+                    match query_delayed_auto_start_config(&mut query, &mut aggregate_config_bytes) {
+                        Ok(value) => WindowsDelayedAutoStart::Observed { value },
+                        Err(error) => {
+                            status = WindowsStartupStatus::Partial;
+                            let code = delayed_auto_start_error_code(error);
+                            let message = "Windows could not establish this service's delayed-auto-start setting; the field remains unknown.";
+                            let diagnostic = match error {
+                                DelayedAutoStartQueryError::Api(win32_error) => {
+                                    diagnostic_win32(code, Some(enumerated), message, win32_error)
+                                }
+                                _ => diagnostic(code, Some(enumerated), message),
+                            };
+                            push_service_diagnostic(&mut diagnostics, diagnostic);
+                            WindowsDelayedAutoStart::Unknown {
+                                diagnostic_code: code,
+                            }
+                        }
+                    }
+                };
+                Some(observation)
+            } else {
+                None
+            };
+            let (dependencies, load_order_group) = if include_service_dependencies {
+                let dependency_result = parse_service_dependencies(
+                    config_base,
+                    config_bytes,
+                    config.dependencies,
+                    MAX_SERVICE_STRING_UNITS,
+                    MAX_SERVICE_DEPENDENCIES_PER_SERVICE.min(
+                        MAX_AGGREGATE_SERVICE_DEPENDENCIES
+                            .saturating_sub(aggregate_dependency_entries),
+                    ),
+                );
+                let group_result = bounded_optional_wide_in_buffer(
+                    config_base,
+                    config_bytes,
+                    config.load_order_group,
+                    MAX_SERVICE_STRING_UNITS,
+                );
+                let dependency_units = dependency_result.as_ref().map_or(0, |values| {
+                    values
+                        .iter()
+                        .map(|value| value.name.encode_utf16().count())
+                        .sum()
+                });
+                let group_units = group_result
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .map_or(0, |value| value.encode_utf16().count());
+                let strings_exceed_budget = aggregate_string_units
+                    .saturating_add(dependency_units)
+                    .saturating_add(group_units)
+                    > MAX_AGGREGATE_SERVICE_STRING_UNITS;
+                if strings_exceed_budget {
+                    status = WindowsStartupStatus::Partial;
+                } else {
+                    aggregate_string_units = aggregate_string_units
+                        .saturating_add(dependency_units)
+                        .saturating_add(group_units);
+                    if let Ok(dependencies) = &dependency_result {
+                        aggregate_dependency_entries =
+                            aggregate_dependency_entries.saturating_add(dependencies.len());
+                    }
+                }
+                let dependencies = match dependency_result {
+                    Ok(entries) if !strings_exceed_budget => {
+                        Some(WindowsServiceDependencies::Observed { entries })
+                    }
+                    result => {
+                        status = WindowsStartupStatus::Partial;
+                        let code = if strings_exceed_budget {
+                            "service_dependency_budget_exceeded"
+                        } else {
+                            service_multisz_error_code(result.expect_err("error branch"))
+                        };
+                        push_service_diagnostic(
+                            &mut diagnostics,
+                            diagnostic(
+                                code,
+                                Some(enumerated),
+                                "Windows could not establish this service's configured dependencies; the field remains unknown.",
+                            ),
+                        );
+                        Some(WindowsServiceDependencies::Unknown {
+                            diagnostic_code: code,
+                        })
+                    }
+                };
+                let load_order_group = match group_result {
+                    Ok(value) if !strings_exceed_budget => {
+                        Some(WindowsServiceLoadOrderGroup::Observed {
+                            value: value.filter(|value| !value.is_empty()),
+                        })
+                    }
+                    result => {
+                        status = WindowsStartupStatus::Partial;
+                        let code = if strings_exceed_budget {
+                            "service_load_order_group_budget_exceeded"
+                        } else {
+                            service_string_error_code(result.expect_err("error branch"))
+                        };
+                        push_service_diagnostic(
+                            &mut diagnostics,
+                            diagnostic(
+                                code,
+                                Some(enumerated),
+                                "Windows could not establish this service's load-order group membership; the field remains unknown.",
+                            ),
+                        );
+                        Some(WindowsServiceLoadOrderGroup::Unknown {
+                            diagnostic_code: code,
+                        })
+                    }
+                };
+                (dependencies, load_order_group)
+            } else {
+                (None, None)
+            };
+            let triggers = if include_service_triggers {
+                let result = if elapsed(started) {
+                    Err(ServiceTriggerQueryError::Api(ERROR_TIMEOUT))
+                } else {
+                    let mut query = |buffer: *mut u8, size: u32, needed: *mut u32| {
+                        let success = unsafe {
+                            QueryServiceConfig2W(
+                                service.0,
+                                SERVICE_CONFIG_TRIGGER_INFO,
+                                buffer,
+                                size,
+                                needed,
+                            )
+                        } != 0;
+                        if success {
+                            Ok(())
+                        } else {
+                            Err(unsafe { GetLastError() })
+                        }
+                    };
+                    query_service_triggers(
+                        &mut query,
+                        &mut aggregate_config_bytes,
+                        &mut aggregate_trigger_data_bytes,
+                        &mut aggregate_trigger_count,
+                    )
+                };
+                match result {
+                    Ok(entries) => Some(WindowsServiceTriggers::Observed { entries }),
+                    Err(error) => {
+                        status = WindowsStartupStatus::Partial;
+                        let code = if matches!(error, ServiceTriggerQueryError::Api(ERROR_TIMEOUT))
+                        {
+                            "service_trigger_deadline_exceeded"
+                        } else {
+                            service_trigger_error_code(error)
+                        };
+                        let message = "Windows could not establish this service's trigger configuration; the field remains unknown.";
+                        let diagnostic = match error {
+                            ServiceTriggerQueryError::Api(ERROR_TIMEOUT) => {
+                                diagnostic(code, Some(enumerated), message)
+                            }
+                            ServiceTriggerQueryError::Api(win32_error) => {
+                                diagnostic_win32(code, Some(enumerated), message, win32_error)
+                            }
+                            _ => diagnostic(code, Some(enumerated), message),
+                        };
+                        push_service_diagnostic(&mut diagnostics, diagnostic);
+                        Some(WindowsServiceTriggers::Unknown {
+                            diagnostic_code: code,
+                        })
+                    }
+                }
+            } else {
+                None
+            };
             entries.push(WindowsServiceStartupEntry {
                 service_name: name,
                 display_name: display,
@@ -1240,12 +2025,26 @@ fn collect_service_start_configuration(
                 start_type_code: config.start_type,
                 account,
                 binary_path,
+                startup_state: super::startup_state::StartupRowState::configured_present(),
+                service_observation: include_service_observation
+                    .then(|| WindowsServiceObservation::from_scm_state(item.status.current_state)),
+                delayed_auto_start,
+                dependencies,
+                load_order_group,
+                triggers,
                 evidence: WindowsServiceStartupEvidence {
-                    source: "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW",
+                    source: if include_delayed_auto_start {
+                        "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W"
+                    } else {
+                        "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW"
+                    },
                     service_index: enumerated,
                 },
             });
             enumerated += 1;
+            if enumeration_finished {
+                break;
+            }
         }
         if enumeration_finished {
             break;
@@ -1830,6 +2629,7 @@ fn collect_scheduled_task_triggers(
                     trigger_type: trigger_name,
                     trigger_enabled,
                     logon_user,
+                    startup_state: super::startup_state::StartupRowState::configured_present(),
                     evidence: WindowsScheduledTaskStartupEvidence {
                         source: "Task Scheduler IRegisteredTask/ITaskDefinition/ITrigger",
                         task_index,
@@ -2110,6 +2910,7 @@ fn collect_task_actions(
                 executable_path: None,
                 arguments: None,
                 working_directory: None,
+                startup_state: super::startup_state::StartupRowState::configured_present(),
                 evidence: WindowsScheduledTaskActionEvidence {
                     source: "Task Scheduler IActionCollection/IAction",
                     task_index,
@@ -2145,6 +2946,7 @@ fn collect_task_actions(
                 executable_path: None,
                 arguments: None,
                 working_directory: None,
+                startup_state: super::startup_state::StartupRowState::configured_present(),
                 evidence: WindowsScheduledTaskActionEvidence {
                     source: "Task Scheduler IActionCollection/IAction",
                     task_index,
@@ -2181,6 +2983,7 @@ fn collect_task_actions(
                     executable_path: None,
                     arguments: None,
                     working_directory: None,
+                    startup_state: super::startup_state::StartupRowState::configured_present(),
                     evidence: WindowsScheduledTaskActionEvidence {
                         source: "Task Scheduler IActionCollection/IExecAction",
                         task_index,
@@ -2276,6 +3079,7 @@ fn collect_task_actions(
             executable_path,
             arguments,
             working_directory,
+            startup_state: crate::inventory::startup_state::StartupRowState::configured_present(),
             evidence: WindowsScheduledTaskActionEvidence {
                 source: "Task Scheduler IActionCollection/IExecAction",
                 task_index,
@@ -2499,7 +3303,144 @@ fn bounded_optional_wide_in_buffer(
     }
 }
 
-fn elapsed(started: Instant) -> bool {
+fn parse_service_dependencies(
+    base: *const u8,
+    buffer_bytes: usize,
+    value: *const u16,
+    maximum_units: usize,
+    maximum_entries: usize,
+) -> Result<Vec<WindowsServiceDependency>, ServiceMultiSzError> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let base_address = base as usize;
+    let address = value as usize;
+    let Some(offset) = address.checked_sub(base_address) else {
+        return Err(ServiceMultiSzError::OutsideBuffer);
+    };
+    if offset >= buffer_bytes {
+        return Err(ServiceMultiSzError::OutsideBuffer);
+    }
+    if offset % std::mem::align_of::<u16>() != 0 {
+        return Err(ServiceMultiSzError::Misaligned);
+    }
+    let available_units = (buffer_bytes - offset) / std::mem::size_of::<u16>();
+    let maximum_units = maximum_units.min(available_units);
+    let mut entries = Vec::new();
+    let mut cursor = 0usize;
+    let mut total_units = 0usize;
+    loop {
+        if cursor >= maximum_units {
+            return Err(if available_units > maximum_units {
+                ServiceMultiSzError::OverLimit
+            } else {
+                ServiceMultiSzError::Unterminated
+            });
+        }
+        let first = unsafe { std::ptr::read_unaligned(value.add(cursor)) };
+        if first == 0 {
+            // A pointer to an empty string is documented as no dependencies.
+            return Ok(entries);
+        }
+        let start = cursor;
+        while cursor < maximum_units {
+            let unit = unsafe { std::ptr::read_unaligned(value.add(cursor)) };
+            if unit == 0 {
+                break;
+            }
+            cursor += 1;
+        }
+        if cursor >= maximum_units {
+            return Err(if available_units > maximum_units {
+                ServiceMultiSzError::OverLimit
+            } else {
+                ServiceMultiSzError::Unterminated
+            });
+        }
+        let units = cursor - start;
+        if units == 0 {
+            return Err(ServiceMultiSzError::EmptyDependency);
+        }
+        let mut dependency = Vec::with_capacity(units);
+        for index in start..cursor {
+            dependency.push(unsafe { std::ptr::read_unaligned(value.add(index)) });
+        }
+        let next = cursor + 1;
+        let next_unit = if next < maximum_units {
+            unsafe { std::ptr::read_unaligned(value.add(next)) }
+        } else {
+            return Err(if available_units > maximum_units {
+                ServiceMultiSzError::OverLimit
+            } else {
+                ServiceMultiSzError::Unterminated
+            });
+        };
+        if next_unit == 0 {
+            let name =
+                String::from_utf16(&dependency).map_err(|_| ServiceMultiSzError::MalformedUtf16)?;
+            let (kind, name) = if let Some(group) = name.strip_prefix('+') {
+                if group.is_empty() {
+                    return Err(ServiceMultiSzError::EmptyDependency);
+                }
+                ("load_order_group", group.to_owned())
+            } else {
+                ("service", name)
+            };
+            if entries.len() >= maximum_entries {
+                return Err(ServiceMultiSzError::OverLimit);
+            }
+            total_units = total_units.saturating_add(units);
+            if total_units > maximum_units {
+                return Err(ServiceMultiSzError::OverLimit);
+            }
+            entries.push(WindowsServiceDependency { kind, name });
+            return Ok(entries);
+        }
+        let name =
+            String::from_utf16(&dependency).map_err(|_| ServiceMultiSzError::MalformedUtf16)?;
+        let (kind, name) = if let Some(group) = name.strip_prefix('+') {
+            if group.is_empty() {
+                return Err(ServiceMultiSzError::EmptyDependency);
+            }
+            ("load_order_group", group.to_owned())
+        } else {
+            ("service", name)
+        };
+        if entries.len() >= maximum_entries {
+            return Err(ServiceMultiSzError::OverLimit);
+        }
+        total_units = total_units.saturating_add(units);
+        if total_units > maximum_units {
+            return Err(ServiceMultiSzError::OverLimit);
+        }
+        entries.push(WindowsServiceDependency { kind, name });
+        cursor = next;
+    }
+}
+
+fn service_multisz_error_code(error: ServiceMultiSzError) -> &'static str {
+    match error {
+        ServiceMultiSzError::OutsideBuffer
+        | ServiceMultiSzError::Misaligned
+        | ServiceMultiSzError::Unterminated
+        | ServiceMultiSzError::MalformedUtf16
+        | ServiceMultiSzError::EmptyDependency => "service_dependencies_response_invalid",
+        ServiceMultiSzError::OverLimit => "service_dependencies_limit_exceeded",
+    }
+}
+
+fn service_string_error_code(error: ServiceStringError) -> &'static str {
+    match error {
+        ServiceStringError::Missing
+        | ServiceStringError::OutsideBuffer
+        | ServiceStringError::Misaligned
+        | ServiceStringError::Unterminated
+        | ServiceStringError::MalformedUtf16 => "service_load_order_group_response_invalid",
+        ServiceStringError::OverLimit => "service_load_order_group_limit_exceeded",
+    }
+}
+
+pub(super) fn elapsed(started: Instant) -> bool {
     started.elapsed().as_millis() >= MAX_SCAN_DURATION_MS
 }
 
@@ -2792,6 +3733,7 @@ fn collect_registry_source_with_api<A: StartupRegistryApi>(
             value_type: type_name,
             command,
             command_utf16_hex: raw_hex,
+            startup_state: super::startup_state::StartupRowState::configured_present(),
             evidence: WindowsRegistryStartupEvidence {
                 source: "RegEnumValueW",
                 hive: source.hive,
@@ -3088,6 +4030,7 @@ fn collect_startup_folder(
             display_path: display_path.clone(),
             path_utf16_hex: hex.clone(),
             kind,
+            startup_state: super::startup_state::StartupRowState::configured_present(),
             evidence: WindowsStartupFolderEvidence {
                 source: "SHGetKnownFolderPath/FindFirstFileW",
                 folder_scope,
@@ -3111,7 +4054,7 @@ fn collect_startup_folder(
     )
 }
 
-fn source_result(
+pub(super) fn source_result(
     id: &'static str,
     status: WindowsStartupStatus,
     entries_seen: usize,
@@ -3151,7 +4094,7 @@ fn source_result_with_location(
     }
 }
 
-fn diagnostic(
+pub(super) fn diagnostic(
     code: &'static str,
     item_index: Option<usize>,
     message: &'static str,
@@ -3180,7 +4123,7 @@ fn diagnostic_win32(
     }
 }
 
-fn diagnostic_hresult(
+pub(super) fn diagnostic_hresult(
     code: &'static str,
     item_index: Option<usize>,
     message: &'static str,
@@ -3432,6 +4375,242 @@ mod tests {
         assert_eq!(FOLDER_IDS[1].0, "common_startup");
     }
 
+    fn aligned_offset<T>(offset: usize) -> usize {
+        let alignment = std::mem::align_of::<T>();
+        offset.div_ceil(alignment) * alignment
+    }
+
+    fn fixture_span() -> (Vec<u64>, usize) {
+        let bytes = vec![0u64; 64];
+        let length = bytes.len() * std::mem::size_of::<u64>();
+        (bytes, length)
+    }
+
+    #[test]
+    fn service_trigger_parser_observes_empty_trigger_list() {
+        let (mut storage, length) = fixture_span();
+        let base = storage.as_mut_ptr().cast::<u8>();
+        unsafe {
+            std::ptr::write_unaligned(
+                base.cast::<ServiceTriggerInfo>(),
+                ServiceTriggerInfo {
+                    trigger_count: 0,
+                    triggers: std::ptr::null_mut(),
+                    reserved: std::ptr::null_mut(),
+                },
+            );
+        }
+        let mut aggregate_data = 0;
+        let mut aggregate_triggers = 0;
+        let parsed = parse_service_triggers(
+            unsafe { std::slice::from_raw_parts(base, length) },
+            &mut aggregate_data,
+            &mut aggregate_triggers,
+        )
+        .unwrap();
+        assert!(parsed.is_empty());
+        assert_eq!(aggregate_data, 0);
+        assert_eq!(aggregate_triggers, 0);
+        assert_eq!(
+            serde_json::to_value(WindowsServiceTriggers::Observed { entries: parsed }).unwrap(),
+            serde_json::json!({"status":"observed","entries":[]})
+        );
+    }
+
+    #[test]
+    fn service_trigger_parser_preserves_unknown_codes_guid_and_raw_data() {
+        let (mut storage, length) = fixture_span();
+        let base = storage.as_mut_ptr().cast::<u8>();
+        let trigger_offset =
+            aligned_offset::<ServiceTriggerInfo>(std::mem::size_of::<ServiceTriggerInfo>());
+        let guid_offset =
+            aligned_offset::<Guid>(trigger_offset + std::mem::size_of::<ServiceTrigger>());
+        let items_offset =
+            aligned_offset::<ServiceTriggerDataItem>(guid_offset + std::mem::size_of::<Guid>());
+        let data_offset = items_offset + std::mem::size_of::<ServiceTriggerDataItem>();
+        let raw = [0x00u8, 0xff, 0x3c];
+        unsafe {
+            std::ptr::write_unaligned(
+                base.cast::<ServiceTriggerInfo>(),
+                ServiceTriggerInfo {
+                    trigger_count: 1,
+                    triggers: base.add(trigger_offset).cast(),
+                    reserved: std::ptr::null_mut(),
+                },
+            );
+            std::ptr::write_unaligned(
+                base.add(trigger_offset).cast::<ServiceTrigger>(),
+                ServiceTrigger {
+                    trigger_type: 999,
+                    action: 888,
+                    subtype: base.add(guid_offset).cast(),
+                    data_item_count: 1,
+                    data_items: base.add(items_offset).cast(),
+                },
+            );
+            std::ptr::write_unaligned(
+                base.add(guid_offset).cast::<Guid>(),
+                Guid {
+                    data1: 0x1234abcd,
+                    data2: 0x5678,
+                    data3: 0x9abc,
+                    data4: [0xde, 0xf0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc],
+                },
+            );
+            std::ptr::write_unaligned(
+                base.add(items_offset).cast::<ServiceTriggerDataItem>(),
+                ServiceTriggerDataItem {
+                    data_type: 777,
+                    data_bytes: raw.len() as u32,
+                    data: base.add(data_offset),
+                },
+            );
+            std::ptr::copy_nonoverlapping(raw.as_ptr(), base.add(data_offset), raw.len());
+        }
+        let mut aggregate_data = 0;
+        let mut aggregate_triggers = 0;
+        let parsed = parse_service_triggers(
+            unsafe { std::slice::from_raw_parts(base, length) },
+            &mut aggregate_data,
+            &mut aggregate_triggers,
+        )
+        .unwrap();
+        assert_eq!(parsed[0].trigger_type_code, 999);
+        assert_eq!(parsed[0].trigger_type, "unknown");
+        assert_eq!(parsed[0].action_code, 888);
+        assert_eq!(parsed[0].action, "unknown");
+        assert_eq!(
+            parsed[0].subtype_guid.as_deref(),
+            Some("1234abcd-5678-9abc-def0-123456789abc")
+        );
+        assert_eq!(parsed[0].data_items[0].data_type_code, 777);
+        assert_eq!(parsed[0].data_items[0].data_type, "unknown");
+        assert_eq!(parsed[0].data_items[0].data_hex, "00ff3c");
+        assert_eq!(aggregate_data, raw.len());
+        assert_eq!(aggregate_triggers, 1);
+
+        unsafe {
+            std::ptr::write_unaligned(
+                base.add(items_offset).cast::<ServiceTriggerDataItem>(),
+                ServiceTriggerDataItem {
+                    data_type: 1,
+                    data_bytes: 1,
+                    data: base.add(length),
+                },
+            );
+        }
+        assert_eq!(
+            parse_service_triggers(
+                unsafe { std::slice::from_raw_parts(base, length) },
+                &mut aggregate_data,
+                &mut aggregate_triggers,
+            ),
+            Err(ServiceTriggerParseError::InvalidResponse)
+        );
+
+        unsafe {
+            std::ptr::write_unaligned(
+                base.add(items_offset).cast::<ServiceTriggerDataItem>(),
+                ServiceTriggerDataItem {
+                    data_type: 1,
+                    data_bytes: (MAX_SERVICE_TRIGGER_DATA_ITEM_BYTES + 1) as u32,
+                    data: base.add(data_offset),
+                },
+            );
+        }
+        assert_eq!(
+            parse_service_triggers(
+                unsafe { std::slice::from_raw_parts(base, length) },
+                &mut aggregate_data,
+                &mut aggregate_triggers,
+            ),
+            Err(ServiceTriggerParseError::DataBudgetExceeded)
+        );
+    }
+
+    #[test]
+    fn service_trigger_parser_rejects_null_outside_and_oversized_pointers_and_counts() {
+        let (mut storage, length) = fixture_span();
+        let base = storage.as_mut_ptr().cast::<u8>();
+        let mut aggregate_data = 0;
+        let mut aggregate_triggers = 0;
+        unsafe {
+            std::ptr::write_unaligned(
+                base.cast::<ServiceTriggerInfo>(),
+                ServiceTriggerInfo {
+                    trigger_count: 0,
+                    triggers: std::ptr::null_mut(),
+                    reserved: base.cast(),
+                },
+            );
+        }
+        assert_eq!(
+            parse_service_triggers(
+                unsafe { std::slice::from_raw_parts(base, length) },
+                &mut aggregate_data,
+                &mut aggregate_triggers,
+            ),
+            Err(ServiceTriggerParseError::InvalidResponse)
+        );
+
+        unsafe {
+            std::ptr::write_unaligned(
+                base.cast::<ServiceTriggerInfo>(),
+                ServiceTriggerInfo {
+                    trigger_count: 1,
+                    triggers: std::ptr::null_mut(),
+                    reserved: std::ptr::null_mut(),
+                },
+            );
+        }
+        assert_eq!(
+            parse_service_triggers(
+                unsafe { std::slice::from_raw_parts(base, length) },
+                &mut aggregate_data,
+                &mut aggregate_triggers,
+            ),
+            Err(ServiceTriggerParseError::InvalidResponse)
+        );
+
+        unsafe {
+            std::ptr::write_unaligned(
+                base.cast::<ServiceTriggerInfo>(),
+                ServiceTriggerInfo {
+                    trigger_count: 1,
+                    triggers: base.add(length).cast(),
+                    reserved: std::ptr::null_mut(),
+                },
+            );
+        }
+        assert_eq!(
+            parse_service_triggers(
+                unsafe { std::slice::from_raw_parts(base, length) },
+                &mut aggregate_data,
+                &mut aggregate_triggers,
+            ),
+            Err(ServiceTriggerParseError::InvalidResponse)
+        );
+
+        unsafe {
+            std::ptr::write_unaligned(
+                base.cast::<ServiceTriggerInfo>(),
+                ServiceTriggerInfo {
+                    trigger_count: (MAX_SERVICE_TRIGGERS_PER_SERVICE + 1) as u32,
+                    triggers: base.add(std::mem::size_of::<ServiceTriggerInfo>()).cast(),
+                    reserved: std::ptr::null_mut(),
+                },
+            );
+        }
+        assert_eq!(
+            parse_service_triggers(
+                unsafe { std::slice::from_raw_parts(base, length) },
+                &mut aggregate_data,
+                &mut aggregate_triggers,
+            ),
+            Err(ServiceTriggerParseError::CountLimitExceeded)
+        );
+    }
+
     #[test]
     fn service_start_type_mapping_preserves_unknown_values() {
         assert_eq!(service_start_type(SERVICE_BOOT_START), "boot");
@@ -3440,6 +4619,204 @@ mod tests {
         assert_eq!(service_start_type(SERVICE_DEMAND_START), "manual");
         assert_eq!(service_start_type(SERVICE_DISABLED), "disabled");
         assert_eq!(service_start_type(99), "unknown");
+    }
+
+    #[test]
+    fn delayed_auto_start_query_observes_true_and_false_values() {
+        for (raw_value, expected) in [(1_i32, true), (0_i32, false)] {
+            let encoded = raw_value.to_ne_bytes();
+            let mut call = 0;
+            let mut aggregate = 0;
+            let observed = query_delayed_auto_start_config(
+                |buffer, size, needed| {
+                    call += 1;
+                    if size == 0 {
+                        unsafe {
+                            *needed = std::mem::size_of::<ServiceDelayedAutoStartInfo>() as u32
+                        };
+                        Err(ERROR_INSUFFICIENT_BUFFER)
+                    } else {
+                        assert_eq!(size as usize, encoded.len());
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(encoded.as_ptr(), buffer, encoded.len());
+                            *needed = encoded.len() as u32;
+                        }
+                        Ok(())
+                    }
+                },
+                &mut aggregate,
+            )
+            .expect("bounded delayed-auto-start query fixture should decode");
+            assert_eq!(observed, expected);
+            assert_eq!(call, 2);
+            assert_eq!(aggregate, encoded.len());
+            assert_eq!(
+                serde_json::to_value(WindowsDelayedAutoStart::Observed { value: observed })
+                    .unwrap(),
+                serde_json::json!({"status":"observed","value":expected})
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_auto_start_query_keeps_errors_and_limits_unknown() {
+        let mut aggregate = 0;
+        let access_denied = query_delayed_auto_start_config(
+            |_buffer, _size, _needed| Err(ERROR_ACCESS_DENIED),
+            &mut aggregate,
+        );
+        assert_eq!(
+            access_denied,
+            Err(DelayedAutoStartQueryError::Api(ERROR_ACCESS_DENIED))
+        );
+        let unknown = WindowsDelayedAutoStart::Unknown {
+            diagnostic_code: delayed_auto_start_error_code(DelayedAutoStartQueryError::Api(
+                ERROR_ACCESS_DENIED,
+            )),
+        };
+        assert_eq!(
+            serde_json::to_value(unknown).unwrap(),
+            serde_json::json!({
+                "status":"unknown",
+                "diagnostic_code":"service_delayed_auto_start_access_denied"
+            })
+        );
+
+        let mut oversized_aggregate = MAX_AGGREGATE_SERVICE_CONFIG_BYTES;
+        let over_budget = query_delayed_auto_start_config(
+            |_buffer, size, needed| {
+                if size == 0 {
+                    unsafe { *needed = std::mem::size_of::<ServiceDelayedAutoStartInfo>() as u32 };
+                    Err(ERROR_INSUFFICIENT_BUFFER)
+                } else {
+                    panic!("over-budget configuration must not allocate or query a buffer")
+                }
+            },
+            &mut oversized_aggregate,
+        );
+        assert_eq!(
+            over_budget,
+            Err(DelayedAutoStartQueryError::ByteBudgetExceeded)
+        );
+    }
+
+    #[test]
+    fn delayed_auto_start_query_rejects_bad_sizes_and_second_call_failures() {
+        let mut aggregate = 0;
+        let malformed_required_size = query_delayed_auto_start_config(
+            |_buffer, size, needed| {
+                if size == 0 {
+                    unsafe { *needed = 1 };
+                    Err(ERROR_INSUFFICIENT_BUFFER)
+                } else {
+                    panic!("invalid required size must not allocate a buffer")
+                }
+            },
+            &mut aggregate,
+        );
+        assert_eq!(
+            malformed_required_size,
+            Err(DelayedAutoStartQueryError::InvalidResponse)
+        );
+
+        let mut calls = 0;
+        let second_call_failure = query_delayed_auto_start_config(
+            |_buffer, size, needed| {
+                calls += 1;
+                if size == 0 {
+                    unsafe { *needed = std::mem::size_of::<ServiceDelayedAutoStartInfo>() as u32 };
+                    Err(ERROR_INSUFFICIENT_BUFFER)
+                } else {
+                    Err(ERROR_ACCESS_DENIED)
+                }
+            },
+            &mut aggregate,
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(
+            second_call_failure,
+            Err(DelayedAutoStartQueryError::Api(ERROR_ACCESS_DENIED))
+        );
+
+        let actual_size_mismatch = query_delayed_auto_start_config(
+            |_buffer, size, needed| {
+                if size == 0 {
+                    unsafe { *needed = std::mem::size_of::<ServiceDelayedAutoStartInfo>() as u32 };
+                    Err(ERROR_INSUFFICIENT_BUFFER)
+                } else {
+                    unsafe { *needed = size - 1 };
+                    Ok(())
+                }
+            },
+            &mut aggregate,
+        );
+        assert_eq!(
+            actual_size_mismatch,
+            Err(DelayedAutoStartQueryError::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn service_state_mapping_preserves_all_known_and_unknown_scm_values() {
+        let known = [
+            (SERVICE_STOPPED, WindowsServiceState::Stopped, "stopped"),
+            (
+                SERVICE_START_PENDING,
+                WindowsServiceState::StartPending,
+                "start_pending",
+            ),
+            (
+                SERVICE_STOP_PENDING,
+                WindowsServiceState::StopPending,
+                "stop_pending",
+            ),
+            (SERVICE_RUNNING, WindowsServiceState::Running, "running"),
+            (
+                SERVICE_CONTINUE_PENDING,
+                WindowsServiceState::ContinuePending,
+                "continue_pending",
+            ),
+            (
+                SERVICE_PAUSE_PENDING,
+                WindowsServiceState::PausePending,
+                "pause_pending",
+            ),
+            (SERVICE_PAUSED, WindowsServiceState::Paused, "paused"),
+        ];
+
+        for (raw_state_code, state, serialized_state) in known {
+            let observation = WindowsServiceObservation::from_scm_state(raw_state_code);
+            assert_eq!(
+                observation,
+                WindowsServiceObservation::Known {
+                    state,
+                    raw_state_code,
+                }
+            );
+            assert_eq!(
+                serde_json::to_value(observation).unwrap(),
+                serde_json::json!({
+                    "status": "known",
+                    "state": serialized_state,
+                    "raw_state_code": raw_state_code
+                })
+            );
+        }
+
+        for raw_state_code in [0, u32::MAX] {
+            let observation = WindowsServiceObservation::from_scm_state(raw_state_code);
+            assert_eq!(
+                observation,
+                WindowsServiceObservation::Unknown { raw_state_code }
+            );
+            assert_eq!(
+                serde_json::to_value(observation).unwrap(),
+                serde_json::json!({
+                    "status": "unknown",
+                    "raw_state_code": raw_state_code
+                })
+            );
+        }
     }
 
     #[test]
@@ -3654,6 +5031,203 @@ mod tests {
     }
 
     #[test]
+    fn service_dependency_multisz_separates_service_names_and_group_names() {
+        let units = "AlphaSvc\0+NetworkGroup\0\0"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                units.as_ptr().cast::<u8>(),
+                units.len() * std::mem::size_of::<u16>(),
+            )
+        };
+        let parsed = parse_service_dependencies(
+            bytes.as_ptr(),
+            bytes.len(),
+            units.as_ptr(),
+            MAX_SERVICE_STRING_UNITS,
+            MAX_SERVICE_DEPENDENCIES_PER_SERVICE,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            [
+                WindowsServiceDependency {
+                    kind: "service",
+                    name: "AlphaSvc".to_owned(),
+                },
+                WindowsServiceDependency {
+                    kind: "load_order_group",
+                    name: "NetworkGroup".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(WindowsServiceDependencies::Observed { entries: parsed }).unwrap(),
+            serde_json::json!({
+                "status":"observed",
+                "entries":[
+                    {"kind":"service","name":"AlphaSvc"},
+                    {"kind":"load_order_group","name":"NetworkGroup"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn service_dependency_multisz_treats_empty_and_null_as_observed_none() {
+        let empty_string = [0u16];
+        let empty_string_bytes = unsafe {
+            std::slice::from_raw_parts(
+                empty_string.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(&empty_string),
+            )
+        };
+        assert!(
+            parse_service_dependencies(
+                empty_string_bytes.as_ptr(),
+                empty_string_bytes.len(),
+                empty_string.as_ptr(),
+                16,
+                4,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let empty = [0u16, 0];
+        let bytes = unsafe {
+            std::slice::from_raw_parts(empty.as_ptr().cast::<u8>(), std::mem::size_of_val(&empty))
+        };
+        assert!(
+            parse_service_dependencies(bytes.as_ptr(), bytes.len(), empty.as_ptr(), 16, 4,)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            parse_service_dependencies(bytes.as_ptr(), bytes.len(), std::ptr::null(), 16, 4)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn service_dependency_parser_rejects_malformed_pointers_strings_and_limits() {
+        let valid = "Svc\0\0".encode_utf16().collect::<Vec<_>>();
+        let valid_bytes = unsafe {
+            std::slice::from_raw_parts(
+                valid.as_ptr().cast::<u8>(),
+                valid.len() * std::mem::size_of::<u16>(),
+            )
+        };
+        let outside = unsafe { valid.as_ptr().add(valid.len()) };
+        assert_eq!(
+            parse_service_dependencies(valid_bytes.as_ptr(), valid_bytes.len(), outside, 16, 4,),
+            Err(ServiceMultiSzError::OutsideBuffer)
+        );
+        let misaligned = unsafe { valid_bytes.as_ptr().add(1).cast::<u16>() };
+        assert_eq!(
+            parse_service_dependencies(valid_bytes.as_ptr(), valid_bytes.len(), misaligned, 16, 4,),
+            Err(ServiceMultiSzError::Misaligned)
+        );
+        let unterminated = "Svc\0".encode_utf16().collect::<Vec<_>>();
+        let unterminated_bytes = unsafe {
+            std::slice::from_raw_parts(
+                unterminated.as_ptr().cast::<u8>(),
+                unterminated.len() * std::mem::size_of::<u16>(),
+            )
+        };
+        assert_eq!(
+            parse_service_dependencies(
+                unterminated_bytes.as_ptr(),
+                unterminated_bytes.len(),
+                unterminated.as_ptr(),
+                16,
+                4,
+            ),
+            Err(ServiceMultiSzError::Unterminated)
+        );
+        assert_eq!(
+            parse_service_dependencies(
+                valid_bytes.as_ptr(),
+                valid_bytes.len(),
+                valid.as_ptr(),
+                2,
+                4,
+            ),
+            Err(ServiceMultiSzError::OverLimit)
+        );
+        assert_eq!(
+            parse_service_dependencies(
+                valid_bytes.as_ptr(),
+                valid_bytes.len(),
+                valid.as_ptr(),
+                16,
+                0,
+            ),
+            Err(ServiceMultiSzError::OverLimit)
+        );
+        let malformed = [0xd800u16, 0, 0];
+        let malformed_bytes = unsafe {
+            std::slice::from_raw_parts(
+                malformed.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(&malformed),
+            )
+        };
+        assert_eq!(
+            parse_service_dependencies(
+                malformed_bytes.as_ptr(),
+                malformed_bytes.len(),
+                malformed.as_ptr(),
+                16,
+                4,
+            ),
+            Err(ServiceMultiSzError::MalformedUtf16)
+        );
+        let empty_group = "+\0\0".encode_utf16().collect::<Vec<_>>();
+        let empty_group_bytes = unsafe {
+            std::slice::from_raw_parts(
+                empty_group.as_ptr().cast::<u8>(),
+                empty_group.len() * std::mem::size_of::<u16>(),
+            )
+        };
+        assert_eq!(
+            parse_service_dependencies(
+                empty_group_bytes.as_ptr(),
+                empty_group_bytes.len(),
+                empty_group.as_ptr(),
+                16,
+                4,
+            ),
+            Err(ServiceMultiSzError::EmptyDependency)
+        );
+    }
+
+    #[test]
+    fn service_dependency_values_are_inert_and_diagnostics_do_not_echo_them() {
+        let payload = "<script>not executable</script>\0\0"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                payload.as_ptr().cast::<u8>(),
+                payload.len() * std::mem::size_of::<u16>(),
+            )
+        };
+        let parsed = parse_service_dependencies(
+            bytes.as_ptr(),
+            bytes.len(),
+            payload.as_ptr(),
+            MAX_SERVICE_STRING_UNITS,
+            MAX_SERVICE_DEPENDENCIES_PER_SERVICE,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(json.contains("<script>not executable</script>"));
+        let diagnostic = service_multisz_error_code(ServiceMultiSzError::Unterminated);
+        assert!(!diagnostic.contains("script"));
+    }
+
+    #[test]
     fn service_limits_are_finite_and_diagnostics_bounded() {
         assert_eq!(MAX_SERVICE_ENTRIES, 8_192);
         assert_eq!(MAX_SERVICE_DIAGNOSTICS, 256);
@@ -3711,6 +5285,7 @@ mod tests {
             executable_path: Some(r"%TEMP%\worker.exe".to_owned()),
             arguments: Some(r#"--name "value"; $(not-run)"#.to_owned()),
             working_directory: Some(r"C:\Work".to_owned()),
+            startup_state: crate::inventory::startup_state::StartupRowState::configured_present(),
             evidence: WindowsScheduledTaskActionEvidence {
                 source: "synthetic unit-test value",
                 task_index: 4,

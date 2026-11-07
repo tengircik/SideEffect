@@ -1,0 +1,4 @@
+8302 execve("/usr/bin/se-v3-tool", ["se-v3-tool"], 0x0) = 0
+8301 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.10")}, 16) = -1 ECONNREFUSED (synthetic failure)
+8303 openat(AT_FDCWD, "/tmp/se-v3/order/e", O_RDONLY) = -1 ENOENT (synthetic failure)
+8304 openat2(AT_FDCWD, "/tmp/se-v3/order/f", O_RDONLY) = 3

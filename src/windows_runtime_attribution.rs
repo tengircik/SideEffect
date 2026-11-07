@@ -1,24 +1,24 @@
 //! Conservative offline process-lineage and event-context view for Windows ETW v3.
 //!
-//! Process-start payloads supply the only lineage edges. Network observations
-//! use their documented payload PID. File and disk header PIDs are exposed as
-//! context candidates only, never as confirmed ownership.
+//! Process-start payloads supply the only lineage edges after raw PID/parent-ID
+//! cross-checks. Network observations use a raw PID only after the shared
+//! decoder matches their serialized sidecar. File and disk header PIDs are
+//! exposed as context candidates only, never as confirmed ownership.
 
 use crate::fingerprint::sha256_hex;
 use crate::windows_runtime::{
-    DecodedProcessPayload, NativeRuntimeEvent, ProcessDecodeStatus, WindowsRuntimeCapture,
-    inspect_windows_runtime_bytes,
+    NativeRuntimeEvent, WindowsRuntimeCapture, inspect_windows_runtime_bytes,
 };
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-const PROCESS_PROVIDER_GUID: &str = "3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c";
 const FILE_PROVIDER_GUID: &str = "90cbdc39-4a3e-11d1-84f4-0000f80464e3";
 const TCP_PROVIDER_GUID: &str = "9a280ac0-c8e0-11d1-84e2-00c04fb998a2";
 const UDP_PROVIDER_GUID: &str = "bf3a50c5-a9c9-4988-a005-2df0b7c80f80";
 const DISK_PROVIDER_GUID: &str = "3d6fa8d4-fe05-11d0-9dda-00c04fd7ba7c";
 const MAX_ATTRIBUTION_EVENTS: usize = crate::windows_runtime::MAX_WINDOWS_RUNTIME_EVENTS;
+const MAX_ATTRIBUTION_DIAGNOSTICS: usize = 128;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct WindowsRuntimeAttributionSummary {
@@ -113,6 +113,12 @@ struct ProcessInstance {
     identity_ambiguous: bool,
 }
 
+struct ValidatedProcessEvent<'a> {
+    process_id: u32,
+    parent_process_id: u32,
+    image_file_name: &'a str,
+}
+
 /// Build a separate, bounded attribution view without changing the capture.
 pub fn summarize_windows_runtime_attribution(
     capture_bytes: &[u8],
@@ -133,8 +139,10 @@ fn summarize_capture(
     let target_starts = capture
         .events
         .iter()
-        .filter_map(|event| process_event(event, "process_start"))
-        .filter(|(decoded, _)| decoded.process_id == Some(target_pid))
+        .filter(|event| {
+            process_event(event, "process_start")
+                .is_some_and(|decoded| decoded.process_id == target_pid)
+        })
         .count();
 
     let target_start_ordinal = (target_starts == 1)
@@ -144,7 +152,7 @@ fn summarize_capture(
                 .iter()
                 .find(|event| {
                     process_event(event, "process_start")
-                        .is_some_and(|(decoded, _)| decoded.process_id == Some(target_pid))
+                        .is_some_and(|decoded| decoded.process_id == target_pid)
                 })
                 .map(|event| event.record_ordinal)
         })
@@ -167,18 +175,18 @@ fn summarize_capture(
         }
         let ordinal = event.record_ordinal;
         if Some(ordinal) == target_start_ordinal {
-            let Some((decoded, image)) = process_event(event, "process_start") else {
+            let Some(decoded) = process_event(event, "process_start") else {
                 return Err("validated target process event became unavailable".to_owned());
             };
-            let process_id = decoded.process_id.expect("validated process ID");
-            let image_file_name = image.to_owned();
+            let process_id = decoded.process_id;
+            let image_file_name = decoded.image_file_name.to_owned();
             let instance_index = instances.len();
             instances.push(ProcessInstance {
                 role: "target",
                 process_id,
                 image_file_name,
                 start_ordinal: ordinal,
-                parent_process_id: decoded.parent_process_id,
+                parent_process_id: Some(decoded.parent_process_id),
                 parent_start_ordinal: None,
                 end_ordinal: None,
                 identity_ambiguous: false,
@@ -194,82 +202,84 @@ fn summarize_capture(
             continue;
         }
 
-        if event.event_kind == "process_start" {
-            if let Some((decoded, image)) = process_event(event, "process_start") {
-                let process_id = decoded.process_id.expect("validated process ID");
-                let parent_pid = decoded
-                    .parent_process_id
-                    .expect("validated parent process ID");
-                if ambiguous_pids.contains(&process_id) {
-                    unassigned_events.push(unassigned(
-                        &capture_sha256,
-                        event,
-                        "process_id_was_ambiguous_earlier_in_capture",
-                    ));
-                    continue;
-                }
-                if active.contains_key(&process_id) {
-                    if let Some(existing_index) = active.remove(&process_id) {
-                        instances[existing_index].identity_ambiguous = true;
+        if let Some(lifecycle_kind) = process_lifecycle_kind(event) {
+            if lifecycle_kind == "process_start" {
+                if let Some(decoded) = process_event(event, lifecycle_kind) {
+                    let process_id = decoded.process_id;
+                    let parent_pid = decoded.parent_process_id;
+                    if ambiguous_pids.contains(&process_id) {
+                        unassigned_events.push(unassigned(
+                            &capture_sha256,
+                            event,
+                            "process_id_was_ambiguous_earlier_in_capture",
+                        ));
+                        continue;
                     }
-                    ambiguous_pids.insert(process_id);
-                    diagnostics.push("overlapping_process_start_reused_an_active_pid");
-                    unassigned_events.push(unassigned(
-                        &capture_sha256,
-                        event,
-                        "overlapping_process_id_makes_instance_identity_ambiguous",
-                    ));
-                    continue;
-                }
-                let parent_index = active.get(&parent_pid).copied();
-                if let Some(parent_index) = parent_index {
-                    let parent = &instances[parent_index];
-                    let instance_index = instances.len();
-                    instances.push(ProcessInstance {
-                        role: "descendant",
-                        process_id,
-                        image_file_name: image.to_owned(),
-                        start_ordinal: ordinal,
-                        parent_process_id: Some(parent_pid),
-                        parent_start_ordinal: Some(parent.start_ordinal),
-                        end_ordinal: None,
-                        identity_ambiguous: false,
-                    });
-                    active.insert(process_id, instance_index);
-                    event_attributions.push(EventAttribution {
-                        event: event_reference(&capture_sha256, event),
-                        event_kind: event.event_kind.clone(),
-                        attribution: "descendant_process_payload_candidate",
-                        process_start_event: event_reference(&capture_sha256, event),
-                        basis: "validated_parent_id_matches_one_active_target_tree_process",
-                    });
+                    if active.contains_key(&process_id) {
+                        if let Some(existing_index) = active.remove(&process_id) {
+                            instances[existing_index].identity_ambiguous = true;
+                        }
+                        ambiguous_pids.insert(process_id);
+                        push_diagnostic(
+                            &mut diagnostics,
+                            "overlapping_process_start_reused_an_active_pid",
+                        );
+                        unassigned_events.push(unassigned(
+                            &capture_sha256,
+                            event,
+                            "overlapping_process_id_makes_instance_identity_ambiguous",
+                        ));
+                        continue;
+                    }
+                    let parent_index = active.get(&parent_pid).copied();
+                    if let Some(parent_index) = parent_index {
+                        let parent = &instances[parent_index];
+                        let instance_index = instances.len();
+                        instances.push(ProcessInstance {
+                            role: "descendant",
+                            process_id,
+                            image_file_name: decoded.image_file_name.to_owned(),
+                            start_ordinal: ordinal,
+                            parent_process_id: Some(parent_pid),
+                            parent_start_ordinal: Some(parent.start_ordinal),
+                            end_ordinal: None,
+                            identity_ambiguous: false,
+                        });
+                        active.insert(process_id, instance_index);
+                        event_attributions.push(EventAttribution {
+                            event: event_reference(&capture_sha256, event),
+                            event_kind: event.event_kind.clone(),
+                            attribution: "descendant_process_payload_candidate",
+                            process_start_event: event_reference(&capture_sha256, event),
+                            basis: "validated_parent_id_matches_one_active_target_tree_process",
+                        });
+                    } else {
+                        unassigned_events.push(unassigned(
+                            &capture_sha256,
+                            event,
+                            "parent_process_id_does_not_match_one_active_target_tree_process",
+                        ));
+                    }
                 } else {
+                    push_diagnostic(
+                        &mut diagnostics,
+                        process_validation_error(event, lifecycle_kind),
+                    );
+                    invalidate_active_lifecycle(&mut active, &mut instances, &mut ambiguous_pids);
                     unassigned_events.push(unassigned(
                         &capture_sha256,
                         event,
-                        "parent_process_id_does_not_match_one_active_target_tree_process",
+                        "process_start_payload_is_not_supported_and_validated",
                     ));
                 }
-            } else {
-                diagnostics
-                    .push("unsupported_or_malformed_process_start_prevents_complete_lineage");
-                unassigned_events.push(unassigned(
-                    &capture_sha256,
-                    event,
-                    "process_start_payload_is_not_supported_and_validated",
-                ));
+                continue;
             }
-            continue;
-        }
 
-        if event.event_kind == "process_end" {
-            if let Some((decoded, image)) = process_event(event, "process_end") {
-                let process_id = decoded.process_id.expect("validated process ID");
+            if let Some(decoded) = process_event(event, lifecycle_kind) {
+                let process_id = decoded.process_id;
                 if let Some(instance_index) = active.remove(&process_id) {
                     let instance = &mut instances[instance_index];
-                    if decoded.parent_process_id == instance.parent_process_id
-                        && image == instance.image_file_name
-                    {
+                    if Some(decoded.parent_process_id) == instance.parent_process_id {
                         instance.end_ordinal = Some(ordinal);
                         event_attributions.push(EventAttribution {
                             event: event_reference(&capture_sha256, event),
@@ -286,17 +296,19 @@ fn summarize_capture(
                                     .get(usize::try_from(instance.start_ordinal - 1).unwrap_or(usize::MAX))
                                     .ok_or_else(|| "process start evidence reference is unavailable".to_owned())?,
                             ),
-                            basis: "validated_process_end_pid_parent_and_image_match_active_process_start_payload",
+                            basis: "raw_checked_process_end_pid_and_parent_match_active_process_start",
                         });
                     } else {
                         instance.identity_ambiguous = true;
                         ambiguous_pids.insert(process_id);
-                        diagnostics
-                            .push("process_end_identity_does_not_match_active_process_start");
+                        push_diagnostic(
+                            &mut diagnostics,
+                            "process_end_identity_does_not_match_active_process_start",
+                        );
                         unassigned_events.push(unassigned(
                             &capture_sha256,
                             event,
-                            "process_end_parent_or_image_does_not_match_active_start_payload",
+                            "process_end_parent_does_not_match_active_start_payload",
                         ));
                     }
                 } else {
@@ -311,12 +323,11 @@ fn summarize_capture(
                     ));
                 }
             } else {
-                diagnostics.push("unsupported_or_malformed_process_end_may_hide_pid_reuse");
-                for instance in active.values().copied().collect::<Vec<_>>() {
-                    ambiguous_pids.insert(instances[instance].process_id);
-                    instances[instance].identity_ambiguous = true;
-                }
-                active.clear();
+                push_diagnostic(
+                    &mut diagnostics,
+                    process_validation_error(event, lifecycle_kind),
+                );
+                invalidate_active_lifecycle(&mut active, &mut instances, &mut ambiguous_pids);
                 unassigned_events.push(unassigned(
                     &capture_sha256,
                     event,
@@ -326,8 +337,36 @@ fn summarize_capture(
             continue;
         }
 
-        if is_network_observation(event) {
-            if let Some(pid) = payload_pid(event) {
+        if matches!(event.event_kind.as_str(), "process_start" | "process_end") {
+            let lifecycle_kind = event.event_kind.as_str();
+            push_diagnostic(
+                &mut diagnostics,
+                process_validation_error(event, lifecycle_kind),
+            );
+            invalidate_active_lifecycle(&mut active, &mut instances, &mut ambiguous_pids);
+            unassigned_events.push(unassigned(
+                &capture_sha256,
+                event,
+                if lifecycle_kind == "process_start" {
+                    "process_start_payload_is_not_supported_and_validated"
+                } else {
+                    "process_end_payload_is_not_supported_and_may_hide_pid_reuse"
+                },
+            ));
+            continue;
+        }
+
+        if is_network_provider_event(event) {
+            let pid = match crate::event::cross_checked_native_network_payload_pid(event) {
+                crate::record::NetworkPayloadCrossCheck::Matched(pid) => pid,
+                check => {
+                    let (diagnostic, reason) = network_payload_failure(check);
+                    push_diagnostic(&mut diagnostics, diagnostic);
+                    unassigned_events.push(unassigned(&capture_sha256, event, reason));
+                    continue;
+                }
+            };
+            {
                 if let Some(instance_index) = active.get(&pid).copied() {
                     let instance = &instances[instance_index];
                     event_attributions.push(EventAttribution {
@@ -345,7 +384,7 @@ fn summarize_capture(
                                 .get(usize::try_from(instance.start_ordinal - 1).unwrap_or(usize::MAX))
                                 .ok_or_else(|| "process start evidence reference is unavailable".to_owned())?,
                         ),
-                        basis: "documented_network_provider_payload_process_id_matches_active_target_tree_instance",
+                        basis: "raw_network_payload_pid_matches_serialized_sidecar_and_active_target_tree_instance",
                     });
                 } else {
                     unassigned_events.push(unassigned(
@@ -358,12 +397,6 @@ fn summarize_capture(
                         },
                     ));
                 }
-            } else {
-                unassigned_events.push(unassigned(
-                    &capture_sha256,
-                    event,
-                    "decoded_network_observation_has_no_valid_payload_process_id",
-                ));
             }
             continue;
         }
@@ -411,9 +444,12 @@ fn summarize_capture(
     }
 
     if target_starts == 0 {
-        diagnostics.push("target_process_start_was_not_observed");
+        push_diagnostic(&mut diagnostics, "target_process_start_was_not_observed");
     } else if target_starts > 1 {
-        diagnostics.push("target_pid_has_multiple_process_start_rows_and_is_ambiguous");
+        push_diagnostic(
+            &mut diagnostics,
+            "target_pid_has_multiple_process_start_rows_and_is_ambiguous",
+        );
     }
     if capture.collection_status != crate::windows_runtime::CollectionStatus::Complete
         || capture.event_loss.events_lost > 0
@@ -423,10 +459,16 @@ fn summarize_capture(
         || !capture.event_loss.final_snapshot_available
         || !capture.diagnostics.is_empty()
     {
-        diagnostics.push("capture_or_loss_metadata_is_partial_or_unavailable");
+        push_diagnostic(
+            &mut diagnostics,
+            "capture_or_loss_metadata_is_partial_or_unavailable",
+        );
     }
     if !ambiguous_pids.is_empty() {
-        diagnostics.push("one_or_more_process_ids_could_not_be_resolved_to_one_instance");
+        push_diagnostic(
+            &mut diagnostics,
+            "one_or_more_process_ids_could_not_be_resolved_to_one_instance",
+        );
     }
     let has_gaps = !diagnostics.is_empty();
     let attribution_status = if target_starts != 1 {
@@ -485,12 +527,12 @@ fn summarize_capture(
 
     Ok(WindowsRuntimeAttributionSummary {
         schema: "sideeffect.windows_runtime_attribution",
-        schema_version: 1,
+        schema_version: 2,
         algorithm: AttributionAlgorithm {
-            id: "windows_etw_process_lineage_payload_pid_context_pid_v1",
-            version: 1,
-            process_lineage_basis: "validated_process_start_payload_parent_id_chain_with_capture_order_lifetimes",
-            network_basis: "documented_network_payload_process_id_exact_match",
+            id: "windows_etw_raw_checked_process_lineage_payload_pid_context_pid_v2",
+            version: 2,
+            process_lineage_basis: "raw_kernel_process_pid_parent_id_cross_check_with_capture_order_lifetimes",
+            network_basis: "raw_network_payload_pid_sidecar_cross_check_and_exact_instance_match",
             file_disk_basis: "header_pid_context_candidate_only_never_confirmed_ownership",
         },
         status: if has_gaps { "partial" } else { "complete" },
@@ -531,7 +573,8 @@ fn summarize_capture(
         limitations: vec![
             "This is a derived candidate view over the supplied capture; its SHA-256 does not authenticate the capture or its collector.",
             "Descendant links require one supported process-start payload whose parent ID matches one active observed target-tree process; they do not establish application-level causation.",
-            "Network association uses the decoded provider payload process ID and the observed process-ID lifetime; it does not identify remote hosts or prove operation success.",
+            "Network association uses raw TCP/UDP payload IDs only after the shared decoder matches serialized observation metadata, then compares them to the observed process-ID lifetime; it does not identify remote hosts or prove operation success.",
+            "Process image names are untrusted decoder metadata used for display only; they are not re-decoded from raw bytes or used to establish process identity.",
             "File and disk header process IDs are event-context candidates only. They do not establish that the selected process performed the represented operation.",
             "Unassigned records remain in the raw capture and are listed by source ordinal; no match does not establish absence or non-execution.",
             "Process-ID reuse, missing lifecycle rows, decoder gaps, or event loss reduce or prevent attribution; capture completeness remains unknown.",
@@ -542,38 +585,35 @@ fn summarize_capture(
 fn process_event<'a>(
     event: &'a NativeRuntimeEvent,
     expected_kind: &str,
-) -> Option<(&'a DecodedProcessPayload, &'a str)> {
-    if !provider_matches(&event.provider_guid)
-        || event.event_id != 0
-        || event.event_kind != expected_kind
-        || match expected_kind {
-            "process_start" => event.opcode != 1,
-            "process_end" => event.opcode != 2,
-            _ => true,
-        }
-    {
-        return None;
-    }
+) -> Option<ValidatedProcessEvent<'a>> {
     let payload = event.payload_decoding.as_ref()?;
-    let process_id = payload.process_id?;
-    let parent_id = payload.parent_process_id?;
-    let image = payload.image_file_name.as_deref()?;
-    if payload.status != ProcessDecodeStatus::Decoded
-        || payload.schema_name.as_deref() != Some("windows.kernel_process_typegroup1")
-        || payload.schema_version != Some(event.event_version)
-        || event.event_version > 3
-        || !matches!(payload.pointer_size_bytes, Some(4 | 8))
-        || process_id == 0
-        || image.is_empty()
-    {
-        return None;
-    }
-    let _ = parent_id;
-    Some((payload, image))
+    let validated =
+        crate::event::validate_native_windows_process_payload(event, expected_kind).ok()?;
+    Some(ValidatedProcessEvent {
+        process_id: validated.process_id,
+        parent_process_id: validated.parent_process_id,
+        image_file_name: payload.image_file_name.as_deref().unwrap_or(""),
+    })
 }
 
-fn provider_matches(value: &str) -> bool {
-    normalized_guid(value).as_deref() == Some(PROCESS_PROVIDER_GUID)
+fn process_lifecycle_kind(event: &NativeRuntimeEvent) -> Option<&'static str> {
+    if normalized_guid(&event.provider_guid).as_deref()
+        != Some("3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c")
+    {
+        return None;
+    }
+    match event.opcode {
+        1 => Some("process_start"),
+        2 => Some("process_end"),
+        _ => None,
+    }
+}
+
+fn process_validation_error(event: &NativeRuntimeEvent, expected_kind: &str) -> &'static str {
+    crate::event::validate_native_windows_process_payload(event, expected_kind)
+        .err()
+        .map(crate::event::WindowsProcessPayloadError::diagnostic_code)
+        .unwrap_or("process_payload_unresolved")
 }
 
 fn normalized_guid(value: &str) -> Option<String> {
@@ -590,44 +630,57 @@ fn normalized_guid(value: &str) -> Option<String> {
     .then(|| value.to_ascii_lowercase())
 }
 
-fn is_network_observation(event: &NativeRuntimeEvent) -> bool {
-    let Some(value) = event.observation_decoding.as_ref() else {
-        return false;
-    };
-    if value.get("status").and_then(Value::as_str) != Some("decoded")
-        || value
-            .pointer("/observation/activity/kind")
-            .and_then(Value::as_str)
-            != Some("network")
-        || value
-            .pointer("/observation/schema_version")
-            .and_then(Value::as_u64)
-            != Some(2)
-        || event.event_kind != "network_observation"
-        || event.event_id != 0
-        || event.event_version != 2
-    {
-        return false;
+fn push_diagnostic(diagnostics: &mut Vec<&'static str>, diagnostic: &'static str) {
+    if diagnostics.len() < MAX_ATTRIBUTION_DIAGNOSTICS && !diagnostics.contains(&diagnostic) {
+        diagnostics.push(diagnostic);
     }
-    let Some(schema) = value.pointer("/observation/schema").and_then(Value::as_str) else {
-        return false;
-    };
-    match normalized_guid(&event.provider_guid).as_deref() {
-        Some(TCP_PROVIDER_GUID) => match event.opcode {
-            10 => schema == "windows.kernel_tcp_ipv4_send",
-            11 | 13 | 14 | 16 | 18 => schema == "windows.kernel_tcp_ipv4_typegroup1",
-            12 | 15 => schema == "windows.kernel_tcp_ipv4_typegroup2",
-            26 => schema == "windows.kernel_tcp_ipv6_send",
-            27 | 29 | 30 | 32 | 34 => schema == "windows.kernel_tcp_ipv6_typegroup3",
-            28 | 31 => schema == "windows.kernel_tcp_ipv6_typegroup4",
-            _ => false,
-        },
-        Some(UDP_PROVIDER_GUID) => match event.opcode {
-            10 | 11 => schema == "windows.kernel_udp_ipv4_typegroup1",
-            26 | 27 => schema == "windows.kernel_udp_ipv6_typegroup2",
-            _ => false,
-        },
-        _ => false,
+}
+
+fn invalidate_active_lifecycle(
+    active: &mut BTreeMap<u32, usize>,
+    instances: &mut [ProcessInstance],
+    ambiguous_pids: &mut BTreeSet<u32>,
+) {
+    for instance_index in active.values().copied() {
+        let instance = &mut instances[instance_index];
+        instance.identity_ambiguous = true;
+        ambiguous_pids.insert(instance.process_id);
+    }
+    active.clear();
+}
+
+fn is_network_provider_event(event: &NativeRuntimeEvent) -> bool {
+    matches!(
+        normalized_guid(&event.provider_guid).as_deref(),
+        Some(TCP_PROVIDER_GUID | UDP_PROVIDER_GUID)
+    )
+}
+
+fn network_payload_failure(
+    check: crate::record::NetworkPayloadCrossCheck,
+) -> (&'static str, &'static str) {
+    match check {
+        crate::record::NetworkPayloadCrossCheck::NotNetworkProvider
+        | crate::record::NetworkPayloadCrossCheck::Unsupported => (
+            "network_payload_unsupported",
+            "network_payload_is_not_supported_and_validated",
+        ),
+        crate::record::NetworkPayloadCrossCheck::Mismatch(_) => (
+            "network_decoder_metadata_mismatch",
+            "network_payload_sidecar_does_not_match_raw_payload",
+        ),
+        crate::record::NetworkPayloadCrossCheck::Malformed => (
+            "network_payload_malformed",
+            "network_payload_is_malformed_or_truncated",
+        ),
+        crate::record::NetworkPayloadCrossCheck::InvalidProcessId => (
+            "network_payload_invalid_process_id",
+            "network_payload_process_id_is_zero_or_invalid",
+        ),
+        crate::record::NetworkPayloadCrossCheck::Matched(_) => (
+            "network_payload_unresolved",
+            "network_payload_process_id_is_not_resolved",
+        ),
     }
 }
 
@@ -671,16 +724,6 @@ fn is_file_or_disk_observation(event: &NativeRuntimeEvent) -> bool {
         ) => event.event_kind == "disk_io_observation",
         _ => false,
     }
-}
-
-fn payload_pid(event: &NativeRuntimeEvent) -> Option<u32> {
-    event
-        .observation_decoding
-        .as_ref()?
-        .pointer("/observation/activity/observation/payload_process_id")?
-        .as_u64()
-        .and_then(|pid| u32::try_from(pid).ok())
-        .filter(|pid| *pid > 0)
 }
 
 fn event_reference(capture_sha256: &str, event: &NativeRuntimeEvent) -> EventReference {

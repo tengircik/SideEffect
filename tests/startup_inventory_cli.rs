@@ -66,7 +66,10 @@ fn discovers_injected_xdg_roots_and_publishes_private_no_clobber_json() {
     );
     let value: serde_json::Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
     assert_eq!(value["schema"], "sideeffect.startup_inventory");
-    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["schema_version"], 3);
+    assert_eq!(value["xdg_autostart"]["schema_version"], 2);
+    assert_eq!(value["systemd_units"]["schema_version"], 2);
+    assert_eq!(value["legacy_sources"]["schema_version"], 2);
     assert_eq!(value["scope"], "curated_xdg_systemd_sysv_cron_sources");
     assert!(value["systemd_units"]["records"].is_array());
     assert!(value["legacy_sources"]["sources"].is_array());
@@ -78,6 +81,18 @@ fn discovers_injected_xdg_roots_and_publishes_private_no_clobber_json() {
     assert_eq!(entries.len(), 2);
     let user = entries.iter().find(|e| e["scope"] == "user").unwrap();
     assert_eq!(user["applicability"], "not_evaluated");
+    assert_eq!(user["startup_state"]["schema_version"], 1);
+    assert_eq!(user["startup_state"]["configured"], "present");
+    assert_eq!(user["startup_state"]["effective"]["status"], "unknown");
+    assert_eq!(
+        user["startup_state"]["effective"]["context"],
+        serde_json::Value::Null
+    );
+    assert_eq!(user["startup_state"]["observed"]["status"], "unknown");
+    assert_eq!(
+        user["startup_state"]["observed"]["evidence"],
+        serde_json::Value::Null
+    );
     let keys = user["keys"].as_array().unwrap();
     assert_eq!(keys.iter().filter(|k| k["key"] == "Name").count(), 2);
     assert!(

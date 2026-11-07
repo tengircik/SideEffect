@@ -117,6 +117,12 @@ fn startup_fixture() -> Vec<u8> {
             "executable_path": "C:\\Synthetic\\worker.exe",
             "arguments": null,
             "working_directory": null,
+            "startup_state": {
+                "schema_version": 1,
+                "configured": "present",
+                "effective": {"status": "unknown", "context": null, "evidence": null},
+                "observed": {"status": "unknown", "capture_interval": null, "evidence": null}
+            },
             "evidence": {
                 "source": "synthetic fixture scheduled-task action",
                 "task_index": 3,
@@ -223,7 +229,7 @@ fn runtime_v3_seed_and_bounded_mutations_preserve_parser_invariants() {
 }
 
 #[test]
-fn startup_v4_mutations_reject_or_preserve_exact_input_and_evidence_semantics() {
+fn startup_v5_mutations_reject_or_preserve_exact_input_and_evidence_semantics() {
     let startup = startup_fixture();
     let runtime = runtime_fixture();
     let baseline = summarize_windows_startup_behavior(&startup, &runtime)

@@ -1,7 +1,7 @@
 //! Linux-first collection and publication for bounded local audit sessions.
 
 use crate::audit_session::{
-    AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, AppliedLimit, ArtifactKind,
+    AUDIT_SESSION_SCHEMA, AUDIT_SESSION_V9_SCHEMA_VERSION, AppliedLimit, ArtifactKind,
     AuditSessionManifest, AuditSessionSource, ContextFact, ContextFactStatus, CoverageManifest,
     HostContext, IntervalSemantics, MAX_SESSION_ARTIFACT_BYTES, MAX_SESSION_SOURCES,
     MAX_SESSION_TIMESTAMP_UNIX_MS, MAX_SESSION_TOTAL_ARTIFACT_BYTES, PrivilegeContext,
@@ -31,6 +31,8 @@ pub struct AuditOptions {
     pub processes: bool,
     pub startup: bool,
     pub path_executables: bool,
+    pub root_path: Option<PathBuf>,
+    pub hash_root_regular_files: bool,
     pub permission_paths: Vec<PathBuf>,
     pub runtime_program: Option<OsString>,
     pub runtime_arguments: Vec<OsString>,
@@ -58,6 +60,8 @@ pub fn collect_and_publish(
         && !options.processes
         && !options.startup
         && !options.path_executables
+        && options.root_path.is_none()
+        && !options.hash_root_regular_files
         && options.permission_paths.is_empty()
         && options.runtime_program.is_none()
     {
@@ -90,12 +94,21 @@ pub fn collect_and_publish(
         );
     }
 
+    let session_start = now_unix_ms()?;
+    // Capture the selected root before creating the sibling staging directory. If the
+    // destination is under the selected root, the session's temporary stage must not
+    // appear as an observed child in its own snapshot.
+    if options.hash_root_regular_files && options.root_path.is_none() {
+        return Err("audit --hash-regular-files requires --root DIRECTORY".to_owned());
+    }
+    let root_snapshot = options.root_path.as_deref().map(|path| {
+        crate::inventory::collect_root_snapshot_with_hash(path, options.hash_root_regular_files)
+    });
     let mut output = SessionOutput::prepare(destination)
         .map_err(|error| format!("could not prepare private audit session: {error}"))?;
     let mut artifacts = Vec::new();
     let mut sources = Vec::new();
     let mut runtime_coverage_detail = None;
-    let session_start = now_unix_ms()?;
 
     if options.packages {
         let started = now_unix_ms()?;
@@ -225,6 +238,84 @@ pub fn collect_and_publish(
         };
         sources.push(path_source);
         artifacts.push(artifact("path-executables.json", &document)?);
+    }
+
+    if let Some(document) = root_snapshot.as_ref() {
+        let started = document.captured_started_at_unix_ms;
+        let ended = document.captured_ended_at_unix_ms;
+        let status = match document.status {
+            "complete" => SourceStatus::Complete,
+            "partial" => SourceStatus::Partial,
+            _ => SourceStatus::Unknown,
+        };
+        let mut limits = vec![
+            limit("max_entries", document.limits.max_entries as u64),
+            limit(
+                "max_root_path_bytes_or_utf16_units",
+                document.limits.max_root_path_bytes_or_utf16_units as u64,
+            ),
+            limit(
+                "max_name_bytes_or_utf16_units",
+                document.limits.max_name_bytes_or_utf16_units as u64,
+            ),
+            limit(
+                "max_aggregate_name_bytes",
+                document.limits.max_aggregate_name_bytes as u64,
+            ),
+            limit("deadline_seconds", document.limits.deadline_seconds),
+        ];
+        if options.hash_root_regular_files {
+            limits.extend([
+                limit(
+                    "max_file_hash_bytes",
+                    crate::inventory::MAX_ROOT_FILE_HASH_BYTES,
+                ),
+                limit(
+                    "max_aggregate_hash_bytes",
+                    crate::inventory::MAX_ROOT_AGGREGATE_HASH_BYTES,
+                ),
+                limit(
+                    "hash_deadline_seconds",
+                    crate::inventory::ROOT_HASH_DEADLINE.as_secs(),
+                ),
+            ]);
+        }
+        let diagnostic_codes = document
+            .diagnostics
+            .iter()
+            .map(|item| item.code.to_owned())
+            .collect();
+        sources.push(AuditSessionSource {
+            role: SourceRole::SelectedRoot,
+            collector: Some(crate::audit_session::collector_identity(
+                "linux",
+                SourceRole::SelectedRoot,
+            )),
+            platform: "linux".to_owned(),
+            scope: if options.hash_root_regular_files {
+                "one explicitly selected directory and direct-child metadata; optional regular-file content fingerprints"
+            } else {
+                "one explicitly selected directory and direct-child metadata only"
+            }
+            .to_owned(),
+            started_at_unix_ms: started,
+            ended_at_unix_ms: ended,
+            status,
+            applied_limits: limits,
+            requested_settings: if options.hash_root_regular_files {
+                vec![crate::audit_session::Setting {
+                    code: "hash_regular_files".to_owned(),
+                    value: 1,
+                }]
+            } else {
+                Vec::new()
+            },
+            effective_settings: Vec::new(),
+            loss: None,
+            diagnostic_codes,
+            artifacts: Vec::new(),
+        });
+        artifacts.push(artifact("root-snapshot.json", &document)?);
     }
 
     if !options.permission_paths.is_empty() {
@@ -363,7 +454,10 @@ pub fn collect_and_publish(
             ArtifactKind::Permissions => SourceRole::Permissions,
             ArtifactKind::Startup => SourceRole::Startup,
             ArtifactKind::PathExecutables => SourceRole::PathExecutables,
+            ArtifactKind::SelectedRoot => SourceRole::SelectedRoot,
             ArtifactKind::WindowsSoftware
+            | ArtifactKind::WindowsMsix
+            | ArtifactKind::WindowsAppPaths
             | ArtifactKind::WindowsProcesses
             | ArtifactKind::WindowsPermissions
             | ArtifactKind::WindowsStartup
@@ -394,7 +488,7 @@ pub fn collect_and_publish(
     ));
     let manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
-        schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+        schema_version: AUDIT_SESSION_V9_SCHEMA_VERSION,
         session_id,
         platform: "linux".to_owned(),
         architecture: std::env::consts::ARCH.to_owned(),
@@ -625,6 +719,7 @@ fn artifact_kind(file_name: &str) -> Result<ArtifactKind, String> {
         "startup.json" => Ok(ArtifactKind::Startup),
         "permissions.json" => Ok(ArtifactKind::Permissions),
         "path-executables.json" => Ok(ArtifactKind::PathExecutables),
+        "root-snapshot.json" => Ok(ArtifactKind::SelectedRoot),
         "run.json" => Ok(ArtifactKind::RuntimeManifest),
         "trace.strace" => Ok(ArtifactKind::RuntimeTrace),
         "software.windows.json" => Ok(ArtifactKind::WindowsSoftware),

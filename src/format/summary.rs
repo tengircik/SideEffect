@@ -44,7 +44,7 @@ pub fn summarize_diff(diff: &TraceDiff<'_>) -> RedactedDiffSummary {
         CategoryChangeCounts::new(EventCategory::Process),
     ];
 
-    for change in &diff.changes {
+    for change in &diff.normalized_changes {
         let category = match change.category {
             EventCategory::File => 0,
             EventCategory::Network => 1,
@@ -151,15 +151,20 @@ mod tests {
                     "raw_result".to_owned(),
                 ],
                 display_only_fields: vec!["lexical_path_hint".to_owned()],
+                normalization_ledger: Vec::new(),
             },
             left_excluded_control_records: 0,
             right_excluded_control_records: 0,
-            changes: vec![ObservedDelta {
+            raw_line_deltas: Vec::new(),
+            semantic_changes: Vec::new(),
+            normalized_changes: vec![ObservedDelta {
                 kind: DeltaKind::Added,
                 category: EventCategory::Network,
                 record_kind: TraceRecordKind::Syscall,
                 syscall: "connect",
                 raw_arguments: "sentinel-secret-arg /private/sentinel/path",
+                before_outcome: None,
+                after_outcome: Some(crate::model::SyscallOutcome::Unknown),
                 before_lexical_path_hint: None,
                 after_lexical_path_hint: Some(hint),
                 before_result: None,

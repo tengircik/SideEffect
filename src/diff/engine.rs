@@ -4,8 +4,9 @@ use std::fmt;
 
 use crate::limits::{MAX_DIFF_INPUT_BYTES, MAX_DIFF_RECORDS};
 use crate::model::{
-    CaptureCompleteness, DeltaKind, EventCategory, MatchingPolicy, ObservedDelta,
-    ParseCompleteness, TRACE_DIFF_SCHEMA_VERSION, TraceDiff, TraceDocument, TraceRecordKind,
+    CaptureCompleteness, DeltaKind, EventCategory, MatchingPolicy, NormalizationLedgerEntry,
+    ObservedDelta, ParseCompleteness, RawLineDelta, SemanticDelta, SemanticRecordClass,
+    SyscallOutcome, TRACE_DIFF_SCHEMA_VERSION, TraceDiff, TraceDocument, TraceRecordKind,
 };
 use crate::trace::LexicalPathHint;
 
@@ -82,6 +83,7 @@ struct Row<'a> {
     syscall: &'a str,
     raw_arguments: &'a str,
     raw_result: Option<&'a str>,
+    outcome: Option<SyscallOutcome>,
     lexical_path_hint: Option<&'a LexicalPathHint>,
     evidence: &'a crate::model::EvidenceReference,
 }
@@ -171,6 +173,8 @@ pub fn compare_traces<'a>(
     validate_document(left, DiffSide::Left)?;
     validate_document(right, DiffSide::Right)?;
 
+    let raw_line_deltas = compare_raw_lines(left, right)?;
+
     let left_syscall_count = left
         .records
         .iter()
@@ -227,6 +231,7 @@ pub fn compare_traces<'a>(
         &mut changes,
     )?;
     changes.sort_by(compare_deltas);
+    let semantic_changes = build_semantic_changes(&changes)?;
 
     Ok(TraceDiff {
         schema_version: TRACE_DIFF_SCHEMA_VERSION,
@@ -246,11 +251,30 @@ pub fn compare_traces<'a>(
                 "raw_result".to_owned(),
             ],
             display_only_fields: vec!["lexical_path_hint".to_owned()],
+            normalization_ledger: vec![
+                ledger("process_id", "ignored_prefix_only"),
+                ledger("timestamp", "ignored_prefix_only"),
+                ledger("record_kind", "exact_parsed_value"),
+                ledger("category", "exact_syscall_name_bucket"),
+                ledger("syscall", "exact_parsed_value"),
+                ledger("raw_arguments", "exact_parsed_value"),
+                ledger("raw_result", "exact_parsed_value"),
+                ledger("lexical_path_hint", "display_only_not_a_match_key"),
+            ],
         },
         left_excluded_control_records,
         right_excluded_control_records,
-        changes,
+        raw_line_deltas,
+        semantic_changes,
+        normalized_changes: changes,
     })
+}
+
+fn ledger(field: &str, transformation: &str) -> NormalizationLedgerEntry {
+    NormalizationLedgerEntry {
+        field: field.to_owned(),
+        transformation: transformation.to_owned(),
+    }
 }
 
 fn validate_document(document: &TraceDocument, side: DiffSide) -> Result<(), DiffError> {
@@ -329,6 +353,7 @@ fn collect_rows<'a>(document: &'a TraceDocument, rows: &mut Vec<Row<'a>>) -> u64
                     syscall,
                     raw_arguments,
                     raw_result: record.raw_result.as_deref(),
+                    outcome: record.outcome,
                     lexical_path_hint: record.lexical_path_hint.as_ref(),
                     evidence: &record.evidence,
                 });
@@ -494,6 +519,8 @@ fn emit_unmatched_changes<'a>(
             record_kind: before.record_kind,
             syscall: before.syscall,
             raw_arguments: before.raw_arguments,
+            before_outcome: Some(before.outcome.unwrap_or(SyscallOutcome::Unknown)),
+            after_outcome: Some(after.outcome.unwrap_or(SyscallOutcome::Unknown)),
             before_lexical_path_hint: before.lexical_path_hint,
             after_lexical_path_hint: after.lexical_path_hint,
             before_result: before.raw_result,
@@ -555,6 +582,14 @@ fn emit_residuals<'a>(
             record_kind: first.record_kind,
             syscall: first.syscall,
             raw_arguments: first.raw_arguments,
+            before_outcome: match kind {
+                DeltaKind::Removed => Some(first.outcome.unwrap_or(SyscallOutcome::Unknown)),
+                _ => None,
+            },
+            after_outcome: match kind {
+                DeltaKind::Added => Some(first.outcome.unwrap_or(SyscallOutcome::Unknown)),
+                _ => None,
+            },
             before_lexical_path_hint: match kind {
                 DeltaKind::Removed => consistent_group_hint(rows, &residual_indices[start..end]),
                 DeltaKind::Added => None,
@@ -573,6 +608,138 @@ fn emit_residuals<'a>(
         start = end;
     }
     Ok(())
+}
+
+fn semantic_class(category: EventCategory) -> SemanticRecordClass {
+    match category {
+        EventCategory::File => SemanticRecordClass::FileSyscallRecord,
+        EventCategory::Network => SemanticRecordClass::NetworkSyscallRecord,
+        EventCategory::Other => SemanticRecordClass::OtherSyscallRecord,
+        EventCategory::Process => SemanticRecordClass::ProcessSyscallRecord,
+    }
+}
+
+fn build_semantic_changes(changes: &[ObservedDelta<'_>]) -> Result<Vec<SemanticDelta>, DiffError> {
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(changes.len())
+        .map_err(|_| DiffError::AllocationFailed {
+            requested: changes.len(),
+        })?;
+    for change in changes {
+        let count = change.before.len().saturating_add(change.after.len());
+        let mut before = Vec::new();
+        before
+            .try_reserve_exact(change.before.len())
+            .map_err(|_| DiffError::AllocationFailed { requested: count })?;
+        before.extend(change.before.iter().cloned());
+        let mut after = Vec::new();
+        after
+            .try_reserve_exact(change.after.len())
+            .map_err(|_| DiffError::AllocationFailed { requested: count })?;
+        after.extend(change.after.iter().cloned());
+        result.push(SemanticDelta {
+            kind: change.kind,
+            record_class: semantic_class(change.category),
+            record_kind: change.record_kind,
+            before_outcome: change.before_outcome,
+            after_outcome: change.after_outcome,
+            before,
+            after,
+        });
+    }
+    Ok(result)
+}
+
+/// Compare exact raw source lines as multisets, including retained control
+/// rows. The raw text is only used as a temporary sort key and is never copied
+/// into the diff result.
+fn compare_raw_lines(
+    left: &TraceDocument,
+    right: &TraceDocument,
+) -> Result<Vec<RawLineDelta>, DiffError> {
+    let mut left_rows = Vec::new();
+    left_rows
+        .try_reserve_exact(left.records.len())
+        .map_err(|_| DiffError::AllocationFailed {
+            requested: left.records.len(),
+        })?;
+    left_rows.extend(left.records.iter());
+    let mut right_rows = Vec::new();
+    right_rows
+        .try_reserve_exact(right.records.len())
+        .map_err(|_| DiffError::AllocationFailed {
+            requested: right.records.len(),
+        })?;
+    right_rows.extend(right.records.iter());
+    left_rows.sort_by(|a, b| {
+        a.raw_line
+            .cmp(&b.raw_line)
+            .then_with(|| a.evidence.byte_offset.cmp(&b.evidence.byte_offset))
+    });
+    right_rows.sort_by(|a, b| {
+        a.raw_line
+            .cmp(&b.raw_line)
+            .then_with(|| a.evidence.byte_offset.cmp(&b.evidence.byte_offset))
+    });
+    let capacity = left_rows.len().saturating_add(right_rows.len());
+    let mut deltas = Vec::new();
+    deltas
+        .try_reserve_exact(capacity)
+        .map_err(|_| DiffError::AllocationFailed {
+            requested: capacity,
+        })?;
+    let (mut li, mut ri) = (0, 0);
+    while li < left_rows.len() || ri < right_rows.len() {
+        match (left_rows.get(li), right_rows.get(ri)) {
+            (Some(l), Some(r)) => match l.raw_line.cmp(&r.raw_line) {
+                Ordering::Less => {
+                    deltas.push(RawLineDelta {
+                        kind: DeltaKind::Removed,
+                        evidence: l.evidence.clone(),
+                    });
+                    li += 1;
+                }
+                Ordering::Greater => {
+                    deltas.push(RawLineDelta {
+                        kind: DeltaKind::Added,
+                        evidence: r.evidence.clone(),
+                    });
+                    ri += 1;
+                }
+                Ordering::Equal => {
+                    li += 1;
+                    ri += 1;
+                }
+            },
+            (Some(l), None) => {
+                deltas.push(RawLineDelta {
+                    kind: DeltaKind::Removed,
+                    evidence: l.evidence.clone(),
+                });
+                li += 1;
+            }
+            (None, Some(r)) => {
+                deltas.push(RawLineDelta {
+                    kind: DeltaKind::Added,
+                    evidence: r.evidence.clone(),
+                });
+                ri += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    deltas.sort_by(|a, b| {
+        let rank = |kind| match kind {
+            DeltaKind::Added => 0,
+            DeltaKind::Changed => 1,
+            DeltaKind::Removed => 2,
+        };
+        rank(a.kind)
+            .cmp(&rank(b.kind))
+            .then_with(|| a.evidence.byte_offset.cmp(&b.evidence.byte_offset))
+    });
+    Ok(deltas)
 }
 
 fn consistent_group_hint<'a>(rows: &[Row<'a>], indices: &[usize]) -> Option<&'a LexicalPathHint> {

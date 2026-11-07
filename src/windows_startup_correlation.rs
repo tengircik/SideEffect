@@ -1,5 +1,5 @@
-//! Conservative, evidence-linked comparison of Windows scheduled-task actions
-//! with process-start rows in a saved ETW capture.
+//! Conservative, evidence-linked comparison of Windows startup literals with
+//! process-start rows in a saved ETW capture.
 
 use crate::fingerprint::sha256_hex;
 use crate::windows_runtime::{
@@ -8,14 +8,17 @@ use crate::windows_runtime::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const WINDOWS_STARTUP_INVENTORY_SCHEMA: &str = "sideeffect.windows_startup_inventory";
-pub const WINDOWS_STARTUP_INVENTORY_SCHEMA_VERSION: u32 = 4;
+pub const WINDOWS_STARTUP_INVENTORY_SCHEMA_VERSION: u32 = 5;
 const MAX_STARTUP_DOCUMENT_BYTES: usize = crate::limits::MAX_REPORT_BYTES;
 const MAX_TASK_ACTIONS: usize = 8_192;
-const MAX_ACTION_METADATA_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STARTUP_COPIED_METADATA_BYTES: usize = 48 * 1024 * 1024;
+const MAX_WMI_COPIED_METADATA_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ACTION_FIELD_BYTES: usize = 65_536;
+const MAX_REGISTRY_RAW_DATA_BYTES: usize = 64 * 1024;
+const MAX_REGISTRY_COMMAND_UTF16_HEX_BYTES: usize = MAX_REGISTRY_RAW_DATA_BYTES * 2;
 const MAX_JSON_VALUE_NODES: usize = 1_000_000;
 const PROCESS_PROVIDER_GUID: &str = "{3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c}";
 
@@ -50,7 +53,7 @@ pub struct WindowsAssociatedBehaviorInputs {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct WindowsAssociatedInputIdentity {
-    pub source_format: &'static str,
+    pub source_format: String,
     pub sha256: String,
     pub source_status: String,
     pub capture_completeness: &'static str,
@@ -61,10 +64,18 @@ pub struct WindowsAssociatedBehaviorCounts {
     pub scheduled_task_action_count: usize,
     pub supported_absolute_exec_action_count: usize,
     pub unsupported_or_incomplete_action_count: usize,
+    pub registry_entry_count: usize,
+    pub supported_absolute_registry_command_count: usize,
+    pub unsupported_or_incomplete_registry_command_count: usize,
+    pub service_entry_count: usize,
+    pub supported_absolute_service_binary_path_count: usize,
+    pub unsupported_or_incomplete_service_binary_path_count: usize,
     pub process_start_event_count: usize,
     pub unsupported_process_start_event_count: usize,
     pub candidate_path_group_count: usize,
     pub candidate_action_reference_count: usize,
+    pub candidate_registry_reference_count: usize,
+    pub candidate_service_reference_count: usize,
     pub candidate_process_event_count: usize,
 }
 
@@ -77,6 +88,8 @@ pub struct WindowsAssociatedBehavior {
     pub multiple_startup_references: bool,
     pub multiple_runtime_observations: bool,
     pub startup_evidence: Vec<WindowsStartupActionEvidenceReference>,
+    pub registry_evidence: Vec<WindowsRegistryStartupEvidenceReference>,
+    pub service_evidence: Vec<WindowsServiceStartupEvidenceReference>,
     pub runtime_evidence: Vec<WindowsProcessStartEvidenceReference>,
 }
 
@@ -90,6 +103,25 @@ pub struct WindowsStartupActionEvidenceReference {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct WindowsRegistryStartupEvidenceReference {
+    pub source: String,
+    pub hive: String,
+    pub registry_view: String,
+    pub registry_key: String,
+    pub value_index: usize,
+    pub value_name: String,
+    pub executable_path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WindowsServiceStartupEvidenceReference {
+    pub source: String,
+    pub service_index: usize,
+    pub service_name: String,
+    pub executable_path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct WindowsProcessStartEvidenceReference {
     pub capture_sha256: String,
     pub record_ordinal: u64,
@@ -98,8 +130,11 @@ pub struct WindowsProcessStartEvidenceReference {
 }
 
 struct StartupInput {
+    schema_version: u32,
     status: String,
     actions: Vec<StartupAction>,
+    registry_entries: Vec<RegistryStartupEntry>,
+    service_entries: Vec<ServiceStartupEntry>,
 }
 
 struct StartupAction {
@@ -113,9 +148,20 @@ struct StartupAction {
     evidence_action_index: usize,
 }
 
+struct RegistryStartupEntry {
+    value_type: String,
+    command: Option<String>,
+    evidence: WindowsRegistryStartupEvidenceReference,
+}
+
+struct ServiceStartupEntry {
+    binary_path: Option<String>,
+    evidence: WindowsServiceStartupEvidenceReference,
+}
+
 /// Compare only saved, bounded Windows startup and ETW documents.
 ///
-/// The output is a candidate view. It never claims that a scheduled task ran or
+/// The output is a candidate view. It never claims that a startup entry ran or
 /// caused an observed process to start.
 pub fn summarize_windows_startup_behavior(
     startup_bytes: &[u8],
@@ -132,8 +178,13 @@ pub fn summarize_windows_startup_behavior(
     let startup_sha256 = sha256_hex(startup_bytes);
     let capture_sha256 = sha256_hex(runtime_bytes);
     let scheduled_task_action_count = startup.actions.len();
+    let registry_entry_count = startup.registry_entries.len();
+    let service_entry_count = startup.service_entries.len();
     let startup_status = startup.status;
     let mut action_groups = BTreeMap::<String, Vec<WindowsStartupActionEvidenceReference>>::new();
+    let mut registry_groups =
+        BTreeMap::<String, Vec<WindowsRegistryStartupEvidenceReference>>::new();
+    let mut service_groups = BTreeMap::<String, Vec<WindowsServiceStartupEvidenceReference>>::new();
     let mut supported_action_count = 0usize;
     let mut unsupported_action_count = 0usize;
     for action in startup.actions {
@@ -160,6 +211,50 @@ pub fn summarize_windows_startup_behavior(
                 action_index: action.action_index,
                 task_path: action.task_path,
                 executable_path: path,
+            },
+        );
+    }
+
+    let mut supported_registry_command_count = 0usize;
+    let mut unsupported_registry_command_count = 0usize;
+    for entry in startup.registry_entries {
+        if entry.value_type != "REG_SZ" {
+            unsupported_registry_command_count += 1;
+            continue;
+        }
+        let Some(path) = entry.command else {
+            unsupported_registry_command_count += 1;
+            continue;
+        };
+        if !is_drive_rooted_windows_path(&path) {
+            unsupported_registry_command_count += 1;
+            continue;
+        }
+        supported_registry_command_count += 1;
+        registry_groups.entry(path.clone()).or_default().push(
+            WindowsRegistryStartupEvidenceReference {
+                executable_path: path,
+                ..entry.evidence
+            },
+        );
+    }
+
+    let mut supported_service_binary_path_count = 0usize;
+    let mut unsupported_service_binary_path_count = 0usize;
+    for entry in startup.service_entries {
+        let Some(path) = entry.binary_path else {
+            unsupported_service_binary_path_count += 1;
+            continue;
+        };
+        if !is_drive_rooted_windows_path(&path) {
+            unsupported_service_binary_path_count += 1;
+            continue;
+        }
+        supported_service_binary_path_count += 1;
+        service_groups.entry(path.clone()).or_default().push(
+            WindowsServiceStartupEvidenceReference {
+                executable_path: path,
+                ..entry.evidence
             },
         );
     }
@@ -207,21 +302,40 @@ pub fn summarize_windows_startup_behavior(
 
     let mut associations = Vec::new();
     let mut action_reference_count = 0usize;
+    let mut registry_reference_count = 0usize;
+    let mut service_reference_count = 0usize;
     let mut process_event_count = 0usize;
-    for (path, startup_evidence) in action_groups {
+    let candidate_paths = action_groups
+        .keys()
+        .chain(registry_groups.keys())
+        .chain(service_groups.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for path in candidate_paths {
         let Some(runtime_evidence) = process_groups.remove(&path) else {
             continue;
         };
+        let startup_evidence = action_groups.remove(&path).unwrap_or_default();
+        let registry_evidence = registry_groups.remove(&path).unwrap_or_default();
+        let service_evidence = service_groups.remove(&path).unwrap_or_default();
         action_reference_count = action_reference_count.saturating_add(startup_evidence.len());
+        registry_reference_count = registry_reference_count.saturating_add(registry_evidence.len());
+        service_reference_count = service_reference_count.saturating_add(service_evidence.len());
         process_event_count = process_event_count.saturating_add(runtime_evidence.len());
+        let startup_reference_count = startup_evidence
+            .len()
+            .saturating_add(registry_evidence.len())
+            .saturating_add(service_evidence.len());
         associations.push(WindowsAssociatedBehavior {
             status: "candidate_match",
             confidence: "limited_candidate",
             basis: "exact_equality_of_drive_rooted_windows_path_strings",
             executable_path: path,
-            multiple_startup_references: startup_evidence.len() > 1,
+            multiple_startup_references: startup_reference_count > 1,
             multiple_runtime_observations: runtime_evidence.len() > 1,
             startup_evidence,
+            registry_evidence,
+            service_evidence,
             runtime_evidence,
         });
     }
@@ -235,6 +349,8 @@ pub fn summarize_windows_startup_behavior(
         || !runtime.event_loss.final_snapshot_available
         || !runtime.diagnostics.is_empty()
         || unsupported_action_count > 0
+        || unsupported_registry_command_count > 0
+        || unsupported_service_binary_path_count > 0
         || unsupported_process_start_event_count > 0;
     let mut diagnostics = Vec::new();
     if startup_status != "complete" {
@@ -256,6 +372,12 @@ pub fn summarize_windows_startup_behavior(
     if unsupported_action_count > 0 {
         diagnostics.push("unsupported_or_incomplete_task_actions_were_excluded");
     }
+    if unsupported_registry_command_count > 0 {
+        diagnostics.push("unsupported_or_incomplete_registry_commands_were_excluded");
+    }
+    if unsupported_service_binary_path_count > 0 {
+        diagnostics.push("unsupported_or_incomplete_service_binary_paths_were_excluded");
+    }
     if unsupported_process_start_event_count > 0 {
         diagnostics.push("unsupported_process_start_payloads_or_paths_were_excluded");
     }
@@ -266,13 +388,13 @@ pub fn summarize_windows_startup_behavior(
 
     Ok(WindowsAssociatedBehaviorSummary {
         schema: "sideeffect.windows_associated_behavior_summary",
-        schema_version: 1,
+        schema_version: 2,
         algorithm: WindowsAssociationAlgorithm {
-            id: "windows_task_action_process_image_exact_path",
-            version: 1,
+            id: "windows_startup_source_process_image_exact_path",
+            version: 2,
             basis: "exact_equality_of_drive_rooted_windows_path_strings",
         },
-        platform_adapter: "windows_startup_inventory_v4_windows_runtime_capture_v3",
+        platform_adapter: "windows_startup_inventory_v4_v5_v6_v7_v8_v9_or_v10_windows_runtime_capture_v3",
         capture_completeness: "unknown",
         status: if partial { "partial" } else { "complete" },
         association_status: if associations.is_empty() {
@@ -282,13 +404,16 @@ pub fn summarize_windows_startup_behavior(
         },
         inputs: WindowsAssociatedBehaviorInputs {
             startup_inventory: WindowsAssociatedInputIdentity {
-                source_format: "sideeffect.windows_startup_inventory_v4",
+                source_format: format!(
+                    "{WINDOWS_STARTUP_INVENTORY_SCHEMA}_v{}",
+                    startup.schema_version
+                ),
                 sha256: startup_sha256,
                 source_status: startup_status,
                 capture_completeness: "unknown",
             },
             runtime_capture: WindowsAssociatedInputIdentity {
-                source_format: "sideeffect.windows_runtime_capture_v3",
+                source_format: "sideeffect.windows_runtime_capture_v3".to_owned(),
                 sha256: capture_sha256,
                 source_status: match runtime.collection_status {
                     CollectionStatus::Complete => "complete",
@@ -302,17 +427,28 @@ pub fn summarize_windows_startup_behavior(
             scheduled_task_action_count,
             supported_absolute_exec_action_count: supported_action_count,
             unsupported_or_incomplete_action_count: unsupported_action_count,
+            registry_entry_count,
+            supported_absolute_registry_command_count: supported_registry_command_count,
+            unsupported_or_incomplete_registry_command_count: unsupported_registry_command_count,
+            service_entry_count,
+            supported_absolute_service_binary_path_count: supported_service_binary_path_count,
+            unsupported_or_incomplete_service_binary_path_count:
+                unsupported_service_binary_path_count,
             process_start_event_count,
             unsupported_process_start_event_count,
             candidate_path_group_count: associations.len(),
             candidate_action_reference_count: action_reference_count,
+            candidate_registry_reference_count: registry_reference_count,
+            candidate_service_reference_count: service_reference_count,
             candidate_process_event_count: process_event_count,
         },
         diagnostics,
         limitations: vec![
-            "Only observed Exec scheduled-task actions with drive-rooted literal paths are considered.",
+            "Only observed Exec task actions, REG_SZ Run/RunOnce command strings, and SCM service binary_path strings that are drive-rooted and exactly equal to a decoded process image path are considered.",
+            "Startup strings are matched as raw values only; no command parsing, argument stripping, environment expansion, quoting removal, case folding, path normalization, basename matching, or device-path conversion is performed.",
+            "WMI permanent event subscriptions are retained by the startup inventory but are not correlated with ETW process-start observations by this adapter.",
             "Only decoded process-start events with a drive-rooted ImageFileName string are considered; no basename matching, path normalization, environment expansion, or device-path conversion is performed.",
-            "A candidate path match does not establish that a task ran, launched the observed process, or caused any behavior.",
+            "A candidate path match does not establish that a task, registry value, or service was active, launched the observed process, or caused any behavior.",
             "The Windows ETW capture is system-wide for a bounded window; target and descendant attribution is not established.",
             "The two inputs are independent snapshots; missing matches do not establish absence or non-execution.",
             "Input fingerprints identify supplied bytes but do not authenticate their origin or contents.",
@@ -332,14 +468,14 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "Windows startup inventory must be a JSON object".to_owned())?;
+    let schema_version = object.get("schema_version").and_then(Value::as_u64);
     if object.get("schema").and_then(Value::as_str) != Some(WINDOWS_STARTUP_INVENTORY_SCHEMA)
-        || object.get("schema_version").and_then(Value::as_u64)
-            != Some(u64::from(WINDOWS_STARTUP_INVENTORY_SCHEMA_VERSION))
+        || !matches!(schema_version, Some(4..=10))
         || object.get("platform").and_then(Value::as_str) != Some("windows")
     {
         return Err("unsupported Windows startup inventory schema or platform".to_owned());
     }
-    const REQUIRED_FIELDS: [&str; 13] = [
+    const REQUIRED_FIELDS_V4_V5: [&str; 13] = [
         "schema",
         "schema_version",
         "platform",
@@ -354,14 +490,36 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
         "scheduled_task_entries",
         "scheduled_task_actions",
     ];
-    if object.len() != REQUIRED_FIELDS.len()
+    const WMI_FIELDS: [&str; 3] = [
+        "wmi_event_filters",
+        "wmi_event_consumers",
+        "wmi_filter_consumer_bindings",
+    ];
+    let wmi_field_count = WMI_FIELDS
+        .iter()
+        .filter(|field| object.contains_key(**field))
+        .count();
+    if schema_version == Some(6) && wmi_field_count != WMI_FIELDS.len()
+        || matches!(schema_version, Some(7..=9))
+            && wmi_field_count != 0
+            && wmi_field_count != WMI_FIELDS.len()
+    {
+        return Err("Windows startup inventory has an incomplete WMI field set".to_owned());
+    }
+    let expected_fields = if schema_version == Some(6) || wmi_field_count == WMI_FIELDS.len() {
+        REQUIRED_FIELDS_V4_V5
+            .into_iter()
+            .chain(WMI_FIELDS)
+            .collect::<Vec<_>>()
+    } else {
+        REQUIRED_FIELDS_V4_V5.to_vec()
+    };
+    if object.len() != expected_fields.len()
         || object
             .keys()
-            .any(|key| !REQUIRED_FIELDS.contains(&key.as_str()))
+            .any(|key| !expected_fields.contains(&key.as_str()))
     {
-        return Err(
-            "Windows startup inventory v4 has missing or unknown top-level fields".to_owned(),
-        );
+        return Err("Windows startup inventory has missing or unknown top-level fields".to_owned());
     }
     bounded_string(object.get("scope"), MAX_ACTION_FIELD_BYTES, "scope")?;
     let capture_started = object
@@ -392,7 +550,195 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
             ));
         }
         for (index, entry) in entries.iter().enumerate() {
-            validate_inventory_row(field, index, entry)?;
+            validate_inventory_row(field, index, entry, schema_version)?;
+        }
+    }
+    if schema_version == Some(6) || wmi_field_count == WMI_FIELDS.len() {
+        let mut copied_bytes = 0usize;
+        for (field, expected_class) in [
+            ("wmi_event_filters", "__EventFilter"),
+            ("wmi_event_consumers", "__EventConsumer"),
+            ("wmi_filter_consumer_bindings", "__FilterToConsumerBinding"),
+        ] {
+            let rows = object
+                .get(field)
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("Windows startup inventory {field} must be an array"))?;
+            if rows.len() > 2048 {
+                return Err(format!(
+                    "Windows startup inventory {field} exceeds the 2048 row limit"
+                ));
+            }
+            for (index, row) in rows.iter().enumerate() {
+                let fields: &[&str] = match field {
+                    "wmi_event_filters" => &[
+                        "object_path",
+                        "name",
+                        "creator_sid",
+                        "event_namespace",
+                        "query_language",
+                        "query",
+                        "evidence",
+                    ],
+                    "wmi_event_consumers" => &[
+                        "object_path",
+                        "class_name",
+                        "name",
+                        "creator_sid",
+                        "status",
+                        "executable_path",
+                        "command_line_template",
+                        "script_file_name",
+                        "script_text",
+                        "evidence",
+                    ],
+                    _ => &[
+                        "object_path",
+                        "filter_reference",
+                        "consumer_reference",
+                        "filter_reference_status",
+                        "consumer_reference_status",
+                        "creator_sid",
+                        "delivery_qos",
+                        "evidence",
+                    ],
+                };
+                let optional_fields: &[&str] = if field == "wmi_event_consumers" {
+                    &["detail_evidence"]
+                } else {
+                    &[]
+                };
+                let row = row
+                    .as_object()
+                    .ok_or_else(|| format!("{field}[{index}] must be an object"))?;
+                if row.keys().any(|key| {
+                    !fields.contains(&key.as_str()) && !optional_fields.contains(&key.as_str())
+                }) || fields.iter().any(|key| !row.contains_key(*key))
+                {
+                    return Err(format!("{field}[{index}] has missing or unknown fields"));
+                }
+                for key in fields.iter().filter(|key| **key != "evidence") {
+                    let value = row.get(*key).unwrap();
+                    if value.is_null()
+                        && *key != "object_path"
+                        && *key != "class_name"
+                        && *key != "filter_reference"
+                        && *key != "consumer_reference"
+                        && *key != "status"
+                        && *key != "filter_reference_status"
+                        && *key != "consumer_reference_status"
+                    {
+                        continue;
+                    }
+                    let text = value.as_str().ok_or_else(|| {
+                        format!("{field}[{index}].{key} must be bounded text or null")
+                    })?;
+                    if text.len() > MAX_ACTION_FIELD_BYTES {
+                        return Err(format!(
+                            "{field}[{index}].{key} exceeds the {MAX_ACTION_FIELD_BYTES} byte limit"
+                        ));
+                    }
+                    copied_bytes = copied_bytes
+                        .checked_add(text.len())
+                        .filter(|total| *total <= MAX_WMI_COPIED_METADATA_BYTES)
+                        .ok_or_else(|| {
+                            "Windows startup WMI metadata exceeds the 8 MiB copied-field budget"
+                                .to_owned()
+                        })?;
+                }
+                let evidence = row
+                    .get("evidence")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| format!("{field}[{index}].evidence must be an object"))?;
+                const EVIDENCE_FIELDS: [&str; 4] =
+                    ["source", "namespace", "class_name", "object_index"];
+                if evidence.len() != EVIDENCE_FIELDS.len()
+                    || evidence
+                        .keys()
+                        .any(|key| !EVIDENCE_FIELDS.contains(&key.as_str()))
+                {
+                    return Err(format!(
+                        "{field}[{index}].evidence has missing or unknown fields"
+                    ));
+                }
+                if evidence.get("class_name").and_then(Value::as_str) != Some(expected_class)
+                    || evidence.get("namespace").and_then(Value::as_str)
+                        != Some("ROOT\\subscription")
+                {
+                    return Err(format!(
+                        "{field}[{index}].evidence does not match the declared WMI source"
+                    ));
+                }
+                for key in ["source", "namespace", "class_name"] {
+                    bounded_string(evidence.get(key), MAX_ACTION_FIELD_BYTES, "wmi evidence")?;
+                }
+                if evidence
+                    .get("object_index")
+                    .and_then(Value::as_u64)
+                    .is_none()
+                {
+                    return Err(format!(
+                        "{field}[{index}].evidence.object_index must be an unsigned integer"
+                    ));
+                }
+                if let Some(detail_value) = row.get("detail_evidence") {
+                    let detail = detail_value.as_object().ok_or_else(|| {
+                        format!("{field}[{index}].detail_evidence must be an object")
+                    })?;
+                    if detail.len() != EVIDENCE_FIELDS.len()
+                        || detail
+                            .keys()
+                            .any(|key| !EVIDENCE_FIELDS.contains(&key.as_str()))
+                    {
+                        return Err(format!(
+                            "{field}[{index}].detail_evidence has missing or unknown fields"
+                        ));
+                    }
+                    if !matches!(
+                        detail.get("class_name").and_then(Value::as_str),
+                        Some("CommandLineEventConsumer" | "ActiveScriptEventConsumer")
+                    ) || detail.get("source").and_then(Value::as_str)
+                        != Some("IWbemLocator/IWbemServices/IEnumWbemClassObject")
+                        || detail.get("namespace").and_then(Value::as_str)
+                            != Some("ROOT\\subscription")
+                    {
+                        return Err(format!(
+                            "{field}[{index}].detail_evidence does not match a fixed consumer projection"
+                        ));
+                    }
+                    for key in ["source", "namespace", "class_name"] {
+                        bounded_string(
+                            detail.get(key),
+                            MAX_ACTION_FIELD_BYTES,
+                            "wmi detail evidence",
+                        )?;
+                    }
+                    if detail.get("object_index").and_then(Value::as_u64).is_none() {
+                        return Err(format!(
+                            "{field}[{index}].detail_evidence.object_index must be an unsigned integer"
+                        ));
+                    }
+                }
+                if field == "wmi_event_consumers"
+                    && !matches!(
+                        row.get("status").and_then(Value::as_str),
+                        Some("observed" | "unsupported_class" | "partial")
+                    )
+                {
+                    return Err(format!("{field}[{index}].status is unsupported"));
+                }
+                if field == "wmi_filter_consumer_bindings"
+                    && (!matches!(
+                        row.get("filter_reference_status").and_then(Value::as_str),
+                        Some("resolved" | "unresolved")
+                    ) || !matches!(
+                        row.get("consumer_reference_status").and_then(Value::as_str),
+                        Some("resolved" | "unresolved")
+                    ))
+                {
+                    return Err(format!("{field}[{index}] has an invalid reference status"));
+                }
+            }
         }
     }
     let status = object
@@ -429,15 +775,20 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
         let action = value
             .as_object()
             .ok_or_else(|| format!("scheduled-task action {index} must be an object"))?;
+        let has_states = schema_version.is_some_and(|version| version >= 5);
+        let mut required_action_fields = vec![
+            "action_index",
+            "action_type",
+            "action_type_code",
+            "status",
+            "evidence",
+        ];
+        if has_states {
+            required_action_fields.push("startup_state");
+        }
         validate_object_fields(
             action,
-            &[
-                "action_index",
-                "action_type",
-                "action_type_code",
-                "status",
-                "evidence",
-            ],
+            &required_action_fields,
             &[
                 "task_path",
                 "executable_path",
@@ -446,6 +797,12 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
             ],
             &format!("scheduled-task action {index}"),
         )?;
+        if has_states {
+            validate_startup_state_value(
+                action.get("startup_state"),
+                &format!("scheduled-task action {index}"),
+            )?;
+        }
         let action_index = action
             .get("action_index")
             .and_then(Value::as_u64)
@@ -553,9 +910,9 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
         {
             aggregate_bytes = aggregate_bytes
                 .checked_add(field.len())
-                .filter(|total| *total <= MAX_ACTION_METADATA_BYTES)
+                .filter(|total| *total <= MAX_STARTUP_COPIED_METADATA_BYTES)
                 .ok_or_else(|| {
-                    "Windows startup metadata exceeds the 8 MiB copied-field budget".to_owned()
+                    "Windows startup metadata exceeds the 48 MiB copied-field budget".to_owned()
                 })?;
         }
         parsed_actions.push(StartupAction {
@@ -569,10 +926,185 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
             evidence_action_index,
         });
     }
+
+    let registry_rows = object
+        .get("registry_entries")
+        .and_then(Value::as_array)
+        .expect("registry_entries were validated above");
+    let mut registry_entries = Vec::with_capacity(registry_rows.len());
+    for (index, row) in registry_rows.iter().enumerate() {
+        let row = row.as_object().expect("registry row was validated above");
+        let evidence = row
+            .get("evidence")
+            .and_then(Value::as_object)
+            .expect("registry evidence was validated above");
+        let command_display = row.get("command").and_then(Value::as_str);
+        let raw_command_hex = row.get("command_utf16_hex").and_then(Value::as_str);
+        let value_type = copy_metadata_field(
+            row.get("value_type"),
+            MAX_ACTION_FIELD_BYTES,
+            "registry value_type",
+            &mut aggregate_bytes,
+        )?;
+        if let Some(command) = command_display {
+            account_metadata_bytes(command.len(), &mut aggregate_bytes)?;
+        }
+        if let Some(raw_hex) = raw_command_hex {
+            account_metadata_bytes(raw_hex.len(), &mut aggregate_bytes)?;
+        }
+        let command = match (value_type.as_str(), command_display, raw_command_hex) {
+            ("REG_SZ", Some(display), Some(raw_hex))
+                if decode_registry_command_sidecar(raw_hex).as_deref() == Some(display) =>
+            {
+                Some(display.to_owned())
+            }
+            _ => None,
+        };
+        let reference = WindowsRegistryStartupEvidenceReference {
+            source: copy_metadata_field(
+                evidence.get("source"),
+                MAX_ACTION_FIELD_BYTES,
+                "registry evidence source",
+                &mut aggregate_bytes,
+            )?,
+            hive: copy_metadata_field(
+                evidence.get("hive"),
+                MAX_ACTION_FIELD_BYTES,
+                "registry evidence hive",
+                &mut aggregate_bytes,
+            )?,
+            registry_view: copy_metadata_field(
+                evidence.get("registry_view"),
+                MAX_ACTION_FIELD_BYTES,
+                "registry evidence view",
+                &mut aggregate_bytes,
+            )?,
+            registry_key: copy_metadata_field(
+                evidence.get("registry_key"),
+                MAX_ACTION_FIELD_BYTES,
+                "registry evidence key",
+                &mut aggregate_bytes,
+            )?,
+            value_index: evidence
+                .get("value_index")
+                .and_then(Value::as_u64)
+                .and_then(|number| usize::try_from(number).ok())
+                .ok_or_else(|| format!("registry_entries[{index}] has invalid value_index"))?,
+            value_name: copy_metadata_field(
+                evidence.get("value_name"),
+                MAX_ACTION_FIELD_BYTES,
+                "registry evidence value_name",
+                &mut aggregate_bytes,
+            )?,
+            executable_path: String::new(),
+        };
+        registry_entries.push(RegistryStartupEntry {
+            value_type,
+            command,
+            evidence: reference,
+        });
+    }
+
+    let service_rows = object
+        .get("service_entries")
+        .and_then(Value::as_array)
+        .expect("service_entries were validated above");
+    let mut service_entries = Vec::with_capacity(service_rows.len());
+    for (index, row) in service_rows.iter().enumerate() {
+        let row = row.as_object().expect("service row was validated above");
+        let evidence = row
+            .get("evidence")
+            .and_then(Value::as_object)
+            .expect("service evidence was validated above");
+        let binary_path = row.get("binary_path").and_then(Value::as_str);
+        let binary_path = binary_path
+            .map(|_| {
+                copy_metadata_field(
+                    row.get("binary_path"),
+                    MAX_ACTION_FIELD_BYTES,
+                    "service binary_path",
+                    &mut aggregate_bytes,
+                )
+            })
+            .transpose()?;
+        let reference = WindowsServiceStartupEvidenceReference {
+            source: copy_metadata_field(
+                evidence.get("source"),
+                MAX_ACTION_FIELD_BYTES,
+                "service evidence source",
+                &mut aggregate_bytes,
+            )?,
+            service_index: evidence
+                .get("service_index")
+                .and_then(Value::as_u64)
+                .and_then(|number| usize::try_from(number).ok())
+                .ok_or_else(|| format!("service_entries[{index}] has invalid service_index"))?,
+            service_name: copy_metadata_field(
+                row.get("service_name"),
+                MAX_ACTION_FIELD_BYTES,
+                "service_name",
+                &mut aggregate_bytes,
+            )?,
+            executable_path: String::new(),
+        };
+        service_entries.push(ServiceStartupEntry {
+            binary_path,
+            evidence: reference,
+        });
+    }
     Ok(StartupInput {
+        schema_version: schema_version.unwrap() as u32,
         status: status.to_owned(),
         actions: parsed_actions,
+        registry_entries,
+        service_entries,
     })
+}
+
+fn copy_metadata_field(
+    value: Option<&Value>,
+    max: usize,
+    label: &str,
+    aggregate_bytes: &mut usize,
+) -> Result<String, String> {
+    let text = value
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("Windows startup inventory {label} must be text"))?;
+    if text.len() > max {
+        return Err(format!(
+            "Windows startup inventory {label} exceeds the {max} byte limit"
+        ));
+    }
+    account_metadata_bytes(text.len(), aggregate_bytes)?;
+    Ok(text.to_owned())
+}
+
+fn account_metadata_bytes(length: usize, aggregate_bytes: &mut usize) -> Result<(), String> {
+    *aggregate_bytes = aggregate_bytes
+        .checked_add(length)
+        .filter(|total| *total <= MAX_STARTUP_COPIED_METADATA_BYTES)
+        .ok_or_else(|| {
+            "Windows startup metadata exceeds the 48 MiB copied-field budget".to_owned()
+        })?;
+    Ok(())
+}
+
+fn decode_registry_command_sidecar(raw_hex: &str) -> Option<String> {
+    if raw_hex.len() % 4 != 0 || !raw_hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut units = Vec::with_capacity(raw_hex.len() / 4);
+    for chunk in raw_hex.as_bytes().chunks_exact(4) {
+        let unit = std::str::from_utf8(chunk)
+            .ok()
+            .and_then(|text| u16::from_str_radix(text, 16).ok())?;
+        units.push(unit);
+    }
+    let end = units
+        .iter()
+        .rposition(|unit| *unit != 0)
+        .map_or(0, |index| index + 1);
+    String::from_utf16(&units[..end]).ok()
 }
 
 fn bounded_string(value: Option<&Value>, max: usize, label: &str) -> Result<String, String> {
@@ -613,12 +1145,24 @@ fn validate_object_fields(
     Ok(())
 }
 
-fn validate_inventory_row(field: &str, index: usize, value: &Value) -> Result<(), String> {
+fn validate_inventory_row(
+    field: &str,
+    index: usize,
+    value: &Value,
+    schema_version: Option<u64>,
+) -> Result<(), String> {
+    let schema_version = schema_version
+        .ok_or_else(|| "Windows startup inventory has an invalid schema version".to_owned())?;
+    let has_states = schema_version >= 5;
+    let has_service_observation = schema_version >= 7;
+    let has_delayed_auto_start = schema_version >= 8;
+    let has_service_dependencies = schema_version >= 9;
+    let has_service_triggers = schema_version >= 10;
     let label = format!("Windows startup inventory {field}[{index}]");
     let object = value
         .as_object()
         .ok_or_else(|| format!("{label} must be an object"))?;
-    let (required, optional): (&[&str], &[&str]) = match field {
+    let (base_required, optional): (&[&str], &[&str]) = match field {
         "sources" => (
             &["id", "status", "entries_seen", "diagnostics"],
             &[
@@ -674,7 +1218,40 @@ fn validate_inventory_row(field: &str, index: usize, value: &Value) -> Result<()
         ),
         _ => return Err("unsupported Windows inventory array".to_owned()),
     };
-    validate_object_fields(object, required, optional, &label)?;
+    let row_has_states = has_states && field != "sources";
+    let mut required = base_required.to_vec();
+    if row_has_states {
+        required.push("startup_state");
+    }
+    if field == "service_entries" && has_service_observation {
+        required.push("service_observation");
+    }
+    if field == "service_entries" && has_delayed_auto_start {
+        required.push("delayed_auto_start");
+    }
+    if field == "service_entries" && has_service_dependencies {
+        required.extend(["dependencies", "load_order_group"]);
+    }
+    if field == "service_entries" && has_service_triggers {
+        required.push("triggers");
+    }
+    validate_object_fields(object, &required, optional, &label)?;
+    if row_has_states {
+        validate_startup_state_value(object.get("startup_state"), &label)?;
+    }
+    if field == "service_entries" && has_service_observation {
+        validate_service_observation_value(object.get("service_observation"), &label)?;
+    }
+    if field == "service_entries" && has_delayed_auto_start {
+        validate_delayed_auto_start_value(object.get("delayed_auto_start"), &label)?;
+    }
+    if field == "service_entries" && has_service_dependencies {
+        validate_service_dependencies_value(object.get("dependencies"), &label)?;
+        validate_load_order_group_value(object.get("load_order_group"), &label)?;
+    }
+    if field == "service_entries" && has_service_triggers {
+        validate_service_triggers_value(object.get("triggers"), &label)?;
+    }
     match field {
         "sources" => {
             bounded_string(object.get("id"), MAX_ACTION_FIELD_BYTES, "source.id")?;
@@ -771,6 +1348,24 @@ fn validate_inventory_row(field: &str, index: usize, value: &Value) -> Result<()
                 &["REG_SZ", "REG_EXPAND_SZ", "unsupported"],
                 "value_type",
             )?;
+            let registry_key = object.get("registry_key").and_then(Value::as_str).unwrap();
+            if !matches!(
+                registry_key,
+                "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+                    | "Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce"
+            ) {
+                return Err(format!(
+                    "{label}.registry_key is outside the selected Run/RunOnce keys"
+                ));
+            }
+            let expected_trigger = if registry_key.ends_with("RunOnce") {
+                "user_logon_once"
+            } else {
+                "user_logon"
+            };
+            if object.get("trigger").and_then(Value::as_str) != Some(expected_trigger) {
+                return Err(format!("{label} has inconsistent registry_key and trigger"));
+            }
             let evidence = object
                 .get("evidence")
                 .and_then(Value::as_object)
@@ -789,10 +1384,45 @@ fn validate_inventory_row(field: &str, index: usize, value: &Value) -> Result<()
                 &["HKEY_CURRENT_USER", "HKEY_LOCAL_MACHINE"],
                 "evidence.hive",
             )?;
-            for name in ["command", "command_utf16_hex"] {
-                if object.contains_key(name) {
-                    optional_bounded_string(object.get(name), MAX_ACTION_FIELD_BYTES, name)?;
-                }
+            if evidence.get("source").and_then(Value::as_str) != Some("RegEnumValueW")
+                || evidence.get("hive") != object.get("hive")
+                || evidence.get("registry_view") != object.get("registry_view")
+                || evidence.get("registry_key") != object.get("registry_key")
+                || evidence.get("value_name") != object.get("value_name")
+            {
+                return Err(format!("{label} has inconsistent registry row evidence"));
+            }
+            if !matches!(
+                (
+                    object.get("hive").and_then(Value::as_str),
+                    object.get("registry_view").and_then(Value::as_str),
+                ),
+                (Some("HKEY_CURRENT_USER"), Some("native" | "wow64_32"))
+                    | (Some("HKEY_LOCAL_MACHINE"), Some("wow64_32" | "wow64_64"))
+            ) {
+                return Err(format!(
+                    "{label} has an unsupported registry hive/view pair"
+                ));
+            }
+            let registry_type = unsigned_integer(evidence.get("registry_type"), "registry_type")?;
+            let type_consistent = match object.get("value_type").and_then(Value::as_str) {
+                Some("REG_SZ") => registry_type == 1,
+                Some("REG_EXPAND_SZ") => registry_type == 2,
+                Some("unsupported") => registry_type != 1 && registry_type != 2,
+                _ => false,
+            };
+            if !type_consistent {
+                return Err(format!("{label} has inconsistent registry type evidence"));
+            }
+            if object.contains_key("command") {
+                optional_bounded_string(object.get("command"), MAX_ACTION_FIELD_BYTES, "command")?;
+            }
+            if object.contains_key("command_utf16_hex") {
+                optional_bounded_string(
+                    object.get("command_utf16_hex"),
+                    MAX_REGISTRY_COMMAND_UTF16_HEX_BYTES,
+                    "command_utf16_hex",
+                )?;
             }
             validate_evidence(
                 object.get("evidence"),
@@ -882,6 +1512,15 @@ fn validate_inventory_row(field: &str, index: usize, value: &Value) -> Result<()
                 &[],
                 &label,
             )?;
+            let evidence = object.get("evidence").and_then(Value::as_object).unwrap();
+            let expected_evidence_source = if has_delayed_auto_start {
+                "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W"
+            } else {
+                "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW"
+            };
+            if evidence.get("source").and_then(Value::as_str) != Some(expected_evidence_source) {
+                return Err(format!("{label} has inconsistent SCM service evidence"));
+            }
         }
         "scheduled_task_entries" => {
             bounded_string(object.get("task_path"), MAX_ACTION_FIELD_BYTES, "task_path")?;
@@ -912,6 +1551,451 @@ fn validate_inventory_row(field: &str, index: usize, value: &Value) -> Result<()
             )?;
         }
         _ => unreachable!(),
+    }
+    Ok(())
+}
+
+fn validate_service_observation_value(value: Option<&Value>, label: &str) -> Result<(), String> {
+    let observation = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{label}.service_observation must be an object"))?;
+    let status = observation
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{label}.service_observation.status must be text"))?;
+    let raw = observation
+        .get("raw_state_code")
+        .and_then(Value::as_u64)
+        .filter(|raw| *raw <= u64::from(u32::MAX))
+        .ok_or_else(|| format!("{label}.service_observation.raw_state_code must be a u32"))?;
+    let expected = match raw {
+        1 => Some("stopped"),
+        2 => Some("start_pending"),
+        3 => Some("stop_pending"),
+        4 => Some("running"),
+        5 => Some("continue_pending"),
+        6 => Some("pause_pending"),
+        7 => Some("paused"),
+        _ => None,
+    };
+    let expected_keys: &[&str] = match status {
+        "known" => &["status", "state", "raw_state_code"],
+        "unknown" => &["status", "raw_state_code"],
+        _ => {
+            return Err(format!(
+                "{label}.service_observation has an unsupported status"
+            ));
+        }
+    };
+    if observation.len() != expected_keys.len()
+        || observation
+            .keys()
+            .any(|key| !expected_keys.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "{label}.service_observation has missing or unknown fields"
+        ));
+    }
+    match status {
+        "known" if observation.get("state").and_then(Value::as_str) == expected => Ok(()),
+        "unknown" if expected.is_none() => Ok(()),
+        _ => Err(format!(
+            "{label}.service_observation state does not match its raw code"
+        )),
+    }
+}
+
+fn validate_delayed_auto_start_value(value: Option<&Value>, label: &str) -> Result<(), String> {
+    let status = value
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("status"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{label}.delayed_auto_start.status must be text"))?;
+    let object = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{label}.delayed_auto_start must be an object"))?;
+    let expected_fields: &[&str] = match status {
+        "observed" => &["status", "value"],
+        "unknown" => &["status", "diagnostic_code"],
+        _ => {
+            return Err(format!(
+                "{label}.delayed_auto_start has an unsupported status"
+            ));
+        }
+    };
+    if object.len() != expected_fields.len()
+        || object
+            .keys()
+            .any(|key| !expected_fields.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "{label}.delayed_auto_start has missing or unknown fields"
+        ));
+    }
+    match status {
+        "observed" if object.get("value").and_then(Value::as_bool).is_some() => Ok(()),
+        "unknown" => {
+            let code = object
+                .get("diagnostic_code")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    format!("{label}.delayed_auto_start.diagnostic_code must be text")
+                })?;
+            if matches!(
+                code,
+                "service_delayed_auto_start_unsupported"
+                    | "service_delayed_auto_start_access_denied"
+                    | "service_delayed_auto_start_query_failed"
+                    | "service_delayed_auto_start_response_invalid"
+                    | "service_delayed_auto_start_budget_exceeded"
+                    | "service_delayed_auto_start_deadline_exceeded"
+            ) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{label}.delayed_auto_start has an unsupported diagnostic"
+                ))
+            }
+        }
+        _ => Err(format!("{label}.delayed_auto_start.value must be boolean")),
+    }
+}
+
+fn validate_service_dependencies_value(value: Option<&Value>, label: &str) -> Result<(), String> {
+    let object = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{label}.dependencies must be an object"))?;
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{label}.dependencies.status must be text"))?;
+    match status {
+        "observed" => {
+            if object.len() != 2 || !object.contains_key("entries") {
+                return Err(format!(
+                    "{label}.dependencies has missing or unknown fields"
+                ));
+            }
+            let entries = object
+                .get("entries")
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("{label}.dependencies.entries must be an array"))?;
+            if entries.len() > 4096 {
+                return Err(format!("{label}.dependencies exceeds the row limit"));
+            }
+            for (index, entry) in entries.iter().enumerate() {
+                let entry = entry
+                    .as_object()
+                    .ok_or_else(|| format!("{label}.dependencies[{index}] must be an object"))?;
+                if entry.len() != 2
+                    || entry
+                        .keys()
+                        .any(|key| !["kind", "name"].contains(&key.as_str()))
+                {
+                    return Err(format!(
+                        "{label}.dependencies[{index}] has missing or unknown fields"
+                    ));
+                }
+                let kind = entry
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("{label}.dependencies[{index}].kind must be text"))?;
+                if !matches!(kind, "service" | "load_order_group") {
+                    return Err(format!("{label}.dependencies[{index}].kind is unsupported"));
+                }
+                let name = entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("{label}.dependencies[{index}].name must be text"))?;
+                if name.is_empty() || name.len() > MAX_ACTION_FIELD_BYTES || name.starts_with('+') {
+                    return Err(format!("{label}.dependencies[{index}].name is invalid"));
+                }
+            }
+            Ok(())
+        }
+        "unknown" => {
+            if object.len() != 2 || !object.contains_key("diagnostic_code") {
+                return Err(format!(
+                    "{label}.dependencies has missing or unknown fields"
+                ));
+            }
+            let code = object
+                .get("diagnostic_code")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{label}.dependencies.diagnostic_code must be text"))?;
+            if matches!(
+                code,
+                "service_dependencies_response_invalid"
+                    | "service_dependencies_limit_exceeded"
+                    | "service_dependency_budget_exceeded"
+            ) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{label}.dependencies has an unsupported diagnostic"
+                ))
+            }
+        }
+        _ => Err(format!("{label}.dependencies has an unsupported status")),
+    }
+}
+
+fn validate_load_order_group_value(value: Option<&Value>, label: &str) -> Result<(), String> {
+    let object = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{label}.load_order_group must be an object"))?;
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{label}.load_order_group.status must be text"))?;
+    match status {
+        "observed" => {
+            if object.len() != 2 || !object.contains_key("value") {
+                return Err(format!(
+                    "{label}.load_order_group has missing or unknown fields"
+                ));
+            }
+            match object.get("value") {
+                Some(Value::Null) => Ok(()),
+                Some(Value::String(value))
+                    if !value.is_empty() && value.len() <= MAX_ACTION_FIELD_BYTES =>
+                {
+                    Ok(())
+                }
+                _ => Err(format!("{label}.load_order_group.value is invalid")),
+            }
+        }
+        "unknown" => {
+            if object.len() != 2 || !object.contains_key("diagnostic_code") {
+                return Err(format!(
+                    "{label}.load_order_group has missing or unknown fields"
+                ));
+            }
+            let code = object
+                .get("diagnostic_code")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{label}.load_order_group.diagnostic_code must be text"))?;
+            if matches!(
+                code,
+                "service_load_order_group_response_invalid"
+                    | "service_load_order_group_limit_exceeded"
+                    | "service_load_order_group_budget_exceeded"
+            ) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{label}.load_order_group has an unsupported diagnostic"
+                ))
+            }
+        }
+        _ => Err(format!(
+            "{label}.load_order_group has an unsupported status"
+        )),
+    }
+}
+
+fn validate_service_triggers_value(value: Option<&Value>, label: &str) -> Result<(), String> {
+    let object = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{label}.triggers must be an object"))?;
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{label}.triggers.status must be text"))?;
+    match status {
+        "observed" => {
+            if object.len() != 2 || !object.contains_key("entries") {
+                return Err(format!("{label}.triggers has missing or unknown fields"));
+            }
+            let entries = object["entries"]
+                .as_array()
+                .ok_or_else(|| format!("{label}.triggers.entries must be an array"))?;
+            if entries.len() > 256 {
+                return Err(format!("{label}.triggers exceeds the trigger limit"));
+            }
+            let mut total_data_bytes = 0usize;
+            for (index, entry) in entries.iter().enumerate() {
+                let entry = entry.as_object().ok_or_else(|| {
+                    format!("{label}.triggers.entries[{index}] must be an object")
+                })?;
+                let required = [
+                    "trigger_index",
+                    "trigger_type_code",
+                    "trigger_type",
+                    "action_code",
+                    "action",
+                    "data_items",
+                ];
+                let optional = ["subtype_guid"];
+                if required.iter().any(|field| !entry.contains_key(*field))
+                    || entry.keys().any(|field| {
+                        !required.contains(&field.as_str()) && !optional.contains(&field.as_str())
+                    })
+                {
+                    return Err(format!(
+                        "{label}.triggers.entries[{index}] has invalid fields"
+                    ));
+                }
+                for field in ["trigger_index", "trigger_type_code", "action_code"] {
+                    unsigned_integer(entry.get(field), &format!("{label}.triggers.{field}"))?;
+                }
+                require_enum(
+                    &entry["trigger_type"],
+                    &[
+                        "device_interface_arrival",
+                        "ip_address_availability",
+                        "domain_join",
+                        "firewall_port_event",
+                        "group_policy",
+                        "network_endpoint",
+                        "custom",
+                        "unknown",
+                    ],
+                    "service trigger type",
+                )?;
+                require_enum(
+                    &entry["action"],
+                    &["service_start", "service_stop", "unknown"],
+                    "service trigger action",
+                )?;
+                if let Some(guid) = entry.get("subtype_guid") {
+                    let guid = guid
+                        .as_str()
+                        .ok_or_else(|| format!("{label}.triggers subtype GUID must be text"))?;
+                    if guid.len() != 36
+                        || !guid.bytes().enumerate().all(|(index, byte)| {
+                            if [8, 13, 18, 23].contains(&index) {
+                                byte == b'-'
+                            } else {
+                                byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+                            }
+                        })
+                    {
+                        return Err(format!("{label}.triggers subtype GUID is invalid"));
+                    }
+                }
+                let items = entry["data_items"].as_array().ok_or_else(|| {
+                    format!("{label}.triggers.entries[{index}].data_items must be an array")
+                })?;
+                if items.len() > 64 {
+                    return Err(format!(
+                        "{label}.triggers data-item count exceeds the limit"
+                    ));
+                }
+                for item in items {
+                    let item = item
+                        .as_object()
+                        .ok_or_else(|| format!("{label}.triggers data item must be an object"))?;
+                    if item.len() != 3
+                        || item.keys().any(|field| {
+                            !["data_type_code", "data_type", "data_hex"].contains(&field.as_str())
+                        })
+                    {
+                        return Err(format!("{label}.triggers data item has invalid fields"));
+                    }
+                    unsigned_integer(item.get("data_type_code"), "service trigger data type")?;
+                    require_enum(
+                        &item["data_type"],
+                        &[
+                            "binary",
+                            "string",
+                            "level",
+                            "keyword_any",
+                            "keyword_all",
+                            "unknown",
+                        ],
+                        "service trigger data type name",
+                    )?;
+                    let hex = item["data_hex"]
+                        .as_str()
+                        .ok_or_else(|| format!("{label}.triggers data hex must be text"))?;
+                    if hex.len() % 2 != 0
+                        || hex.len() > 2 * 1024
+                        || !hex
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                    {
+                        return Err(format!(
+                            "{label}.triggers data hex is invalid or over limit"
+                        ));
+                    }
+                    total_data_bytes = total_data_bytes.saturating_add(hex.len() / 2);
+                    if total_data_bytes > 8 * 1024 {
+                        return Err(format!(
+                            "{label}.triggers data exceeds the per-service byte limit"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        "unknown" => {
+            if object.len() != 2 || !object.contains_key("diagnostic_code") {
+                return Err(format!("{label}.triggers has missing or unknown fields"));
+            }
+            let code = object["diagnostic_code"]
+                .as_str()
+                .ok_or_else(|| format!("{label}.triggers.diagnostic_code must be text"))?;
+            if matches!(
+                code,
+                "service_trigger_unsupported"
+                    | "service_trigger_access_denied"
+                    | "service_trigger_query_failed"
+                    | "service_trigger_response_invalid"
+                    | "service_trigger_budget_exceeded"
+                    | "service_trigger_count_limit_exceeded"
+                    | "service_trigger_deadline_exceeded"
+            ) {
+                Ok(())
+            } else {
+                Err(format!("{label}.triggers has an unsupported diagnostic"))
+            }
+        }
+        _ => Err(format!("{label}.triggers has an unsupported status")),
+    }
+}
+
+fn validate_startup_state_value(value: Option<&Value>, label: &str) -> Result<(), String> {
+    let state = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{label} has no startup_state object"))?;
+    validate_object_fields(
+        state,
+        &["schema_version", "configured", "effective", "observed"],
+        &[],
+        &format!("{label}.startup_state"),
+    )?;
+    if state.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || state.get("configured").and_then(Value::as_str) != Some("present")
+    {
+        return Err(format!("{label} has an unsupported startup_state contract"));
+    }
+    for dimension in ["effective", "observed"] {
+        let object = state
+            .get(dimension)
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("{label}.startup_state.{dimension} must be an object"))?;
+        let fields: &[&str] = if dimension == "effective" {
+            &["status", "context", "evidence"]
+        } else {
+            &["status", "capture_interval", "evidence"]
+        };
+        validate_object_fields(
+            object,
+            fields,
+            &[],
+            &format!("{label}.startup_state.{dimension}"),
+        )?;
+        if object.get("status").and_then(Value::as_str) != Some("unknown")
+            || fields
+                .iter()
+                .skip(1)
+                .any(|field| object.get(*field).is_none_or(|value| !value.is_null()))
+        {
+            return Err(format!(
+                "{label}.startup_state.{dimension} must remain unknown without linked evidence"
+            ));
+        }
     }
     Ok(())
 }
@@ -1052,6 +2136,76 @@ mod tests {
         .unwrap()
     }
 
+    fn registry_entry(command: Option<&str>, value_type: &str, value_index: usize) -> Value {
+        serde_json::json!({
+            "registry_key": "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            "hive": "HKEY_CURRENT_USER",
+            "registry_view": "native",
+            "trigger": "user_logon",
+            "value_name": format!("synthetic-{value_index}"),
+            "value_type": value_type,
+            "command": command,
+            "command_utf16_hex": command.map(utf16_hex),
+            "startup_state": {
+                "schema_version": 1,
+                "configured": "present",
+                "effective": {"status": "unknown", "context": null, "evidence": null},
+                "observed": {"status": "unknown", "capture_interval": null, "evidence": null}
+            },
+            "evidence": {
+                "source": "RegEnumValueW",
+                "hive": "HKEY_CURRENT_USER",
+                "registry_view": "native",
+                "registry_key": "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                "value_index": value_index,
+                "value_name": format!("synthetic-{value_index}"),
+                "registry_type": if value_type == "REG_SZ" { 1 } else { 2 }
+            }
+        })
+    }
+
+    fn utf16_hex(value: &str) -> String {
+        use std::fmt::Write as _;
+
+        let mut hex = String::with_capacity(value.encode_utf16().count().saturating_mul(4));
+        for unit in value.encode_utf16() {
+            write!(&mut hex, "{unit:04x}").unwrap();
+        }
+        hex
+    }
+
+    fn service_entry(binary_path: Option<&str>, service_index: usize) -> Value {
+        serde_json::json!({
+            "service_name": format!("SyntheticService{service_index}"),
+            "display_name": "Synthetic service",
+            "start_type": "automatic",
+            "start_type_code": 2,
+            "binary_path": binary_path,
+            "startup_state": {
+                "schema_version": 1,
+                "configured": "present",
+                "effective": {"status": "unknown", "context": null, "evidence": null},
+                "observed": {"status": "unknown", "capture_interval": null, "evidence": null}
+            },
+            "evidence": {
+                "source": "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW",
+                "service_index": service_index
+            }
+        })
+    }
+
+    fn startup_with_rows(
+        actions: Vec<Value>,
+        registry_entries: Vec<Value>,
+        service_entries: Vec<Value>,
+        status: &str,
+    ) -> Vec<u8> {
+        let mut startup: Value = serde_json::from_slice(&startup_bytes(actions, status)).unwrap();
+        startup["registry_entries"] = Value::Array(registry_entries);
+        startup["service_entries"] = Value::Array(service_entries);
+        serde_json::to_vec(&startup).unwrap()
+    }
+
     fn action(path: Option<&str>, status: &str, action_index: usize) -> Value {
         serde_json::json!({
             "task_path": "\\Synthetic\\Task",
@@ -1062,6 +2216,12 @@ mod tests {
             "executable_path": path,
             "arguments": null,
             "working_directory": null,
+            "startup_state": {
+                "schema_version": 1,
+                "configured": "present",
+                "effective": {"status": "unknown", "context": null, "evidence": null},
+                "observed": {"status": "unknown", "capture_interval": null, "evidence": null}
+            },
             "evidence": {
                 "source": "synthetic fixture scheduled-task action",
                 "task_index": 3,
@@ -1202,6 +2362,283 @@ mod tests {
     }
 
     #[test]
+    fn exact_run_value_and_service_binary_path_matches_keep_native_evidence() {
+        let path = r"C:\Program Files\Synthetic\worker.exe";
+        let startup = startup_with_rows(
+            vec![],
+            vec![registry_entry(Some(path), "REG_SZ", 12)],
+            vec![service_entry(Some(path), 0)],
+            "complete",
+        );
+        let runtime = capture_bytes(vec![process_start(path, 1)], CollectionStatus::Complete, 0);
+        let summary = summarize_windows_startup_behavior(&startup, &runtime).unwrap();
+
+        assert_eq!(summary.schema_version, 2);
+        assert_eq!(summary.association_status, "candidate_match");
+        assert_eq!(summary.summary.supported_absolute_registry_command_count, 1);
+        assert_eq!(
+            summary.summary.supported_absolute_service_binary_path_count,
+            1
+        );
+        assert_eq!(summary.summary.candidate_registry_reference_count, 1);
+        assert_eq!(summary.summary.candidate_service_reference_count, 1);
+        let association = &summary.associations[0];
+        assert!(association.multiple_startup_references);
+        assert_eq!(association.registry_evidence[0].value_index, 12);
+        assert_eq!(association.registry_evidence[0].value_name, "synthetic-12");
+        assert_eq!(association.service_evidence[0].service_index, 0);
+        assert_eq!(
+            association.service_evidence[0].service_name,
+            "SyntheticService0"
+        );
+        assert_eq!(association.runtime_evidence[0].record_ordinal, 1);
+        assert_eq!(association.runtime_evidence[0].capture_sha256.len(), 64);
+    }
+
+    #[test]
+    fn registry_candidates_require_valid_matching_utf16_sidecars_and_trim_trailing_nuls() {
+        let path = r"C:\Apps\worker.exe";
+        let mut valid_with_nuls = registry_entry(Some(path), "REG_SZ", 1);
+        valid_with_nuls["command_utf16_hex"] =
+            Value::String(format!("{}00000000", utf16_hex(path)));
+        let startup = startup_with_rows(vec![], vec![valid_with_nuls], vec![], "complete");
+        let runtime = capture_bytes(vec![process_start(path, 1)], CollectionStatus::Complete, 0);
+        let valid = summarize_windows_startup_behavior(&startup, &runtime).unwrap();
+        assert_eq!(valid.association_status, "candidate_match");
+        assert_eq!(valid.status, "complete");
+
+        let mut malformed_sidecar = registry_entry(Some(path), "REG_SZ", 1);
+        malformed_sidecar["command_utf16_hex"] = Value::String(format!("{}d800", utf16_hex(path)));
+        let startup = startup_with_rows(vec![], vec![malformed_sidecar], vec![], "complete");
+        let malformed = summarize_windows_startup_behavior(&startup, &runtime).unwrap();
+        assert_eq!(malformed.association_status, "insufficient_evidence");
+        assert_eq!(malformed.status, "partial");
+        assert!(malformed.associations.is_empty());
+        assert_eq!(
+            malformed
+                .summary
+                .unsupported_or_incomplete_registry_command_count,
+            1
+        );
+
+        let mut mismatched_sidecar = registry_entry(Some(path), "REG_SZ", 1);
+        mismatched_sidecar["command_utf16_hex"] =
+            Value::String(utf16_hex(r"C:\Apps\different.exe"));
+        let startup = startup_with_rows(vec![], vec![mismatched_sidecar], vec![], "complete");
+        let mismatched = summarize_windows_startup_behavior(&startup, &runtime).unwrap();
+        assert_eq!(mismatched.association_status, "insufficient_evidence");
+        assert_eq!(mismatched.status, "partial");
+        assert!(mismatched.associations.is_empty());
+    }
+
+    #[test]
+    fn producer_maximum_registry_sidecar_is_accepted_and_one_unit_over_is_rejected() {
+        let path = format!("C:\\{}", "a".repeat(MAX_REGISTRY_RAW_DATA_BYTES / 2 - 3));
+        let sidecar = utf16_hex(&path);
+        assert_eq!(sidecar.len(), MAX_REGISTRY_COMMAND_UTF16_HEX_BYTES);
+        let mut row = registry_entry(Some(&path), "REG_SZ", 1);
+        row["command_utf16_hex"] = Value::String(sidecar.clone());
+        let startup = startup_with_rows(vec![], vec![row], vec![], "complete");
+        let runtime = capture_bytes(vec![process_start(&path, 1)], CollectionStatus::Complete, 0);
+        let summary = summarize_windows_startup_behavior(&startup, &runtime).unwrap();
+        assert_eq!(summary.association_status, "candidate_match");
+        assert_eq!(summary.status, "complete");
+
+        let mut oversized_row = registry_entry(Some(&path), "REG_SZ", 1);
+        oversized_row["command_utf16_hex"] = Value::String(format!("{sidecar}0000"));
+        let oversized_startup = startup_with_rows(vec![], vec![oversized_row], vec![], "complete");
+        assert!(summarize_windows_startup_behavior(&oversized_startup, &runtime).is_err());
+    }
+
+    #[test]
+    fn producer_aggregate_registry_data_budget_fits_copied_metadata_budget() {
+        // 64 maximum-size values represent exactly the producer's 4 MiB aggregate
+        // registry-data budget and generate 8 MiB of UTF-16 hex sidecars alone.
+        let path = format!("C:\\{}", "a".repeat(MAX_REGISTRY_RAW_DATA_BYTES / 2 - 3));
+        let sidecar_len = utf16_hex(&path).len();
+        assert_eq!(sidecar_len, MAX_REGISTRY_COMMAND_UTF16_HEX_BYTES);
+        let registry_entries = (0..64)
+            .map(|index| registry_entry(Some(&path), "REG_SZ", index))
+            .collect::<Vec<_>>();
+        assert_eq!(registry_entries.len() * (sidecar_len / 2), 4 * 1024 * 1024);
+        let startup = startup_with_rows(vec![], registry_entries, vec![], "complete");
+        assert!(startup.len() < MAX_STARTUP_DOCUMENT_BYTES);
+        let runtime = capture_bytes(vec![process_start(&path, 1)], CollectionStatus::Complete, 0);
+        let summary = summarize_windows_startup_behavior(&startup, &runtime).unwrap();
+        assert_eq!(summary.association_status, "candidate_match");
+        assert_eq!(summary.status, "complete");
+        assert_eq!(summary.summary.candidate_registry_reference_count, 64);
+    }
+
+    #[test]
+    fn copied_metadata_budget_has_a_hard_48_mib_boundary() {
+        let mut copied = MAX_STARTUP_COPIED_METADATA_BYTES - 1;
+        assert!(account_metadata_bytes(1, &mut copied).is_ok());
+        assert_eq!(copied, MAX_STARTUP_COPIED_METADATA_BYTES);
+        assert!(account_metadata_bytes(1, &mut copied).is_err());
+        assert_eq!(copied, MAX_STARTUP_COPIED_METADATA_BYTES);
+    }
+
+    #[test]
+    fn missing_registry_sidecars_are_partial_non_candidates_for_startup_v4_to_v7() {
+        let path = r"C:\Apps\worker.exe";
+        let runtime = capture_bytes(vec![process_start(path, 1)], CollectionStatus::Complete, 0);
+        for version in 4..=8 {
+            let mut startup: Value =
+                serde_json::from_slice(&startup_bytes(vec![], "complete")).unwrap();
+            startup["schema_version"] = Value::from(version);
+            startup["registry_entries"] =
+                serde_json::json!([registry_entry(Some(path), "REG_SZ", 1)]);
+            startup["registry_entries"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("command_utf16_hex");
+            if version == 4 {
+                startup["registry_entries"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("startup_state");
+            }
+            if version == 6 {
+                startup["wmi_event_filters"] = Value::Array(Vec::new());
+                startup["wmi_event_consumers"] = Value::Array(Vec::new());
+                startup["wmi_filter_consumer_bindings"] = Value::Array(Vec::new());
+            }
+            let summary = summarize_windows_startup_behavior(
+                &serde_json::to_vec(&startup).unwrap(),
+                &runtime,
+            )
+            .unwrap();
+            assert_eq!(
+                summary.association_status, "insufficient_evidence",
+                "v{version}"
+            );
+            assert_eq!(summary.status, "partial", "v{version}");
+            assert!(summary.associations.is_empty(), "v{version}");
+        }
+    }
+
+    #[test]
+    fn raw_startup_variants_do_not_match_decoded_process_image_paths() {
+        let image = r"C:\Apps\worker.exe";
+        for variant in [
+            r#""C:\Apps\worker.exe""#,
+            r"C:\Apps\worker.exe --quiet",
+            r"%ProgramFiles%\worker.exe",
+            r"C:\%ProgramFiles%\worker.exe",
+            r"Apps\worker.exe",
+            r"\\?\C:\Apps\worker.exe",
+            r"c:\Apps\worker.exe",
+        ] {
+            let startup = startup_with_rows(
+                vec![],
+                vec![registry_entry(Some(variant), "REG_SZ", 1)],
+                vec![],
+                "complete",
+            );
+            let runtime =
+                capture_bytes(vec![process_start(image, 1)], CollectionStatus::Complete, 0);
+            let summary = summarize_windows_startup_behavior(&startup, &runtime).unwrap();
+            assert_eq!(
+                summary.association_status, "insufficient_evidence",
+                "{variant}"
+            );
+            assert!(summary.associations.is_empty(), "{variant}");
+        }
+
+        for variant in [
+            r#""C:\Apps\worker.exe" --service"#,
+            r"C:\Apps\worker.exe --service",
+            r"%ProgramFiles%\worker.exe",
+            r"C:\%ProgramFiles%\worker.exe",
+            r"Apps\worker.exe",
+            r"\\.\C:\Apps\worker.exe",
+            r"c:\Apps\worker.exe",
+        ] {
+            let startup = startup_with_rows(
+                vec![],
+                vec![],
+                vec![service_entry(Some(variant), 0)],
+                "complete",
+            );
+            let runtime =
+                capture_bytes(vec![process_start(image, 1)], CollectionStatus::Complete, 0);
+            let summary = summarize_windows_startup_behavior(&startup, &runtime).unwrap();
+            assert_eq!(
+                summary.association_status, "insufficient_evidence",
+                "{variant}"
+            );
+            assert!(summary.associations.is_empty(), "{variant}");
+        }
+
+        let startup = startup_with_rows(
+            vec![],
+            vec![registry_entry(Some(image), "REG_EXPAND_SZ", 1)],
+            vec![],
+            "complete",
+        );
+        let runtime = capture_bytes(vec![process_start(image, 1)], CollectionStatus::Complete, 0);
+        let summary = summarize_windows_startup_behavior(&startup, &runtime).unwrap();
+        assert_eq!(summary.association_status, "insufficient_evidence");
+        assert_eq!(
+            summary
+                .summary
+                .unsupported_or_incomplete_registry_command_count,
+            1
+        );
+        assert_eq!(summary.status, "partial");
+    }
+
+    #[test]
+    fn duplicate_startup_and_runtime_rows_remain_ambiguous_with_all_evidence() {
+        let path = r"C:\Apps\worker.exe";
+        let startup = startup_with_rows(
+            vec![],
+            vec![
+                registry_entry(Some(path), "REG_SZ", 1),
+                registry_entry(Some(path), "REG_SZ", 2),
+            ],
+            vec![],
+            "complete",
+        );
+        let runtime = capture_bytes(
+            vec![process_start(path, 1), process_start(path, 2)],
+            CollectionStatus::Complete,
+            0,
+        );
+        let summary = summarize_windows_startup_behavior(&startup, &runtime).unwrap();
+        let association = &summary.associations[0];
+        assert!(association.multiple_startup_references);
+        assert!(association.multiple_runtime_observations);
+        assert_eq!(association.registry_evidence.len(), 2);
+        assert_eq!(association.runtime_evidence[0].record_ordinal, 1);
+        assert_eq!(association.runtime_evidence[1].record_ordinal, 2);
+    }
+
+    #[test]
+    fn registry_and_service_partiality_and_loss_remain_visible() {
+        let path = r"C:\Apps\worker.exe";
+        let startup = startup_with_rows(
+            vec![],
+            vec![registry_entry(Some(path), "REG_SZ", 1)],
+            vec![service_entry(Some(path), 0)],
+            "partial",
+        );
+        let runtime = capture_bytes(vec![process_start(path, 1)], CollectionStatus::Partial, 2);
+        let summary = summarize_windows_startup_behavior(&startup, &runtime).unwrap();
+        assert_eq!(summary.status, "partial");
+        assert_eq!(summary.association_status, "candidate_match");
+        assert!(
+            summary
+                .diagnostics
+                .contains(&"startup_inventory_is_not_complete")
+        );
+        assert!(summary.diagnostics.contains(&"etw_loss_was_reported"));
+        assert_eq!(summary.associations[0].registry_evidence.len(), 1);
+        assert_eq!(summary.associations[0].service_evidence.len(), 1);
+    }
+
+    #[test]
     fn basename_mismatch_and_non_absolute_forms_remain_insufficient_evidence() {
         let startup = startup_bytes(
             vec![action(Some(r"C:\Apps\worker.exe"), "observed", 0)],
@@ -1275,10 +2712,19 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_versions_malformed_fields_and_duplicate_keys_are_rejected() {
+    fn v7_is_accepted_while_unsupported_versions_and_malformed_fields_are_rejected() {
         let mut startup: Value =
             serde_json::from_slice(&startup_bytes(vec![], "complete")).unwrap();
-        startup["schema_version"] = Value::from(5);
+        startup["schema_version"] = Value::from(7);
+        assert!(
+            summarize_windows_startup_behavior(
+                &serde_json::to_vec(&startup).unwrap(),
+                &capture_bytes(vec![], CollectionStatus::Complete, 0)
+            )
+            .is_ok()
+        );
+
+        startup["schema_version"] = Value::from(11);
         assert!(
             summarize_windows_startup_behavior(
                 &serde_json::to_vec(&startup).unwrap(),
@@ -1331,8 +2777,126 @@ mod tests {
     }
 
     #[test]
+    fn v8_delayed_auto_start_field_is_validated_but_not_used_as_runtime_causation() {
+        let mut service = service_entry(Some(r"C:\Apps\worker.exe"), 0);
+        service["service_observation"] = serde_json::json!(
+            {"status":"known","state":"running","raw_state_code":4}
+        );
+        service["delayed_auto_start"] = serde_json::json!({"status":"observed","value":true});
+        service["evidence"]["source"] = Value::String(
+            "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W"
+                .to_owned(),
+        );
+        let mut startup: Value =
+            serde_json::from_slice(&startup_bytes(vec![], "complete")).unwrap();
+        startup["schema_version"] = Value::from(8);
+        startup["service_entries"] = Value::Array(vec![service]);
+        let runtime = capture_bytes(vec![], CollectionStatus::Complete, 0);
+        assert!(
+            summarize_windows_startup_behavior(&serde_json::to_vec(&startup).unwrap(), &runtime)
+                .is_ok()
+        );
+
+        startup["service_entries"][0]["delayed_auto_start"] = serde_json::json!({
+            "status":"unknown","diagnostic_code":"untrusted_free_text"
+        });
+        assert!(
+            summarize_windows_startup_behavior(&serde_json::to_vec(&startup).unwrap(), &runtime)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_v4_startup_inventory_without_row_state_remains_accepted() {
+        let mut startup: Value = serde_json::from_slice(&startup_bytes(
+            vec![action(Some(r"C:\Apps\worker.exe"), "observed", 0)],
+            "complete",
+        ))
+        .unwrap();
+        startup["schema_version"] = Value::from(4);
+        startup["scheduled_task_actions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("startup_state");
+        let summary = summarize_windows_startup_behavior(
+            &serde_json::to_vec(&startup).unwrap(),
+            &capture_bytes(vec![], CollectionStatus::Complete, 0),
+        )
+        .unwrap();
+        assert_eq!(summary.association_status, "insufficient_evidence");
+        assert_eq!(
+            summary.platform_adapter,
+            "windows_startup_inventory_v4_v5_v6_v7_v8_v9_or_v10_windows_runtime_capture_v3"
+        );
+        assert_eq!(
+            summary.inputs.startup_inventory.source_format,
+            "sideeffect.windows_startup_inventory_v4"
+        );
+    }
+
+    #[test]
     fn malformed_inventory_rows_and_unknown_nested_fields_are_rejected() {
         let capture = capture_bytes(vec![], CollectionStatus::Complete, 0);
+
+        let mut arbitrary_registry_key: Value =
+            serde_json::from_slice(&startup_bytes(vec![], "complete")).unwrap();
+        arbitrary_registry_key["registry_entries"] =
+            serde_json::json!([registry_entry(Some(r"C:\Apps\worker.exe"), "REG_SZ", 1)]);
+        arbitrary_registry_key["registry_entries"][0]["registry_key"] =
+            Value::String("Software\\Vendor\\Other".to_owned());
+        assert!(
+            summarize_windows_startup_behavior(
+                &serde_json::to_vec(&arbitrary_registry_key).unwrap(),
+                &capture
+            )
+            .is_err()
+        );
+
+        let mut inconsistent_registry_evidence: Value =
+            serde_json::from_slice(&startup_bytes(vec![], "complete")).unwrap();
+        inconsistent_registry_evidence["registry_entries"] =
+            serde_json::json!([registry_entry(Some(r"C:\Apps\worker.exe"), "REG_SZ", 1)]);
+        inconsistent_registry_evidence["registry_entries"][0]["evidence"]["registry_type"] =
+            Value::from(2);
+        assert!(
+            summarize_windows_startup_behavior(
+                &serde_json::to_vec(&inconsistent_registry_evidence).unwrap(),
+                &capture
+            )
+            .is_err()
+        );
+
+        let mut unsupported_registry_view: Value =
+            serde_json::from_slice(&startup_bytes(vec![], "complete")).unwrap();
+        unsupported_registry_view["registry_entries"] =
+            serde_json::json!([registry_entry(Some(r"C:\Apps\worker.exe"), "REG_SZ", 1)]);
+        unsupported_registry_view["registry_entries"][0]["registry_view"] =
+            Value::String("wow64_64".to_owned());
+        unsupported_registry_view["registry_entries"][0]["evidence"]["registry_view"] =
+            Value::String("wow64_64".to_owned());
+        assert!(
+            summarize_windows_startup_behavior(
+                &serde_json::to_vec(&unsupported_registry_view).unwrap(),
+                &capture
+            )
+            .is_err()
+        );
+
+        let mut malformed_service_evidence: Value =
+            serde_json::from_slice(&startup_bytes(vec![], "complete")).unwrap();
+        malformed_service_evidence["service_entries"] =
+            serde_json::json!([service_entry(Some(r"C:\Apps\worker.exe"), 0)]);
+        malformed_service_evidence["service_entries"][0]["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("service_index");
+        assert!(
+            summarize_windows_startup_behavior(
+                &serde_json::to_vec(&malformed_service_evidence).unwrap(),
+                &capture
+            )
+            .is_err()
+        );
 
         let mut malformed_row: Value =
             serde_json::from_slice(&startup_bytes(vec![], "complete")).unwrap();

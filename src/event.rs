@@ -5,9 +5,7 @@
 
 use serde::Serialize;
 use sha2::Digest;
-#[cfg(windows)]
-use std::collections::BTreeSet;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::model::{
     EvidenceReference as TraceEvidenceReference, ParseCompleteness, SyscallOutcome, TraceDocument,
@@ -15,7 +13,11 @@ use crate::model::{
 };
 
 pub const COMMON_EVENT_SCHEMA: &str = "sideeffect.common_event_envelope";
-pub const COMMON_EVENT_SCHEMA_VERSION: u32 = 2;
+pub const COMMON_EVENT_SCHEMA_VERSION: u32 = 5;
+pub const EVENT_GRAPH_SCHEMA: &str = "sideeffect.event_graph";
+pub const EVENT_GRAPH_SCHEMA_VERSION: u32 = 5;
+pub const EVENT_TIMELINE_SCHEMA: &str = "sideeffect.event_timeline";
+pub const EVENT_TIMELINE_SCHEMA_VERSION: u32 = 5;
 #[cfg(windows)]
 const WINDOWS_RUNTIME_SCHEMA: &str = "sideeffect.windows_runtime_capture";
 #[cfg(windows)]
@@ -24,6 +26,8 @@ const MAX_COMMON_EVENTS: usize = 100_000;
 const MAX_COMMON_PROCESS_RELATIONS: usize = 50_000;
 const MAX_COMMON_PROCESS_DIAGNOSTICS: usize = 256;
 const MAX_COMMON_PROCESS_OBSERVATIONS: usize = MAX_COMMON_EVENTS + MAX_COMMON_PROCESS_RELATIONS;
+const MAX_EVENT_GRAPH_NODES: usize = 500_000;
+const MAX_EVENT_GRAPH_EDGES: usize = 200_000;
 #[cfg(windows)]
 const MAX_ETW_EVENTS: usize = 50_000;
 #[cfg(windows)]
@@ -90,6 +94,23 @@ pub struct EventIdentityContext {
     pub ambiguity: String,
 }
 
+/// A bounded source-derived file-name observation attached to one event's evidence.
+/// It remains a literal spelling and is never resolved against the filesystem.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EventPathObservation {
+    pub path: String,
+    pub basis: EventPathBasis,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EventPathBasis {
+    LinuxStraceLexicalHint {
+        lexical_basis: crate::trace::LexicalPathBasis,
+    },
+    WindowsEtwValidatedFileName,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CommonEvent {
     /// Source-local one-based row position, not a cross-source sequence.
@@ -99,6 +120,8 @@ pub struct CommonEvent {
     pub operation: OperationSemantics,
     pub evidence: EvidenceReference,
     pub identity_context: Vec<EventIdentityContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_observation: Option<EventPathObservation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -138,7 +161,11 @@ pub struct EventDiagnostic {
 pub struct ProcessObservation {
     pub source_local_id: u64,
     pub identity: ProcessIdentity,
+    /// Exact evidence anchoring the observation. Its meaning depends on the
+    /// identity kind; a task context's first row is not proof of task start,
+    /// and a returned child PID is supported only by the caller's result row.
     pub evidence: EvidenceReference,
+    /// Exact terminal evidence when the source establishes one.
     pub end_evidence: Option<EvidenceReference>,
 }
 
@@ -146,9 +173,13 @@ pub struct ProcessObservation {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProcessIdentity {
     /// The strace line prefix identifies a task/thread context. It is not
-    /// normalized to an OS process identity or a PID generation.
+    /// normalized to an OS process identity or PID generation. Epoch values
+    /// are source-local segments split only by an observed task termination;
+    /// they do not identify kernel process generations.
     LinuxTraceTaskContext {
         task_id: u32,
+        observed_task_epoch: Option<u64>,
+        epoch_basis: LinuxTaskEpochBasis,
         identity_status: ProcessIdentityStatus,
     },
     /// A successful creation syscall returned this child PID. No later rows
@@ -157,9 +188,9 @@ pub enum ProcessIdentity {
         process_id: u32,
         identity_status: ProcessIdentityStatus,
     },
-    /// Supported serialized ETW decoder metadata anchors this candidate to
-    /// its source-local start record; the offline adapter does not re-decode
-    /// the raw payload bytes.
+    /// Supported raw ETW process payload IDs are checked against the TDH
+    /// decoder sidecar before an instance is treated as observed. This is a
+    /// capture-local identity claim, not producer authentication.
     WindowsProcessInstance {
         process_id: u32,
         start_record_ordinal: u64,
@@ -170,12 +201,27 @@ pub enum ProcessIdentity {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum LinuxTaskEpochBasis {
+    /// First context observed for this numeric trace prefix; it may predate
+    /// the beginning of the supplied trace.
+    FirstObservedTaskContext,
+    /// Context observed after an exact prefixed strace task-termination row.
+    AfterObservedTaskTermination,
+    /// The trace parse is partial, so source-local task continuity is unknown.
+    ContinuityUnknownDueToPartialParse,
+    /// A bounded counter could not represent the next source-local epoch.
+    EpochNumberUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProcessIdentityStatus {
     TaskIdOnlyGenerationUnknown,
     ReturnedChildPidOnly,
     ObservedStart,
-    /// Imported ETW decoder fields are structurally supported but are not
-    /// re-decoded from the retained raw payload by the offline adapter.
+    /// Kept for historical schema compatibility. Current adapters do not emit
+    /// this status for supported process start records whose raw payload IDs
+    /// match their decoder sidecar.
     DecoderMetadataUnverified,
     AmbiguousPidReuse,
     LifecycleContinuityUnknown,
@@ -192,8 +238,8 @@ pub enum ProcessRelationshipKind {
 #[serde(rename_all = "snake_case")]
 pub enum RelationshipResolution {
     Observed,
-    /// The relationship is derived from serialized ETW decoder metadata that
-    /// has not been independently checked against the raw payload bytes.
+    /// Historical status for relationships derived from decoder metadata
+    /// without checking raw ETW payload bytes.
     DecoderMetadataUnverified,
     ParentInstanceUnresolved,
     ParentPidAmbiguous,
@@ -266,6 +312,488 @@ pub struct CommonEventEnvelope {
     pub diagnostics: Vec<EventDiagnostic>,
 }
 
+/// A source-local event listing with exact references back to the adapted
+/// source. `source_local_ordinal` is retained as the display order; timestamps
+/// are not parsed or used to imply a total or causal ordering.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EventTimeline {
+    pub schema: &'static str,
+    pub schema_version: u32,
+    pub source: SourceDescriptor,
+    pub source_state: SourceState,
+    pub ordering: &'static str,
+    pub semantics: &'static str,
+    pub filter: EventTimelineFilter,
+    /// The selected source-local observation, including its evidence, when a
+    /// process-observation filter was requested.
+    pub selected_process_observation: Option<ProcessObservation>,
+    pub items: Vec<CommonEvent>,
+    /// All source-native process links for displayed items, including
+    /// unresolved and context-candidate links.
+    pub event_process_links: Vec<EventProcessLink>,
+    pub diagnostics: Vec<EventDiagnostic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EventTimelineFilter {
+    pub event_kind: Option<String>,
+    /// Envelope-local source_local_id; never a PID or cross-capture ID.
+    pub process_observation_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum TimelineEvidenceKey {
+    RawTraceRecord(u64, u64, u64),
+    WindowsEtwRecord(u64, String, String),
+}
+
+fn timeline_evidence_key(evidence: &EvidenceReference) -> TimelineEvidenceKey {
+    match evidence {
+        EvidenceReference::RawTraceRecord {
+            line_number,
+            byte_offset,
+            byte_length,
+        } => TimelineEvidenceKey::RawTraceRecord(*line_number, *byte_offset, *byte_length),
+        EvidenceReference::WindowsEtwRecord {
+            record_ordinal,
+            json_pointer,
+            raw_payload_sha256,
+        } => TimelineEvidenceKey::WindowsEtwRecord(
+            *record_ordinal,
+            json_pointer.clone(),
+            raw_payload_sha256.clone(),
+        ),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EventGraphFilter {
+    pub event_kind: Option<String>,
+    /// Envelope-local process observation ID; never a PID or cross-capture ID.
+    pub process_observation_id: Option<u64>,
+}
+
+/// A source-local graph view over an adapted event envelope. PID-only context
+/// nodes are unique per edge and are never merged into process instances.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EventGraph {
+    pub schema: &'static str,
+    pub schema_version: u32,
+    pub filter: EventGraphFilter,
+    pub source: SourceDescriptor,
+    pub source_state: SourceState,
+    pub semantics: &'static str,
+    pub nodes: Vec<EventGraphNode>,
+    pub edges: Vec<EventGraphEdge>,
+    pub diagnostics: Vec<EventDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventGraphNodeKind {
+    Event,
+    ProcessObservation,
+    ProcessIdContext,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EventGraphNode {
+    pub id: String,
+    pub kind: EventGraphNodeKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_local_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<EvidenceReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<CommonEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_observation: Option<ProcessObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reported_process_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_note: Option<&'static str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EventGraphEdge {
+    pub from_node_id: String,
+    pub to_node_id: String,
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship_kind: Option<ProcessRelationshipKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship_resolution: Option<RelationshipResolution>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_link_role: Option<EventProcessLinkRole>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_link_status: Option<EventProcessLinkStatus>,
+    pub basis: String,
+    pub evidence: Vec<EvidenceReference>,
+}
+
+/// Convert already validated source adapters into an evidence-linked graph
+/// view. This function does not infer ownership, ancestry, or causation.
+pub fn graph(
+    envelope: &CommonEventEnvelope,
+    event_kind: Option<&str>,
+    process_observation_id: Option<u64>,
+) -> Result<EventGraph, String> {
+    let estimated_nodes = envelope
+        .events
+        .len()
+        .saturating_add(envelope.process_observations.len());
+    let estimated_edges = envelope
+        .process_relationships
+        .len()
+        .saturating_add(envelope.event_process_links.len());
+    if estimated_nodes > MAX_EVENT_GRAPH_NODES || estimated_edges > MAX_EVENT_GRAPH_EDGES {
+        return Err("event graph exceeds its bounded node or edge limit".to_owned());
+    }
+
+    let mut nodes = Vec::with_capacity(estimated_nodes);
+    let mut edges = Vec::with_capacity(estimated_edges);
+    let mut process_nodes = BTreeMap::new();
+    let mut event_nodes = HashMap::new();
+    let mut event_ordinals = BTreeSet::new();
+
+    for event in &envelope.events {
+        if !event_ordinals.insert(event.source_local_ordinal) {
+            return Err("event graph source contains duplicate event ordinals".to_owned());
+        }
+        let id = format!("event:{}", event.source_local_ordinal);
+        let key = serde_json::to_string(&event.evidence)
+            .map_err(|_| "could not index event graph evidence references".to_owned())?;
+        if event_nodes.insert(key, id.clone()).is_some() {
+            return Err(
+                "event graph source contains duplicate event evidence references".to_owned(),
+            );
+        }
+        nodes.push(EventGraphNode {
+            id,
+            kind: EventGraphNodeKind::Event,
+            source_local_ordinal: Some(event.source_local_ordinal),
+            evidence: Some(event.evidence.clone()),
+            event: Some(event.clone()),
+            process_observation: None,
+            reported_process_id: None,
+            context_note: None,
+        });
+    }
+
+    for observation in &envelope.process_observations {
+        let id = format!("process:{}", observation.source_local_id);
+        if process_nodes
+            .insert(observation.source_local_id, id.clone())
+            .is_some()
+        {
+            return Err("event graph source contains duplicate process observation IDs".to_owned());
+        }
+        nodes.push(EventGraphNode {
+            id,
+            kind: EventGraphNodeKind::ProcessObservation,
+            source_local_ordinal: None,
+            evidence: Some(observation.evidence.clone()),
+            event: None,
+            process_observation: Some(observation.clone()),
+            reported_process_id: None,
+            context_note: None,
+        });
+    }
+
+    let mut context_ordinal = 0_u64;
+    for relationship in &envelope.process_relationships {
+        let Some(to_node_id) = process_nodes.get(&relationship.to_observation_id).cloned() else {
+            return Err(
+                "event graph relationship references a missing target observation".to_owned(),
+            );
+        };
+        let from_node_id = if let Some(from_id) = relationship.from_observation_id {
+            process_nodes.get(&from_id).cloned().ok_or_else(|| {
+                "event graph relationship references a missing source observation".to_owned()
+            })?
+        } else {
+            context_ordinal = context_ordinal.saturating_add(1);
+            let id = format!("pid_context:{context_ordinal}");
+            nodes.push(EventGraphNode {
+                id: id.clone(),
+                kind: EventGraphNodeKind::ProcessIdContext,
+                source_local_ordinal: None,
+                evidence: relationship.evidence.first().cloned(),
+                event: None,
+                process_observation: None,
+                reported_process_id: relationship.reported_from_process_id,
+                context_note: Some("PID context is not merged into a process instance"),
+            });
+            id
+        };
+        edges.push(EventGraphEdge {
+            from_node_id,
+            to_node_id,
+            kind: "process_relationship",
+            relationship_kind: Some(relationship.kind),
+            relationship_resolution: Some(relationship.resolution),
+            event_link_role: None,
+            event_link_status: None,
+            basis: relationship.basis.clone(),
+            evidence: relationship.evidence.clone(),
+        });
+    }
+
+    for link in &envelope.event_process_links {
+        let key = serde_json::to_string(&link.event)
+            .map_err(|_| "could not index event graph evidence references".to_owned())?;
+        let Some(from_node_id) = event_nodes.get(&key).cloned() else {
+            return Err("event graph process link references a missing event".to_owned());
+        };
+        let to_node_id = if let Some(observation_id) = link.process_observation_id {
+            process_nodes.get(&observation_id).cloned().ok_or_else(|| {
+                "event graph process link references a missing observation".to_owned()
+            })?
+        } else {
+            context_ordinal = context_ordinal.saturating_add(1);
+            let id = format!("pid_context:{context_ordinal}");
+            let context_note = match link.status {
+                EventProcessLinkStatus::ContextCandidate => {
+                    "Reported event PID is context only, not verified ownership"
+                }
+                EventProcessLinkStatus::Unresolved => {
+                    "No unique process observation was resolved for this event"
+                }
+                EventProcessLinkStatus::Observed => {
+                    "Event-local process ID has no process-instance observation"
+                }
+            };
+            nodes.push(EventGraphNode {
+                id: id.clone(),
+                kind: EventGraphNodeKind::ProcessIdContext,
+                source_local_ordinal: None,
+                evidence: Some(link.event.clone()),
+                event: None,
+                process_observation: None,
+                reported_process_id: link.reported_process_id,
+                context_note: Some(context_note),
+            });
+            id
+        };
+        edges.push(EventGraphEdge {
+            from_node_id,
+            to_node_id,
+            kind: "event_process_link",
+            relationship_kind: None,
+            relationship_resolution: None,
+            event_link_role: Some(link.role),
+            event_link_status: Some(link.status),
+            basis: link.basis.clone(),
+            evidence: vec![link.event.clone()],
+        });
+    }
+
+    if nodes.len() > MAX_EVENT_GRAPH_NODES || edges.len() > MAX_EVENT_GRAPH_EDGES {
+        return Err("event graph exceeds its bounded node or edge limit".to_owned());
+    }
+
+    if let Some(observation_id) = process_observation_id {
+        if !process_nodes.contains_key(&observation_id) {
+            return Err(format!(
+                "no source-local process observation ID {observation_id} was emitted for this input"
+            ));
+        }
+    }
+
+    let mut graph = EventGraph {
+        schema: EVENT_GRAPH_SCHEMA,
+        schema_version: EVENT_GRAPH_SCHEMA_VERSION,
+        filter: EventGraphFilter {
+            event_kind: event_kind.map(str::to_owned),
+            process_observation_id,
+        },
+        source: envelope.source.clone(),
+        source_state: envelope.source_state.clone(),
+        semantics: "Evidence-linked relationships and event context only; edges do not establish ownership, causation, or a complete process tree. Filters select rows represented in this input; no matching event link is not proof of absence",
+        nodes,
+        edges,
+        diagnostics: envelope.diagnostics.clone(),
+    };
+
+    if event_kind.is_some() || process_observation_id.is_some() {
+        let selected_process_node_id =
+            process_observation_id.map(|observation_id| format!("process:{observation_id}"));
+        let process_linked_event_ids = selected_process_node_id.as_ref().map(|process_id| {
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == "event_process_link" && edge.to_node_id == *process_id)
+                .map(|edge| edge.from_node_id.clone())
+                .collect::<BTreeSet<_>>()
+        });
+        let mut selected_event_ids = BTreeSet::new();
+        for node in &graph.nodes {
+            let event_matches_kind = event_kind.is_none_or(|event_kind| {
+                node.event
+                    .as_ref()
+                    .is_some_and(|event| event.event_kind == event_kind)
+            });
+            let event_matches_process = process_linked_event_ids
+                .as_ref()
+                .is_none_or(|event_ids| event_ids.contains(&node.id));
+            if node.kind == EventGraphNodeKind::Event && event_matches_kind && event_matches_process
+            {
+                selected_event_ids.insert(node.id.clone());
+            }
+        }
+
+        let mut included_node_ids = selected_event_ids.clone();
+        let mut direct_process_node_ids = BTreeSet::new();
+        let mut filtered_edges = Vec::new();
+        if let Some(id) = selected_process_node_id.as_ref() {
+            direct_process_node_ids.insert(id.clone());
+            included_node_ids.insert(id.clone());
+        }
+        for edge in &graph.edges {
+            if edge.kind == "event_process_link" && selected_event_ids.contains(&edge.from_node_id)
+            {
+                direct_process_node_ids.insert(edge.to_node_id.clone());
+                included_node_ids.insert(edge.to_node_id.clone());
+                filtered_edges.push(edge.clone());
+            }
+        }
+
+        for edge in &graph.edges {
+            if edge.kind == "process_relationship"
+                && (direct_process_node_ids.contains(&edge.from_node_id)
+                    || direct_process_node_ids.contains(&edge.to_node_id))
+            {
+                included_node_ids.insert(edge.from_node_id.clone());
+                included_node_ids.insert(edge.to_node_id.clone());
+                filtered_edges.push(edge.clone());
+            }
+        }
+
+        graph
+            .nodes
+            .retain(|node| included_node_ids.contains(&node.id));
+        graph.edges = filtered_edges;
+    }
+
+    Ok(graph)
+}
+
+#[cfg(all(test, windows))]
+mod path_diagnostic_tests {
+    use super::{EventDiagnostic, MAX_COMMON_PROCESS_DIAGNOSTICS, push_path_diagnostic};
+
+    #[test]
+    fn path_validation_diagnostics_use_a_bounded_path_specific_truncation_marker() {
+        let mut diagnostics = Vec::<EventDiagnostic>::new();
+        let mut count = 0;
+        for ordinal in 1..=MAX_COMMON_PROCESS_DIAGNOSTICS + 10 {
+            push_path_diagnostic(
+                &mut diagnostics,
+                &mut count,
+                "file_observation_unverified",
+                "synthetic diagnostic",
+                Some(ordinal as u64),
+                None,
+            );
+        }
+
+        assert_eq!(diagnostics.len(), MAX_COMMON_PROCESS_DIAGNOSTICS);
+        assert_eq!(count, MAX_COMMON_PROCESS_DIAGNOSTICS);
+        assert_eq!(
+            diagnostics
+                .last()
+                .map(|diagnostic| diagnostic.code.as_str()),
+            Some("path_diagnostics_truncated")
+        );
+    }
+}
+
+/// Build a bounded timeline view from an already adapted envelope. The
+/// envelope's source-local ordinals and evidence references remain unchanged.
+pub fn timeline(
+    envelope: &CommonEventEnvelope,
+    event_kind: Option<&str>,
+    process_observation_id: Option<u64>,
+) -> Result<EventTimeline, String> {
+    let selected_process_observation = if let Some(id) = process_observation_id {
+        if id == 0 {
+            return Err("process observation ID must be greater than zero".to_owned());
+        }
+        let mut observations = envelope
+            .process_observations
+            .iter()
+            .filter(|observation| observation.source_local_id == id);
+        let observation = observations.next().ok_or_else(|| {
+            format!("no source-local process observation ID {id} was emitted for this input")
+        })?;
+        if observations.next().is_some() {
+            return Err(format!(
+                "source-local process observation ID {id} is ambiguous in this input"
+            ));
+        }
+        Some(observation.clone())
+    } else {
+        None
+    };
+
+    let linked_evidence = process_observation_id.map(|id| {
+        envelope
+            .event_process_links
+            .iter()
+            .filter(|link| link.process_observation_id == Some(id))
+            .map(|link| timeline_evidence_key(&link.event))
+            .collect::<BTreeSet<_>>()
+    });
+    let mut items = envelope
+        .events
+        .iter()
+        .filter(|event| {
+            event_kind.is_none_or(|kind| event.event_kind == kind)
+                && linked_evidence
+                    .as_ref()
+                    .is_none_or(|linked| linked.contains(&timeline_evidence_key(&event.evidence)))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    items.sort_by_key(|event| event.source_local_ordinal);
+    let item_evidence = items
+        .iter()
+        .map(|event| timeline_evidence_key(&event.evidence))
+        .collect::<BTreeSet<_>>();
+    let event_process_links = envelope
+        .event_process_links
+        .iter()
+        .filter(|link| item_evidence.contains(&timeline_evidence_key(&link.event)))
+        .cloned()
+        .collect();
+    Ok(EventTimeline {
+        schema: EVENT_TIMELINE_SCHEMA,
+        schema_version: EVENT_TIMELINE_SCHEMA_VERSION,
+        source: envelope.source.clone(),
+        source_state: envelope.source_state.clone(),
+        ordering: "source_local_ordinal; timestamps are source text and do not establish causal order",
+        semantics: "source-local selection only; an empty item set or missing event link does not prove activity was absent",
+        filter: EventTimelineFilter {
+            event_kind: event_kind.map(str::to_owned),
+            process_observation_id,
+        },
+        selected_process_observation,
+        items,
+        event_process_links,
+        diagnostics: envelope.diagnostics.clone(),
+    })
+}
+
+fn push_unique_source_diagnostic(
+    diagnostics: &mut Vec<String>,
+    seen_codes: &mut BTreeSet<&'static str>,
+    code: &'static str,
+) {
+    if seen_codes.insert(code) {
+        diagnostics.push(code.to_owned());
+    }
+}
+
 fn push_process_diagnostic(
     diagnostics: &mut Vec<EventDiagnostic>,
     process_diagnostic_count: &mut usize,
@@ -292,6 +820,38 @@ fn push_process_diagnostic(
                 evidence: None,
             });
             *process_diagnostic_count += 1;
+        }
+        std::cmp::Ordering::Greater => {}
+    }
+}
+
+#[cfg(windows)]
+fn push_path_diagnostic(
+    diagnostics: &mut Vec<EventDiagnostic>,
+    diagnostic_count: &mut usize,
+    code: &str,
+    message: &str,
+    source_local_ordinal: Option<u64>,
+    evidence: Option<EvidenceReference>,
+) {
+    match (*diagnostic_count).cmp(&(MAX_COMMON_PROCESS_DIAGNOSTICS - 1)) {
+        std::cmp::Ordering::Less => {
+            diagnostics.push(EventDiagnostic {
+                code: code.to_owned(),
+                message: message.to_owned(),
+                source_local_ordinal,
+                evidence,
+            });
+            *diagnostic_count += 1;
+        }
+        std::cmp::Ordering::Equal => {
+            diagnostics.push(EventDiagnostic {
+                code: "path_diagnostics_truncated".to_owned(),
+                message: "path validation diagnostics exceeded the 256 entry limit".to_owned(),
+                source_local_ordinal: None,
+                evidence: None,
+            });
+            *diagnostic_count += 1;
         }
         std::cmp::Ordering::Greater => {}
     }
@@ -340,10 +900,13 @@ pub fn from_linux_strace(
     let process_lineage_matches_records =
         crate::trace::process_tree::derive_process_lineage(&trace.records) == trace.process_lineage;
     let mut events = Vec::with_capacity(trace.records.len().min(MAX_COMMON_EVENTS));
-    let mut process_observations = Vec::new();
+    let mut process_observations = Vec::<ProcessObservation>::new();
     let mut process_relationships = Vec::new();
     let mut event_process_links = Vec::new();
     let mut task_observations = BTreeMap::<u32, u64>::new();
+    let mut task_epoch_counts = BTreeMap::<u32, u64>::new();
+    let mut seen_task_ids = BTreeSet::<u32>::new();
+    let mut task_termination_diagnostic_codes = BTreeSet::<&'static str>::new();
     let mut adapted_evidence = HashMap::<(u64, u64, u64), AdaptedLinuxTraceRow>::new();
     let mut diagnostics = Vec::new();
     let mut process_diagnostic_count = 0;
@@ -462,6 +1025,83 @@ pub fn from_linux_strace(
         }
         previous_ordinal = record.evidence.line_number;
 
+        if trace.parse_status == ParseCompleteness::Complete
+            && record.kind == TraceRecordKind::Control
+            && crate::trace::strace::task_termination_kind(record).is_some()
+        {
+            match record.process_id.filter(|task_id| *task_id > 0) {
+                Some(task_id) => {
+                    if let Some(observation_id) = task_observations.remove(&task_id) {
+                        let observation_index = observation_id
+                            .checked_sub(1)
+                            .and_then(|index| usize::try_from(index).ok());
+                        match observation_index
+                            .and_then(|index| process_observations.get_mut(index))
+                        {
+                            Some(observation) => {
+                                observation.end_evidence = Some(evidence.clone());
+                            }
+                            None => {
+                                push_process_diagnostic(
+                                    &mut diagnostics,
+                                    &mut process_diagnostic_count,
+                                    "task_termination_observation_invalid",
+                                    "recognized task termination did not resolve to a retained source-local observation",
+                                    Some(ordinal),
+                                    Some(evidence.clone()),
+                                );
+                                push_unique_source_diagnostic(
+                                    &mut source_state_diagnostics,
+                                    &mut task_termination_diagnostic_codes,
+                                    "task_termination_observation_invalid",
+                                );
+                                process_relationships_partial = true;
+                            }
+                        }
+                        seen_task_ids.insert(task_id);
+                    } else {
+                        let code = if seen_task_ids.contains(&task_id) {
+                            "task_termination_without_active_observation"
+                        } else {
+                            "task_termination_without_observed_context"
+                        };
+                        push_process_diagnostic(
+                            &mut diagnostics,
+                            &mut process_diagnostic_count,
+                            code,
+                            "recognized task termination has no active observed task context to close",
+                            Some(ordinal),
+                            Some(evidence.clone()),
+                        );
+                        push_unique_source_diagnostic(
+                            &mut source_state_diagnostics,
+                            &mut task_termination_diagnostic_codes,
+                            code,
+                        );
+                        seen_task_ids.insert(task_id);
+                        process_relationships_partial = true;
+                    }
+                }
+                None => {
+                    push_process_diagnostic(
+                        &mut diagnostics,
+                        &mut process_diagnostic_count,
+                        "task_termination_missing_task_id",
+                        "recognized task termination has no positive trace task ID and cannot close a context",
+                        Some(ordinal),
+                        Some(evidence.clone()),
+                    );
+                    push_unique_source_diagnostic(
+                        &mut source_state_diagnostics,
+                        &mut task_termination_diagnostic_codes,
+                        "task_termination_missing_task_id",
+                    );
+                    process_relationships_partial = true;
+                }
+            }
+            continue;
+        }
+
         if events.len() >= MAX_COMMON_EVENTS {
             diagnostics.push(EventDiagnostic {
                 code: "event_limit_reached".to_owned(),
@@ -516,6 +1156,12 @@ pub fn from_linux_strace(
                 value: pid.to_string(),
                 ambiguity: "source-local tracing context; no ownership or cross-platform identity asserted".to_owned(),
             }]).unwrap_or_default(),
+            path_observation: record.lexical_path_hint.as_ref().map(|hint| EventPathObservation {
+                path: hint.path.clone(),
+                basis: EventPathBasis::LinuxStraceLexicalHint {
+                    lexical_basis: hint.basis,
+                },
+            }),
         };
         if let Some(task_id) = record.process_id {
             if let std::collections::btree_map::Entry::Vacant(entry) =
@@ -523,16 +1169,63 @@ pub fn from_linux_strace(
             {
                 if process_observations.len() < MAX_COMMON_PROCESS_OBSERVATIONS {
                     let id = process_observations.len() as u64 + 1;
+                    let (observed_task_epoch, epoch_basis) = if trace.parse_status
+                        == ParseCompleteness::Complete
+                    {
+                        let next_epoch = task_epoch_counts
+                            .get(&task_id)
+                            .copied()
+                            .unwrap_or(0)
+                            .checked_add(1);
+                        match next_epoch {
+                            Some(epoch) => {
+                                task_epoch_counts.insert(task_id, epoch);
+                                (
+                                    Some(epoch),
+                                    if epoch == 1 && !seen_task_ids.contains(&task_id) {
+                                        LinuxTaskEpochBasis::FirstObservedTaskContext
+                                    } else {
+                                        LinuxTaskEpochBasis::AfterObservedTaskTermination
+                                    },
+                                )
+                            }
+                            None => {
+                                push_process_diagnostic(
+                                    &mut diagnostics,
+                                    &mut process_diagnostic_count,
+                                    "task_epoch_limit_reached",
+                                    "source-local task epoch counter overflowed; task context continuity remains unknown",
+                                    Some(ordinal),
+                                    Some(event.evidence.clone()),
+                                );
+                                push_unique_source_diagnostic(
+                                    &mut source_state_diagnostics,
+                                    &mut task_termination_diagnostic_codes,
+                                    "task_epoch_limit_reached",
+                                );
+                                process_relationships_partial = true;
+                                (None, LinuxTaskEpochBasis::EpochNumberUnavailable)
+                            }
+                        }
+                    } else {
+                        (
+                            None,
+                            LinuxTaskEpochBasis::ContinuityUnknownDueToPartialParse,
+                        )
+                    };
                     process_observations.push(ProcessObservation {
                         source_local_id: id,
                         identity: ProcessIdentity::LinuxTraceTaskContext {
                             task_id,
+                            observed_task_epoch,
+                            epoch_basis,
                             identity_status: ProcessIdentityStatus::TaskIdOnlyGenerationUnknown,
                         },
                         evidence: event.evidence.clone(),
                         end_evidence: None,
                     });
                     entry.insert(id);
+                    seen_task_ids.insert(task_id);
                 } else {
                     push_process_diagnostic(
                         &mut diagnostics,
@@ -880,7 +1573,6 @@ struct EtwEventView<'a> {
     observation_decoding: Option<&'a serde_json::Value>,
 }
 
-#[cfg(windows)]
 #[derive(Clone, Copy)]
 struct EtwProcessPayloadView<'a> {
     decoded: bool,
@@ -889,7 +1581,17 @@ struct EtwProcessPayloadView<'a> {
     pointer_size_bytes: Option<u8>,
     process_id: Option<u32>,
     parent_process_id: Option<u32>,
-    image_file_name: Option<&'a str>,
+}
+
+struct WindowsProcessEventView<'a> {
+    provider_guid: &'a str,
+    event_id: u16,
+    event_version: u8,
+    opcode: u8,
+    event_kind: &'a str,
+    header_flags: u16,
+    raw_payload_hex: &'a str,
+    process_payload: Option<EtwProcessPayloadView<'a>>,
 }
 
 #[cfg(windows)]
@@ -968,7 +1670,6 @@ impl EtwCaptureView for crate::record::WindowsRuntimeCapture {
                     pointer_size_bytes: payload.pointer_size_bytes,
                     process_id: payload.process_id,
                     parent_process_id: payload.parent_process_id,
-                    image_file_name: payload.image_file_name.as_deref(),
                 }),
             observation_decoding: event.observation_decoding.as_ref(),
         })
@@ -1039,7 +1740,6 @@ impl EtwCaptureView for crate::windows_runtime::WindowsRuntimeCapture {
                     pointer_size_bytes: payload.pointer_size_bytes,
                     process_id: payload.process_id,
                     parent_process_id: payload.parent_process_id,
-                    image_file_name: payload.image_file_name.as_deref(),
                 }),
             observation_decoding: event.observation_decoding.as_ref(),
         })
@@ -1056,6 +1756,8 @@ fn from_windows_etw_source(capture: &impl EtwCaptureView) -> CommonEventEnvelope
     let mut event_process_links = Vec::new();
     let mut adapted_event_evidence = BTreeMap::<u64, EvidenceReference>::new();
     let mut diagnostics = Vec::new();
+    let mut path_diagnostic_count = 0;
+    let mut path_diagnostic_codes = BTreeSet::new();
     let mut source_diagnostics = capture
         .diagnostics()
         .iter()
@@ -1176,6 +1878,62 @@ fn from_windows_etw_source(capture: &impl EtwCaptureView) -> CommonEventEnvelope
                     .to_owned(),
         }];
         adapted_event_evidence.insert(expected, evidence.clone());
+        let path_observation = match cross_checked_windows_file_path(&event) {
+            crate::record::FilePathCrossCheck::NotFileProvider
+            | crate::record::FilePathCrossCheck::Matched(None) => None,
+            crate::record::FilePathCrossCheck::Matched(Some(path)) => Some(EventPathObservation {
+                path,
+                basis: EventPathBasis::WindowsEtwValidatedFileName,
+            }),
+            crate::record::FilePathCrossCheck::Mismatch => {
+                push_path_diagnostic(
+                    &mut diagnostics,
+                    &mut path_diagnostic_count,
+                    "file_observation_sidecar_mismatch",
+                    "raw ETW file payload does not match its serialized observation sidecar; path filtering is unavailable for this row",
+                    Some(expected),
+                    Some(evidence.clone()),
+                );
+                push_unique_source_diagnostic(
+                    &mut source_diagnostics,
+                    &mut path_diagnostic_codes,
+                    "file_observation_sidecar_mismatch",
+                );
+                None
+            }
+            crate::record::FilePathCrossCheck::Unsupported => {
+                push_path_diagnostic(
+                    &mut diagnostics,
+                    &mut path_diagnostic_count,
+                    "file_observation_unverified",
+                    "ETW file observation could not be validated against its retained raw payload; path filtering is unavailable for this row",
+                    Some(expected),
+                    Some(evidence.clone()),
+                );
+                push_unique_source_diagnostic(
+                    &mut source_diagnostics,
+                    &mut path_diagnostic_codes,
+                    "file_observation_unverified",
+                );
+                None
+            }
+            crate::record::FilePathCrossCheck::Malformed => {
+                push_path_diagnostic(
+                    &mut diagnostics,
+                    &mut path_diagnostic_count,
+                    "file_observation_malformed",
+                    "ETW file observation raw payload is malformed; path filtering is unavailable for this row",
+                    Some(expected),
+                    Some(evidence.clone()),
+                );
+                push_unique_source_diagnostic(
+                    &mut source_diagnostics,
+                    &mut path_diagnostic_codes,
+                    "file_observation_malformed",
+                );
+                None
+            }
+        };
         events.push(CommonEvent {
             source_local_ordinal: expected,
             source_timestamp: Some(SourceTimestamp {
@@ -1186,6 +1944,7 @@ fn from_windows_etw_source(capture: &impl EtwCaptureView) -> CommonEventEnvelope
             operation: OperationSemantics::NativeObservation,
             evidence,
             identity_context,
+            path_observation,
         });
     }
     let loss = capture.event_loss();
@@ -1296,7 +2055,6 @@ fn from_windows_etw_source(capture: &impl EtwCaptureView) -> CommonEventEnvelope
 struct ActiveWindowsProcess {
     observation_index: usize,
     parent_process_id: u32,
-    image_file_name: String,
 }
 
 #[cfg(windows)]
@@ -1309,6 +2067,7 @@ fn derive_windows_process_relationships(
     links: &mut Vec<EventProcessLink>,
     diagnostics: &mut Vec<EventDiagnostic>,
 ) -> bool {
+    let mut generation_evidence_unreliable = generation_evidence_unreliable;
     let mut active = BTreeMap::<u32, ActiveWindowsProcess>::new();
     let mut ambiguous_pids = BTreeSet::<u32>::new();
     let mut lifecycle_unknown_pids = BTreeSet::<u32>::new();
@@ -1326,36 +2085,46 @@ fn derive_windows_process_relationships(
         };
 
         if event.event_kind == "process_start" {
-            let Some(payload) = validated_process_payload(&event, "process_start") else {
-                invalidate_active_windows_instances(
-                    &mut active,
-                    &mut lifecycle_unknown_pids,
-                    observations,
-                    &mut deferred_lifecycle_invalidations,
-                );
-                if let Some(process_id) = event
-                    .process_payload
-                    .and_then(|payload| payload.process_id)
-                    .filter(|process_id| *process_id > 0)
-                {
-                    lifecycle_unknown_pids.insert(process_id);
+            let payload = match validated_process_payload(&event, "process_start") {
+                Ok(payload) => payload,
+                Err(error) => {
+                    invalidate_active_windows_instances(
+                        &mut active,
+                        &mut lifecycle_unknown_pids,
+                        observations,
+                        &mut deferred_lifecycle_invalidations,
+                    );
+                    generation_evidence_unreliable = true;
+                    push_process_diagnostic(
+                        diagnostics,
+                        &mut process_diagnostic_count,
+                        error.diagnostic_code(),
+                        &error.diagnostic_message("process-start"),
+                        Some(event.record_ordinal),
+                        Some(event_evidence.clone()),
+                    );
+                    let _ = push_bounded_process_link(
+                        links,
+                        MAX_ETW_EVENTS,
+                        EventProcessLink {
+                            event: event_evidence.clone(),
+                            process_observation_id: None,
+                            reported_process_id: None,
+                            role: EventProcessLinkRole::WindowsProcessStartPayload,
+                            status: EventProcessLinkStatus::Unresolved,
+                            basis: error.diagnostic_code().to_owned(),
+                        },
+                        diagnostics,
+                        &mut process_diagnostic_count,
+                        Some(event.record_ordinal),
+                        Some(event_evidence),
+                    );
+                    partial = true;
+                    continue;
                 }
-                push_process_diagnostic(
-                    diagnostics,
-                    &mut process_diagnostic_count,
-                    "process_start_payload_unavailable",
-                    "process-start row lacks a supported, validated process payload; active lifecycle continuity is unknown",
-                    Some(event.record_ordinal),
-                    Some(event_evidence),
-                );
-                partial = true;
-                continue;
             };
-            let process_id = payload.process_id.expect("validated process ID");
-            let parent_id = payload
-                .parent_process_id
-                .expect("validated parent process ID");
-            let image = payload.image_file_name.expect("validated image name");
+            let process_id = payload.process_id;
+            let parent_id = payload.parent_process_id;
             let existing = active.remove(&process_id);
             let previously_ambiguous = ambiguous_pids.contains(&process_id);
             let identity_status = if existing.is_some() || ambiguous_pids.contains(&process_id) {
@@ -1438,7 +2207,6 @@ fn derive_windows_process_relationships(
                         observation_index: usize::try_from(observation_id - 1)
                             .expect("bounded process observation index"),
                         parent_process_id: parent_id,
-                        image_file_name: image.to_owned(),
                     },
                 );
             }
@@ -1451,7 +2219,7 @@ fn derive_windows_process_relationships(
                     reported_process_id: None,
                     role: EventProcessLinkRole::WindowsProcessStartPayload,
                     status: EventProcessLinkStatus::Observed,
-                    basis: "supported_serialized_process_decoder_metadata_identifies_candidate_instance"
+                    basis: "supported_raw_process_payload_ids_match_serialized_decoder_sidecar"
                         .to_owned(),
                 },
                 diagnostics,
@@ -1512,7 +2280,7 @@ fn derive_windows_process_relationships(
                     reported_from_process_id: Some(parent_id),
                     resolution,
                     basis: if resolution == RelationshipResolution::Observed {
-                        "serialized_parent_pid_matches_one_active_process_decoder_metadata_candidate".to_owned()
+                        "raw_and_serialized_reported_parent_pid_match_one_active_capture_local_process_instance".to_owned()
                     } else if resolution == RelationshipResolution::ParentPidAmbiguous {
                         "serialized_parent_pid_is_ambiguous_in_capture".to_owned()
                     } else if generation_evidence_unreliable {
@@ -1530,29 +2298,46 @@ fn derive_windows_process_relationships(
         }
 
         if event.event_kind == "process_end" {
-            let Some(payload) = validated_process_payload(&event, "process_end") else {
-                invalidate_active_windows_instances(
-                    &mut active,
-                    &mut lifecycle_unknown_pids,
-                    observations,
-                    &mut deferred_lifecycle_invalidations,
-                );
-                push_process_diagnostic(
-                    diagnostics,
-                    &mut process_diagnostic_count,
-                    "process_end_payload_unavailable",
-                    "unsupported process-end row breaks lifecycle continuity; active instances are no longer linked",
-                    Some(event.record_ordinal),
-                    Some(event_evidence),
-                );
-                partial = true;
-                continue;
+            let payload = match validated_process_payload(&event, "process_end") {
+                Ok(payload) => payload,
+                Err(error) => {
+                    invalidate_active_windows_instances(
+                        &mut active,
+                        &mut lifecycle_unknown_pids,
+                        observations,
+                        &mut deferred_lifecycle_invalidations,
+                    );
+                    generation_evidence_unreliable = true;
+                    push_process_diagnostic(
+                        diagnostics,
+                        &mut process_diagnostic_count,
+                        error.diagnostic_code(),
+                        &error.diagnostic_message("process-end"),
+                        Some(event.record_ordinal),
+                        Some(event_evidence.clone()),
+                    );
+                    let _ = push_bounded_process_link(
+                        links,
+                        MAX_ETW_EVENTS,
+                        EventProcessLink {
+                            event: event_evidence.clone(),
+                            process_observation_id: None,
+                            reported_process_id: None,
+                            role: EventProcessLinkRole::WindowsProcessEndPayload,
+                            status: EventProcessLinkStatus::Unresolved,
+                            basis: error.diagnostic_code().to_owned(),
+                        },
+                        diagnostics,
+                        &mut process_diagnostic_count,
+                        Some(event.record_ordinal),
+                        Some(event_evidence),
+                    );
+                    partial = true;
+                    continue;
+                }
             };
-            let process_id = payload.process_id.expect("validated process ID");
-            let parent_id = payload
-                .parent_process_id
-                .expect("validated parent process ID");
-            let image = payload.image_file_name.expect("validated image name");
+            let process_id = payload.process_id;
+            let parent_id = payload.parent_process_id;
             if ambiguous_pids.contains(&process_id)
                 || lifecycle_unknown_pids.contains(&process_id)
                 || generation_evidence_unreliable
@@ -1583,7 +2368,7 @@ fn derive_windows_process_relationships(
                 continue;
             }
             if let Some(process) = active.remove(&process_id) {
-                if process.parent_process_id == parent_id && process.image_file_name == image {
+                if process.parent_process_id == parent_id {
                     observations[process.observation_index].end_evidence =
                         Some(event_evidence.clone());
                     if !push_bounded_process_link(
@@ -1595,7 +2380,7 @@ fn derive_windows_process_relationships(
                             reported_process_id: None,
                             role: EventProcessLinkRole::WindowsProcessEndPayload,
                             status: EventProcessLinkStatus::Observed,
-                            basis: "validated_process_end_pid_parent_and_image_match_active_start"
+                            basis: "raw_and_serialized_process_end_ids_match_active_start_ids"
                                 .to_owned(),
                         },
                         diagnostics,
@@ -1761,46 +2546,19 @@ fn derive_windows_process_relationships(
         links,
         &deferred_lifecycle_invalidations,
     );
-    mark_windows_decoder_metadata_unverified(observations, relationships, links);
+    keep_windows_network_links_context_only(links);
     partial
 }
 
 #[cfg(windows)]
-fn mark_windows_decoder_metadata_unverified(
-    observations: &mut [ProcessObservation],
-    relationships: &mut [ProcessRelationship],
-    links: &mut [EventProcessLink],
-) {
-    for observation in observations {
-        if let ProcessIdentity::WindowsProcessInstance {
-            identity_status, ..
-        } = &mut observation.identity
-        {
-            if *identity_status == ProcessIdentityStatus::ObservedStart {
-                *identity_status = ProcessIdentityStatus::DecoderMetadataUnverified;
-            }
-        }
-    }
-    for relationship in relationships {
-        if relationship.resolution == RelationshipResolution::Observed {
-            relationship.resolution = RelationshipResolution::DecoderMetadataUnverified;
-            relationship.basis.push_str(
-                "; derived from serialized ETW decoder metadata, not re-decoded from raw payload bytes",
-            );
-        }
-    }
+fn keep_windows_network_links_context_only(links: &mut [EventProcessLink]) {
     for link in links {
-        if matches!(
-            link.role,
-            EventProcessLinkRole::WindowsProcessStartPayload
-                | EventProcessLinkRole::WindowsProcessEndPayload
-                | EventProcessLinkRole::WindowsNetworkPayloadPid
-        ) && link.status == EventProcessLinkStatus::Observed
+        if link.role == EventProcessLinkRole::WindowsNetworkPayloadPid
+            && link.status == EventProcessLinkStatus::Observed
         {
             link.status = EventProcessLinkStatus::ContextCandidate;
-            link.basis.push_str(
-                "; serialized ETW decoder metadata is not re-decoded from raw payload bytes",
-            );
+            link.basis
+                .push_str("; network attribution remains context-only");
         }
     }
 }
@@ -1932,42 +2690,202 @@ fn mark_windows_observation_unresolved(
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ValidatedWindowsProcessPayload {
+    pub(crate) process_id: u32,
+    pub(crate) parent_process_id: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WindowsProcessPayloadError {
+    Unsupported,
+    Malformed,
+    Mismatch,
+    InvalidProcessId,
+}
+
+impl WindowsProcessPayloadError {
+    pub(crate) fn diagnostic_code(self) -> &'static str {
+        match self {
+            Self::Unsupported => "process_payload_unsupported",
+            Self::Malformed => "process_payload_malformed",
+            Self::Mismatch => "process_payload_sidecar_mismatch",
+            Self::InvalidProcessId => "process_payload_invalid_process_id",
+        }
+    }
+
+    #[cfg(windows)]
+    fn diagnostic_message(self, kind: &str) -> String {
+        let reason = match self {
+            Self::Unsupported => {
+                "descriptor, schema, or header pointer-width flags are outside the reviewed layout contract"
+            }
+            Self::Malformed => {
+                "retained raw payload or serialized process sidecar is missing, truncated, or malformed"
+            }
+            Self::Mismatch => {
+                "raw process IDs, header pointer width, and serialized process sidecar do not agree"
+            }
+            Self::InvalidProcessId => {
+                "raw process payload contains a zero or unrepresentable process ID"
+            }
+        };
+        format!("{kind} row is unresolved: {reason}; lifecycle continuity is unknown")
+    }
+}
+
 #[cfg(windows)]
-fn validated_process_payload<'a>(
-    event: &EtwEventView<'a>,
+fn validated_process_payload(
+    event: &EtwEventView<'_>,
     expected_kind: &str,
-) -> Option<EtwProcessPayloadView<'a>> {
+) -> Result<ValidatedWindowsProcessPayload, WindowsProcessPayloadError> {
+    validate_windows_process_payload_contract(
+        WindowsProcessEventView {
+            provider_guid: event.provider_guid,
+            event_id: event.event_id,
+            event_version: event.event_version,
+            opcode: event.opcode,
+            event_kind: event.event_kind,
+            header_flags: event.header_flags,
+            raw_payload_hex: event.raw_payload_hex,
+            process_payload: event.process_payload,
+        },
+        expected_kind,
+    )
+}
+
+/// Apply the common raw-payload contract to a retained native Windows ETW event.
+/// This is shared by the common event adapter and offline attribution so the two
+/// outputs cannot assign different confidence to the same process row.
+pub(crate) fn validate_native_windows_process_payload(
+    event: &crate::windows_runtime::NativeRuntimeEvent,
+    expected_kind: &str,
+) -> Result<ValidatedWindowsProcessPayload, WindowsProcessPayloadError> {
+    let payload = event.payload_decoding.as_ref();
+    let process_payload = payload.map(|payload| EtwProcessPayloadView {
+        decoded: payload.status == crate::windows_runtime::ProcessDecodeStatus::Decoded,
+        schema_name: payload.schema_name.as_deref(),
+        schema_version: payload.schema_version,
+        pointer_size_bytes: payload.pointer_size_bytes,
+        process_id: payload.process_id,
+        parent_process_id: payload.parent_process_id,
+    });
+    validate_windows_process_payload_contract(
+        WindowsProcessEventView {
+            provider_guid: &event.provider_guid,
+            event_id: event.event_id,
+            event_version: event.event_version,
+            opcode: event.opcode,
+            event_kind: &event.event_kind,
+            header_flags: event.header_flags,
+            raw_payload_hex: &event.raw_payload_hex,
+            process_payload,
+        },
+        expected_kind,
+    )
+}
+
+fn validate_windows_process_payload_contract(
+    event: WindowsProcessEventView<'_>,
+    expected_kind: &str,
+) -> Result<ValidatedWindowsProcessPayload, WindowsProcessPayloadError> {
     const PROCESS_PROVIDER_GUID: &str = "3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c";
-    let payload = event.process_payload?;
-    let process_id = payload.process_id?;
-    let parent_id = payload.parent_process_id?;
-    let image = payload.image_file_name?;
+    const EVENT_HEADER_FLAG_32_BIT_HEADER: u16 = 0x0020;
+    const EVENT_HEADER_FLAG_64_BIT_HEADER: u16 = 0x0040;
     if normalized_guid(event.provider_guid).as_deref() != Some(PROCESS_PROVIDER_GUID)
         || event.event_id != 0
         || event.event_kind != expected_kind
         || (expected_kind == "process_start" && event.opcode != 1)
         || (expected_kind == "process_end" && event.opcode != 2)
-        || !payload.decoded
-        || !matches!(
-            (payload.schema_name, payload.schema_version),
-            (Some("windows.kernel_process_typegroup1"), Some(version))
-                if version == event.event_version
-        ) && !matches!(
-            (payload.schema_name, payload.schema_version),
-            (Some("Process_V2_TypeGroup1"), Some(2))
-        )
-        || event.event_version > 3
-        || !matches!(payload.pointer_size_bytes, Some(4 | 8))
-        || process_id == 0
-        || image.is_empty()
     {
-        return None;
+        return Err(WindowsProcessPayloadError::Unsupported);
     }
-    let _ = parent_id;
-    Some(payload)
+    let expected_schema = match event.event_version {
+        0 => "Process_V0_TypeGroup1",
+        1 => "Process_V1_TypeGroup1",
+        2 => "Process_V2_TypeGroup1",
+        3 => "Process_TypeGroup1",
+        _ => return Err(WindowsProcessPayloadError::Unsupported),
+    };
+    let payload = event
+        .process_payload
+        .ok_or(WindowsProcessPayloadError::Malformed)?;
+    let sidecar_process_id = payload
+        .process_id
+        .ok_or(WindowsProcessPayloadError::Malformed)?;
+    let sidecar_parent_process_id = payload
+        .parent_process_id
+        .ok_or(WindowsProcessPayloadError::Malformed)?;
+    let schema_matches = payload.schema_name == Some("windows.kernel_process_typegroup1")
+        || payload.schema_name == Some(expected_schema);
+    if !payload.decoded || !schema_matches || payload.schema_version != Some(event.event_version) {
+        return Err(WindowsProcessPayloadError::Unsupported);
+    }
+    let flags = event.header_flags;
+    let pointer_size = match (
+        flags & EVENT_HEADER_FLAG_32_BIT_HEADER != 0,
+        flags & EVENT_HEADER_FLAG_64_BIT_HEADER != 0,
+    ) {
+        (true, false) => 4usize,
+        (false, true) => 8usize,
+        _ => return Err(WindowsProcessPayloadError::Unsupported),
+    };
+    if payload.pointer_size_bytes != Some(pointer_size as u8) {
+        return Err(WindowsProcessPayloadError::Mismatch);
+    }
+    let raw_payload =
+        decode_hex(event.raw_payload_hex).ok_or(WindowsProcessPayloadError::Malformed)?;
+    let (pid_offset, parent_offset, field_width) = match event.event_version {
+        // Process_V0_TypeGroup1 declares both IDs as Pointer fields.
+        0 => (0usize, pointer_size, pointer_size),
+        // V1 puts PageDirectoryBase before 32-bit ProcessId/ParentId.
+        // V2 and V3 put UniqueProcessKey in that pointer-sized position.
+        1..=3 => (pointer_size, pointer_size + 4, 4usize),
+        _ => return Err(WindowsProcessPayloadError::Unsupported),
+    };
+    let process_id = decode_windows_process_id(&raw_payload, pid_offset, field_width)?;
+    let parent_process_id = decode_windows_process_id(&raw_payload, parent_offset, field_width)?;
+    if process_id == 0 {
+        return Err(WindowsProcessPayloadError::InvalidProcessId);
+    }
+    if sidecar_process_id != process_id || sidecar_parent_process_id != parent_process_id {
+        return Err(WindowsProcessPayloadError::Mismatch);
+    }
+    Ok(ValidatedWindowsProcessPayload {
+        process_id,
+        parent_process_id,
+    })
 }
 
-#[cfg(windows)]
+fn decode_windows_process_id(
+    bytes: &[u8],
+    offset: usize,
+    width: usize,
+) -> Result<u32, WindowsProcessPayloadError> {
+    let end = offset
+        .checked_add(width)
+        .ok_or(WindowsProcessPayloadError::Malformed)?;
+    let field = bytes
+        .get(offset..end)
+        .ok_or(WindowsProcessPayloadError::Malformed)?;
+    match width {
+        4 => {
+            let field: [u8; 4] = field
+                .try_into()
+                .map_err(|_| WindowsProcessPayloadError::Malformed)?;
+            Ok(u32::from_le_bytes(field))
+        }
+        8 => {
+            let field: [u8; 8] = field
+                .try_into()
+                .map_err(|_| WindowsProcessPayloadError::Malformed)?;
+            u32::try_from(u64::from_le_bytes(field))
+                .map_err(|_| WindowsProcessPayloadError::Malformed)
+        }
+        _ => Err(WindowsProcessPayloadError::Unsupported),
+    }
+}
+
 fn normalized_guid(value: &str) -> Option<String> {
     let value = value.trim();
     let value = value
@@ -2072,6 +2990,35 @@ fn cross_checked_network_payload_pid(event: &EtwEventView<'_>) -> NetworkPayload
     }
 }
 
+/// Reuse the common event adapter's raw network decoder for offline attribution.
+pub(crate) fn cross_checked_native_network_payload_pid(
+    event: &crate::windows_runtime::NativeRuntimeEvent,
+) -> crate::record::NetworkPayloadCrossCheck {
+    let Some(raw_payload) = decode_hex(&event.raw_payload_hex) else {
+        let network_provider = normalized_guid(&event.provider_guid).is_some_and(|guid| {
+            matches!(
+                guid.as_str(),
+                "9a280ac0-c8e0-11d1-84e2-00c04fb998a2" | "bf3a50c5-a9c9-4988-a005-2df0b7c80f80"
+            )
+        });
+        return if network_provider {
+            crate::record::NetworkPayloadCrossCheck::Malformed
+        } else {
+            crate::record::NetworkPayloadCrossCheck::NotNetworkProvider
+        };
+    };
+    crate::record::cross_check_network_payload(crate::record::NetworkPayloadInput {
+        provider_guid: &event.provider_guid,
+        event_id: event.event_id,
+        event_version: event.event_version,
+        opcode: event.opcode,
+        header_flags: event.header_flags,
+        event_kind: &event.event_kind,
+        raw_payload: &raw_payload,
+        serialized_decoding: event.observation_decoding.as_ref(),
+    })
+}
+
 #[cfg(windows)]
 fn is_file_or_disk_observation(event: &EtwEventView<'_>) -> bool {
     let Some(value) = event.observation_decoding else {
@@ -2101,11 +3048,33 @@ fn is_file_or_disk_observation(event: &EtwEventView<'_>) -> bool {
     )
 }
 
+#[cfg(windows)]
+fn cross_checked_windows_file_path(event: &EtwEventView<'_>) -> crate::record::FilePathCrossCheck {
+    if event.event_kind != "file_io_observation"
+        || normalized_guid(event.provider_guid)
+            .is_none_or(|guid| guid != "90cbdc39-4a3e-11d1-84f4-0000f80464e3")
+    {
+        return crate::record::FilePathCrossCheck::NotFileProvider;
+    }
+    let Some(raw_payload) = decode_hex(event.raw_payload_hex) else {
+        return crate::record::FilePathCrossCheck::Malformed;
+    };
+    crate::record::cross_check_file_path(crate::record::FilePathInput {
+        provider_guid: event.provider_guid,
+        event_id: event.event_id,
+        event_version: event.event_version,
+        opcode: event.opcode,
+        header_flags: event.header_flags,
+        event_kind: event.event_kind,
+        raw_payload: &raw_payload,
+        serialized_decoding: event.observation_decoding,
+    })
+}
+
 fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-#[cfg(windows)]
 fn decode_hex(value: &str) -> Option<Vec<u8>> {
     if value.len() % 2 != 0 {
         return None;
@@ -2132,4 +3101,229 @@ fn truncate_utf8(value: &str, maximum_bytes: usize) -> String {
         end -= 1;
     }
     value[..end].to_owned()
+}
+
+#[cfg(all(test, windows))]
+mod windows_process_payload_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct TestOverrides {
+        raw_payload: Option<Vec<u8>>,
+        header_flags: Option<u16>,
+        descriptor: Option<(&'static str, u16, u8)>,
+        missing_sidecar: bool,
+    }
+
+    fn encode_hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+
+        let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+        for byte in bytes {
+            write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        encoded
+    }
+
+    fn validate(
+        version: u8,
+        pointer_size: usize,
+        raw_process_id: u32,
+        sidecar_process_id: u32,
+        raw_parent_id: u32,
+        sidecar_parent_id: u32,
+        overrides: TestOverrides,
+    ) -> Result<ValidatedWindowsProcessPayload, WindowsProcessPayloadError> {
+        let mut raw = Vec::new();
+        match version {
+            0 => {
+                if pointer_size == 4 {
+                    raw.extend_from_slice(&raw_process_id.to_le_bytes());
+                    raw.extend_from_slice(&raw_parent_id.to_le_bytes());
+                } else {
+                    raw.extend_from_slice(&u64::from(raw_process_id).to_le_bytes());
+                    raw.extend_from_slice(&u64::from(raw_parent_id).to_le_bytes());
+                }
+            }
+            1..=3 => {
+                raw.resize(pointer_size, 0);
+                raw.extend_from_slice(&raw_process_id.to_le_bytes());
+                raw.extend_from_slice(&raw_parent_id.to_le_bytes());
+            }
+            _ => {}
+        }
+        let raw = overrides
+            .raw_payload
+            .as_deref()
+            .map(encode_hex)
+            .unwrap_or_else(|| encode_hex(&raw));
+        let schema = match version {
+            0 => "Process_V0_TypeGroup1",
+            1 => "Process_V1_TypeGroup1",
+            2 => "Process_V2_TypeGroup1",
+            3 => "Process_TypeGroup1",
+            _ => "unsupported",
+        };
+        let (provider_guid, event_id, opcode) =
+            overrides
+                .descriptor
+                .unwrap_or(("{3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c}", 0, 1));
+        let event = EtwEventView {
+            record_ordinal: 1,
+            provider_guid,
+            event_id,
+            event_version: version,
+            opcode,
+            event_kind: "process_start",
+            header_process_id: 99,
+            header_flags: overrides.header_flags.unwrap_or(if pointer_size == 4 {
+                0x20
+            } else {
+                0x40
+            }),
+            timestamp_qpc: 1,
+            raw_payload_hex: &raw,
+            process_payload: (!overrides.missing_sidecar).then_some(EtwProcessPayloadView {
+                decoded: true,
+                schema_name: Some(schema),
+                schema_version: Some(version),
+                pointer_size_bytes: Some(pointer_size as u8),
+                process_id: Some(sidecar_process_id),
+                parent_process_id: Some(sidecar_parent_id),
+            }),
+            observation_decoding: None,
+        };
+        validated_process_payload(&event, "process_start")
+    }
+
+    #[test]
+    fn exact_supported_layouts_cross_check_raw_ids_for_both_pointer_widths() {
+        for (version, width) in [
+            (0, 4),
+            (0, 8),
+            (1, 4),
+            (1, 8),
+            (2, 4),
+            (2, 8),
+            (3, 4),
+            (3, 8),
+        ] {
+            let payload =
+                validate(version, width, 321, 321, 12, 12, TestOverrides::default()).unwrap();
+            assert_eq!(payload.process_id, 321, "version={version}, width={width}");
+            assert_eq!(
+                payload.parent_process_id, 12,
+                "version={version}, width={width}"
+            );
+        }
+    }
+
+    #[test]
+    fn mismatch_truncation_unsupported_and_pointer_flags_are_distinct() {
+        assert!(matches!(
+            validate(2, 8, 321, 322, 12, 12, TestOverrides::default()),
+            Err(WindowsProcessPayloadError::Mismatch)
+        ));
+        assert!(matches!(
+            validate(2, 8, 321, 321, 12, 13, TestOverrides::default()),
+            Err(WindowsProcessPayloadError::Mismatch)
+        ));
+        assert!(matches!(
+            validate(
+                2,
+                8,
+                321,
+                321,
+                12,
+                12,
+                TestOverrides {
+                    raw_payload: Some(vec![1, 2, 3]),
+                    ..TestOverrides::default()
+                }
+            ),
+            Err(WindowsProcessPayloadError::Malformed)
+        ));
+        assert!(matches!(
+            validate(4, 8, 321, 321, 12, 12, TestOverrides::default()),
+            Err(WindowsProcessPayloadError::Unsupported)
+        ));
+        assert!(matches!(
+            validate(
+                2,
+                8,
+                321,
+                321,
+                12,
+                12,
+                TestOverrides {
+                    header_flags: Some(0),
+                    ..TestOverrides::default()
+                }
+            ),
+            Err(WindowsProcessPayloadError::Unsupported)
+        ));
+        assert!(matches!(
+            validate(
+                2,
+                8,
+                321,
+                321,
+                12,
+                12,
+                TestOverrides {
+                    header_flags: Some(0x60),
+                    ..TestOverrides::default()
+                }
+            ),
+            Err(WindowsProcessPayloadError::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn zero_raw_process_id_is_invalid_not_a_sidecar_mismatch() {
+        assert!(matches!(
+            validate(2, 8, 0, 0, 12, 12, TestOverrides::default()),
+            Err(WindowsProcessPayloadError::InvalidProcessId)
+        ));
+    }
+
+    #[test]
+    fn descriptor_and_sidecar_gates_reject_unreviewed_events() {
+        for descriptor in [
+            ("{00000000-0000-0000-0000-000000000000}", 0, 1),
+            ("{3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c}", 1, 1),
+            ("{3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c}", 0, 2),
+        ] {
+            assert!(matches!(
+                validate(
+                    2,
+                    8,
+                    321,
+                    321,
+                    12,
+                    12,
+                    TestOverrides {
+                        descriptor: Some(descriptor),
+                        ..TestOverrides::default()
+                    }
+                ),
+                Err(WindowsProcessPayloadError::Unsupported)
+            ));
+        }
+        assert!(matches!(
+            validate(
+                2,
+                8,
+                321,
+                321,
+                12,
+                12,
+                TestOverrides {
+                    missing_sidecar: true,
+                    ..TestOverrides::default()
+                }
+            ),
+            Err(WindowsProcessPayloadError::Malformed)
+        ));
+    }
 }

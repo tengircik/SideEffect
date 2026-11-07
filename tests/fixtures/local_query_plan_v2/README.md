@@ -1,6 +1,6 @@
-# Independent local query plan v2 holdout corpus
+# Frozen local query-plan v2 evaluation corpus
 
-This is a new, independent synthetic holdout for the strict typed query-plan v2 contract. Its questions and scenarios were authored separately from `tests/fixtures/local_model_synthetic/corpus.json`; v1 question wording was not copied or paraphrased. The `.trace` files are hand-authored synthetic strace-like fixtures. They are not captures from a computer, and the documentation-only IP addresses do not identify hosts.
+This is a separately authored synthetic evaluation corpus for the strict typed query-plan v2 contract. “Separately authored” describes its origin; it does not mean the labels are independently reviewed or that the corpus is a hidden holdout. Its questions and scenarios were authored separately from `tests/fixtures/local_model_synthetic/corpus.json`; v1 question wording was not copied or paraphrased. The `.trace` files are hand-authored synthetic strace-like fixtures. They are not captures from a computer, and the documentation-only IP addresses do not identify hosts.
 
 ## Frozen evaluation set
 
@@ -9,6 +9,10 @@ This is a new, independent synthetic holdout for the strict typed query-plan v2 
 There are five independent four-case source-order groups. Within a group, each fixture contains the same four facts, with each fact moved to a distinct ordinal. The expected typed plan is invariant across all four cases. All five group sizes are pinned in the corpus.
 
 The output contract is the strict Rust schema v2: every plan has exactly `decision`, `abstain_reason`, `entity`, `filters`, and `combine`. `filters` is an object with all eight keys, including for abstentions, where each value is null. Filter plans use `combine: "all"`, exact equality, and only fields allowed for their selected entity. `process_id` is allowed on syscall-result plans and can be the sole predicate. Supported syscall values are `execve`, `execveat`, `openat`, `openat2`, and `connect`; relation values are `fork`, `vfork`, `clone`, and `clone3`. A supported filter can intentionally match zero or multiple facts.
+
+## Qualification status
+
+Do not use this frozen corpus to approve a model. A read-only question-to-oracle audit on 2026-11-06 found 30/70 answerable expected plans fully inferable from the question, 36 partly inferable, and 4 not inferable; the model prompt excludes trace facts. Its repeated permutation and lookup patterns also overweight a small number of intents. Keep this corpus, its digest, thresholds, and historical scores unchanged for reproducibility. A corrected, independently reviewed, versioned corpus and a genuinely hidden final holdout are required before model qualification. See [the evaluation contract](../../../docs/LOCAL_QUERY_PLAN_EVALUATION.md#frozen-v2-question-to-oracle-audit-2026-11-06).
 
 ## Candidate pins and limits
 

@@ -394,6 +394,122 @@ fn is_control_body(body: &str) -> bool {
     body.starts_with("+++") || body.starts_with("---") || body.starts_with("[ Process")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TaskTerminationKind {
+    Exited,
+    Killed,
+}
+
+/// Recognize only exact strace task-termination control rows. This is used by
+/// the event adapter to close source-local task contexts; it does not identify
+/// an OS process generation. The raw row is reparsed and its prefix checked so
+/// a modified `TraceRecord` cannot use unrelated control text as a boundary.
+pub(crate) fn task_termination_kind(record: &TraceRecord) -> Option<TaskTerminationKind> {
+    if record.kind != TraceRecordKind::Control {
+        return None;
+    }
+    let syntax_line = record
+        .raw_line
+        .strip_suffix('\r')
+        .unwrap_or(&record.raw_line);
+    let mut cursor = skip_whitespace(syntax_line, 0);
+    let mut parsed_process_id = None;
+    if syntax_line[cursor..].starts_with("[pid") {
+        let close = syntax_line[cursor..]
+            .find(']')
+            .map(|relative| cursor + relative)?;
+        parsed_process_id = Some(parse_bracketed_pid(&syntax_line[cursor..=close]).ok()?);
+        cursor = skip_whitespace(syntax_line, close + 1);
+    } else if let Some((token, end)) = next_token(syntax_line, cursor) {
+        if is_decimal_integer(token) {
+            parsed_process_id = Some(token.parse::<u32>().ok()?);
+            cursor = skip_whitespace(syntax_line, end);
+        }
+    }
+    if parsed_process_id != record.process_id {
+        return None;
+    }
+    if let Some((token, end)) = next_token(syntax_line, cursor) {
+        if is_timestamp(token) {
+            cursor = skip_whitespace(syntax_line, end);
+        }
+    }
+    let body = &syntax_line[cursor..];
+    if !is_control_body(body) {
+        return None;
+    }
+    if let Some(status) = body
+        .strip_prefix("+++ exited with ")
+        .and_then(|value| value.strip_suffix(" +++"))
+    {
+        return (status.len() <= 3
+            && status.bytes().all(|byte| byte.is_ascii_digit())
+            && status.parse::<u8>().is_ok())
+        .then_some(TaskTerminationKind::Exited);
+    }
+    let killed = body
+        .strip_prefix("+++ killed by ")
+        .and_then(|value| value.strip_suffix(" +++"))?;
+    let signal = killed.strip_suffix(" (core dumped)").unwrap_or(killed);
+    if !valid_strace_signal_name(signal) {
+        return None;
+    }
+    Some(TaskTerminationKind::Killed)
+}
+
+fn valid_strace_signal_name(value: &str) -> bool {
+    const SIGNALS: &[&str] = &[
+        "SIGHUP",
+        "SIGINT",
+        "SIGQUIT",
+        "SIGILL",
+        "SIGTRAP",
+        "SIGABRT",
+        "SIGIOT",
+        "SIGBUS",
+        "SIGFPE",
+        "SIGKILL",
+        "SIGUSR1",
+        "SIGSEGV",
+        "SIGUSR2",
+        "SIGPIPE",
+        "SIGALRM",
+        "SIGTERM",
+        "SIGSTKFLT",
+        "SIGCHLD",
+        "SIGCLD",
+        "SIGCONT",
+        "SIGSTOP",
+        "SIGTSTP",
+        "SIGTTIN",
+        "SIGTTOU",
+        "SIGURG",
+        "SIGXCPU",
+        "SIGXFSZ",
+        "SIGVTALRM",
+        "SIGPROF",
+        "SIGWINCH",
+        "SIGIO",
+        "SIGPOLL",
+        "SIGPWR",
+        "SIGSYS",
+        "SIGUNUSED",
+        "SIGRTMIN",
+        "SIGRTMAX",
+    ];
+    if SIGNALS.contains(&value) {
+        return true;
+    }
+    ["SIGRTMIN+", "SIGRTMAX-", "SIGRT_"].iter().any(|prefix| {
+        value.strip_prefix(prefix).is_some_and(|offset| {
+            !offset.is_empty()
+                && offset.len() <= 2
+                && offset.bytes().all(|byte| byte.is_ascii_digit())
+                && offset.parse::<u8>().is_ok()
+        })
+    })
+}
+
 fn resumed_marker(body: &str) -> Option<(&str, &str)> {
     let prefix = body.strip_prefix("<... ")?;
     let end = prefix.find(RESUMED_MARKER)?;

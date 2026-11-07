@@ -16,16 +16,21 @@ use std::path::Path;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-const MAX_ENTRIES: usize = 9;
+const MAX_ENTRIES: usize = 10;
 
 #[derive(Debug)]
 pub struct VerifiedAuditSession {
     manifest: AuditSessionManifest,
+    manifest_bytes: Vec<u8>,
     artifacts: Vec<VerifiedAuditArtifact>,
 }
 impl VerifiedAuditSession {
     pub fn manifest(&self) -> &AuditSessionManifest {
         &self.manifest
+    }
+    /// Exact bounded bytes of the manifest validated by this reader.
+    pub fn manifest_bytes(&self) -> &[u8] {
+        &self.manifest_bytes
     }
     pub fn artifacts(&self) -> &[VerifiedAuditArtifact] {
         &self.artifacts
@@ -203,6 +208,7 @@ pub fn read_verified_session(path: &Path) -> Result<VerifiedAuditSession, Sessio
     drop(directory_lock);
     Ok(VerifiedAuditSession {
         manifest,
+        manifest_bytes: manifest_file,
         artifacts,
     })
 }
@@ -352,7 +358,9 @@ fn label(path: &str) -> &'static str {
         "permissions.json" => "permissions.json",
         "startup.json" => "startup.json",
         "path-executables.json" => "path-executables.json",
+        "root-snapshot.json" => "root-snapshot.json",
         "software.windows.json" => "software.windows.json",
+        "msix.windows.json" => "msix.windows.json",
         "processes.windows.json" => "processes.windows.json",
         "permissions.windows.json" => "permissions.windows.json",
         "startup.windows.json" => "startup.windows.json",
@@ -365,7 +373,7 @@ fn label(path: &str) -> &'static str {
 
 // Windows publication creates a protected DACL. The reader accepts only an explicit
 // non-inheriting DACL with a single allow ACE for the current user SID.
-fn owner_only_acl(path: &Path) -> io::Result<bool> {
+pub(crate) fn owner_only_acl(path: &Path) -> io::Result<bool> {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
     type Handle = *mut c_void;
@@ -692,6 +700,108 @@ mod tests {
             Err(SessionReadError::ArtifactSchemaMismatch(
                 "software.windows.json"
             ))
+        ));
+    }
+
+    #[test]
+    fn startup_v6_through_v10_headers_are_verified_only_for_the_declared_native_version() {
+        let reference = crate::audit_session::SessionArtifactRef {
+            kind: ArtifactKind::WindowsStartup,
+            path: "startup.windows.json".to_owned(),
+            schema: "sideeffect.windows_startup_inventory".to_owned(),
+            schema_version: 6,
+            byte_length: 1,
+            sha256: "a".repeat(64),
+        };
+        assert!(
+            verify_schema(
+                &reference,
+                br#"{"schema":"sideeffect.windows_startup_inventory","schema_version":6}"#
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            verify_schema(
+                &reference,
+                br#"{"schema":"sideeffect.windows_startup_inventory","schema_version":5}"#
+            ),
+            Err(SessionReadError::ArtifactSchemaMismatch(_))
+        ));
+
+        let v9_reference = crate::audit_session::SessionArtifactRef {
+            schema_version: 9,
+            ..reference.clone()
+        };
+        assert!(
+            verify_schema(
+                &v9_reference,
+                br#"{"schema":"sideeffect.windows_startup_inventory","schema_version":9}"#
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            verify_schema(
+                &v9_reference,
+                br#"{"schema":"sideeffect.windows_startup_inventory","schema_version":8}"#
+            ),
+            Err(SessionReadError::ArtifactSchemaMismatch(_))
+        ));
+
+        let v8_reference = crate::audit_session::SessionArtifactRef {
+            schema_version: 8,
+            ..reference.clone()
+        };
+        assert!(
+            verify_schema(
+                &v8_reference,
+                br#"{"schema":"sideeffect.windows_startup_inventory","schema_version":8}"#
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            verify_schema(
+                &v8_reference,
+                br#"{"schema":"sideeffect.windows_startup_inventory","schema_version":7}"#
+            ),
+            Err(SessionReadError::ArtifactSchemaMismatch(_))
+        ));
+
+        let v7_reference = crate::audit_session::SessionArtifactRef {
+            schema_version: 7,
+            ..reference.clone()
+        };
+        assert!(
+            verify_schema(
+                &v7_reference,
+                br#"{"schema":"sideeffect.windows_startup_inventory","schema_version":7}"#
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            verify_schema(
+                &v7_reference,
+                br#"{"schema":"sideeffect.windows_startup_inventory","schema_version":6}"#
+            ),
+            Err(SessionReadError::ArtifactSchemaMismatch(_))
+        ));
+
+        let v10_reference = crate::audit_session::SessionArtifactRef {
+            schema_version: 10,
+            ..reference
+        };
+        assert!(
+            verify_schema(
+                &v10_reference,
+                br#"{"schema":"sideeffect.windows_startup_inventory","schema_version":10}"#
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            verify_schema(
+                &v10_reference,
+                br#"{"schema":"sideeffect.windows_startup_inventory","schema_version":9}"#
+            ),
+            Err(SessionReadError::ArtifactSchemaMismatch(_))
         ));
     }
 

@@ -29,6 +29,7 @@ MAX_RUNS = 10
 MAX_WARMUPS = 3
 MAX_SCHEDULED_CASES = 100
 MAX_REQUESTED_SIZE = 10_000_000
+RSS_SAMPLE_INTERVAL_SECONDS = 0.01
 DEFAULT_SIZES = (10_000, 100_000, 1_000_000)
 
 WORKLOADS = {
@@ -73,6 +74,39 @@ def _child_cpu():
     return usage.ru_utime, usage.ru_stime
 
 
+def _process_group_rss_bytes(process_group_id):
+    """Return the sampled resident bytes of live processes in one process group."""
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    total_pages = 0
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        return 0
+    with entries:
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                with open(os.path.join(entry.path, "stat"), "r", encoding="ascii") as stream:
+                    stat = stream.read(4096)
+                # comm is parenthesized and may contain spaces or ')'; fields
+                # after its final ')' begin with state (field 3), then ppid,
+                # pgrp, session, and so on.
+                close_paren = stat.rfind(")")
+                if close_paren < 0:
+                    continue
+                fields = stat[close_paren + 1:].split()
+                if len(fields) < 3 or int(fields[2]) != process_group_id:
+                    continue
+                with open(os.path.join(entry.path, "statm"), "r", encoding="ascii") as stream:
+                    resident_pages = int(stream.read(256).split()[1])
+                total_pages += resident_pages
+            except (OSError, ValueError, IndexError):
+                # Processes can exit between the /proc reads.
+                continue
+    return total_pages * page_size
+
+
 def _run(command, stdout_path, stdout_limit, stderr_path, timeout=MAX_SECONDS):
     before_cpu = _child_cpu()
     start = time.perf_counter_ns()
@@ -85,8 +119,17 @@ def _run(command, stdout_path, stdout_limit, stderr_path, timeout=MAX_SECONDS):
             start_new_session=True,
             preexec_fn=lambda: _limit_file_size(stdout_limit),
         )
+        peak_rss_bytes = 0
+        deadline = time.monotonic() + timeout
         try:
-            return_code = process.wait(timeout=timeout)
+            while process.poll() is None:
+                peak_rss_bytes = max(peak_rss_bytes, _process_group_rss_bytes(process.pid))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                time.sleep(min(RSS_SAMPLE_INTERVAL_SECONDS, remaining))
+            return_code = process.wait()
+            peak_rss_bytes = max(peak_rss_bytes, _process_group_rss_bytes(process.pid))
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGTERM)
             try:
@@ -108,6 +151,7 @@ def _run(command, stdout_path, stdout_limit, stderr_path, timeout=MAX_SECONDS):
             "user": max(0.0, after_cpu[0] - before_cpu[0]),
             "system": max(0.0, after_cpu[1] - before_cpu[1]),
         },
+        "sampled_peak_process_group_rss_bytes": peak_rss_bytes,
         "stdout_bytes": out_size,
         "stderr_bytes": err_size,
         "stderr_tail": _read_tail(stderr_path),
@@ -215,7 +259,9 @@ def _trace_case(root, sideeffect, python, size, repetitions, warmups, profile):
                               else "limit_exceeded" if inspect.stat().st_size >= MAX_REPORT_BYTES
                               else "failed")
             record["inspect"] = {
-                **{key: inspected[key] for key in ("return_code", "wall_seconds", "child_cpu_seconds", "stdout_bytes", "stderr_bytes")},
+                **{key: inspected[key] for key in ("return_code", "wall_seconds", "child_cpu_seconds",
+                                                    "sampled_peak_process_group_rss_bytes",
+                                                    "stdout_bytes", "stderr_bytes")},
                 "status": inspect_status,
                 "parsed_records": count,
                 "parse_status": parse_status,
@@ -348,6 +394,8 @@ def main():
                     "warmups_per_size": args.warmups,
                     "measured_runs_per_size": args.runs,
                     "cpu_measurement": "harness getrusage(RUSAGE_CHILDREN) deltas around each waited child process group",
+                    "memory_measurement": "sampled aggregate RSS of live processes in each launched process group via /proc, at up to 10 ms intervals",
+                    "memory_sample_interval_ms": RSS_SAMPLE_INTERVAL_SECONDS * 1000,
                     "diff": "compares the first two measured complete captures; with one measured run, uses that same capture twice",
                 },
                 "limits": {

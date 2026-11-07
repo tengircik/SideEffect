@@ -1,0 +1,2215 @@
+//! Bounded item-level comparison of verified audit-session inventory artifacts.
+
+use crate::audit_session::{
+    AUDIT_SESSION_V7_SCHEMA_VERSION, AUDIT_SESSION_V9_SCHEMA_VERSION,
+    AUDIT_SESSION_V10_SCHEMA_VERSION, ArtifactKind, AuditSessionManifest, SessionArtifactRef,
+    SourceRole, SourceStatus, compare_sessions,
+};
+use crate::fingerprint::sha256_hex;
+use crate::inventory::{
+    compare_package_inventory_json, compare_path_executable_inventory_json,
+    compare_permission_inventory_json, compare_process_inventory_json,
+    compare_selected_root_inventory_json, compare_startup_inventory_json,
+    compare_windows_app_paths_inventory_json, compare_windows_msix_inventory_json,
+    compare_windows_software_inventory_json,
+};
+use serde::Serialize;
+use serde_json::Value;
+
+/// Existing inventory comparators accept at most this many bytes across a pair.
+pub const MAX_SESSION_DIFF_PAIR_BYTES: usize = 64 * 1024 * 1024;
+pub const AUDIT_SESSION_DIFF_SCHEMA: &str = "sideeffect.audit_session_diff";
+pub const AUDIT_SESSION_DIFF_SCHEMA_VERSION: u32 = 2;
+const SELECTED_ROOT_METADATA_SCOPE: &str =
+    "one explicitly selected directory and direct-child metadata only";
+const SELECTED_ROOT_HASH_SCOPE: &str = "one explicitly selected directory and direct-child metadata; optional regular-file content fingerprints";
+
+#[derive(Clone, Copy, Debug)]
+pub struct VerifiedArtifactBytes<'a> {
+    pub kind: ArtifactKind,
+    pub path: &'a str,
+    pub bytes: &'a [u8],
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AuditSessionDiff {
+    pub schema: &'static str,
+    pub schema_version: u32,
+    /// Preserves the existing compare-sessions metadata readiness result.
+    pub status: &'static str,
+    pub comparable: bool,
+    pub reason_codes: Vec<&'static str>,
+    pub metadata_scope: &'static str,
+    pub scope: &'static str,
+    pub item_comparison_status: &'static str,
+    pub native_pair_input_limit_bytes: usize,
+    pub before_session_id: String,
+    pub after_session_id: String,
+    pub before_platform: String,
+    pub after_platform: String,
+    pub before_interval_unix_ms: [u128; 2],
+    pub after_interval_unix_ms: [u128; 2],
+    pub source_diffs: Vec<SessionSourceDiff>,
+    pub limitations: [&'static str; 6],
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionSourceDiff {
+    pub role: SourceRole,
+    /// `compared`, `partial`, `not_compared`, or `incomparable`.
+    pub status: &'static str,
+    pub reason_code: Option<&'static str>,
+    pub before_source_status: Option<SourceStatus>,
+    pub after_source_status: Option<SourceStatus>,
+    pub before_source_platform: Option<String>,
+    pub after_source_platform: Option<String>,
+    pub before_source_scope: Option<String>,
+    pub after_source_scope: Option<String>,
+    pub before_artifacts: Vec<ArtifactEvidence>,
+    pub after_artifacts: Vec<ArtifactEvidence>,
+    /// Native comparator result, including its item-level deltas and local evidence locators.
+    pub comparison: Option<Value>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ArtifactEvidence {
+    pub path: String,
+    pub schema: String,
+    pub schema_version: u32,
+    pub sha256: String,
+}
+
+pub fn compare_audit_sessions(
+    before: &AuditSessionManifest,
+    after: &AuditSessionManifest,
+    before_artifacts: &[VerifiedArtifactBytes<'_>],
+    after_artifacts: &[VerifiedArtifactBytes<'_>],
+) -> AuditSessionDiff {
+    let context = compare_sessions(before, after);
+    let roles = [
+        SourceRole::Packages,
+        SourceRole::Processes,
+        SourceRole::Permissions,
+        SourceRole::Startup,
+        SourceRole::Runtime,
+        SourceRole::PathExecutables,
+        SourceRole::SelectedRoot,
+        SourceRole::Msix,
+        SourceRole::AppPaths,
+    ];
+    let source_diffs: Vec<_> = roles
+        .into_iter()
+        .filter(|role| {
+            before.sources.iter().any(|source| source.role == *role)
+                || after.sources.iter().any(|source| source.role == *role)
+        })
+        .map(|role| compare_source_role(role, before, after, before_artifacts, after_artifacts))
+        .collect();
+
+    let item_comparison_status =
+        if !source_diffs.is_empty() && source_diffs.iter().all(|item| item.status == "compared") {
+            "complete"
+        } else if source_diffs.iter().any(|item| item.status == "partial") {
+            "partial"
+        } else {
+            "not_complete"
+        };
+    AuditSessionDiff {
+        schema: AUDIT_SESSION_DIFF_SCHEMA,
+        schema_version: AUDIT_SESSION_DIFF_SCHEMA_VERSION,
+        status: if context.comparable {
+            "comparable"
+        } else {
+            "incomparable"
+        },
+        comparable: context.comparable,
+        reason_codes: context.reasons.iter().map(|reason| reason.code()).collect(),
+        metadata_scope: "metadata_readiness_only",
+        scope: "metadata_and_item_level_inventory_runtime_and_selected_root_metadata",
+        item_comparison_status,
+        native_pair_input_limit_bytes: MAX_SESSION_DIFF_PAIR_BYTES,
+        before_session_id: before.session_id.clone(),
+        after_session_id: after.session_id.clone(),
+        before_platform: before.platform.clone(),
+        after_platform: after.platform.clone(),
+        before_interval_unix_ms: [before.started_at_unix_ms, before.ended_at_unix_ms],
+        after_interval_unix_ms: [after.started_at_unix_ms, after.ended_at_unix_ms],
+        source_diffs,
+        limitations: [
+            "Metadata comparability describes declared collection context; it does not establish equal observations or complete system coverage.",
+            "Each item reference is local to its verified artifact; the artifact SHA-256 links the locator to bytes but does not authenticate their producer.",
+            "Unmatched rows are additions or removals only where the native comparator establishes complete source coverage and certain identity.",
+            "Snapshots are non-atomic observations. Differences do not establish installation, execution history, causation, or safety.",
+            "Caller privilege contexts are not comparability keys and may differ.",
+            "PATH-executable comparisons use exact captured directory and filename encodings; they do not resolve shell commands or prove launchability.",
+        ],
+    }
+}
+
+fn compare_source_role(
+    role: SourceRole,
+    before: &AuditSessionManifest,
+    after: &AuditSessionManifest,
+    before_artifacts: &[VerifiedArtifactBytes<'_>],
+    after_artifacts: &[VerifiedArtifactBytes<'_>],
+) -> SessionSourceDiff {
+    let left = before.sources.iter().find(|source| source.role == role);
+    let right = after.sources.iter().find(|source| source.role == role);
+    let left_status = left.map(|source| source.status);
+    let right_status = right.map(|source| source.status);
+    let left_platform = left.map(|source| source.platform.clone());
+    let right_platform = right.map(|source| source.platform.clone());
+    let left_scope = left.map(|source| source.scope.clone());
+    let right_scope = right.map(|source| source.scope.clone());
+    let left_references = left
+        .map(|source| source.artifacts.as_slice())
+        .unwrap_or_default();
+    let right_references = right
+        .map(|source| source.artifacts.as_slice())
+        .unwrap_or_default();
+    let left_reference = left_references.first();
+    let right_reference = right_references.first();
+    let mut result = SessionSourceDiff {
+        role,
+        status: "not_compared",
+        reason_code: None,
+        before_source_status: left_status,
+        after_source_status: right_status,
+        before_source_platform: left_platform,
+        after_source_platform: right_platform,
+        before_source_scope: left_scope,
+        after_source_scope: right_scope,
+        before_artifacts: left_references.iter().map(ArtifactEvidence::from).collect(),
+        after_artifacts: right_references
+            .iter()
+            .map(ArtifactEvidence::from)
+            .collect(),
+        comparison: None,
+    };
+
+    if before.platform != after.platform {
+        return result.incomparable("platform_mismatch");
+    }
+    let (Some(left), Some(right)) = (left, right) else {
+        return result.not_compared(if left.is_none() {
+            "source_missing_before"
+        } else {
+            "source_missing_after"
+        });
+    };
+    if left.platform != right.platform {
+        return result.incomparable("source_platform_mismatch");
+    }
+    if left.scope != right.scope
+        && !selected_root_scope_extension_compatible(
+            role,
+            before.schema_version,
+            after.schema_version,
+            &left.scope,
+            &right.scope,
+        )
+    {
+        return result.incomparable("source_scope_mismatch");
+    }
+    let (Some(left_ref), Some(right_ref)) = (left_reference, right_reference) else {
+        return result.not_compared(if left_reference.is_none() {
+            "artifact_missing_before"
+        } else {
+            "artifact_missing_after"
+        });
+    };
+    let selected_root_versions_compatible = role == SourceRole::SelectedRoot
+        && left_ref.kind == ArtifactKind::SelectedRoot
+        && right_ref.kind == ArtifactKind::SelectedRoot
+        && left_ref.schema == "sideeffect.selected_root_inventory"
+        && right_ref.schema == "sideeffect.selected_root_inventory"
+        && matches!(left_ref.schema_version, 1 | 2)
+        && matches!(right_ref.schema_version, 1 | 2);
+    let startup_versions_compatible = role == SourceRole::Startup
+        && left_ref.kind == right_ref.kind
+        && match left_ref.kind {
+            ArtifactKind::Startup => {
+                matches!(left_ref.schema_version, 2 | 3)
+                    && matches!(right_ref.schema_version, 2 | 3)
+            }
+            ArtifactKind::WindowsStartup => {
+                matches!(left_ref.schema_version, 4..=9)
+                    && matches!(right_ref.schema_version, 4..=9)
+            }
+            _ => false,
+        };
+    if left_ref.kind != right_ref.kind
+        || left_ref.schema != right_ref.schema
+        || (left_ref.schema_version != right_ref.schema_version
+            && !selected_root_versions_compatible
+            && !startup_versions_compatible)
+    {
+        return result.incomparable("artifact_contract_mismatch");
+    }
+    if !supported_role_kind(role, left_ref.kind) {
+        return result.not_compared("role_not_supported_by_item_diff");
+    }
+    if left_ref
+        .byte_length
+        .checked_add(right_ref.byte_length)
+        .is_none_or(|combined| combined > MAX_SESSION_DIFF_PAIR_BYTES as u64)
+    {
+        return result.not_compared("native_input_limit_exceeded");
+    }
+    let left_bytes = find_verified_bytes(left_ref, before_artifacts);
+    let right_bytes = find_verified_bytes(right_ref, after_artifacts);
+    let (Some(left_bytes), Some(right_bytes)) = (left_bytes, right_bytes) else {
+        return result.incomparable("verified_artifact_reference_mismatch");
+    };
+    if left_bytes
+        .bytes
+        .len()
+        .checked_add(right_bytes.bytes.len())
+        .is_none_or(|combined| combined > MAX_SESSION_DIFF_PAIR_BYTES)
+    {
+        return result.not_compared("native_input_limit_exceeded");
+    }
+    match compare_native(role, left_ref.kind, left_bytes.bytes, right_bytes.bytes) {
+        Ok((mut status, mut value)) => {
+            if left.status != SourceStatus::Complete || right.status != SourceStatus::Complete {
+                suppress_session_incomplete_presence(role, &mut value);
+                status = "partial";
+                result.reason_code = Some("session_source_incomplete");
+            }
+            result.status = status;
+            result.comparison = Some(value);
+            result
+        }
+        Err(NativeCompareError::InputLimit) => result.not_compared("native_input_limit_exceeded"),
+        Err(NativeCompareError::Malformed) => result.incomparable("invalid_inventory_artifact"),
+        Err(NativeCompareError::Unsupported) => result.not_compared("native_schema_not_supported"),
+        Err(NativeCompareError::Incompatible) => result.incomparable("native_contract_mismatch"),
+        Err(NativeCompareError::RootMismatch) => result.incomparable("selected_root_mismatch"),
+        Err(NativeCompareError::Limit) => result.not_compared("native_comparison_limit_exceeded"),
+    }
+}
+
+fn selected_root_scope_extension_compatible(
+    role: SourceRole,
+    before_version: u32,
+    after_version: u32,
+    before_scope: &str,
+    after_scope: &str,
+) -> bool {
+    if role != SourceRole::SelectedRoot {
+        return false;
+    }
+    let valid_scope = |version, scope| match version {
+        AUDIT_SESSION_V7_SCHEMA_VERSION => scope == SELECTED_ROOT_METADATA_SCOPE,
+        AUDIT_SESSION_V9_SCHEMA_VERSION
+        | AUDIT_SESSION_V10_SCHEMA_VERSION
+        | crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION
+        | crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION
+        | crate::audit_session::AUDIT_SESSION_V13_SCHEMA_VERSION
+        | crate::audit_session::AUDIT_SESSION_V14_SCHEMA_VERSION => {
+            matches!(
+                scope,
+                SELECTED_ROOT_METADATA_SCOPE | SELECTED_ROOT_HASH_SCOPE
+            )
+        }
+        _ => false,
+    };
+    valid_scope(before_version, before_scope)
+        && valid_scope(after_version, after_scope)
+        && matches!(
+            (before_scope, after_scope),
+            (SELECTED_ROOT_METADATA_SCOPE, SELECTED_ROOT_HASH_SCOPE)
+                | (SELECTED_ROOT_HASH_SCOPE, SELECTED_ROOT_METADATA_SCOPE)
+        )
+}
+
+/// A source-level session status is authoritative for unmatched-row claims, even if the
+/// referenced artifact's own document claims complete coverage. Matched changes remain useful.
+fn suppress_session_incomplete_presence(role: SourceRole, comparison: &mut Value) {
+    let (before_only_kind, after_only_kind, before_count, after_count, suppressed_count) =
+        match role {
+            SourceRole::Packages => (
+                "removed",
+                "added",
+                "removals",
+                "additions",
+                "unmatched_rows_with_incomplete_source",
+            ),
+            SourceRole::Msix => (
+                "removed",
+                "added",
+                "removals",
+                "additions",
+                "unmatched_rows_with_incomplete_source",
+            ),
+            SourceRole::AppPaths => (
+                "removed",
+                "added",
+                "removals",
+                "additions",
+                "unmatched_rows_with_incomplete_source",
+            ),
+            SourceRole::Processes => (
+                "removed",
+                "added",
+                "removals",
+                "additions",
+                "unmatched_rows_suppressed_for_partial_source",
+            ),
+            SourceRole::Permissions => (
+                "removed",
+                "added",
+                "removals",
+                "additions",
+                "unmatched_rows_suppressed_for_partial_source",
+            ),
+            SourceRole::Startup => (
+                "observed_before_only",
+                "observed_after_only",
+                "observed_before_only",
+                "observed_after_only",
+                "unmatched_rows_suppressed_for_incomplete_source",
+            ),
+            SourceRole::PathExecutables => (
+                "candidate_removed",
+                "candidate_added",
+                "candidates_removed",
+                "candidates_added",
+                "unmatched_candidates_suppressed_for_incomplete_or_changed_context",
+            ),
+            SourceRole::SelectedRoot => (
+                "removed",
+                "added",
+                "removals",
+                "additions",
+                "unmatched_rows_suppressed",
+            ),
+            SourceRole::Runtime => return,
+        };
+
+    let Some(deltas) = comparison.get_mut("deltas").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut before_only = 0usize;
+    let mut after_only = 0usize;
+    deltas.retain(|delta| {
+        let kind = delta.get("kind").and_then(Value::as_str);
+        match kind {
+            Some(kind) if kind == before_only_kind => {
+                before_only = before_only.saturating_add(1);
+                false
+            }
+            Some(kind) if kind == after_only_kind => {
+                after_only = after_only.saturating_add(1);
+                false
+            }
+            _ => true,
+        }
+    });
+    let suppressed = before_only.saturating_add(after_only);
+    if let Some(counts) = comparison.get_mut("counts").and_then(Value::as_object_mut) {
+        subtract_count(counts, before_count, before_only);
+        subtract_count(counts, after_count, after_only);
+        add_count(counts, suppressed_count, suppressed);
+    }
+    if let Some(status) = comparison.get_mut("status") {
+        *status = Value::String("partial".into());
+    }
+    if let Some(diagnostics) = comparison
+        .get_mut("diagnostics")
+        .and_then(Value::as_array_mut)
+    {
+        // Package diagnostics are a closed enum in Rust; use its existing equivalent.
+        let diagnostic = if role == SourceRole::Packages {
+            "source_incomplete"
+        } else {
+            "session_source_incomplete"
+        };
+        if !diagnostics
+            .iter()
+            .any(|item| item.as_str() == Some(diagnostic))
+        {
+            diagnostics.push(Value::String(diagnostic.into()));
+        }
+    }
+}
+
+fn subtract_count(counts: &mut serde_json::Map<String, Value>, key: &str, amount: usize) {
+    if let Some(count) = counts.get(key).and_then(Value::as_u64) {
+        *counts.get_mut(key).expect("count key was just read") =
+            Value::from(count.saturating_sub(amount as u64));
+    }
+}
+
+fn add_count(counts: &mut serde_json::Map<String, Value>, key: &str, amount: usize) {
+    let current = counts.get(key).and_then(Value::as_u64).unwrap_or(0);
+    counts.insert(
+        key.into(),
+        Value::from(current.saturating_add(amount as u64)),
+    );
+}
+
+impl SessionSourceDiff {
+    fn not_compared(mut self, reason: &'static str) -> Self {
+        self.status = "not_compared";
+        self.reason_code = Some(reason);
+        self
+    }
+    fn incomparable(mut self, reason: &'static str) -> Self {
+        self.status = "incomparable";
+        self.reason_code = Some(reason);
+        self
+    }
+}
+
+impl AuditSessionDiff {
+    pub fn refresh_item_comparison_status(&mut self) {
+        self.item_comparison_status = if !self.source_diffs.is_empty()
+            && self
+                .source_diffs
+                .iter()
+                .all(|item| item.status == "compared")
+        {
+            "complete"
+        } else if self
+            .source_diffs
+            .iter()
+            .any(|item| item.status == "partial")
+        {
+            "partial"
+        } else {
+            "not_complete"
+        };
+    }
+}
+
+impl From<&SessionArtifactRef> for ArtifactEvidence {
+    fn from(reference: &SessionArtifactRef) -> Self {
+        Self {
+            path: reference.path.clone(),
+            schema: reference.schema.clone(),
+            schema_version: reference.schema_version,
+            sha256: reference.sha256.clone(),
+        }
+    }
+}
+
+fn find_verified_bytes<'a>(
+    reference: &SessionArtifactRef,
+    artifacts: &'a [VerifiedArtifactBytes<'a>],
+) -> Option<&'a VerifiedArtifactBytes<'a>> {
+    artifacts.iter().find(|artifact| {
+        artifact.kind == reference.kind
+            && artifact.path == reference.path
+            && artifact.bytes.len() as u64 == reference.byte_length
+            && sha256_hex(artifact.bytes) == reference.sha256
+    })
+}
+
+fn supported_role_kind(role: SourceRole, kind: ArtifactKind) -> bool {
+    matches!(
+        (role, kind),
+        (
+            SourceRole::Packages,
+            ArtifactKind::Packages | ArtifactKind::WindowsSoftware
+        ) | (
+            SourceRole::Processes,
+            ArtifactKind::Processes | ArtifactKind::WindowsProcesses
+        ) | (
+            SourceRole::Permissions,
+            ArtifactKind::Permissions | ArtifactKind::WindowsPermissions
+        ) | (
+            SourceRole::Startup,
+            ArtifactKind::Startup | ArtifactKind::WindowsStartup
+        ) | (SourceRole::PathExecutables, ArtifactKind::PathExecutables)
+            | (SourceRole::SelectedRoot, ArtifactKind::SelectedRoot)
+            | (SourceRole::Msix, ArtifactKind::WindowsMsix)
+            | (SourceRole::AppPaths, ArtifactKind::WindowsAppPaths)
+    )
+}
+
+#[derive(Clone, Copy)]
+enum NativeCompareError {
+    InputLimit,
+    Malformed,
+    Unsupported,
+    Incompatible,
+    RootMismatch,
+    Limit,
+}
+
+fn compare_native(
+    role: SourceRole,
+    kind: ArtifactKind,
+    left: &[u8],
+    right: &[u8],
+) -> Result<(&'static str, Value), NativeCompareError> {
+    let value = match (role, kind) {
+        (SourceRole::SelectedRoot, ArtifactKind::SelectedRoot) => {
+            let result = compare_selected_root_inventory_json(left, right)
+                .map_err(map_root_snapshot_error)?;
+            let status = if result.status == "complete" {
+                "compared"
+            } else {
+                "partial"
+            };
+            (
+                status,
+                serde_json::to_value(result).map_err(|_| NativeCompareError::Malformed)?,
+            )
+        }
+        (SourceRole::PathExecutables, ArtifactKind::PathExecutables) => {
+            let result = compare_path_executable_inventory_json(left, right)
+                .map_err(map_path_executable_error)?;
+            let status = if result.status == "complete" {
+                "compared"
+            } else {
+                "partial"
+            };
+            (
+                status,
+                serde_json::to_value(result).map_err(|_| NativeCompareError::Malformed)?,
+            )
+        }
+        (SourceRole::Packages, ArtifactKind::Packages) => {
+            let result = compare_package_inventory_json(left, right).map_err(map_package_error)?;
+            let status = if result.status == crate::inventory::PackageComparisonStatus::Complete {
+                "compared"
+            } else {
+                "partial"
+            };
+            (
+                status,
+                serde_json::to_value(result).map_err(|_| NativeCompareError::Malformed)?,
+            )
+        }
+        (SourceRole::Packages, ArtifactKind::WindowsSoftware) => {
+            let result =
+                compare_windows_software_inventory_json(left, right).map_err(map_software_error)?;
+            let status =
+                if result.status == crate::inventory::WindowsSoftwareComparisonStatus::Complete {
+                    "compared"
+                } else {
+                    "partial"
+                };
+            (
+                status,
+                serde_json::to_value(result).map_err(|_| NativeCompareError::Malformed)?,
+            )
+        }
+        (SourceRole::Msix, ArtifactKind::WindowsMsix) => {
+            let result =
+                compare_windows_msix_inventory_json(left, right).map_err(map_msix_error)?;
+            let status = if result.status == crate::inventory::WindowsMsixComparisonStatus::Complete
+            {
+                "compared"
+            } else {
+                "partial"
+            };
+            (
+                status,
+                serde_json::to_value(result).map_err(|_| NativeCompareError::Malformed)?,
+            )
+        }
+        (SourceRole::AppPaths, ArtifactKind::WindowsAppPaths) => {
+            let result = compare_windows_app_paths_inventory_json(left, right)
+                .map_err(map_app_paths_error)?;
+            let status =
+                if result.status == crate::inventory::WindowsAppPathsComparisonStatus::Complete {
+                    "compared"
+                } else {
+                    "partial"
+                };
+            (
+                status,
+                serde_json::to_value(result).map_err(|_| NativeCompareError::Malformed)?,
+            )
+        }
+        (SourceRole::Processes, ArtifactKind::Processes | ArtifactKind::WindowsProcesses)
+        | (SourceRole::Permissions, ArtifactKind::Permissions | ArtifactKind::WindowsPermissions)
+        | (SourceRole::Startup, ArtifactKind::Startup | ArtifactKind::WindowsStartup) => match role
+        {
+            SourceRole::Processes => {
+                let result =
+                    compare_process_inventory_json(left, right).map_err(map_process_error)?;
+                let status = if result.status == crate::inventory::ProcessDiffStatus::Complete {
+                    "compared"
+                } else {
+                    "partial"
+                };
+                (
+                    status,
+                    serde_json::to_value(result).map_err(|_| NativeCompareError::Malformed)?,
+                )
+            }
+            SourceRole::Permissions => {
+                let result =
+                    compare_permission_inventory_json(left, right).map_err(map_permission_error)?;
+                let status = if result.status == crate::inventory::PermissionDiffStatus::Complete {
+                    "compared"
+                } else {
+                    "partial"
+                };
+                (
+                    status,
+                    serde_json::to_value(result).map_err(|_| NativeCompareError::Malformed)?,
+                )
+            }
+            SourceRole::Startup => {
+                let result =
+                    compare_startup_inventory_json(left, right).map_err(map_startup_error)?;
+                let status = if result.status == crate::inventory::StartupDiffStatus::Complete {
+                    "compared"
+                } else {
+                    "partial"
+                };
+                (
+                    status,
+                    serde_json::to_value(result).map_err(|_| NativeCompareError::Malformed)?,
+                )
+            }
+            _ => return Err(NativeCompareError::Unsupported),
+        },
+        _ => return Err(NativeCompareError::Unsupported),
+    };
+    Ok(value)
+}
+
+fn map_root_snapshot_error(error: crate::inventory::RootSnapshotDiffError) -> NativeCompareError {
+    use crate::inventory::RootSnapshotDiffError as E;
+    match error {
+        E::MalformedInput => NativeCompareError::Malformed,
+        E::InputTooLarge => NativeCompareError::InputLimit,
+        E::UnsupportedSchema => NativeCompareError::Unsupported,
+        E::PlatformMismatch | E::ScopeMismatch => NativeCompareError::Incompatible,
+        E::RootMismatch => NativeCompareError::RootMismatch,
+        E::LimitExceeded => NativeCompareError::Limit,
+    }
+}
+
+fn map_path_executable_error(
+    error: crate::inventory::PathExecutableDiffError,
+) -> NativeCompareError {
+    use crate::inventory::PathExecutableDiffError as E;
+    match error {
+        E::MalformedInput => NativeCompareError::Malformed,
+        E::InputTooLarge => NativeCompareError::InputLimit,
+        E::UnsupportedSchema => NativeCompareError::Unsupported,
+        E::PlatformMismatch => NativeCompareError::Incompatible,
+        E::LimitExceeded => NativeCompareError::Limit,
+    }
+}
+
+fn map_process_error(error: crate::inventory::ProcessDiffError) -> NativeCompareError {
+    use crate::inventory::ProcessDiffError as E;
+    match error {
+        E::MalformedInput => NativeCompareError::Malformed,
+        E::InputTooLarge => NativeCompareError::InputLimit,
+        E::UnsupportedSchema => NativeCompareError::Unsupported,
+        E::SchemaMismatch | E::PlatformMismatch => NativeCompareError::Incompatible,
+        E::LimitExceeded => NativeCompareError::Limit,
+    }
+}
+
+fn map_permission_error(error: crate::inventory::PermissionDiffError) -> NativeCompareError {
+    use crate::inventory::PermissionDiffError as E;
+    match error {
+        E::MalformedInput => NativeCompareError::Malformed,
+        E::InputTooLarge => NativeCompareError::InputLimit,
+        E::UnsupportedSchema => NativeCompareError::Unsupported,
+        E::SchemaMismatch | E::PlatformMismatch => NativeCompareError::Incompatible,
+        E::LimitExceeded => NativeCompareError::Limit,
+    }
+}
+
+fn map_startup_error(error: crate::inventory::StartupDiffError) -> NativeCompareError {
+    use crate::inventory::StartupDiffError as E;
+    match error {
+        E::MalformedInput => NativeCompareError::Malformed,
+        E::InputTooLarge => NativeCompareError::InputLimit,
+        E::UnsupportedSchema => NativeCompareError::Unsupported,
+        E::SchemaMismatch | E::PlatformMismatch => NativeCompareError::Incompatible,
+        E::LimitExceeded => NativeCompareError::Limit,
+    }
+}
+
+fn map_package_error(error: crate::inventory::PackageComparisonError) -> NativeCompareError {
+    use crate::inventory::PackageComparisonError as E;
+    match error {
+        E::MalformedInput => NativeCompareError::Malformed,
+        E::InputTooLarge => NativeCompareError::InputLimit,
+        E::UnsupportedSchema => NativeCompareError::Unsupported,
+        E::SchemaMismatch | E::PlatformMismatch | E::ScopeMismatch => {
+            NativeCompareError::Incompatible
+        }
+        E::UnsupportedSourceId
+        | E::SourceLimitExceeded
+        | E::PackageLimitExceeded
+        | E::FieldLimitExceeded
+        | E::DocumentTextLimitExceeded
+        | E::DuplicateSourceId
+        | E::DeltaLimitExceeded => NativeCompareError::Limit,
+    }
+}
+
+fn map_software_error(
+    error: crate::inventory::WindowsSoftwareComparisonError,
+) -> NativeCompareError {
+    use crate::inventory::WindowsSoftwareComparisonError as E;
+    match error {
+        E::MalformedInput => NativeCompareError::Malformed,
+        E::InputTooLarge => NativeCompareError::InputLimit,
+        E::UnsupportedSchema => NativeCompareError::Unsupported,
+        E::PlatformMismatch | E::ScopeMismatch | E::InvalidSourceSet => {
+            NativeCompareError::Incompatible
+        }
+        E::LimitExceeded => NativeCompareError::Limit,
+    }
+}
+
+fn map_msix_error(error: crate::inventory::WindowsMsixComparisonError) -> NativeCompareError {
+    use crate::inventory::WindowsMsixComparisonError as E;
+    match error {
+        E::MalformedInput => NativeCompareError::Malformed,
+        E::InputTooLarge => NativeCompareError::InputLimit,
+        E::UnsupportedSchema => NativeCompareError::Unsupported,
+        E::Incompatible => NativeCompareError::Incompatible,
+        E::LimitExceeded => NativeCompareError::Limit,
+    }
+}
+
+fn map_app_paths_error(
+    error: crate::inventory::WindowsAppPathsComparisonError,
+) -> NativeCompareError {
+    use crate::inventory::WindowsAppPathsComparisonError as E;
+    match error {
+        E::MalformedInput => NativeCompareError::Malformed,
+        E::InputTooLarge => NativeCompareError::InputLimit,
+        E::UnsupportedSchema => NativeCompareError::Unsupported,
+        E::Incompatible | E::InvalidSourceSet => NativeCompareError::Incompatible,
+        E::LimitExceeded => NativeCompareError::Limit,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SELECTED_ROOT_HASH_SCOPE, SELECTED_ROOT_METADATA_SCOPE, VerifiedArtifactBytes,
+        compare_audit_sessions, selected_root_scope_extension_compatible,
+    };
+    use crate::audit_session::{
+        ArtifactKind, AuditSessionManifest, AuditSessionSource, IntervalSemantics,
+        SessionArtifactRef, SessionStatus, SourceRole, SourceStatus,
+    };
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    #[test]
+    fn selected_root_scope_extension_keeps_v7_v9_and_v10_compatible() {
+        let role = SourceRole::SelectedRoot;
+        for (before_version, after_version) in
+            [(7, 9), (7, 10), (9, 10), (7, 12), (9, 12), (10, 12)]
+        {
+            assert!(selected_root_scope_extension_compatible(
+                role,
+                before_version,
+                after_version,
+                SELECTED_ROOT_METADATA_SCOPE,
+                SELECTED_ROOT_HASH_SCOPE,
+            ));
+            assert!(selected_root_scope_extension_compatible(
+                role,
+                after_version,
+                before_version,
+                SELECTED_ROOT_HASH_SCOPE,
+                SELECTED_ROOT_METADATA_SCOPE,
+            ));
+        }
+        assert!(!selected_root_scope_extension_compatible(
+            role,
+            8,
+            10,
+            SELECTED_ROOT_METADATA_SCOPE,
+            SELECTED_ROOT_HASH_SCOPE,
+        ));
+        assert!(!selected_root_scope_extension_compatible(
+            SourceRole::Packages,
+            9,
+            10,
+            SELECTED_ROOT_METADATA_SCOPE,
+            SELECTED_ROOT_HASH_SCOPE,
+        ));
+    }
+
+    fn inventory(name: &str, version: &str, source_status: &str, global_status: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema":"sideeffect.inventory", "schema_version":2, "platform":"linux",
+            "scope":"available_package_manager_databases", "captured_at_unix_ms":1001,
+            "status":global_status,
+            "sources":[{"id":"dpkg_query","status":source_status,"records_seen":1,"diagnostics":[]}],
+            "packages":[{"source_id":"dpkg_query","name":name,"version":version,"architecture":"amd64","status_abbrev":"ii ","evidence":{"line":1,"byte_offset":0,"byte_length":8,"record_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","raw_record":null,"raw_record_hex":null},"diagnostic_code":null}]
+        })).unwrap()
+    }
+
+    fn session(
+        bytes: &[u8],
+        id: &str,
+        source_status: SourceStatus,
+    ) -> (AuditSessionManifest, String) {
+        session_for(
+            bytes,
+            id,
+            SessionSpec {
+                role: SourceRole::Packages,
+                kind: ArtifactKind::Packages,
+                platform: "linux",
+                schema: "sideeffect.inventory",
+                schema_version: 2,
+                scope: "available_package_manager_databases",
+            },
+            source_status,
+        )
+    }
+
+    #[derive(Clone, Copy)]
+    struct SessionSpec<'a> {
+        role: SourceRole,
+        kind: ArtifactKind,
+        platform: &'a str,
+        schema: &'a str,
+        schema_version: u32,
+        scope: &'a str,
+    }
+
+    fn session_for(
+        bytes: &[u8],
+        id: &str,
+        spec: SessionSpec<'_>,
+        source_status: SourceStatus,
+    ) -> (AuditSessionManifest, String) {
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let reference = SessionArtifactRef {
+            kind: spec.kind,
+            path: match spec.kind {
+                ArtifactKind::Permissions => "permissions.json",
+                ArtifactKind::Startup => "startup.json",
+                ArtifactKind::WindowsStartup => "startup.windows.json",
+                ArtifactKind::PathExecutables => "path-executables.json",
+                ArtifactKind::SelectedRoot => "root-snapshot.json",
+                ArtifactKind::WindowsMsix => "msix.windows.json",
+                _ => "packages.json",
+            }
+            .into(),
+            schema: spec.schema.into(),
+            schema_version: spec.schema_version,
+            byte_length: bytes.len() as u64,
+            sha256: digest.clone(),
+        };
+        let source = AuditSessionSource {
+            role: spec.role,
+            collector: (spec.role == SourceRole::SelectedRoot)
+                .then(|| crate::audit_session::collector_identity(spec.platform, spec.role)),
+            platform: spec.platform.into(),
+            scope: spec.scope.into(),
+            started_at_unix_ms: 1000,
+            ended_at_unix_ms: 1001,
+            status: source_status,
+            applied_limits: vec![],
+            requested_settings: vec![],
+            effective_settings: vec![],
+            loss: None,
+            diagnostic_codes: vec![],
+            artifacts: vec![reference],
+        };
+        (
+            AuditSessionManifest {
+                schema: "sideeffect.audit_session".into(),
+                schema_version: crate::audit_session::AUDIT_SESSION_SCHEMA_VERSION,
+                session_id: id.into(),
+                platform: spec.platform.into(),
+                architecture: "x86_64".into(),
+                started_at_unix_ms: 1000,
+                ended_at_unix_ms: 1002,
+                interval_semantics: IntervalSemantics::BestEffortNonAtomic,
+                status: if source_status == SourceStatus::Complete {
+                    SessionStatus::Complete
+                } else {
+                    SessionStatus::Partial
+                },
+                sources: vec![source],
+                host_context: None,
+                coverage_manifest: None,
+            },
+            digest,
+        )
+    }
+
+    fn root_snapshot(path_hex: &str, entries: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "sideeffect.selected_root_inventory",
+            "schema_version": 1,
+            "platform": "linux",
+            "scope": "one_explicit_root_and_its_direct_children_metadata_only",
+            "captured_started_at_unix_ms": 1000,
+            "captured_ended_at_unix_ms": 1001,
+            "status": "complete",
+            "root": {
+                "display_path": "/selected",
+                "path_bytes_hex": path_hex,
+                "object_type": "directory",
+                "device_or_volume_serial": 1,
+                "inode_or_file_index": 2
+            },
+            "entries": entries,
+            "diagnostics": [],
+            "limits": {
+                "max_root_path_bytes_or_utf16_units": 4095,
+                "max_entries": 10000,
+                "max_name_bytes_or_utf16_units": 32767,
+                "max_aggregate_name_bytes": 8388608,
+                "deadline_seconds": 5
+            }
+        }))
+        .unwrap()
+    }
+
+    fn msix_snapshot(version: u16, include_extra: bool) -> Vec<u8> {
+        let exact = |text: String| {
+            let mut utf16_hex = String::with_capacity(text.encode_utf16().count() * 4);
+            for unit in text.encode_utf16() {
+                write!(&mut utf16_hex, "{unit:04x}").unwrap();
+            }
+            serde_json::json!({"text":text,"utf16_hex":utf16_hex,"display_replaced_invalid_utf16":false})
+        };
+        let mut packages = vec![serde_json::json!({
+            "ordinal":0,"name":exact("Demo".into()),"publisher":exact("Publisher".into()),
+            "full_name":exact(format!("Demo_{version}")),"family_name":exact("Demo_publisher".into()),
+            "install_location":exact("C:\\Apps\\Demo".into()),
+            "version":{"major":version,"minor":0,"build":0,"revision":0},"is_framework":false,"is_resource_package":false,"is_bundle":false,"is_development_mode":false
+        })];
+        if include_extra {
+            packages.push(serde_json::json!({
+                "ordinal":1,"name":exact("Other".into()),"publisher":exact("Publisher".into()),
+                "full_name":exact("Other_1".into()),"family_name":exact("Other_publisher".into()),
+                "install_location":exact("C:\\Apps\\Other".into()),
+                "version":{"major":1,"minor":0,"build":0,"revision":0},"is_framework":false,"is_resource_package":false,"is_bundle":false,"is_development_mode":false
+            }));
+        }
+        serde_json::to_vec(&serde_json::json!({
+            "schema":"sideeffect.windows_msix_inventory","schema_version":1,
+            "platform":"windows","scope":"current_user_registered_appx_and_msix_packages_only",
+            "capture_started_at_unix_ms":1000,"capture_ended_at_unix_ms":1001,"status":"complete",
+            "sources":[{"id":"current_user_appx_msix_packages","status":"complete","packages_seen":packages.len(),"scope":"calling_user_only","diagnostics":[]}],
+            "packages":packages
+        })).unwrap()
+    }
+
+    #[test]
+    fn msix_session_diff_uses_verified_artifacts_and_suppresses_partial_presence() {
+        let before_bytes = msix_snapshot(1, false);
+        let after_bytes = msix_snapshot(2, true);
+        assert!(
+            crate::inventory::compare_windows_msix_inventory_json(&before_bytes, &after_bytes)
+                .is_ok()
+        );
+        let spec = SessionSpec {
+            role: SourceRole::Msix,
+            kind: ArtifactKind::WindowsMsix,
+            platform: "windows",
+            schema: "sideeffect.windows_msix_inventory",
+            schema_version: 1,
+            scope: "bounded current-user MSIX package registrations",
+        };
+        let (before, before_digest) = session_for(
+            &before_bytes,
+            "0123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Complete,
+        );
+        let (after, after_digest) = session_for(
+            &after_bytes,
+            "1123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Complete,
+        );
+        let left = [VerifiedArtifactBytes {
+            kind: ArtifactKind::WindowsMsix,
+            path: "msix.windows.json",
+            bytes: &before_bytes,
+        }];
+        let right = [VerifiedArtifactBytes {
+            kind: ArtifactKind::WindowsMsix,
+            path: "msix.windows.json",
+            bytes: &after_bytes,
+        }];
+        let result = compare_audit_sessions(&before, &after, &left, &right);
+        let source = &result.source_diffs[0];
+        assert_eq!(
+            source.status, "compared",
+            "reason: {:?}",
+            source.reason_code
+        );
+        assert_eq!(source.before_artifacts[0].sha256, before_digest);
+        assert_eq!(source.after_artifacts[0].sha256, after_digest);
+        assert_eq!(source.comparison.as_ref().unwrap()["counts"]["changes"], 1);
+        let partial = session_for(
+            &after_bytes,
+            "2123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Partial,
+        )
+        .0;
+        let partial_result = compare_audit_sessions(&before, &partial, &left, &right);
+        let partial_source = &partial_result.source_diffs[0];
+        assert_eq!(partial_source.status, "partial");
+        assert_eq!(
+            partial_source.comparison.as_ref().unwrap()["counts"]["additions"],
+            0
+        );
+        assert_eq!(
+            partial_source.comparison.as_ref().unwrap()["counts"]["unmatched_rows_with_incomplete_source"],
+            1
+        );
+    }
+
+    fn linux_startup(version: u32, component_version: u32) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema":"sideeffect.startup_inventory",
+            "schema_version":version,
+            "platform":"linux",
+            "scope":"curated_xdg_systemd_sysv_cron_sources",
+            "capture_started_at_unix_ms":1000,
+            "capture_ended_at_unix_ms":1001,
+            "status":"complete",
+            "xdg_autostart":{"schema":"sideeffect.xdg_autostart_inventory","schema_version":component_version,"platform":"linux","scope":"xdg_autostart_files_only","capture_started_at_unix_ms":1000,"capture_ended_at_unix_ms":1001,"status":"complete","directories":[],"entries":[]},
+            "systemd_units":{"schema":"sideeffect.systemd_unit_inventory","schema_version":component_version,"platform":"linux","scope":"systemd_unit_files_and_enablement_symlink_references","capture_started_at_unix_ms":1000,"capture_ended_at_unix_ms":1001,"status":"complete","directories":[],"records":[]},
+            "legacy_sources":{"schema":"sideeffect.legacy_startup_inventory","schema_version":component_version,"platform":"linux","scope":"common_sysv_cron_paths_only","capture_started_at_unix_ms":1000,"capture_ended_at_unix_ms":1001,"status":"complete","sources":[],"entries":[]}
+        }))
+        .unwrap()
+    }
+
+    fn windows_startup(version: u32) -> Vec<u8> {
+        let observation = (version >= 7)
+            .then(|| serde_json::json!({"status":"known","state":"running","raw_state_code":4}));
+        let mut service = serde_json::json!({
+            "service_name":"ExampleService",
+            "display_name":"Example Service",
+            "start_type":"SERVICE_AUTO_START",
+            "start_type_code":2,
+            "account":null,
+            "binary_path":"C:\\Tools\\example.exe",
+            "startup_state": {
+                "schema_version":1,
+                "configured":"present",
+                "effective":{"status":"unknown","context":null,"evidence":null},
+                "observed":{"status":"unknown","capture_interval":null,"evidence":null}
+            },
+            "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW","service_index":0}
+        });
+        if let Some(observation) = observation {
+            service["service_observation"] = observation;
+        }
+        serde_json::to_vec(&serde_json::json!({
+            "schema":"sideeffect.windows_startup_inventory",
+            "schema_version":version,
+            "platform":"windows",
+            "scope":"current_user_and_accessible_machine_run_keys_startup_folders_services_current_token_visible_tasks_and_local_root_subscription_wmi_objects",
+            "capture_started_at_unix_ms":1000,
+            "capture_ended_at_unix_ms":1001,
+            "status":"complete",
+            "sources":[
+                {"id":"current_user_run_native","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"current_user_run_once_native","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"current_user_run_32","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"current_user_run_once_32","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"local_machine_run_64","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"local_machine_run_once_64","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"local_machine_run_32","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"local_machine_run_once_32","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"user_startup","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"common_startup","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"service_start_configuration","status":"complete","entries_seen":1,"diagnostics":[]},
+                {"id":"scheduled_task_triggers","status":"complete","entries_seen":0,"diagnostics":[]},
+                {"id":"wmi_permanent_event_subscriptions","status":"complete","entries_seen":0,"location_path":"ROOT\\subscription","diagnostics":[]}
+            ],
+            "registry_entries":[],"folder_entries":[],"service_entries":[service],
+            "scheduled_task_entries":[],"scheduled_task_actions":[],
+            "wmi_event_filters":[],"wmi_event_consumers":[],"wmi_filter_consumer_bindings":[]
+        })).unwrap()
+    }
+
+    fn windows_startup_session(
+        bytes: &[u8],
+        id: &str,
+        envelope_version: u32,
+        artifact_version: u32,
+    ) -> AuditSessionManifest {
+        let source = AuditSessionSource {
+            role: SourceRole::Startup,
+            collector: Some(crate::audit_session::collector_identity(
+                "windows",
+                SourceRole::Startup,
+            )),
+            platform: "windows".into(),
+            scope: "selected Windows startup sources".into(),
+            started_at_unix_ms: 1000,
+            ended_at_unix_ms: 1001,
+            status: SourceStatus::Complete,
+            applied_limits: vec![],
+            requested_settings: vec![],
+            effective_settings: vec![],
+            loss: None,
+            diagnostic_codes: vec![],
+            artifacts: vec![SessionArtifactRef {
+                kind: ArtifactKind::WindowsStartup,
+                path: "startup.windows.json".into(),
+                schema: "sideeffect.windows_startup_inventory".into(),
+                schema_version: artifact_version,
+                byte_length: bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+            }],
+        };
+        let host_context = Some(crate::audit_session::HostContext {
+            os_name: crate::audit_session::ContextFact {
+                status: crate::audit_session::ContextFactStatus::Observed,
+                value: Some("Windows".into()),
+            },
+            os_version: crate::audit_session::ContextFact {
+                status: crate::audit_session::ContextFactStatus::Observed,
+                value: Some("10.0".into()),
+            },
+            privilege: crate::audit_session::PrivilegeContext::Unknown,
+        });
+        let coverage_manifest = Some(crate::audit_session::CoverageManifest::from_sources(
+            std::slice::from_ref(&source),
+        ));
+        AuditSessionManifest {
+            schema: "sideeffect.audit_session".into(),
+            schema_version: envelope_version,
+            session_id: id.into(),
+            platform: "windows".into(),
+            architecture: "x86_64".into(),
+            started_at_unix_ms: 1000,
+            ended_at_unix_ms: 1002,
+            interval_semantics: crate::audit_session::IntervalSemantics::BestEffortNonAtomic,
+            status: SessionStatus::Complete,
+            sources: vec![source],
+            host_context,
+            coverage_manifest,
+        }
+    }
+
+    #[test]
+    fn session_comparison_accepts_windows_startup_v7_and_keeps_v6_v7_incomparable() {
+        let v6 = windows_startup(6);
+        let v7 = windows_startup(7);
+        crate::inventory::compare_startup_inventory_json(&v6, &v7).unwrap();
+        let before_v6 = windows_startup_session(
+            &v6,
+            "0123456789abcdef0123456789abcdef",
+            crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION,
+            6,
+        );
+        let after_v7 = windows_startup_session(
+            &v7,
+            "fedcba9876543210fedcba9876543210",
+            crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION,
+            7,
+        );
+        let result = compare_audit_sessions(
+            &before_v6,
+            &after_v7,
+            &[VerifiedArtifactBytes {
+                kind: ArtifactKind::WindowsStartup,
+                path: "startup.windows.json",
+                bytes: &v6,
+            }],
+            &[VerifiedArtifactBytes {
+                kind: ArtifactKind::WindowsStartup,
+                path: "startup.windows.json",
+                bytes: &v7,
+            }],
+        );
+        assert!(!result.comparable);
+        assert!(result.reason_codes.contains(&"artifact_contract_mismatch"));
+        assert_eq!(
+            result.source_diffs[0].status, "partial",
+            "reason: {:?}",
+            result.source_diffs[0].reason_code
+        );
+        assert_eq!(
+            result.source_diffs[0].comparison.as_ref().unwrap()["counts"]["changed"],
+            0
+        );
+
+        let before_v7 = windows_startup_session(
+            &v7,
+            "0123456789abcdef0123456789abcdef",
+            crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION,
+            7,
+        );
+        let after_v7 = windows_startup_session(
+            &v7,
+            "fedcba9876543210fedcba9876543210",
+            crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION,
+            7,
+        );
+        let result = compare_audit_sessions(
+            &before_v7,
+            &after_v7,
+            &[VerifiedArtifactBytes {
+                kind: ArtifactKind::WindowsStartup,
+                path: "startup.windows.json",
+                bytes: &v7,
+            }],
+            &[VerifiedArtifactBytes {
+                kind: ArtifactKind::WindowsStartup,
+                path: "startup.windows.json",
+                bytes: &v7,
+            }],
+        );
+        assert!(result.comparable, "{:?}", result.reason_codes);
+        assert_eq!(result.source_diffs[0].status, "compared");
+    }
+
+    #[test]
+    fn session_item_diff_keeps_mixed_legacy_and_stateful_startup_artifacts_comparable_as_items() {
+        let before_bytes = linux_startup(2, 1);
+        let after_bytes = linux_startup(3, 2);
+        let spec = |version| SessionSpec {
+            role: SourceRole::Startup,
+            kind: ArtifactKind::Startup,
+            platform: "linux",
+            schema: "sideeffect.startup_inventory",
+            schema_version: version,
+            scope: "curated_xdg_systemd_sysv_cron_sources",
+        };
+        let (before, _) = session_for(
+            &before_bytes,
+            "0123456789abcdef0123456789abcdef",
+            spec(2),
+            SourceStatus::Complete,
+        );
+        let (after, _) = session_for(
+            &after_bytes,
+            "fedcba9876543210fedcba9876543210",
+            spec(3),
+            SourceStatus::Complete,
+        );
+        let result = compare_audit_sessions(
+            &before,
+            &after,
+            &[VerifiedArtifactBytes {
+                kind: ArtifactKind::Startup,
+                path: "startup.json",
+                bytes: &before_bytes,
+            }],
+            &[VerifiedArtifactBytes {
+                kind: ArtifactKind::Startup,
+                path: "startup.json",
+                bytes: &after_bytes,
+            }],
+        );
+        assert_eq!(result.source_diffs[0].status, "compared");
+        assert_eq!(
+            result.source_diffs[0].comparison.as_ref().unwrap()["counts"]["changed"],
+            0
+        );
+        assert!(
+            !result.comparable,
+            "metadata still requires matching artifact versions"
+        );
+    }
+
+    #[test]
+    fn selected_root_sessions_compare_verified_artifacts_and_keep_evidence_links() {
+        let before_bytes = root_snapshot("2f73656c6563746564", serde_json::json!([]));
+        let after_bytes = root_snapshot(
+            "2f73656c6563746564",
+            serde_json::json!([{
+                "ordinal": 0,
+                "display_name": "new.txt",
+                "name_bytes_hex": "6e65772e747874",
+                "object_type": "regular_file",
+                "size_bytes": 12,
+                "modified_at_unix_ms": 1001,
+                "device_or_volume_serial": 1,
+                "inode_or_file_index": 3,
+                "evidence": {"source":"selected_root_directory_entry","entry_ordinal":0}
+            }]),
+        );
+        let spec = SessionSpec {
+            role: SourceRole::SelectedRoot,
+            kind: ArtifactKind::SelectedRoot,
+            platform: "linux",
+            schema: "sideeffect.selected_root_inventory",
+            schema_version: 1,
+            scope: "one explicitly selected directory and direct-child metadata only",
+        };
+        let (before, before_digest) = session_for(
+            &before_bytes,
+            "0123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Complete,
+        );
+        let (after, after_digest) = session_for(
+            &after_bytes,
+            "1123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Complete,
+        );
+        let left = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &before_bytes,
+        }];
+        let right = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &after_bytes,
+        }];
+        let report = compare_audit_sessions(&before, &after, &left, &right);
+        let source = &report.source_diffs[0];
+        assert_eq!(source.role, SourceRole::SelectedRoot);
+        assert_eq!(source.status, "compared");
+        assert_eq!(source.before_artifacts[0].sha256, before_digest);
+        assert_eq!(source.after_artifacts[0].sha256, after_digest);
+        assert_eq!(
+            source.comparison.as_ref().unwrap()["counts"]["additions"],
+            1
+        );
+        assert_eq!(
+            source.comparison.as_ref().unwrap()["deltas"][0]["after"]["entry_ordinal"],
+            0
+        );
+
+        let (partial, _) = session_for(
+            &after_bytes,
+            "2123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Partial,
+        );
+        let partial_report = compare_audit_sessions(&before, &partial, &left, &right);
+        let partial_source = &partial_report.source_diffs[0];
+        assert_eq!(partial_source.status, "partial");
+        assert_eq!(
+            partial_source.comparison.as_ref().unwrap()["counts"]["additions"],
+            0
+        );
+        assert_eq!(
+            partial_source.comparison.as_ref().unwrap()["counts"]["unmatched_rows_suppressed"],
+            1
+        );
+
+        let other_root = root_snapshot("2f6f74686572", serde_json::json!([]));
+        let (different, _) = session_for(
+            &other_root,
+            "3123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Complete,
+        );
+        let other = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &other_root,
+        }];
+        let mismatch = compare_audit_sessions(&before, &different, &left, &other);
+        assert_eq!(mismatch.source_diffs[0].status, "incomparable");
+        assert_eq!(
+            mismatch.source_diffs[0].reason_code,
+            Some("selected_root_mismatch")
+        );
+        assert!(mismatch.source_diffs[0].comparison.is_none());
+    }
+
+    #[test]
+    fn windows_selected_root_sessions_compare_synthetic_utf16_evidence_and_suppress_partial_rows() {
+        fn windows_snapshot(root_hex: &str, entries: serde_json::Value) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "schema":"sideeffect.selected_root_inventory",
+                "schema_version":1,
+                "platform":"windows",
+                "scope":"one_explicit_root_and_its_direct_children_metadata_only",
+                "captured_started_at_unix_ms":1000,
+                "captured_ended_at_unix_ms":1001,
+                "status":"complete",
+                "root":{
+                    "display_path":"C:\\selected",
+                    "path_utf16le_hex":root_hex,
+                    "object_type":"directory",
+                    "device_or_volume_serial":7,
+                    "inode_or_file_index":9
+                },
+                "entries":entries,
+                "diagnostics":[],
+                "limits":{
+                    "max_root_path_bytes_or_utf16_units":32766,
+                    "max_entries":10000,
+                    "max_name_bytes_or_utf16_units":32767,
+                    "max_aggregate_name_bytes":8388608,
+                    "deadline_seconds":5
+                }
+            }))
+            .unwrap()
+        }
+        let before_bytes = windows_snapshot(
+            "43003a005c00730065006c0065006300740065006400",
+            serde_json::json!([]),
+        );
+        let after_bytes = windows_snapshot(
+            "43003a005c00730065006c0065006300740065006400",
+            serde_json::json!([{
+                "ordinal":0,
+                "display_name":"new.txt",
+                "name_utf16le_hex":"6e00650077002e00740078007400",
+                "object_type":"regular_or_other_file",
+                "size_bytes":12,
+                "modified_at_unix_ms":1001,
+                "device_or_volume_serial":7,
+                "inode_or_file_index":10,
+                "evidence":{"source":"selected_root_directory_entry","entry_ordinal":0}
+            }]),
+        );
+        let spec = SessionSpec {
+            role: SourceRole::SelectedRoot,
+            kind: ArtifactKind::SelectedRoot,
+            platform: "windows",
+            schema: "sideeffect.selected_root_inventory",
+            schema_version: 1,
+            scope: "one explicitly selected directory and direct-child metadata only",
+        };
+        let (before, _) = session_for(
+            &before_bytes,
+            "0123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Complete,
+        );
+        let (after, _) = session_for(
+            &after_bytes,
+            "1123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Complete,
+        );
+        let left = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &before_bytes,
+        }];
+        let right = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &after_bytes,
+        }];
+        let report = compare_audit_sessions(&before, &after, &left, &right);
+        assert_eq!(report.source_diffs[0].status, "compared");
+        assert_eq!(
+            report.source_diffs[0].comparison.as_ref().unwrap()["counts"]["additions"],
+            1
+        );
+        assert_eq!(
+            report.source_diffs[0].comparison.as_ref().unwrap()["deltas"][0]["after"]["entry_ordinal"],
+            0
+        );
+
+        let windows_hashed_snapshot = |digest: &str| {
+            let mut value: serde_json::Value = serde_json::from_slice(&windows_snapshot(
+                "43003a005c00730065006c0065006300740065006400",
+                serde_json::json!([{
+                    "ordinal":0,
+                    "display_name":"same.txt",
+                    "name_utf16le_hex":"730061006d0065002e00740078007400",
+                    "object_type":"regular_or_other_file",
+                    "size_bytes":6,
+                    "modified_at_unix_ms":1001,
+                    "device_or_volume_serial":7,
+                    "inode_or_file_index":10,
+                    "evidence":{"source":"selected_root_directory_entry","entry_ordinal":0}
+                }]),
+            ))
+            .unwrap();
+            value["schema_version"] = serde_json::json!(2);
+            value["scope"] = serde_json::json!(
+                "one_explicit_root_and_its_direct_children_metadata_and_opt_in_sha256"
+            );
+            value["content_hashing"] = serde_json::json!({
+                "requested":true,
+                "algorithm":"sha256",
+                "max_file_bytes":16777216,
+                "max_aggregate_bytes":67108864,
+                "deadline_seconds":5
+            });
+            value["entries"][0]["content_sha256"] = serde_json::json!(digest);
+            value["entries"][0]["content_hash_status"] = serde_json::json!("observed");
+            serde_json::to_vec(&value).unwrap()
+        };
+        let content_before = windows_hashed_snapshot(&"a".repeat(64));
+        let content_after = windows_hashed_snapshot(&"b".repeat(64));
+        let hashed_spec = SessionSpec {
+            schema_version: 2,
+            ..spec
+        };
+        let (hash_before_manifest, _) = session_for(
+            &content_before,
+            "4123456789abcdef0123456789abcdef",
+            hashed_spec,
+            SourceStatus::Complete,
+        );
+        let (hash_after_manifest, _) = session_for(
+            &content_after,
+            "5123456789abcdef0123456789abcdef",
+            hashed_spec,
+            SourceStatus::Complete,
+        );
+        let hash_before_artifact = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &content_before,
+        }];
+        let hash_after_artifact = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &content_after,
+        }];
+        let content_report = compare_audit_sessions(
+            &hash_before_manifest,
+            &hash_after_manifest,
+            &hash_before_artifact,
+            &hash_after_artifact,
+        );
+        assert!(
+            content_report.source_diffs[0].comparison.is_some(),
+            "status={} reason={:?}",
+            content_report.source_diffs[0].status,
+            content_report.source_diffs[0].reason_code
+        );
+        let changed = &content_report.source_diffs[0].comparison.as_ref().unwrap()["deltas"][0];
+        assert!(
+            changed["changed_fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "content_sha256")
+        );
+        assert_eq!(changed["before"]["entry_ordinal"], 0);
+        assert_eq!(
+            changed["after"]["evidence_source"],
+            "selected_root_directory_entry"
+        );
+
+        let metadata_only_bytes = windows_snapshot(
+            "43003a005c00730065006c0065006300740065006400",
+            serde_json::json!([{
+                "ordinal":0,
+                "display_name":"same.txt",
+                "name_utf16le_hex":"730061006d0065002e00740078007400",
+                "object_type":"regular_or_other_file",
+                "size_bytes":6,
+                "modified_at_unix_ms":1001,
+                "device_or_volume_serial":7,
+                "inode_or_file_index":10,
+                "evidence":{"source":"selected_root_directory_entry","entry_ordinal":0}
+            }]),
+        );
+        let (metadata_manifest, _) = session_for(
+            &metadata_only_bytes,
+            "6123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Complete,
+        );
+        let metadata_artifact = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &metadata_only_bytes,
+        }];
+        let metadata_hash_comparison = compare_audit_sessions(
+            &metadata_manifest,
+            &hash_after_manifest,
+            &metadata_artifact,
+            &hash_after_artifact,
+        );
+        assert_eq!(metadata_hash_comparison.source_diffs[0].status, "partial");
+        assert_eq!(
+            metadata_hash_comparison.source_diffs[0]
+                .comparison
+                .as_ref()
+                .unwrap()["deltas"][0]["unknown_fields"][0],
+            "content_sha256"
+        );
+
+        let mut unavailable_value: serde_json::Value =
+            serde_json::from_slice(&content_after).unwrap();
+        unavailable_value["status"] = serde_json::json!("partial");
+        unavailable_value["entries"][0]["content_sha256"] = serde_json::Value::Null;
+        unavailable_value["entries"][0]["content_hash_status"] = serde_json::json!("unavailable");
+        let unavailable_bytes = serde_json::to_vec(&unavailable_value).unwrap();
+        let (unavailable_manifest, _) = session_for(
+            &unavailable_bytes,
+            "7123456789abcdef0123456789abcdef",
+            hashed_spec,
+            SourceStatus::Partial,
+        );
+        let unavailable_artifact = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &unavailable_bytes,
+        }];
+        let unavailable_comparison = compare_audit_sessions(
+            &hash_before_manifest,
+            &unavailable_manifest,
+            &hash_before_artifact,
+            &unavailable_artifact,
+        );
+        assert_eq!(unavailable_comparison.source_diffs[0].status, "partial");
+        assert_eq!(
+            unavailable_comparison.source_diffs[0]
+                .comparison
+                .as_ref()
+                .unwrap()["deltas"][0]["unknown_fields"][0],
+            "content_sha256"
+        );
+
+        let (partial, _) = session_for(
+            &after_bytes,
+            "2123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Partial,
+        );
+        let report = compare_audit_sessions(&before, &partial, &left, &right);
+        let comparison = report.source_diffs[0].comparison.as_ref().unwrap();
+        assert_eq!(report.source_diffs[0].status, "partial");
+        assert_eq!(comparison["counts"]["additions"], 0);
+        assert_eq!(comparison["counts"]["unmatched_rows_suppressed"], 1);
+
+        let other_bytes = windows_snapshot(
+            "44003a005c00730065006c0065006300740065006400",
+            serde_json::json!([]),
+        );
+        let (other, _) = session_for(
+            &other_bytes,
+            "3123456789abcdef0123456789abcdef",
+            spec,
+            SourceStatus::Complete,
+        );
+        let other_artifact = [VerifiedArtifactBytes {
+            kind: ArtifactKind::SelectedRoot,
+            path: "root-snapshot.json",
+            bytes: &other_bytes,
+        }];
+        let report = compare_audit_sessions(&before, &other, &left, &other_artifact);
+        assert_eq!(
+            report.source_diffs[0].reason_code,
+            Some("selected_root_mismatch")
+        );
+        assert!(report.source_diffs[0].comparison.is_none());
+    }
+
+    #[test]
+    fn emits_item_deltas_linked_to_both_verified_artifact_digests() {
+        let before_bytes = inventory("demo", "1", "complete", "complete");
+        let after_bytes = inventory("demo", "2", "complete", "complete");
+        let (before, before_digest) = session(
+            &before_bytes,
+            "0123456789abcdef0123456789abcdef",
+            SourceStatus::Complete,
+        );
+        let (after, after_digest) = session(
+            &after_bytes,
+            "1123456789abcdef0123456789abcdef",
+            SourceStatus::Complete,
+        );
+        let left = [VerifiedArtifactBytes {
+            kind: ArtifactKind::Packages,
+            path: "packages.json",
+            bytes: &before_bytes,
+        }];
+        let right = [VerifiedArtifactBytes {
+            kind: ArtifactKind::Packages,
+            path: "packages.json",
+            bytes: &after_bytes,
+        }];
+        let report = compare_audit_sessions(&before, &after, &left, &right);
+        assert_eq!(report.schema, "sideeffect.audit_session_diff");
+        assert_eq!(report.source_diffs[0].status, "compared");
+        assert_eq!(
+            report.source_diffs[0].before_artifacts[0].sha256,
+            before_digest
+        );
+        assert_eq!(
+            report.source_diffs[0].after_artifacts[0].sha256,
+            after_digest
+        );
+        assert_eq!(
+            report.source_diffs[0].before_artifacts[0].path,
+            "packages.json"
+        );
+        assert_eq!(
+            report.source_diffs[0].comparison.as_ref().unwrap()["counts"]["changes"],
+            1
+        );
+        assert_eq!(
+            report.source_diffs[0].comparison.as_ref().unwrap()["deltas"][0]["before"]["evidence"]
+                ["line"],
+            1
+        );
+    }
+
+    #[test]
+    fn partial_and_ambiguous_native_rows_remain_partial_without_presence_claims() {
+        let before_bytes = inventory("demo", "1", "partial", "partial");
+        let after_bytes = inventory("demo", "2", "partial", "partial");
+        let (before, _) = session(
+            &before_bytes,
+            "0123456789abcdef0123456789abcdef",
+            SourceStatus::Partial,
+        );
+        let (after, _) = session(
+            &after_bytes,
+            "1123456789abcdef0123456789abcdef",
+            SourceStatus::Partial,
+        );
+        let left = [VerifiedArtifactBytes {
+            kind: ArtifactKind::Packages,
+            path: "packages.json",
+            bytes: &before_bytes,
+        }];
+        let right = [VerifiedArtifactBytes {
+            kind: ArtifactKind::Packages,
+            path: "packages.json",
+            bytes: &after_bytes,
+        }];
+        let report = compare_audit_sessions(&before, &after, &left, &right);
+        assert_eq!(report.source_diffs[0].status, "partial");
+        let comparison = report.source_diffs[0].comparison.as_ref().unwrap();
+        assert_eq!(comparison["counts"]["changes"], 1);
+        assert_eq!(comparison["counts"]["additions"], 0);
+        assert_eq!(comparison["counts"]["removals"], 0);
+    }
+
+    #[test]
+    fn session_partial_status_suppresses_presence_deltas_from_complete_package_documents() {
+        let with_unmatched = |version: &str, unmatched_name: &str| {
+            let mut document: serde_json::Value =
+                serde_json::from_slice(&inventory("demo", version, "complete", "complete"))
+                    .unwrap();
+            let mut unmatched = document["packages"][0].clone();
+            unmatched["name"] = serde_json::Value::String(unmatched_name.into());
+            document["packages"] = serde_json::json!([document["packages"][0].clone(), unmatched]);
+            document["sources"][0]["records_seen"] = serde_json::json!(2);
+            serde_json::to_vec(&document).unwrap()
+        };
+        let before_bytes = with_unmatched("1", "old-package");
+        let after_bytes = with_unmatched("2", "new-package");
+        let (before, before_digest) = session(
+            &before_bytes,
+            "0123456789abcdef0123456789abcdef",
+            SourceStatus::Partial,
+        );
+        let (after, after_digest) = session(
+            &after_bytes,
+            "1123456789abcdef0123456789abcdef",
+            SourceStatus::Complete,
+        );
+        let left = [VerifiedArtifactBytes {
+            kind: ArtifactKind::Packages,
+            path: "packages.json",
+            bytes: &before_bytes,
+        }];
+        let right = [VerifiedArtifactBytes {
+            kind: ArtifactKind::Packages,
+            path: "packages.json",
+            bytes: &after_bytes,
+        }];
+
+        let report = compare_audit_sessions(&before, &after, &left, &right);
+        assert_eq!(report.item_comparison_status, "partial");
+        let source = &report.source_diffs[0];
+        assert_eq!(source.status, "partial");
+        assert_eq!(source.reason_code, Some("session_source_incomplete"));
+        let comparison = source.comparison.as_ref().unwrap();
+        assert_eq!(comparison["status"], "partial");
+        assert_eq!(comparison["counts"]["changes"], 1);
+        assert_eq!(comparison["counts"]["additions"], 0);
+        assert_eq!(comparison["counts"]["removals"], 0);
+        assert_eq!(
+            comparison["counts"]["unmatched_rows_with_incomplete_source"],
+            2
+        );
+        assert_eq!(comparison["deltas"].as_array().unwrap().len(), 1);
+        assert_eq!(comparison["deltas"][0]["kind"], "changed");
+        assert!(
+            comparison["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic == "source_incomplete")
+        );
+        assert_eq!(source.before_artifacts[0].sha256, before_digest);
+        assert_eq!(source.after_artifacts[0].sha256, after_digest);
+    }
+
+    #[test]
+    fn duplicate_package_identities_are_reported_ambiguous_without_deltas() {
+        let make_duplicates = |version: &str| {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&inventory("demo", version, "complete", "complete"))
+                    .unwrap();
+            let row = value["packages"][0].clone();
+            value["packages"] = serde_json::json!([row.clone(), row]);
+            value["sources"][0]["records_seen"] = serde_json::json!(2);
+            serde_json::to_vec(&value).unwrap()
+        };
+        let before_bytes = make_duplicates("1");
+        let after_bytes = make_duplicates("2");
+        let (before, _) = session(
+            &before_bytes,
+            "0123456789abcdef0123456789abcdef",
+            SourceStatus::Complete,
+        );
+        let (after, _) = session(
+            &after_bytes,
+            "1123456789abcdef0123456789abcdef",
+            SourceStatus::Complete,
+        );
+        let left = [VerifiedArtifactBytes {
+            kind: ArtifactKind::Packages,
+            path: "packages.json",
+            bytes: &before_bytes,
+        }];
+        let right = [VerifiedArtifactBytes {
+            kind: ArtifactKind::Packages,
+            path: "packages.json",
+            bytes: &after_bytes,
+        }];
+        let report = compare_audit_sessions(&before, &after, &left, &right);
+        assert_eq!(report.source_diffs[0].status, "partial");
+        let comparison = report.source_diffs[0].comparison.as_ref().unwrap();
+        assert!(
+            comparison["counts"]["ambiguous_identity_groups"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(comparison["deltas"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reports_missing_unsupported_and_invalid_artifacts_without_inventing_deltas() {
+        let bytes = inventory("demo", "1", "complete", "complete");
+        let (mut before, _) = session(
+            &bytes,
+            "0123456789abcdef0123456789abcdef",
+            SourceStatus::Complete,
+        );
+        let (after, _) = session(
+            &bytes,
+            "1123456789abcdef0123456789abcdef",
+            SourceStatus::Complete,
+        );
+        before.sources[0].artifacts.clear();
+        let left: [VerifiedArtifactBytes<'_>; 0] = [];
+        let right = [VerifiedArtifactBytes {
+            kind: ArtifactKind::Packages,
+            path: "packages.json",
+            bytes: &bytes,
+        }];
+        let missing = compare_audit_sessions(&before, &after, &left, &right);
+        assert_eq!(
+            missing.source_diffs[0].reason_code,
+            Some("artifact_missing_before")
+        );
+        assert!(missing.source_diffs[0].comparison.is_none());
+
+        let bad = b"{\"schema\":\"sideeffect.inventory\",\"schema_version\":2}";
+        let (before, _) = session(
+            bad,
+            "0123456789abcdef0123456789abcdef",
+            SourceStatus::Complete,
+        );
+        let (after, _) = session(
+            bad,
+            "1123456789abcdef0123456789abcdef",
+            SourceStatus::Complete,
+        );
+        let left = [VerifiedArtifactBytes {
+            kind: ArtifactKind::Packages,
+            path: "packages.json",
+            bytes: bad,
+        }];
+        let right = [VerifiedArtifactBytes {
+            kind: ArtifactKind::Packages,
+            path: "packages.json",
+            bytes: bad,
+        }];
+        let invalid = compare_audit_sessions(&before, &after, &left, &right);
+        assert_eq!(invalid.source_diffs[0].status, "incomparable");
+        assert_eq!(
+            invalid.source_diffs[0].reason_code,
+            Some("invalid_inventory_artifact")
+        );
+        assert!(invalid.source_diffs[0].comparison.is_none());
+
+        let (before, _) = session(
+            &bytes,
+            "0123456789abcdef0123456789abcdef",
+            SourceStatus::Complete,
+        );
+        let (after, _) = session(
+            &bytes,
+            "1123456789abcdef0123456789abcdef",
+            SourceStatus::Complete,
+        );
+        let mismatched = [VerifiedArtifactBytes {
+            kind: ArtifactKind::Packages,
+            path: "packages.json",
+            bytes: bad,
+        }];
+        let verified = [VerifiedArtifactBytes {
+            kind: ArtifactKind::Packages,
+            path: "packages.json",
+            bytes: &bytes,
+        }];
+        let report = compare_audit_sessions(&before, &after, &mismatched, &verified);
+        assert_eq!(
+            report.source_diffs[0].reason_code,
+            Some("verified_artifact_reference_mismatch")
+        );
+        assert!(report.source_diffs[0].comparison.is_none());
+
+        let mut same_length_tamper = bytes.clone();
+        let last = same_length_tamper.len() - 1;
+        same_length_tamper[last] ^= 1;
+        let same_length_mismatch = [VerifiedArtifactBytes {
+            kind: ArtifactKind::Packages,
+            path: "packages.json",
+            bytes: &same_length_tamper,
+        }];
+        let report = compare_audit_sessions(&before, &after, &same_length_mismatch, &verified);
+        assert_eq!(
+            report.source_diffs[0].reason_code,
+            Some("verified_artifact_reference_mismatch")
+        );
+        assert!(report.source_diffs[0].comparison.is_none());
+
+        let (mut before, _) = session(
+            &bytes,
+            "0123456789abcdef0123456789abcdef",
+            SourceStatus::Complete,
+        );
+        let (mut after, _) = session(
+            &bytes,
+            "1123456789abcdef0123456789abcdef",
+            SourceStatus::Complete,
+        );
+        before.sources[0].artifacts[0].byte_length = (32 * 1024 * 1024 + 1) as u64;
+        after.sources[0].artifacts[0].byte_length = (32 * 1024 * 1024 + 1) as u64;
+        let oversized = compare_audit_sessions(&before, &after, &verified, &verified);
+        assert_eq!(oversized.source_diffs[0].status, "not_compared");
+        assert_eq!(
+            oversized.source_diffs[0].reason_code,
+            Some("native_input_limit_exceeded")
+        );
+        assert!(oversized.source_diffs[0].comparison.is_none());
+    }
+
+    #[test]
+    fn dispatches_permission_artifacts_through_the_existing_comparator() {
+        fn permission(mode: u64) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "schema":"sideeffect.permission_inventory", "schema_version":1,
+                "platform":"linux", "scope":"explicit_paths_metadata_posix_acl_file_capability",
+                "captured_at_unix_ms":100, "status":"complete", "paths_requested":1,
+                "acl_bytes_read":0, "capability_bytes_read":0,
+                "objects":[{
+                    "path":"/tmp/fixture", "path_bytes_hex":"2f746d702f66697874757265",
+                    "status":"complete", "object_type":"regular_file", "uid":1000,
+                    "gid":1000, "mode":mode, "device":1, "inode":2,
+                    "access_acl":{"status":"absent","source":"fgetxattr/system.posix_acl_access"},
+                    "default_acl":{"status":"not_applicable","source":"fgetxattr/system.posix_acl_default"},
+                    "file_capability":{"status":"absent","source":"fgetxattr/security.capability"},
+                    "diagnostics":[]
+                }], "diagnostics":[]
+            })).unwrap()
+        }
+        let before_bytes = permission(0o644);
+        let after_bytes = permission(0o600);
+        let (before, _) = session_for(
+            &before_bytes,
+            "0123456789abcdef0123456789abcdef",
+            SessionSpec {
+                role: SourceRole::Permissions,
+                kind: ArtifactKind::Permissions,
+                platform: "linux",
+                schema: "sideeffect.permission_inventory",
+                schema_version: 1,
+                scope: "selected explicit paths",
+            },
+            SourceStatus::Complete,
+        );
+        let (after, _) = session_for(
+            &after_bytes,
+            "1123456789abcdef0123456789abcdef",
+            SessionSpec {
+                role: SourceRole::Permissions,
+                kind: ArtifactKind::Permissions,
+                platform: "linux",
+                schema: "sideeffect.permission_inventory",
+                schema_version: 1,
+                scope: "selected explicit paths",
+            },
+            SourceStatus::Complete,
+        );
+        let left = [VerifiedArtifactBytes {
+            kind: ArtifactKind::Permissions,
+            path: "permissions.json",
+            bytes: &before_bytes,
+        }];
+        let right = [VerifiedArtifactBytes {
+            kind: ArtifactKind::Permissions,
+            path: "permissions.json",
+            bytes: &after_bytes,
+        }];
+        let report = compare_audit_sessions(&before, &after, &left, &right);
+        assert_eq!(report.source_diffs[0].status, "compared");
+        assert_eq!(
+            report.source_diffs[0].comparison.as_ref().unwrap()["counts"]["changes"],
+            1
+        );
+        assert_eq!(
+            report.source_diffs[0].before_artifacts[0].path,
+            "permissions.json"
+        );
+    }
+
+    #[test]
+    fn path_executable_session_diff_suppresses_unmatched_candidates_for_partial_sources() {
+        fn path_doc(candidate_status: &str, unmatched_name: &str) -> Vec<u8> {
+            fn hex(bytes: &[u8]) -> String {
+                use std::fmt::Write as _;
+
+                let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+                for byte in bytes {
+                    write!(&mut output, "{byte:02x}")
+                        .expect("writing formatted bytes to String cannot fail");
+                }
+                output
+            }
+            let exact = |display: &str, bytes: &str| {
+                serde_json::json!({
+                    "display": display,
+                    "exact": true,
+                    "raw_bytes_hex": bytes
+                })
+            };
+            let directory_path = exact("/tools", "2f746f6f6c73");
+            serde_json::to_vec(&serde_json::json!({
+                "schema":"sideeffect.path_executable_inventory",
+                "schema_version":1,
+                "platform":"linux",
+                "path_source":"current_process_environment_PATH",
+                "candidate_extensions":[],
+                "candidate_extensions_status":"not_applicable",
+                "status":"complete",
+                "components":[{
+                    "ordinal":0,
+                    "path":directory_path,
+                    "empty_component_mapped_to_cwd":false,
+                    "directory_ordinal":0
+                }],
+                "directories":[{
+                    "ordinal":0,
+                    "component_ordinal":0,
+                    "path":exact("/tools", "2f746f6f6c73"),
+                    "status":"complete",
+                    "entries":[
+                        {
+                            "ordinal":0,
+                            "name":exact("tool", "746f6f6c"),
+                            "status":candidate_status,
+                            "metadata_status":"observed",
+                            "candidate_rule":if candidate_status == "candidate" { Some("regular_file_with_execute_bit") } else { None },
+                            "evidence":{"directory_ordinal":0,"entry_ordinal":0}
+                        },
+                        {
+                            "ordinal":1,
+                            "name":exact(unmatched_name, &hex(unmatched_name.as_bytes())),
+                            "status":"candidate",
+                            "metadata_status":"observed",
+                            "candidate_rule":"regular_file_with_execute_bit",
+                            "evidence":{"directory_ordinal":0,"entry_ordinal":1}
+                        }
+                    ]
+                }],
+                "diagnostics":[],
+                "limits":{
+                    "max_components":256,
+                    "max_component_path_bytes_or_units":4096,
+                    "max_entries":20000,
+                    "max_aggregate_path_and_name_bytes_or_units":16777216,
+                    "max_pathext_utf16_units":32767,
+                    "max_pathext_extensions":256,
+                    "deadline_seconds":5
+                }
+            })).unwrap()
+        }
+
+        let before_bytes = path_doc("candidate", "old");
+        let after_bytes = path_doc("not_candidate", "new");
+        let (before, _) = session_for(
+            &before_bytes,
+            "0123456789abcdef0123456789abcdef",
+            SessionSpec {
+                role: SourceRole::PathExecutables,
+                kind: ArtifactKind::PathExecutables,
+                platform: "linux",
+                schema: "sideeffect.path_executable_inventory",
+                schema_version: 1,
+                scope: "current process PATH metadata",
+            },
+            SourceStatus::Partial,
+        );
+        let (after, _) = session_for(
+            &after_bytes,
+            "1123456789abcdef0123456789abcdef",
+            SessionSpec {
+                role: SourceRole::PathExecutables,
+                kind: ArtifactKind::PathExecutables,
+                platform: "linux",
+                schema: "sideeffect.path_executable_inventory",
+                schema_version: 1,
+                scope: "current process PATH metadata",
+            },
+            SourceStatus::Partial,
+        );
+        let left = [VerifiedArtifactBytes {
+            kind: ArtifactKind::PathExecutables,
+            path: "path-executables.json",
+            bytes: &before_bytes,
+        }];
+        let right = [VerifiedArtifactBytes {
+            kind: ArtifactKind::PathExecutables,
+            path: "path-executables.json",
+            bytes: &after_bytes,
+        }];
+        let report = compare_audit_sessions(&before, &after, &left, &right);
+        let source = &report.source_diffs[0];
+        assert_eq!(source.role, SourceRole::PathExecutables);
+        assert_eq!(source.status, "partial");
+        let comparison = source.comparison.as_ref().unwrap();
+        assert_eq!(comparison["counts"]["candidates_added"], 0);
+        assert_eq!(comparison["counts"]["candidates_removed"], 0);
+        assert_eq!(
+            comparison["counts"]["unmatched_candidates_suppressed_for_incomplete_or_changed_context"],
+            2
+        );
+        assert_eq!(comparison["counts"]["candidate_status_changes"], 1);
+        assert_eq!(comparison["deltas"][0]["kind"], "candidate_status_changed");
+        assert_eq!(
+            source.before_artifacts[0].sha256,
+            format!("{:x}", Sha256::digest(&before_bytes))
+        );
+        assert_eq!(
+            source.after_artifacts[0].sha256,
+            format!("{:x}", Sha256::digest(&after_bytes))
+        );
+    }
+}

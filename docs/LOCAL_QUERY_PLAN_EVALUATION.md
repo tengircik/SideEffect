@@ -1,6 +1,53 @@
 # Local query-plan evaluation
 
-**Status: experimental and not release-approved.** This is a separately gated M8 experiment. No model candidate has passed the frozen v2 usefulness gate. This is not a claim that local model analysis is useful or accurate on real captures. The model-query command is currently implemented only for Linux x86_64; GPU model experiments below were run separately on Windows and do not establish native Windows product support.
+**Status: experimental and not release-approved.** This is a separately gated M8 experiment. No model candidate has passed a valid usefulness gate. A 2026-11-06 question-to-oracle audit found that the historical v2 corpus is not valid for model approval. A public v3 development corpus has since been added, but it has not received independent human label review and is not a hidden holdout or release evidence. No v3 model run has been made. This is not a claim that local model analysis is useful or accurate on real captures. The model-query command is currently implemented only for Linux x86_64; GPU model experiments below were run separately on Windows and do not establish native Windows product support.
+
+`sideeffect model doctor --task query` checks the pinned runtime's exact `0.7.0-dev (build 11938, commit 19cce6919)` version string in a bounded `--version` invocation. The schema-v2 readiness report does not load weights, run inference, or assess query-plan quality. Runtime and query support remain Linux x86_64-only; device status is `not_applicable`. See [the task-wide runtime readiness guide](LOCAL_MODEL_DOCTOR.md).
+
+## Frozen v2 question-to-oracle audit (2026-11-06)
+
+A read-only audit compared the expected selectors for all 70 answerable cases with what the model actually receives: the question plus the fixed scope/schema in `src/local_query_plan.rs`. Queryable trace facts are kept in the local preview and are not included in the model prompt. The review found **30/70 fully inferable expected plans, 36/70 partly inferable plans, and 4/70 plans with selectors not inferable from the question**. The 30 must-abstain cases have no expected selectors and remain abstention cases.
+
+Examples of missing expected values include `lookup_01` (the question does not distinguish `openat2` from other supported calls), `lookup_11` (it does not distinguish `execveat` from `execve`), `lookup_21` (it names an index lock but not the expected exact path), and `lookup_41` (it names a session record but not its expected full path). Some partially inferable cases require an unstated exact path, syscall variant, or errno where a directly supported outcome is sufficient. This means a model that follows the prompt's instruction not to infer missing values can be marked wrong for failing to reproduce a trace-specific selector it never received.
+
+The 20 source-order rows represent only five query intents (four variants per intent), or 28.6% of the answerable set. The 50 lookup rows reuse ten task patterns across five fixture scenarios, so the aggregate weights those intents repeatedly rather than sampling 70 independent language intents. The registered permutation gate also counts each repeated intent four times.
+
+This was a single internal AI-assisted read-only review, not an independent human or third-party qualification review. Keep the existing corpus SHA, thresholds, and historical result reports unchanged, but treat their scores as diagnostics only; they cannot approve a model. Before another qualification run, create a versioned replacement corpus whose expected selectors are entailed by the question or a documented question-only synonym map, separately review question/label consistency, and score permutation variants at the intent-group level. Preserve a genuinely hidden external holdout for the final frozen candidate. Do not tune against this public v2 corpus or silently edit its labels.
+
+## Public v3 development corpus (2026-11-06)
+
+The new [`local_query_plan_v3_development` corpus](../tests/fixtures/local_query_plan_v3_development/README.md) replaces the old corpus only for public development work. It contains 120 synthetic cases (80 answerable and 40 must-abstain), 65 answerable intent groups, five four-variant source-order groups, five explicit zero-match conjunctions, and 25 digest-pinned trace fixtures. Expected non-null filter values use exact field/value literals in the question; a strict local validator checks the schema, question grounding, fixture evidence, count and byte bounds, and group invariants. All abstention cases use one digest-pinned synthetic `evaluation_fixture` while retaining null oracle fixture/target/match labels.
+
+This corpus is public and its labels are not independently human-reviewed. Its Python fixture parser is a bounded development validator, not SideEffect's product parser. The v2 evaluator remains coupled to v2's schema, candidate pins, and thresholds. A separate [`evaluate_local_query_plan_v3.py`](../scripts/evaluate_local_query_plan_v3.py) stages digest-verified fixtures and calls the actual SideEffect preview and analysis CLI. Its nine tests, including mocked-boundary, metric, and provenance tests, pass. A preview-only run against a built Linux CLI under WSL Ubuntu validated all 120 cases; it used a synthetic GGUF-header placeholder, no inference, and no runtime. This is WSL development evidence, not native Linux acceptance or model-quality evidence. The evaluator hashes the product binary, supports missing Git revision metadata on non-Git mounts, requires caller-supplied model/runtime SHA-256 pins, isolates model registration in a temporary `XDG_DATA_HOME`, and supports preview-only validation without inference. The full path uses the existing pinned CPU query runtime; GPU query inference is not supported by the product command. The tool reports development diagnostics, keeps qualification `not_assessed`, and has no quality thresholds. Before treating any score as evidence, independently review and freeze question/label consistency and preregister intent-group scoring, privacy/resource limits, and candidate-specific thresholds. Any emitted filter on a must-abstain question is a false filter, even when it returns zero rows. A separate external holdout is still required for final qualification.
+
+An independent AI-assisted peer audit found no answerable plan/fixture mismatches in the 80 answerable cases. It flagged one questionable insufficient-evidence label and several adversarial abstain-reason labels; the public generator, validator, and cases were updated and rerun. This peer audit is not human review, does not independently validate all semantic judgments, and does not qualify the corpus. All answerable questions include explicit bracketed `[field=value]` selectors, so the set mainly checks exact field/value extraction and plan serialization. It does not measure broad natural-language understanding, and the five source-order groups remain only five distinct intents despite having 20 rows.
+
+## Optional external holdout directory
+
+The evaluator can opt into a caller-supplied holdout directory instead of the repository's public development corpus. This mode accepts only the current strict query-plan v2 corpus contract and requires an exact caller-supplied SHA-256 pin for `holdout-manifest.json`:
+
+```text
+holdout-directory/
+  holdout-manifest.json
+  corpus.json
+  <each exact .trace basename listed in both manifest and corpus>
+```
+
+The manifest schema is `sideeffect.local_query_plan_external_holdout_manifest` v1 with exactly these fields: `schema`, `schema_version`, `corpus_path` (the literal `corpus.json`), `corpus_sha256`, and `fixtures` (a list of exact `{path, sha256}` objects). The folder may contain only that manifest, `corpus.json`, and the listed regular trace files. The evaluator rejects unlisted files, symlinks/junctions, path separators/traversal, duplicate JSON keys, unknown fields, oversized files, and manifest/corpus/trace digest mismatches. It stages verified fixtures into a private temporary directory before invoking SideEffect.
+
+Use it only after freezing the candidate and evaluation plan; do not expose holdout labels or per-case score feedback to prompt authors. Example full run:
+
+```sh
+python3 scripts/evaluate_local_query_plan.py \
+  --sideeffect ./target/release/sideeffect \
+  --model /path/to/pinned-model.gguf \
+  --runtime /path/to/pinned-llama-completion \
+  --external-holdout-directory /private/holdout-directory \
+  --holdout-manifest-sha256 EXPECTED_MANIFEST_SHA256 \
+  --report /private/holdout-score.json
+```
+
+The external mode emits aggregate score metrics only; it omits per-case oracle and model-output rows, case identifiers, questions, expected plans, and the per-trace filename/hash map. The manifest and hashes establish byte consistency against the caller's pin only. They do **not** verify semantic labels, corpus authorship, reviewer identity, reviewer independence, blinding, or qualification. Its report marks those review/qualification states unverified or not assessed. Repeated scoring and prompt/model tuning against the same holdout invalidate its use as a hidden holdout. This tool does not create or review a holdout; it evaluates only the caller-supplied directory and cannot establish that it was kept hidden. In this mode, exit code `0` means scoring completed and a report was produced; threshold outcomes are reported separately and do not affect that exit code or establish qualification.
 
 ## Select a query model
 

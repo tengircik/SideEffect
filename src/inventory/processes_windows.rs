@@ -105,7 +105,24 @@ pub struct WindowsProcessRow {
     pub creation_time: WindowsProcessCreationTime,
     pub image: WindowsProcessImage,
     pub token_context: WindowsProcessTokenContext,
+    /// Tool Help provides no process generation. The entry's PID-only fields
+    /// remain a candidate context even when live facts are read through one
+    /// process handle.
+    pub snapshot_binding_status: WindowsProcessSnapshotBindingStatus,
     pub evidence: WindowsProcessEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsProcessSnapshotBindingStatus {
+    CandidatePidOnly,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WindowsProcessIdentityDomain {
+    pub status: &'static str,
+    pub kind: &'static str,
+    pub reason: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -204,6 +221,9 @@ pub struct WindowsProcessInventoryDocument {
     pub capture_started_at_unix_ms: u128,
     pub capture_ended_at_unix_ms: u128,
     pub status: WindowsProcessInventoryStatus,
+    /// No reviewed machine/boot identifier is currently available. Do not
+    /// treat PID or FILETIME equality across captures as a presence claim.
+    pub identity_domain: WindowsProcessIdentityDomain,
     pub source: WindowsProcessInventorySource,
     pub processes: Vec<WindowsProcessRow>,
 }
@@ -236,9 +256,11 @@ trait WindowsProcessApi {
         &mut self,
         snapshot: &mut Self::Snapshot,
     ) -> Result<Option<ProcessEntry32W>, u32>;
+    fn begin_process(&mut self, process_id: u32) -> Result<(), u32>;
+    fn end_process(&mut self);
     fn read_image_path(
         &mut self,
-        process_id: u32,
+        _process_id: u32,
         aggregate_remaining: usize,
     ) -> WindowsProcessImage;
     fn read_creation_time(&mut self, process_id: u32) -> WindowsProcessCreationTime;
@@ -249,7 +271,9 @@ trait WindowsProcessApi {
     ) -> WindowsProcessTokenContext;
 }
 
-struct NativeWindowsProcessApi;
+struct NativeWindowsProcessApi {
+    process: Option<OwnedHandle>,
+}
 
 impl WindowsProcessApi for NativeWindowsProcessApi {
     type Snapshot = OwnedHandle;
@@ -299,31 +323,55 @@ impl WindowsProcessApi for NativeWindowsProcessApi {
         }
     }
 
-    fn read_image_path(
-        &mut self,
-        process_id: u32,
-        aggregate_remaining: usize,
-    ) -> WindowsProcessImage {
-        read_image_path_native(process_id, aggregate_remaining)
+    fn begin_process(&mut self, process_id: u32) -> Result<(), u32> {
+        self.process = None;
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+        if process.is_null() {
+            Err(unsafe { GetLastError() })
+        } else {
+            self.process = Some(OwnedHandle(process));
+            Ok(())
+        }
     }
 
-    fn read_creation_time(&mut self, process_id: u32) -> WindowsProcessCreationTime {
-        read_creation_time_native(process_id)
+    fn end_process(&mut self) {
+        self.process = None;
+    }
+
+    fn read_image_path(
+        &mut self,
+        _process_id: u32,
+        aggregate_remaining: usize,
+    ) -> WindowsProcessImage {
+        self.process.as_ref().map_or_else(
+            || empty_image(WindowsProcessImageStatus::Error),
+            |process| read_image_path_from_handle(process, aggregate_remaining),
+        )
+    }
+
+    fn read_creation_time(&mut self, _process_id: u32) -> WindowsProcessCreationTime {
+        self.process.as_ref().map_or_else(
+            || empty_creation_time(WindowsProcessCreationTimeStatus::Error),
+            read_creation_time_from_handle_value,
+        )
     }
 
     fn read_token_context(
         &mut self,
-        process_id: u32,
+        _process_id: u32,
         aggregate_sid_remaining: usize,
     ) -> WindowsProcessTokenContext {
-        read_token_context_native(process_id, aggregate_sid_remaining)
+        self.process.as_ref().map_or_else(
+            || token_context_for_process_error(WindowsProcessTokenFieldStatus::IdentityUnverified),
+            |process| read_token_context_from_handle(process, aggregate_sid_remaining),
+        )
     }
 }
 
 struct RawEntry(ProcessEntry32W);
 
 pub fn collect_windows_processes() -> WindowsProcessInventoryDocument {
-    collect_windows_processes_with_api(&mut NativeWindowsProcessApi)
+    collect_windows_processes_with_api(&mut NativeWindowsProcessApi { process: None })
 }
 
 fn collect_windows_processes_with_api<A: WindowsProcessApi>(
@@ -440,8 +488,11 @@ fn collect_windows_processes_with_api<A: WindowsProcessApi>(
                 "The executable name contained invalid UTF-16 and was displayed lossily.",
             ));
         }
+        let process_handle_error = api.begin_process(entry.process_id).err();
         let available = MAX_AGGREGATE_IMAGE_PATH_UTF16_UNITS.saturating_sub(image_total);
-        let image = if available == 0 {
+        let image = if let Some(error) = process_handle_error {
+            empty_image(image_status(error))
+        } else if available == 0 {
             truncated = true;
             WindowsProcessImage {
                 status: WindowsProcessImageStatus::OverLimit,
@@ -459,7 +510,10 @@ fn collect_windows_processes_with_api<A: WindowsProcessApi>(
             }
             image
         };
-        let creation_time = api.read_creation_time(entry.process_id);
+        let creation_time = process_handle_error.map_or_else(
+            || api.read_creation_time(entry.process_id),
+            |error| empty_creation_time(creation_time_status(error)),
+        );
         if creation_time.status != WindowsProcessCreationTimeStatus::Observed {
             truncated = true;
             diagnostics.push(creation_time_diagnostic(
@@ -468,7 +522,10 @@ fn collect_windows_processes_with_api<A: WindowsProcessApi>(
             ));
         }
         let sid_remaining = MAX_AGGREGATE_TOKEN_SID_UTF16_UNITS.saturating_sub(token_sid_total);
-        let mut token_context = api.read_token_context(entry.process_id, sid_remaining);
+        let mut token_context = process_handle_error.map_or_else(
+            || api.read_token_context(entry.process_id, sid_remaining),
+            |error| token_context_for_process_error(token_field_status(error)),
+        );
         if let Some(sid) = token_context.user_sid.value.as_ref() {
             token_sid_total = token_sid_total.saturating_add(sid.encode_utf16().count());
         }
@@ -491,6 +548,7 @@ fn collect_windows_processes_with_api<A: WindowsProcessApi>(
                 diagnostics.push(token_field_diagnostic(entry.process_id, field, status));
             }
         }
+        api.end_process();
         rows.push(WindowsProcessRow {
             process_id: entry.process_id,
             parent_process_id: entry.parent_process_id,
@@ -499,6 +557,7 @@ fn collect_windows_processes_with_api<A: WindowsProcessApi>(
             image,
             creation_time,
             token_context,
+            snapshot_binding_status: WindowsProcessSnapshotBindingStatus::CandidatePidOnly,
             evidence: WindowsProcessEvidence {
                 snapshot_source: "ToolHelp32Snapshot/PROCESSENTRY32W",
                 snapshot_index: index,
@@ -558,12 +617,10 @@ fn decode_executable_name(name: &[u16; 260]) -> (String, bool) {
     }
 }
 
-fn read_image_path_native(process_id: u32, aggregate_remaining: usize) -> WindowsProcessImage {
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
-    if handle.is_null() {
-        return empty_image(image_status(unsafe { GetLastError() }));
-    }
-    let handle = OwnedHandle(handle);
+fn read_image_path_from_handle(
+    handle: &OwnedHandle,
+    aggregate_remaining: usize,
+) -> WindowsProcessImage {
     let mut buffer = vec![0u16; MAX_IMAGE_PATH_UTF16_UNITS];
     let mut length = buffer.len() as u32;
     if unsafe { QueryFullProcessImageNameW(handle.0, 0, buffer.as_mut_ptr(), &mut length) } == 0 {
@@ -580,12 +637,7 @@ fn read_image_path_native(process_id: u32, aggregate_remaining: usize) -> Window
     decode_image_path(&buffer[..length])
 }
 
-fn read_creation_time_native(process_id: u32) -> WindowsProcessCreationTime {
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
-    if handle.is_null() {
-        return empty_creation_time(creation_time_status(unsafe { GetLastError() }));
-    }
-    let handle = OwnedHandle(handle);
+fn read_creation_time_from_handle_value(handle: &OwnedHandle) -> WindowsProcessCreationTime {
     let mut creation = FileTime { low: 0, high: 0 };
     let mut exit = FileTime { low: 0, high: 0 };
     let mut kernel = FileTime { low: 0, high: 0 };
@@ -721,17 +773,11 @@ impl Drop for LocalString {
     }
 }
 
-fn read_token_context_native(
-    process_id: u32,
+fn read_token_context_from_handle(
+    process: &OwnedHandle,
     aggregate_sid_remaining: usize,
 ) -> WindowsProcessTokenContext {
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
-    if process.is_null() {
-        let status = token_field_status(unsafe { GetLastError() });
-        return token_context_for_process_error(status);
-    }
-    let process = OwnedHandle(process);
-    let generation = read_creation_time_from_handle(&process);
+    let generation = read_creation_time_from_handle(process);
     let Some(generation) = generation else {
         return token_context_for_process_error(WindowsProcessTokenFieldStatus::IdentityUnverified);
     };
@@ -1150,12 +1196,17 @@ fn finish(
     };
     WindowsProcessInventoryDocument {
         schema: "sideeffect.windows_process_inventory",
-        schema_version: 3,
+        schema_version: 4,
         platform: "windows",
         scope: "toolhelp_process_snapshot_image_paths_and_token_context",
         capture_started_at_unix_ms: started_at,
         capture_ended_at_unix_ms: now_ms(),
         status,
+        identity_domain: WindowsProcessIdentityDomain {
+            status: "unknown",
+            kind: "windows_host_boot_epoch",
+            reason: "no reviewed native host boot identity source is recorded",
+        },
         source: WindowsProcessInventorySource {
             id: "toolhelp_process_snapshot",
             status,
@@ -1179,6 +1230,9 @@ mod tests {
         enumeration_error_at: Option<usize>,
         entries: Vec<ProcessEntry32W>,
         next_index: usize,
+        active_process: Option<u32>,
+        active_generation: Option<u64>,
+        process_open_count: usize,
         images: HashMap<u32, WindowsProcessImage>,
         creation_times: HashMap<u32, WindowsProcessCreationTime>,
         token_contexts: HashMap<u32, WindowsProcessTokenContext>,
@@ -1192,6 +1246,9 @@ mod tests {
                 enumeration_error_at: None,
                 entries,
                 next_index: 0,
+                active_process: None,
+                active_generation: None,
+                process_open_count: 0,
                 images: HashMap::new(),
                 creation_times: HashMap::new(),
                 token_contexts: HashMap::new(),
@@ -1235,11 +1292,29 @@ mod tests {
             Ok(next)
         }
 
+        fn begin_process(&mut self, process_id: u32) -> Result<(), u32> {
+            self.active_process = Some(process_id);
+            self.active_generation = self
+                .creation_times
+                .get(&process_id)
+                .and_then(|time| time.filetime_100ns);
+            self.process_open_count += 1;
+            Ok(())
+        }
+
+        fn end_process(&mut self) {
+            self.active_process = None;
+            self.active_generation = None;
+        }
+
         fn read_image_path(
             &mut self,
             process_id: u32,
             _aggregate_remaining: usize,
         ) -> WindowsProcessImage {
+            if self.active_process != Some(process_id) {
+                return empty_image(WindowsProcessImageStatus::Error);
+            }
             self.images
                 .get(&process_id)
                 .cloned()
@@ -1247,6 +1322,15 @@ mod tests {
         }
 
         fn read_creation_time(&mut self, process_id: u32) -> WindowsProcessCreationTime {
+            if self.active_process != Some(process_id)
+                || self.active_generation
+                    != self
+                        .creation_times
+                        .get(&process_id)
+                        .and_then(|time| time.filetime_100ns)
+            {
+                return empty_creation_time(WindowsProcessCreationTimeStatus::Error);
+            }
             self.creation_times
                 .get(&process_id)
                 .cloned()
@@ -1258,6 +1342,11 @@ mod tests {
             process_id: u32,
             _aggregate_sid_remaining: usize,
         ) -> WindowsProcessTokenContext {
+            if self.active_process != Some(process_id) {
+                return token_context_for_process_error(
+                    WindowsProcessTokenFieldStatus::IdentityUnverified,
+                );
+            }
             if let Some(context) = self.token_contexts.get(&process_id) {
                 return context.clone();
             }
@@ -1451,6 +1540,13 @@ mod tests {
         assert_eq!(document.status, WindowsProcessInventoryStatus::Partial);
         assert_eq!(document.processes.len(), 1);
         assert_eq!(document.processes[0].process_id, 10);
+        assert_eq!(api.process_open_count, 1);
+        assert_eq!(
+            document.processes[0].snapshot_binding_status,
+            WindowsProcessSnapshotBindingStatus::CandidatePidOnly
+        );
+        assert_eq!(document.identity_domain.status, "unknown");
+        assert_eq!(document.schema_version, 4);
         assert_eq!(
             document.processes[0].image.status,
             WindowsProcessImageStatus::Observed

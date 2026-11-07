@@ -52,7 +52,7 @@ fn windows_session_publishes_and_inspects_selected_source_with_private_acl() {
     );
     let value: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
     assert_eq!(value["schema"], "sideeffect.audit_session_review");
-    assert_eq!(value["schema_version"], 6);
+    assert_eq!(value["schema_version"], 7);
     assert_eq!(
         value["sources"][0]["collector"]["id"],
         "windows.software_registry"
@@ -60,6 +60,75 @@ fn windows_session_publishes_and_inspects_selected_source_with_private_acl() {
     assert_eq!(value["host_context"]["os_name"]["value"], "Windows");
     assert!(value["host_context"]["privilege"].is_string());
     assert_eq!(value["platform"], "windows");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn windows_msix_session_publishes_a_separate_v9_artifact() {
+    let root = temp_dir();
+    let session = root.join("msix-audit");
+    let output = cli(&["audit", "--output", session.to_str().unwrap(), "--msix"]);
+    assert!(
+        published(&output),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(session.join("session.json")).unwrap()).unwrap();
+    assert_eq!(manifest["schema_version"], 9);
+    assert_eq!(manifest["sources"][0]["role"], "msix");
+    assert_eq!(
+        manifest["sources"][0]["collector"]["id"],
+        "windows.msix_package_registrations"
+    );
+    assert_eq!(
+        manifest["sources"][0]["artifacts"][0]["path"],
+        "msix.windows.json"
+    );
+    assert!(session.join("msix.windows.json").is_file());
+    assert!(!session.join("software.windows.json").exists());
+
+    let artifact: serde_json::Value =
+        serde_json::from_slice(&fs::read(session.join("msix.windows.json")).unwrap()).unwrap();
+    assert_eq!(artifact["schema"], "sideeffect.windows_msix_inventory");
+    assert_eq!(artifact["schema_version"], 1);
+    let inspect = cli(&[
+        "inspect",
+        "--format",
+        "json",
+        "--session",
+        session.to_str().unwrap(),
+    ]);
+    assert!(
+        published(&inspect),
+        "{}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let review: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(review["sources"][0]["role"], "msix");
+    assert_eq!(
+        review["sources"][0]["scope"],
+        "bounded current-user MSIX package registrations"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn windows_audit_rejects_repeated_msix_flag() {
+    let root = temp_dir();
+    let session = root.join("duplicate-msix");
+    let output = cli(&[
+        "audit",
+        "--output",
+        session.to_str().unwrap(),
+        "--msix",
+        "--msix",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--msix was specified more than once")
+    );
+    assert!(!session.exists());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -74,6 +143,8 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
         .arg("--output")
         .arg(&session)
         .arg("--packages")
+        .arg("--msix")
+        .arg("--app-paths")
         .arg("--processes")
         .arg("--startup")
         .arg("--path-executables")
@@ -88,6 +159,8 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
     );
     for file in [
         "software.windows.json",
+        "msix.windows.json",
+        "app-paths.windows.json",
         "processes.windows.json",
         "permissions.windows.json",
         "startup.windows.json",
@@ -113,6 +186,11 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
     assert_eq!(review["platform"], "windows");
     for (role, expected_scope) in [
         ("packages", "bounded uninstall-registry registrations"),
+        ("msix", "bounded current-user MSIX package registrations"),
+        (
+            "app_paths",
+            "selected current-user native and accessible machine 32-bit and 64-bit App Paths registry entries",
+        ),
         (
             "processes",
             "visible Tool Help process snapshot, permitted image paths, and token context",
@@ -121,10 +199,7 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
             "permissions",
             "explicit caller-selected paths only; no recursion or effective-access evaluation",
         ),
-        (
-            "startup",
-            "selected Run/RunOnce, Startup folders, services, and visible boot/logon scheduled tasks",
-        ),
+        ("startup", "WMI permanent event subscriptions"),
         (
             "path_executables",
             "one-level metadata snapshot of the current process PATH; candidate heuristics only, no execution or shell resolution",
@@ -136,12 +211,244 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
             .iter()
             .find(|source| source["role"] == role)
             .unwrap_or_else(|| panic!("missing {role} source in session review"));
-        assert_eq!(source["scope"], expected_scope);
+        if role == "startup" {
+            let scope = source["scope"].as_str().unwrap();
+            assert!(scope.contains("ROOT"));
+            assert!(scope.contains(expected_scope));
+        } else {
+            assert_eq!(source["scope"], expected_scope);
+        }
         assert!(source["started_at_unix_ms"].as_u64().is_some());
         assert!(source["ended_at_unix_ms"].as_u64().is_some());
         assert_eq!(source["artifacts"].as_array().unwrap().len(), 1);
     }
-    assert_eq!(review["sources"].as_array().unwrap().len(), 5);
+    assert_eq!(review["sources"].as_array().unwrap().len(), 7);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(session.join("session.json")).unwrap()).unwrap();
+    assert_eq!(manifest["schema_version"], 15);
+    let startup_source = manifest["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["role"] == "startup")
+        .unwrap();
+    assert!(
+        startup_source["scope"]
+            .as_str()
+            .unwrap()
+            .contains("WMI permanent event subscriptions")
+    );
+    assert_eq!(startup_source["artifacts"][0]["schema_version"], 10);
+    let startup: serde_json::Value =
+        serde_json::from_slice(&fs::read(session.join("startup.windows.json")).unwrap()).unwrap();
+    assert_eq!(startup["schema_version"], 10);
+    assert!(
+        startup["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| { source["id"] == "wmi_permanent_event_subscriptions" })
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn windows_audit_session_captures_and_compares_selected_root_metadata() {
+    let root = temp_dir();
+    let selected = root.join("selected-root");
+    fs::create_dir(&selected).unwrap();
+    fs::write(selected.join("before.txt"), b"synthetic fixture").unwrap();
+    let before = root.join("before-session");
+    let first = cli(&[
+        "audit",
+        "--output",
+        before.to_str().unwrap(),
+        "--root",
+        selected.to_str().unwrap(),
+    ]);
+    assert!(
+        published(&first),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(before.join("root-snapshot.json")).unwrap()).unwrap();
+    assert_eq!(snapshot["platform"], "windows");
+    assert_eq!(snapshot["schema_version"], 1);
+    assert!(snapshot["content_hashing"].is_null());
+    assert_eq!(snapshot["entries"].as_array().unwrap().len(), 1);
+    let review = cli(&[
+        "inspect",
+        "--format",
+        "json",
+        "--session",
+        before.to_str().unwrap(),
+    ]);
+    assert!(
+        published(&review),
+        "{}",
+        String::from_utf8_lossy(&review.stderr)
+    );
+    let review: serde_json::Value = serde_json::from_slice(&review.stdout).unwrap();
+    assert!(
+        review["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["role"] == "selected_root")
+    );
+
+    fs::write(selected.join("after.txt"), b"another fixture").unwrap();
+    let after = root.join("after-session");
+    let second = cli(&[
+        "audit",
+        "--output",
+        after.to_str().unwrap(),
+        "--root",
+        selected.to_str().unwrap(),
+    ]);
+    assert!(
+        published(&second),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let comparison = cli(&[
+        "compare-sessions",
+        before.to_str().unwrap(),
+        after.to_str().unwrap(),
+    ]);
+    assert!(
+        comparison.status.success(),
+        "{}",
+        String::from_utf8_lossy(&comparison.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&comparison.stdout).unwrap();
+    let root_diff = report["source_diffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["role"] == "selected_root")
+        .unwrap();
+    assert_eq!(root_diff["status"], "compared");
+    assert_eq!(root_diff["comparison"]["counts"]["additions"], 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn windows_audit_session_opt_in_hashing_compares_content_changes() {
+    let root = temp_dir();
+    let selected = root.join("selected-root-hashed");
+    fs::create_dir(&selected).unwrap();
+    let file = selected.join("payload.bin");
+    fs::write(&file, b"before").unwrap();
+    let before = root.join("before-session");
+    let first = cli(&[
+        "audit",
+        "--output",
+        before.to_str().unwrap(),
+        "--root",
+        selected.to_str().unwrap(),
+        "--hash-regular-files",
+    ]);
+    assert!(
+        published(&first),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(before.join("session.json")).unwrap()).unwrap();
+    assert_eq!(first_manifest["schema_version"], 9);
+    let first_snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(before.join("root-snapshot.json")).unwrap()).unwrap();
+    assert_eq!(first_snapshot["schema_version"], 2);
+    assert!(
+        first_snapshot["entries"][0]["content_sha256"]
+            .as_str()
+            .is_some()
+    );
+
+    fs::write(&file, b"after!").unwrap();
+    let after = root.join("after-session");
+    let second = cli(&[
+        "audit",
+        "--output",
+        after.to_str().unwrap(),
+        "--root",
+        selected.to_str().unwrap(),
+        "--hash-regular-files",
+    ]);
+    assert!(
+        published(&second),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let comparison = cli(&[
+        "compare-sessions",
+        before.to_str().unwrap(),
+        after.to_str().unwrap(),
+    ]);
+    assert!(
+        comparison.status.success(),
+        "{}",
+        String::from_utf8_lossy(&comparison.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&comparison.stdout).unwrap();
+    let root_diff = report["source_diffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "selected_root")
+        .unwrap();
+    assert_eq!(root_diff["status"], "compared");
+    let changed = root_diff["comparison"]["deltas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|delta| delta["name"] == "payload.bin")
+        .unwrap();
+    assert!(
+        changed["changed_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "content_sha256")
+    );
+    assert_eq!(
+        changed["before"]["evidence_source"],
+        "selected_root_directory_entry"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn windows_root_snapshot_does_not_capture_its_session_output_directory() {
+    let root = temp_dir();
+    let selected = root.join("selected-root");
+    fs::create_dir(&selected).unwrap();
+    fs::write(selected.join("input.txt"), b"synthetic fixture").unwrap();
+    let session = selected.join("audit-session");
+    let output = cli(&[
+        "audit",
+        "--output",
+        session.to_str().unwrap(),
+        "--root",
+        selected.to_str().unwrap(),
+    ]);
+    assert!(
+        published(&output),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(session.join("root-snapshot.json")).unwrap()).unwrap();
+    let names = snapshot["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["display_name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["input.txt"]);
+    assert!(!names.contains(&"audit-session"));
     fs::remove_dir_all(root).unwrap();
 }
 

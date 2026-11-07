@@ -30,7 +30,7 @@ In Codex, Claude Code, Cursor, Gemini CLI, GitHub Copilot, OpenCode, Windsurf, o
 
 The agent reads the repository's installation guide, installs the skill for its current client, installs the CLI using the supported method for your computer, and verifies both. It does not start an audit. This requires an agent that can access GitHub and run local setup commands. CLI installation from source requires Rust/Cargo 1.85 or later to already be installed; the agent must tell you if a prerequisite is missing. See the complete [Agent Skill installation guide](docs/AGENT_SKILL.md).
 
-The community skill installer requires Node.js 22.20 or later. The [v0.1.0 release](https://github.com/tengircik/SideEffect/releases/tag/v0.1.0) provides verified Linux x86_64 and Windows x64 CLI archives; installing a release binary does not require Rust. The [installation guide](docs/INSTALL.md) shows checksum and build-provenance verification. To build from source instead, use the instructions below.
+The community skill installer requires Node.js 22.20 or later. The [v0.1.0 release](https://github.com/tengircik/SideEffect/releases/tag/v0.1.0) provides Linux x86_64 and Windows x64 CLI archives; installing a release binary does not require Rust. The Windows archive passed fresh checksum, attestation, extraction, and invocation checks. The Linux checksum matched, but attestation verification and archive installation remain unverified; see the [release acceptance record](docs/RELEASE_ACCEPTANCE.md). The [installation guide](docs/INSTALL.md) shows checksum and build-provenance verification. To build from source instead, use the instructions below.
 
 ```sh
 DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/ea7c5ef17ca16263afb62026e36c42d135bf6de8/.agents/skills/sideeffect-audit -g --copy
@@ -82,11 +82,25 @@ On Windows:
 sideeffect.exe inventory startup --output .\startup.json
 ```
 
-The inventory retains source-linked configuration facts for supported startup locations, including XDG, systemd, SysV, and cron on Linux; Windows Run/RunOnce entries, Startup folders, visible services, and visible Task Scheduler boot/logon triggers. Configured commands remain inert evidence.
+The inventory retains source-linked configuration facts for supported startup locations, including XDG, systemd, SysV, and cron on Linux; Windows Run/RunOnce entries, Startup folders, visible services, Task Scheduler boot/logon triggers, and permanent WMI subscriptions from the local `ROOT\subscription` namespace. WMI query, command, and script strings remain inert evidence. Standalone Windows startup schema v7 adds a point-in-time SCM service-state observation; v8 adds read-only SCM delayed-auto-start configuration as observed true/false or unknown; v9 records bounded configured service dependencies (including service-versus-load-order-group kind) and separate load-order-group membership; v10 records bounded SCM trigger/action codes, subtype GUIDs, and trigger data as inert hex. Malformed or over-limit dependency and trigger data stays unknown with fixed diagnostics that do not echo raw values. Trigger configuration is not evidence that an event occurred or a service ran, and trigger data may be sensitive. The delayed bit is ignored unless the service start type is automatic; it does not specify an exact start time or show that a service ran. Unknown raw service-state codes are preserved, and WMI fields remain optional as an all-or-none extension. The observed service state does not establish that a startup entry caused it. Selecting `audit --startup` emits envelope v15 with startup v10, including when App Paths is also selected; v13/startup-v8 and v12/startup-v7 sessions remain readable. App-Paths-only sessions remain v11; sessions without startup or App Paths and Linux sessions continue to emit v9.
+
+On Windows, inspect registered executable path metadata with `sideeffect.exe inventory app-paths --output .\app-paths.json`. This reads only selected current-user and accessible machine App Paths registry entries. It does not scan disks, expand environment strings, or establish that a registered program exists or can be launched. Registry paths and names can be sensitive.
+
+On Windows, inspect current-user AppX/MSIX package registrations with `sideeffect.exe inventory msix --output .\msix.json`. This reads bounded package metadata through the Windows package query API; it does not query other users, activate packages, inspect package files, or establish that a package is available, launchable, or has run. Package names, publishers, and installation locations can be sensitive.
 
 To inspect the current process's executable-name candidates, run `sideeffect inventory path-executables --output ./path-executables.json` (PowerShell: `sideeffect.exe inventory path-executables --output .\path-executables.json`). It snapshots only the current process `PATH`, checks each listed directory one level deep, and never runs discovered files. Rows label candidates, non-candidates, and unknown entries. Linux uses regular files with an execute bit; Windows uses regular files whose suffix matches the captured `PATHEXT`. Empty components map to the current working directory and are recorded. Results are heuristic, preserve PATH order and observed directory enumeration order (which may vary between runs), and may be partial; paths and names can reveal local configuration.
 
-The same inventory can be selected inside an audit session with `sideeffect audit --output ./audit-session --path-executables` (PowerShell: `sideeffect.exe audit --output .\audit-session --path-executables`). The session records its status, limits, fixed artifact provenance, and collector identity. It remains a point-in-time candidate inventory: SideEffect does not execute candidates or resolve commands through a shell.
+To snapshot one selected directory's direct children, run `sideeffect inventory root --output ./root-before.json ./selected-directory` (PowerShell: `sideeffect.exe inventory root --output .\root-before.json .\selected-directory`). By default this bounded inventory reads metadata only. Add `--hash-regular-files` to opt in to schema v2 SHA-256 fingerprints for direct-child regular files. Files are limited to 16 MiB each and 64 MiB aggregate, with a five-second cooperative deadline; an in-flight filesystem read can extend the deadline. Symlinks/reparse points are never followed. Compare saved snapshots with `sideeffect explain --inventory-diff ./root-before.json ./root-after.json`; exact root path and child-name encodings are matched. Content differences are compared only when both snapshots observed hashes. Added/removed rows are shown only when both snapshots are complete and known local root identity hints do not conflict. A hint conflict suppresses unmatched rows but does not prove the root object changed. The comparison does not establish persistent object identity, installation, deletion cause, authenticity, or filesystem history. Exact paths, names, timestamps, sizes, local file-ID hints, and hashes can be sensitive.
+
+The offline `explain --inventory-diff` command accepts same-platform Linux or Windows selected-root schema v1 and v2 snapshots. `audit --root PATH` stores metadata-only schema v1 by default; add `--hash-regular-files` to opt in to the bounded content fingerprints and schema v2. Session v8 introduced this artifact contract; v9 retains it, and v7 sessions remain readable with their historical v1 contract.
+
+The same inventory can be selected inside an audit session with `sideeffect audit --output ./audit-session --path-executables` (PowerShell: `sideeffect.exe audit --output .\audit-session --path-executables`). On native Windows, add `--msix` to include a separate bounded snapshot of current-user MSIX package registrations; it does not activate packages or inspect package files. On native Windows, add `--app-paths` to snapshot selected App Paths registrations; an App-Paths-only session uses envelope v11, while combining it with `--startup` uses envelope v15. Comparison output contains hashed value fingerprints and source references instead of registry text. To also snapshot one selected directory and its direct children, add `--root ./selected-directory` (PowerShell: `--root .\selected-directory`). Add `--hash-regular-files` to explicitly read bounded direct-child regular-file content and include SHA-256 equality fingerprints; links/reparse points and nonregular files are not followed or hashed. Hashes and path metadata are sensitive and do not authenticate content. The session records status, limits, fixed artifact provenance, and collector identity. These point-in-time observations do not establish exhaustive coverage.
+
+To compare two sessions that both include this source, run `sideeffect compare-sessions ./before-session ./after-session` (PowerShell: `sideeffect.exe compare-sessions .\before-session .\after-session`). PATH candidate changes use exact platform path encodings and evidence references. Selected-root changes compare direct-child metadata and compare content only when both sides observed hashes; missing hashes remain unknown and make the item comparison partial when hashing was requested. Different roots are incomparable. Incomplete sources and ambiguous identities suppress one-sided presence claims. A candidate label is a metadata heuristic, not proof that a shell resolves or can launch a file. Session artifacts and comparison output can contain sensitive paths, names, timestamps, sizes, hashes, and local file-ID hints.
+
+When both Windows sessions include the optional `--app-paths` source, `compare-sessions` reports selected App Paths registration additions, removals, and changes. The output hashes registry values and registered names, retaining fixed source and entry references without displaying raw registry text. Incomplete sources, duplicate identities, or invalid identities suppress unmatched presence claims; a registration is not proof that a target exists or can launch. App Paths uses session envelope v11 when selected alone; selecting Windows startup uses envelope v15 and startup v10, retaining App Paths if both sources are selected.
+
+When both Windows sessions include the optional `--msix` source, `compare-sessions` reports current-user package registration additions, removals, and selected metadata changes using exact valid family-name evidence. Incomplete sources, duplicate identities, or any invalid identity suppress unmatched presence claims. A registration change does not establish package availability, health, launchability, or execution.
 
 ### Capture a selected Linux command
 
@@ -107,6 +121,38 @@ sideeffect.exe inspect --format text --session .\session
 
 The bounded ETW window records selected process, file, and network event families. Controlling the Windows Kernel Logger requires an already-administrative token; SideEffect never elevates automatically.
 
+`sideeffect.exe associated-behavior .\startup.windows.json .\runtime.windows.json` can compare a saved Windows startup inventory with a validated ETW capture. It checks exact drive-rooted strings from scheduled-task Exec actions, `REG_SZ` Run/RunOnce values whose raw UTF-16 sidecars strictly agree with the display text (missing or inconsistent sidecars leave that row unmatched and the result partial), and SCM service `binary_path` rows against decoded process-start image paths. The candidate report retains source evidence and event ordinals; it does not establish a launch, cause, or complete coverage. Arguments, expandable values, relative/device paths, and other string variants are not interpreted or normalized.
+
+An existing validated ETW v3 capture can be reviewed with the experimental local evidence selector:
+
+```powershell
+$preview = sideeffect.exe model-explain-preview --question "Which network observation is recorded?" --backend cpu --windows-runtime .\runtime.windows.json | ConvertFrom-Json
+sideeffect.exe model-explain --question "Which network observation is recorded?" --backend cpu --confirm-sha256 $preview.request_sha256 --windows-runtime .\runtime.windows.json
+```
+
+The ETW preview and result use their own schema versions. The selector can choose only exact preview event IDs. File, network, and disk payload observations appear only when SideEffect re-decodes retained bytes and matches the serialized sidecar; process payload fields are unknown when live TDH metadata is needed. Unsupported event-kind labels are marked as unverified capture metadata: the capture fingerprint detects representation changes but does not authenticate the capture. Event-header PID/TID values are context only. ETW capture completeness remains unknown, and this feature does not pass the local-model quality gate.
+
+Local-model selection remains experimental; no model is approved for decisions. The [evaluation record](docs/LOCAL_MODEL_EXPLANATION_EVALUATION.md) describes the current quality limits and separate Linux/Windows development evaluators. Native Windows ETW has a small development corpus with four cases and two pinned synthetic capture fixtures. It uses a source-specific result schema and `W…` evidence IDs, separate from Linux `E…` IDs. Its labels are unreviewed; the evaluator validates structure and fixture digests but performs no semantic scoring. There is still no independently reviewed or qualified ETW model-quality corpus, and no model or platform is approved.
+
+To check the Windows ETW synthetic corpus without running SideEffect or a model:
+
+```powershell
+py -3 scripts/evaluate_local_model_windows_etw_explain.py --check-corpus
+```
+
+To run the ETW development cases, use the built CLI with an already configured explanation model and trusted local runtime:
+
+```powershell
+py -3 scripts/run_local_model_windows_etw_explain_corpus.py `
+  --sideeffect .\target\release\sideeffect.exe `
+  --backend auto `
+  --timeout-seconds 60 `
+  --output .\private-windows-etw-results.json
+py -3 scripts/evaluate_local_model_windows_etw_explain.py --results .\private-windows-etw-results.json
+```
+
+The runner invokes SideEffect's actual preview and analysis commands for every pinned synthetic capture. Running it performs local model inference; it does not download or install model weights or a runtime. Results preserve the unreviewed-label and development-only status and are not semantic-quality scores or qualification evidence.
+
 ### Adapt runtime evidence into a common event envelope
 
 ```sh
@@ -119,7 +165,145 @@ On native Windows, a validated ETW capture can also be adapted:
 sideeffect.exe events --windows-runtime .\runtime.windows.json
 ```
 
-The command writes versioned JSON to stdout and never runs represented commands or modifies the input. Events keep their source-local order, timestamps, outcome/status, and evidence links. Envelope v2 adds source-local process observations and event links: Linux process-creation rows link the caller task ID to the returned child PID. Windows process identities and parent relationships come from serialized ETW lifecycle decoder fields and are labeled `decoder_metadata_unverified`. For supported classic TCP/UDP rows, the adapter re-decodes retained raw payload bytes and checks the serialized observation; a mismatch is diagnosed and only the raw payload PID can support a context-candidate link. Unsupported or malformed payloads remain raw with an unresolved link and diagnostic. Windows file/disk header PIDs remain context candidates. These links do not form a merged process graph or causal view. A partial or unknown source exits with status `2`; the envelope does not infer one global clock or process ownership.
+The command writes versioned JSON to stdout and never runs represented commands or modifies the input. Events keep their source-local order, timestamps, outcome/status, and evidence links. Envelope v5 adds optional `path_observation` values tied to each event's source evidence. Linux paths are limited to parser-derived lexical hints; Windows names are emitted only when the FileIo sidecar exactly matches a re-decoding of its raw payload. These values are literal source spellings, not resolved filesystem identities. Envelope v5 also preserves source-local process observations and event links: Linux process-creation rows link the caller task ID to the returned child PID, while exact prefixed task-termination rows can split trace-task observations into source-local epochs on complete parses. These epochs are not OS process/PID generations or ancestry, and partial parses retain task-ID-only observations. Windows process start/end IDs are decoded from retained raw bytes only for reviewed Kernel-Process v0-v3 layouts and checked against the serialized TDH sidecar; image names remain decoder metadata only. For supported classic TCP/UDP rows, the adapter re-decodes retained raw payload bytes and checks the serialized observation; a mismatch is diagnosed and only the raw payload PID can support a context-candidate link. Unsupported or malformed payloads remain raw with an unresolved link and diagnostic. Windows file/disk header PIDs remain context candidates. These links do not form a merged process graph or causal view. A partial or unknown source exits with status `2`; the envelope does not infer one global clock or process ownership.
+
+### Query runtime evidence
+
+Create an exact-filter query file:
+
+```json
+{
+  "schema": "sideeffect.event_query",
+  "schema_version": 1,
+  "filters": {
+    "event_kind": "connect",
+    "operation_kind": "syscall_attempt",
+    "outcome": "failure"
+  },
+  "limit": 100
+}
+```
+
+Schema v2 adds an optional exact path filter:
+
+```json
+{
+  "schema": "sideeffect.event_query",
+  "schema_version": 2,
+  "filters": { "path_exact": "/tmp/example.txt" },
+  "limit": 100
+}
+```
+
+`path_exact` compares the full string exactly. It does not normalize separators or case, resolve `.`/`..` or symlinks, or perform glob/substring matching. Linux currently exposes hints only for supported `openat`/`openat2` trace spellings with a usable absolute base. Windows exposes a name only when a supported ETW FileIo name record has a validated raw-payload sidecar; many file events contain no path, and some observed Windows names may omit a drive letter. Unsupported, pathless, undecoded, or lost events cannot match. No match does not show that the path was not accessed. Schema v1 event queries remain accepted; `path_exact` requires schema v2. Query text output escapes terminal controls; JSON output remains ordinary data and may contain sensitive paths.
+
+Schema v3 adds a literal string-prefix filter:
+
+```json
+{
+  "schema": "sideeffect.event_query",
+  "schema_version": 3,
+  "filters": { "path_prefix": "/tmp/app" },
+  "limit": 100
+}
+```
+
+`path_prefix` is case-sensitive and compares the observed path spelling as text. For example, `/tmp/app` also matches `/tmp/apple`; this is not directory containment. Neither path filter resolves symlinks or canonicalizes paths. Query v1 and v2 remain accepted for their existing filters; event-query, session-result, and multi-session-result schemas are v3.
+
+Apply it directly to a Linux trace or Windows ETW capture:
+
+```sh
+sideeffect query --query ./query.json --trace ./capture.trace
+```
+
+```powershell
+sideeffect.exe query --query .\query.json --windows-runtime .\runtime.windows.json
+```
+
+Or query the verified runtime artifact in one audit session:
+
+```sh
+sideeffect query --query ./query.json --session ./audit-session --source runtime
+```
+
+```powershell
+sideeffect.exe query --query .\query.json --session .\audit-session --source runtime
+```
+
+To search multiple verified sessions from the same native platform, repeat `--session` (2–16 sessions):
+
+```sh
+sideeffect query --query ./query.json --session ./before --session ./after --source runtime
+```
+
+```powershell
+sideeffect.exe query --query .\query.json --session .\before --session .\after --source runtime
+```
+
+An optional `evidence` filter matches one complete source-native locator exactly. For Linux the locator contains `kind: "raw_trace_record"`, `line_number`, `byte_offset`, and `byte_length`; for Windows it contains `kind: "windows_etw_record"`, `record_ordinal`, `json_pointer`, and `raw_payload_sha256`. Copy the tuple from an event result when constructing the query. Evidence locators are exact tuple matches; path filtering is a separate schema-v2 feature with source-specific limits. Evidence locators and `process_observation_id` are source-local, so both are rejected across sessions. Each session's results stay nested under that session ID; event ordinals and evidence remain source-local. Multi-session queries cap aggregate runtime artifacts at 256 MiB, total matching rows at 5,000, a cooperative 10-second total-work budget checked between sessions, and output at 8 MiB. Session/source/capture/parse status and diagnostics remain separate. Linux `run.json` must bind `trace.strace` by exact schema, length, and SHA-256. Windows uses the session reader's verified ETW v3 artifact and validates its capture fingerprint. A missing or invalid selected session is an error; partial or unknown evidence exits `2`.
+
+Query selected-root snapshots from one or more verified sessions with the separate `sideeffect.inventory_query` v1 contract:
+
+```json
+{
+  "schema": "sideeffect.inventory_query",
+  "schema_version": 1,
+  "filters": {},
+  "limit": 100
+}
+```
+
+```sh
+sideeffect query --query ./inventory-query.json --session ./audit-session --source selected_root
+```
+
+Repeat `--session` to query 2–16 sessions from the same native platform. Optional `root_path_hex` and `entry_name_hex` filters match exact native encodings: Linux path/name bytes or Windows UTF-16LE code units, with no display-name decoding or path normalization. The query accepts verified selected-root v1/v2 artifacts and preserves source status, diagnostics, artifact digest, and entry ordinals. Its bounded results cover only each selected root's one-level snapshot; zero matches do not establish system-wide absence. The install guide documents the PowerShell form and full limits.
+
+### Explore an evidence-linked event graph
+
+```sh
+sideeffect graph --trace ./capture.trace --event-kind openat
+```
+
+On native Windows, adapt a validated ETW capture:
+
+```powershell
+sideeffect.exe graph --windows-runtime .\runtime.windows.json --event-kind file_io_observation
+```
+
+JSON remains the default. Add `--format text` for an 8 MiB-bounded ASCII-only terminal summary that escapes controls, line breaks, and non-ASCII source strings. Add `--format html --output ./graph-report.html` to write a bounded, accessible, static offline report. HTML uses a restrictive CSP, contains no scripts or external assets, escapes input values, and is published privately without replacing an existing file. Both reports retain source completeness and diagnostics, node/edge identities and counts, event operation/path/evidence, source-local process-observation IDs, PID-only context warnings, and edge roles/statuses/bases/evidence. The HTML report links edges to stable node sections and includes exact evidence references. Review reports before sharing; local process and path data can be sensitive. Empty filtered graphs do not prove absence; the graph does not establish ownership, causality, ancestry, or total coverage. The graph contains source-local event and process-observation nodes, process-relationship edges, and event-to-process links. `--event-kind` matches one exact kind and keeps its direct process links plus one-hop process relationships; diagnostics and source status still describe the full input. Unresolved PID context is represented by a separate node for each edge; equal PID values are never merged into one process instance. Every node and edge retains its source evidence, link status, and derivation basis. Context candidates and decoder-metadata relationships stay labeled as such. The graph does not establish ownership, causation, or a complete process tree. Partial or unknown input exits with status `2`.
+
+### Browse a source-local event timeline
+
+```sh
+sideeffect timeline --trace ./capture.trace --event-kind openat
+```
+
+On native Windows, use a validated ETW capture:
+
+```powershell
+sideeffect.exe timeline --windows-runtime .\runtime.windows.json --event-kind file_io_observation
+```
+
+To filter by a process observation from that same source, add `--process-observation ID`:
+
+```sh
+sideeffect timeline --trace ./capture.trace --process-observation PROC_OBS_ID
+```
+
+```powershell
+sideeffect.exe timeline --windows-runtime .\runtime.windows.json --process-observation PROC_OBS_ID
+```
+
+The filters can be combined in either order; combined filters select events matching both the exact event kind and a direct link to that process observation. Process observation IDs are source-local identifiers, not PIDs, and are not portable across captures. The selected observation and its evidence remain present even when the combined filters select no events. JSON remains the default. Add `--format text` to write a bounded ASCII-only terminal summary to stdout; it escapes controls, line breaks, and non-ASCII source text while retaining each source's original order, timestamp representation, evidence references, selected observation with its evidence and end_evidence, and direct-link role/status/basis. Full-source diagnostics remain visible, and partial or unknown status exits with status `2`. An empty filtered result does not prove that the event or process activity was absent. Timelines are single-source views: they do not merge clocks or establish causal order. Hosted tests exercise the timeline adapter on real Linux `strace` and native Windows ETW captures for named file/loopback scenarios on Ubuntu 24.04 and Windows Server 2022/2025; they do not establish broad OS or event coverage.
+
+On native Windows, resolve one ETW timeline or graph event directly to its validated source row using the capture fingerprint, record ordinal, and raw-payload digest from that reference:
+
+```powershell
+sideeffect.exe evidence --windows-runtime .\runtime.windows.json CAPTURE_SHA256 RECORD_ORDINAL RAW_PAYLOAD_SHA256
+```
+
+The command verifies all three reference values and returns the original event row with its JSON pointer, capture loss, and diagnostics. It does not independently verify serialized decode metadata or authenticate the producer. Unknown completeness and partial status are preserved and exit with status `2`.
 
 ### Compare saved inventories
 
@@ -147,9 +331,95 @@ sideeffect.exe inventory startup --output .\startup-after.json
 sideeffect.exe explain --inventory-diff .\startup-before.json .\startup-after.json
 ```
 
-On Windows, use `sideeffect.exe inventory packages --output .\before.json` and `sideeffect.exe explain --inventory-diff .\before.json .\after.json`. The offline comparison accepts same-platform pairs of Linux package v2, Windows software-registration v1, Linux/Windows process v3, Linux/Windows selected-path permission v1, Linux startup v2, or Windows startup v4 inventories. Permission rows match only by exact selected path bytes (Linux) or UTF-16LE path bytes (Windows); paths are not normalized. It compares bounded metadata and native ACL/capability or descriptor/ACE facts, keeps evidence references, and omits raw xattr/security descriptor bytes. Duplicate identities and incomplete inputs do not produce confident unmatched presence changes. It does not calculate effective access or establish that inode/file-index values identify a persistent object. Process rows match only by PID plus observed generation (Linux proc start ticks or Windows creation FILETIME), never PID alone. Selected process facts are compared with evidence references on both sides. Unmatched process rows become additions/removals only when both snapshots and sources are complete and identity is certain. Startup rows use native source-specific identities; task action rows are compared as an ordered sequence, and duplicate task triggers or lossy XDG display paths remain ambiguous. Startup output contains only hashed identities, changed-field labels, and before/after source references; raw commands/configuration values stay in the input files. A startup comparison does not establish that a configured entry was installed, removed, effective, or executed. These bounded outputs compare two snapshots, not start/exit or execution history, exhaustive inventory, causation, or proof of absence. PIDs, generation values, paths, and source references can be sensitive. Hashed identities are not anonymization and may be guessable for common paths or names. Incomplete sources or ambiguous identities suppress uncertain presence changes and produce exit status `2`.
+On Windows, use `sideeffect.exe inventory packages --output .\before.json` and `sideeffect.exe explain --inventory-diff .\before.json .\after.json`. The offline comparison accepts same-platform pairs of Linux package v2, Windows software-registration v1, Linux process v3-v5, Windows process v3-v4, Linux/Windows selected-path permission v1, Linux startup v2/v3, or Windows startup v4-v10 inventories. Permission rows match only by exact selected path bytes (Linux) or UTF-16LE path bytes (Windows); paths are not normalized. It compares bounded metadata and native ACL/capability or descriptor/ACE facts, keeps evidence references, and omits raw xattr/security descriptor bytes. Duplicate identities and incomplete inputs do not produce confident unmatched presence changes. It does not calculate effective access or establish that inode/file-index values identify a persistent object. Process rows are matched only by PID plus observed generation (Linux proc start ticks or Windows creation FILETIME), never PID alone. Linux v5 requires matching boot-ID and PID-namespace inode hints; Linux v4 has no PID-namespace identity, and Windows v3-v4 have no reviewed reusable host boot identity. Exact matches in those candidate domains can produce only `candidate_changed` field comparisons; unmatched additions/removals are suppressed. Linux v3 snapshots suppress all cross-snapshot deltas. These are bounded evidence hints, not host authentication or process history. Selected process facts preserve evidence references on both sides. Startup rows use native source-specific identities; task action rows are compared as an ordered sequence, and duplicate task triggers or lossy XDG display paths remain ambiguous. Startup output contains only hashed identities, changed-field labels, and before/after source references; raw commands/configuration values stay in the input files. A startup comparison does not establish that a configured entry was installed, removed, effective, or executed. These bounded outputs compare two snapshots, not start/exit or execution history, exhaustive inventory, causation, or proof of absence. PIDs, generation values, paths, and source references can be sensitive. Hashed identities are not anonymization and may be guessable for common paths or names. Incomplete sources or ambiguous identities suppress uncertain presence changes and produce exit status `2`.
 
-For process snapshots, use `sideeffect inventory processes --output ./before.json` and `sideeffect inventory processes --output ./after.json` (or `sideeffect.exe` on Windows), then run the same `explain --inventory-diff` command. Process output includes local PIDs, generation values, and selected paths; review it before sharing.
+For process snapshots, use `sideeffect inventory processes --output ./before.json` and `sideeffect inventory processes --output ./after.json` (or `sideeffect.exe` on Windows), then run the same `explain --inventory-diff` command. Linux v5 records a boot-ID and caller PID-namespace inode hint; Linux v4 has no namespace identity, and Linux v3 has no identity domain. Linux v4-v5 and Windows v3-v4 comparisons emit candidate field changes only for exact PID/generation matches and suppress unmatched presence; missing or mismatched Linux v5 domains and Linux v3 comparisons suppress all deltas. The hints are procfs evidence, not host authentication or durable process identity; cloned VM state may preserve boot IDs and namespace inodes can be reused. Process output includes local PIDs, generation values, and selected paths; review it before sharing.
+
+### Keep evidence in a local investigation case
+
+Inspect a case without resolving evidence or opening session directories:
+
+```sh
+sideeffect case show --case ./review.case.json --format text
+```
+
+The default JSON output uses `sideeffect.investigation_case_summary` v1; `--format text` emits an ASCII-safe terminal summary. Both formats show case metadata, declared session bindings, entry kinds/authorship/text byte lengths, and locator counts, but omit analyst-written text and raw evidence rows. Evidence is marked `not_resolved`. This bounded read-only command validates locator shapes and internal bindings within the case document, but does not open sessions or resolve locators against artifacts. It makes no authenticity or claim assessment.
+Create a private schema-v2 draft from one or more verified sessions on the same native platform:
+
+```sh
+sideeffect case init --output ./review.case.json --title "Review selected behavior" --session ./audit-session
+```
+
+On Windows, use `sideeffect.exe` and PowerShell paths. Repeat `--session` for additional sessions (up to 16). The case stores each session ID and SHA-256 of its exact manifest bytes. For a plain note, put the UTF-8 text in a file and add it without editing the case JSON:
+
+```sh
+sideeffect case add-note --case ./review.case.json --id N001 --text-file ./note.txt --output ./review-with-note.case.json --session ./audit-session
+```
+
+The file is capped at 16 KiB and must be valid, non-empty UTF-8 without NUL. Its text is stored as an existing schema-v2 `note` entry with `analyst_supplied_unverified` authorship and no evidence locators. It is analyst-authored text, not a verified observation. The command does not accept inline note text or echo the file contents. For assertions and manually structured notes, use the bounded entry JSON interface:
+
+```json
+{
+  "id": "N001",
+  "kind": "note",
+  "authorship": "analyst_supplied_unverified",
+  "text": "Review this observation",
+  "evidence": []
+}
+```
+
+```sh
+sideeffect case add-entry --case ./review.case.json --entry ./note.json --output ./review-with-note.case.json --session ./audit-session
+```
+
+For assertions, include exact evidence locators copied from the relevant session artifact. Assertions remain analyst-supplied and unverified. The command verifies the supplied sessions and locators, preserves the source case, increments the branch-local revision, and writes a private output without overwriting an existing file. Repeat it with a new output path for each entry. Entries can be added only while the case is `draft` or `open`.
+
+For a shortcut that builds the existing schema-v2 note or assertion entry from a separate text file and a strict locator-array JSON file, use `case add-evidence`:
+
+```sh
+sideeffect case add-evidence --case ./review.case.json --id A002 --kind assertion --text-file ./assertion.txt --evidence-file ./locators.json --output ./review-with-evidence.case.json --session ./audit-session
+```
+
+The text file must be non-empty UTF-8 without NUL and is limited to 16 KiB; it is never accepted inline or echoed in errors. `locators.json` is a JSON array of exact existing case locator objects copied from evidence output, capped at 64 KiB and 64 locators. Unknown locator fields/tags, malformed input, and oversized input are rejected. Assertions require at least one locator; notes may use an empty locator array or include references. Every locator must resolve against the supplied verified session before publication. Missing or mismatched sessions and unresolved locators fail without writing a case. If a locator resolves but source completeness is partial or unknown, the new private revision is still written and the command exits `2` with that uncertainty preserved. Locators identify source rows; they do not validate the analyst's interpretation. Both note and assertion authorship remains `analyst_supplied_unverified`.
+
+Move a case through its review states by writing new files. `draft` can become `open` or `cancelled`; `open` can become `in_review`, `closed`, or `cancelled`; `in_review` can return to `open` or become `closed` or `cancelled`. `closed` and `cancelled` are terminal. Status describes the analyst workflow and does not assess evidence quality or completeness:
+
+```sh
+sideeffect case set-status --case ./review-with-note.case.json --status in_review --output ./review-in-review.case.json --session ./audit-session
+```
+
+V1 case files remain readable and resolvable, but have no stored status. Migrate one explicitly by choosing its initial status; the migration preserves all entries and evidence locators, hashes the exact source bytes as the parent, and leaves the source file unchanged:
+
+```sh
+sideeffect case migrate --case ./legacy.case.json --status open --output ./review-v2.case.json --session ./audit-session
+```
+
+Resolve the locators against the same verified sessions:
+
+```sh
+sideeffect case resolve --case ./review.case.json --session ./audit-session
+```
+
+For a private, static HTML review report with links from each entry to its resolved evidence facts, use:
+
+```sh
+sideeffect case resolve --format html --output ./review.html --case ./review.case.json --session ./audit-session
+```
+
+The default command writes bounded JSON; HTML is static, offline, size-bounded, private, and never overwrites an existing file. For a terminal review, `--format text` writes a bounded ASCII-only summary to stdout, escapes terminal controls and non-ASCII text, and shows source completeness, diagnostics, and exact evidence locators. Text has no output-file option. Text is a review convenience, not a redaction or safe-to-share format. JSON remains unchanged as the default. All formats retain case status/revision and source/session status. Exit status `2` means some source or capture remains partial or unknown. Manifest, artifact, and parent-case hashes establish byte consistency; they do not authenticate who produced the evidence or prove an assertion, and the parent hash does not prevent forks or rewrites. Entry authoring remains one entry at a time, with file-based note/assertion conveniences; there is no interactive editor or role-specific report set yet. Reports can contain sensitive paths, arguments, and event payloads; keep them local and review before sharing.
+
+To preview exact whole-field omissions for an HTML export, select one or more groups. The preview keeps the existing omission totals and adds a four-group inventory of renderer-known retained and omitted field/record occurrences for `case-text`, `artifact-paths`, `source-records`, and `evidence-identifiers`. It prints no values and writes no report; rerun without `--preview-redaction` to write a separate redacted report:
+
+```sh
+sideeffect case resolve --format html --redact case-text --redact artifact-paths --redact source-records --redact evidence-identifiers --preview-redaction --case ./review.case.json --session ./audit-session
+sideeffect case resolve --format html --redact case-text --redact artifact-paths --redact source-records --redact evidence-identifiers --output ./review-redacted.html --case ./review.case.json --session ./audit-session
+```
+
+These groups omit the named renderer fields as a whole and leave the source case and evidence unchanged. The counts cover only field positions and source-record blocks known to the current renderer; categories can overlap and are not a taxonomy or scan of content. `artifact-paths` also replaces values under the exact structured key `artifact_path` inside source records that remain in the report; unrelated keys such as `path` or `display_name`, and substrings in free text, remain untouched. Retained source records can contain arbitrary strings, arguments, or payloads. This is not a secret scan and does not make sharing safe. Review the complete output before sharing.
+
+When any redaction group is selected, the HTML report includes a counts-only receipt for the selected groups, using the same renderer-known counts shown by the preview. The receipt is structural metadata, not a content or secret scan, and does not make the report safe to share.
+
+`case-text` covers the case title and analyst entry text; `source-records` omits each resolved record block; `evidence-identifiers` omits the case/session identifiers and locator objects. Identifiers inside a retained source record remain unless `source-records` is also selected.
 
 ## What you can do
 
@@ -158,11 +428,14 @@ For process snapshots, use `sideeffect inventory processes --output ./before.jso
 | Software inventory | Package-manager records on Linux and registered software entries on Windows, with source identifiers and collection status |
 | Process snapshot | Visible process identity and executable-link or image-path evidence |
 | Permission inspection | Linux mode, supported ACL, and file-capability evidence; Windows owner, group, and DACL evidence for paths you select |
+| Selected-directory snapshot | Bounded metadata by default; optional SHA-256 fingerprints for selected direct-child regular files on Linux and Windows; no recursion |
 | Startup discovery | Source-linked startup configuration, retained as inert values and scripts |
 | Runtime capture | Linux `strace` records for a selected command and traced children; native Windows ETW events for a bounded capture window |
 | Evidence review | Bounded JSON, terminal-safe text, exact source references, and static offline HTML reports where supported |
+| Investigation case | Private v2 drafts, explicit v1 migration, status transitions, immutable no-clobber revisions, exact evidence-locator resolution, and linked static offline HTML review; interactive editing and role-specific reports remain open |
 | Comparison | Evidence-backed trace and ETW differences, aggregate summaries, and conservative association candidates |
 | Deterministic explanation | Source-aware `explain` summaries without a model dependency |
+| Optional local model tools | Experimental, user-selected model workflows with reviewed previews; no model is release-approved |
 | Agent workflow | A portable skill for using SideEffect through your preferred agent and model |
 
 Inventory collectors expose their source, status, diagnostics, and limits. Comparisons preserve their matching rules and evidence references. A relationship is identified as a candidate when the available records support only a candidate match.
@@ -182,11 +455,19 @@ SideEffect does not run startup entries or scripts. It does not upload audit dat
 
 SideEffect provides a native Rust CLI for Linux x86_64 and Windows x64. The Linux workflow uses the external `strace` executable. The Windows runtime collector uses ETW. Linux CI validates the real `strace` workflow on Ubuntu 24.04; Windows Server 2022 and 2025 CI exercises live process, file, and loopback network ETW events. The [compatibility matrix](docs/INSTALL.md#compatibility-and-observation-matrix) lists the exact tested environments and source boundaries.
 
+## Optional local models
+
+Local-model analysis is optional and experimental; no model is approved for answer quality, and SideEffect works without one. The public 100-case query-plan v2 corpus is diagnostic only: a 2026-11-06 question-to-oracle audit found 30/70 answerable expected plans fully inferable from the question, 36 partly inferable, and 4 not inferable. A separate public v3 development corpus contains 120 synthetic cases; its labels have not received independent human review and it is not a hidden holdout. The v3 evaluator has nine tests and its preview-only path passed all 120 cases through a built Linux CLI under WSL Ubuntu using a synthetic GGUF-header placeholder; no model inference or runtime was used, and this is not native Linux acceptance. Full model evaluation, a private external holdout, and qualification gates remain outstanding. See the [query-plan evaluation record](docs/LOCAL_QUERY_PLAN_EVALUATION.md#public-v3-development-corpus-2026-11-06). The explanation catalog includes `explanation-qwen3.5-0.8b-q4-0`, a 563,036,064-byte Qwen3.5-0.8B Q4_0 workflow-test candidate pinned by revision and SHA-256. It is not evaluated, qualified, recommended, or approved; see the [explanation evaluation record](docs/LOCAL_MODEL_EXPLANATION_EVALUATION.md). `sideeffect model setup ID [--runtime EXISTING_FILE]` installs pinned catalog weights after exact license acceptance and selects the model for its task. If `--runtime` is supplied, the file must already have been obtained by you; setup validates its canonical regular file, size, and SHA-256 before the license prompt, never downloads or executes it, and saves it for the same task after the weights install successfully. `sideeffect model doctor --task evidence|explanation|query` checks the selected model and the task-specific runtime contract; evidence/query checks are Linux x86_64 only, while explanation also supports native Windows. Doctor does not run inference or assess quality. See [local model setup and readiness](docs/LOCAL_MODEL_DOCTOR.md) and the [Windows explanation setup and limitations](docs/LOCAL_MODEL_WINDOWS_SETUP.md).
+
 ## Documentation
 
 - [Build, install, and platform compatibility](docs/INSTALL.md)
 - [Install SideEffect as an agent skill](docs/AGENT_SKILL.md)
 - [Product scope](docs/PRODUCT.md)
+- [Optional local model setup and readiness checks](docs/LOCAL_MODEL_DOCTOR.md)
+- [Windows local explanation model setup](docs/LOCAL_MODEL_WINDOWS_SETUP.md)
+- [Local model evaluation and external holdout protocol](docs/LOCAL_QUERY_PLAN_EVALUATION.md)
+- [Bounded Windows GPU memory sampling for local models](docs/WINDOWS_LOCAL_MODEL_GPU_MEMORY_MEASUREMENT.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Delivery plan](docs/PLAN.md)
 - [Linux real-trace benchmark methodology](docs/TRACE_BENCHMARKING.md)

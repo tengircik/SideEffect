@@ -53,6 +53,22 @@ pub fn default_unit_directories(home: Option<&OsStr>) -> Vec<UnitDirectory> {
             path: "/run/systemd/system".into(),
         },
         UnitDirectory {
+            scope: "system_generated_early",
+            path: "/run/systemd/generator.early".into(),
+        },
+        UnitDirectory {
+            scope: "system_generated",
+            path: "/run/systemd/generator".into(),
+        },
+        UnitDirectory {
+            scope: "system_generated_late",
+            path: "/run/systemd/generator.late".into(),
+        },
+        UnitDirectory {
+            scope: "system_transient",
+            path: "/run/systemd/transient".into(),
+        },
+        UnitDirectory {
             scope: "system",
             path: "/usr/local/lib/systemd/system".into(),
         },
@@ -106,6 +122,9 @@ pub fn default_unit_directories(home: Option<&OsStr>) -> Vec<UnitDirectory> {
             },
         ]);
     }
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|p| !p.is_empty()) {
+        dirs.extend(user_runtime_unit_directories(&PathBuf::from(runtime_dir)));
+    }
     let config_dirs = std::env::var_os("XDG_CONFIG_DIRS")
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| OsStr::new("/etc/xdg").to_owned());
@@ -115,6 +134,32 @@ pub fn default_unit_directories(home: Option<&OsStr>) -> Vec<UnitDirectory> {
         .unwrap_or_else(|| OsStr::new("/usr/local/share:/usr/share").to_owned());
     append_configured_paths(&mut dirs, &data_dirs, "user_data_dir");
     dirs
+}
+
+fn user_runtime_unit_directories(runtime_dir: &Path) -> Vec<UnitDirectory> {
+    let user_systemd = runtime_dir.join("systemd");
+    vec![
+        UnitDirectory {
+            scope: "user_runtime",
+            path: user_systemd.join("user"),
+        },
+        UnitDirectory {
+            scope: "user_generated_early",
+            path: user_systemd.join("generator.early"),
+        },
+        UnitDirectory {
+            scope: "user_generated",
+            path: user_systemd.join("generator"),
+        },
+        UnitDirectory {
+            scope: "user_generated_late",
+            path: user_systemd.join("generator.late"),
+        },
+        UnitDirectory {
+            scope: "user_transient",
+            path: user_systemd.join("transient"),
+        },
+    ]
 }
 
 fn append_configured_paths(dirs: &mut Vec<UnitDirectory>, paths: &OsStr, scope: &'static str) {
@@ -177,6 +222,7 @@ pub struct UnitRecord {
     pub source_path_bytes_hex: String,
     /// `unit_file`, `unit_symlink`, or a symlink inside a `*.wants`/`*.requires` directory.
     pub record_type: &'static str,
+    pub startup_state: super::startup_state::StartupRowState,
     pub symlink_target: Option<ValueEvidence>,
     pub directives: Vec<DirectiveEvidence>,
 }
@@ -608,6 +654,8 @@ fn collect_with_symlink_budget(
                             } else {
                                 "unit_symlink"
                             },
+                            startup_state:
+                                super::startup_state::StartupRowState::configured_present(),
                             symlink_target: target,
                             directives: Vec::new(),
                         });
@@ -714,6 +762,7 @@ fn collect_with_symlink_budget(
                         source_path: display_path(&path),
                         source_path_bytes_hex: path_bytes_hex(&path),
                         record_type: if drop_in { "drop_in_file" } else { "unit_file" },
+                        startup_state: super::startup_state::StartupRowState::configured_present(),
                         symlink_target: None,
                         directives: parsed.directives,
                     });
@@ -741,7 +790,7 @@ fn collect_with_symlink_budget(
     }
     UnitInventory {
         schema: "sideeffect.systemd_unit_inventory",
-        schema_version: 1,
+        schema_version: 2,
         platform: "linux",
         scope: "systemd_unit_files_and_enablement_symlink_references",
         capture_started_at_unix_ms: capture_started,
@@ -977,6 +1026,80 @@ mod tests {
                 .position(|w| w == b"ExecStart=/bin")
                 .unwrap()
         );
+    }
+    #[test]
+    fn default_paths_include_system_and_configured_user_runtime_units() {
+        let runtime = std::env::temp_dir().join("sideeffect-xdg-runtime-fixture");
+        let dirs = default_unit_directories(Some(OsStr::new("/home/example")));
+        for path in [
+            "/run/systemd/generator.early",
+            "/run/systemd/generator",
+            "/run/systemd/generator.late",
+            "/run/systemd/transient",
+        ] {
+            assert!(dirs.iter().any(|d| d.path == Path::new(path)), "{path}");
+        }
+
+        // The default helper reads XDG_RUNTIME_DIR from the process environment. Keep
+        // this test deterministic without mutating process-global environment state.
+        let user_dirs = user_runtime_unit_directories(&runtime);
+        assert_eq!(user_dirs.len(), 5);
+        assert!(user_dirs.iter().any(|d| {
+            d.scope == "user_generated" && d.path == runtime.join("systemd/generator")
+        }));
+        assert!(user_dirs.iter().any(|d| {
+            d.scope == "user_transient" && d.path == runtime.join("systemd/transient")
+        }));
+    }
+    #[test]
+    fn generated_and_transient_fixture_units_keep_scope_and_source_evidence() {
+        let t = Temp::new();
+        let generated = t.0.join("generator");
+        let transient = t.0.join("transient");
+        fs::create_dir(&generated).unwrap();
+        fs::create_dir(&transient).unwrap();
+        fs::write(
+            generated.join("fixture.service"),
+            b"[Unit]\nDescription=generated\n",
+        )
+        .unwrap();
+        fs::write(
+            transient.join("fixture.socket"),
+            b"[Socket]\nListenStream=1234\n",
+        )
+        .unwrap();
+        let d = collect_with_limits(
+            &[
+                UnitDirectory {
+                    scope: "system_generated",
+                    path: generated.clone(),
+                },
+                UnitDirectory {
+                    scope: "system_transient",
+                    path: transient.clone(),
+                },
+            ],
+            10,
+            4096,
+            8192,
+            Duration::from_secs(1),
+            100,
+        );
+        assert_eq!(d.status, Status::Complete);
+        assert!(d.records.iter().any(|r| {
+            r.scope == "system_generated"
+                && r.source_path == display_path(&generated.join("fixture.service"))
+                && r.directives
+                    .iter()
+                    .any(|x| x.key == "Description" && x.value.as_deref() == Some("generated"))
+        }));
+        assert!(d.records.iter().any(|r| {
+            r.scope == "system_transient"
+                && r.source_path == display_path(&transient.join("fixture.socket"))
+                && r.directives
+                    .iter()
+                    .any(|x| x.key == "ListenStream" && x.value.as_deref() == Some("1234"))
+        }));
     }
     #[test]
     fn malformed_oversized_and_non_utf8_evidence_is_bounded_and_diagnostic() {
