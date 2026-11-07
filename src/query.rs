@@ -44,7 +44,607 @@ pub const INVENTORY_QUERY_RESULT_SCHEMA: &str = "sideeffect.inventory_query_resu
 pub const INVENTORY_QUERY_RESULT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_ROOT_QUERY_ENTRIES: usize = 10_000;
 pub const MAX_ROOT_QUERY_AGGREGATE_NAME_BYTES: usize = 8 * 1024 * 1024;
+pub const STARTUP_QUERY_SCHEMA: &str = "sideeffect.startup_query";
+pub const STARTUP_QUERY_SCHEMA_VERSION: u32 = 1;
+pub const STARTUP_QUERY_RESULT_SCHEMA: &str = "sideeffect.startup_query_result";
+pub const STARTUP_QUERY_RESULT_SCHEMA_VERSION: u32 = 1;
+pub const MAX_STARTUP_QUERY_ROWS: usize = 20_000;
+pub const MAX_STARTUP_QUERY_STRING_BYTES: usize = 16 * 1024;
 const MAX_FILTER_TEXT_BYTES: usize = 128;
+
+/// Exact, case-sensitive equality over a string field in one native startup row.
+/// `source` and `field` are names from that platform's startup artifact; they are
+/// intentionally not mapped to a cross-platform identity.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupQueryFilters {
+    pub source: Option<String>,
+    pub field: Option<String>,
+    pub value: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupQuery {
+    pub schema: String,
+    pub schema_version: u32,
+    #[serde(default)]
+    pub filters: StartupQueryFilters,
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+}
+
+impl StartupQuery {
+    pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_QUERY_BYTES {
+            return Err(format!(
+                "startup query input exceeds the {MAX_QUERY_BYTES}-byte limit"
+            ));
+        }
+        let query: Self = serde_json::from_slice(bytes)
+            .map_err(|error| format!("invalid startup query JSON: {error}"))?;
+        if query.schema != STARTUP_QUERY_SCHEMA
+            || query.schema_version != STARTUP_QUERY_SCHEMA_VERSION
+        {
+            return Err(format!(
+                "startup query schema must be {STARTUP_QUERY_SCHEMA} version {STARTUP_QUERY_SCHEMA_VERSION}"
+            ));
+        }
+        if query.limit == 0 || query.limit as usize > MAX_QUERY_RESULTS {
+            return Err(format!(
+                "startup query limit must be between 1 and {MAX_QUERY_RESULTS}"
+            ));
+        }
+        for (label, value) in [
+            ("source", query.filters.source.as_deref()),
+            ("field", query.filters.field.as_deref()),
+            ("value", query.filters.value.as_deref()),
+        ] {
+            if value.is_some_and(|value| {
+                value.is_empty() || value.len() > MAX_STARTUP_QUERY_STRING_BYTES
+            }) {
+                return Err(format!(
+                    "startup query {label} must be non-empty and at most {MAX_STARTUP_QUERY_STRING_BYTES} UTF-8 bytes"
+                ));
+            }
+        }
+        if query.filters.field.is_some() != query.filters.value.is_some() {
+            return Err(
+                "startup query field and value filters must be supplied together".to_owned(),
+            );
+        }
+        Ok(query)
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StartupQueryArtifact {
+    pub path: String,
+    pub schema: String,
+    pub schema_version: u32,
+    pub byte_length: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StartupQueryRow {
+    pub source: String,
+    pub json_pointer: String,
+    pub evidence: serde_json::Value,
+    pub row: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StartupQuerySource {
+    pub role: SourceRole,
+    pub platform: String,
+    pub status: SourceStatus,
+    pub scope: Option<String>,
+    pub started_at_unix_ms: Option<u128>,
+    pub ended_at_unix_ms: Option<u128>,
+    pub diagnostic_codes: Vec<String>,
+    pub inventory_status: Option<String>,
+    pub inventory_diagnostics: Vec<serde_json::Value>,
+    pub source_states: Vec<serde_json::Value>,
+    pub artifact: Option<StartupQueryArtifact>,
+    pub matched_count: usize,
+    pub rows: Vec<StartupQueryRow>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionStartupQueryResult {
+    pub session: SessionQueryIdentity,
+    pub startup_source: StartupQuerySource,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MultiSessionStartupQueryResult {
+    pub schema: &'static str,
+    pub schema_version: u32,
+    pub session_count: usize,
+    pub matched_count: usize,
+    pub complete: bool,
+    pub filter: StartupQueryFilters,
+    pub limit: u32,
+    pub sessions: Vec<SessionStartupQueryResult>,
+}
+
+pub struct StartupQueryInput<'a> {
+    pub platform: &'a str,
+    pub source_status: SourceStatus,
+    pub scope: Option<String>,
+    pub started_at_unix_ms: Option<u128>,
+    pub ended_at_unix_ms: Option<u128>,
+    pub diagnostic_codes: Vec<String>,
+    pub artifact: Option<&'a SessionArtifactRef>,
+    pub bytes: Option<&'a [u8]>,
+}
+
+fn required_json_object<'a>(
+    parent: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, String> {
+    parent
+        .get(key)
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| format!("startup artifact component {key} is missing or malformed"))
+}
+
+fn required_json_array<'a>(
+    parent: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<&'a Vec<serde_json::Value>, String> {
+    parent
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("startup artifact collection {key} is missing or malformed"))
+}
+
+/// Query exact string fields from native startup-inventory rows. Rows and JSON
+/// pointers stay in the artifact's source schema; no OS identity is inferred.
+pub fn query_startup_artifact(
+    input: StartupQueryInput<'_>,
+    query: &StartupQuery,
+) -> Result<StartupQuerySource, String> {
+    use serde_json::Value;
+    use std::time::Instant;
+    let started = Instant::now();
+    let StartupQueryInput {
+        platform,
+        source_status,
+        scope,
+        started_at_unix_ms,
+        ended_at_unix_ms,
+        diagnostic_codes,
+        artifact,
+        bytes,
+    } = input;
+    if let Some(artifact) = artifact {
+        let (schema, path, version_ok) = match platform {
+            "linux" => (
+                "sideeffect.startup_inventory",
+                "startup.json",
+                (2..=3).contains(&artifact.schema_version),
+            ),
+            "windows" => (
+                "sideeffect.windows_startup_inventory",
+                "startup.windows.json",
+                (4..=10).contains(&artifact.schema_version),
+            ),
+            _ => return Err("startup query session platform is unsupported".to_owned()),
+        };
+        let bytes =
+            bytes.ok_or_else(|| "startup verified artifact bytes are unavailable".to_owned())?;
+        if artifact.kind
+            != if platform == "windows" {
+                ArtifactKind::WindowsStartup
+            } else {
+                ArtifactKind::Startup
+            }
+            || artifact.schema != schema
+            || artifact.path != path
+            || !version_ok
+            || bytes.len() as u64 != artifact.byte_length
+            || bytes.len() > crate::audit_session::MAX_SESSION_ARTIFACT_BYTES as usize
+        {
+            return Err(
+                "startup artifact contract or verified bytes do not match the session manifest"
+                    .to_owned(),
+            );
+        }
+        let document: Value = serde_json::from_slice(bytes)
+            .map_err(|_| "startup artifact is malformed JSON".to_owned())?;
+        let object = document
+            .as_object()
+            .ok_or_else(|| "startup artifact root must be an object".to_owned())?;
+        let allowed_root: &[&str] = if platform == "linux" {
+            &[
+                "schema",
+                "schema_version",
+                "platform",
+                "scope",
+                "capture_started_at_unix_ms",
+                "capture_ended_at_unix_ms",
+                "status",
+                "xdg_autostart",
+                "systemd_units",
+                "legacy_sources",
+            ]
+        } else {
+            &[
+                "schema",
+                "schema_version",
+                "platform",
+                "scope",
+                "capture_started_at_unix_ms",
+                "capture_ended_at_unix_ms",
+                "status",
+                "sources",
+                "registry_entries",
+                "folder_entries",
+                "service_entries",
+                "scheduled_task_entries",
+                "scheduled_task_actions",
+                "wmi_event_filters",
+                "wmi_event_consumers",
+                "wmi_filter_consumer_bindings",
+            ]
+        };
+        if object
+            .keys()
+            .any(|key| !allowed_root.contains(&key.as_str()))
+        {
+            return Err("startup artifact contains unsupported top-level fields".to_owned());
+        }
+        if object.get("schema").and_then(Value::as_str) != Some(schema)
+            || object.get("schema_version").and_then(Value::as_u64)
+                != Some(artifact.schema_version as u64)
+            || object.get("platform").and_then(Value::as_str) != Some(platform)
+        {
+            return Err(
+                "startup artifact header does not match its verified native contract".to_owned(),
+            );
+        }
+        let artifact_scope = object
+            .get("scope")
+            .and_then(Value::as_str)
+            .filter(|scope| !scope.is_empty())
+            .ok_or_else(|| "startup artifact scope is missing or malformed".to_owned())?;
+        let capture_started = object
+            .get("capture_started_at_unix_ms")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "startup artifact start timestamp is missing or malformed".to_owned())?;
+        let capture_ended = object
+            .get("capture_ended_at_unix_ms")
+            .and_then(Value::as_u64)
+            .filter(|ended| *ended >= capture_started)
+            .ok_or_else(|| "startup artifact end timestamp is missing or malformed".to_owned())?;
+        let _ = (artifact_scope, capture_ended);
+        let status = object
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "startup artifact status is missing".to_owned())?;
+        if !matches!(status, "complete" | "partial") {
+            return Err("startup artifact status is unsupported".to_owned());
+        }
+        let mut inventory_diagnostics = Vec::new();
+        let mut source_states = Vec::new();
+        let mut diagnostic_count = 0usize;
+        let mut collect_diagnostics = |owner: &Value| -> Result<(), String> {
+            let diagnostics = owner
+                .get("diagnostics")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "startup artifact diagnostics collection is malformed".to_owned())?;
+            diagnostic_count = diagnostic_count
+                .checked_add(diagnostics.len())
+                .ok_or_else(|| "startup artifact diagnostic count overflow".to_owned())?;
+            if diagnostic_count > 2048 {
+                return Err(
+                    "startup artifact diagnostics exceed the 2048-row query limit".to_owned(),
+                );
+            }
+            inventory_diagnostics.extend(diagnostics.iter().cloned());
+            Ok(())
+        };
+        if platform == "windows" {
+            let sources = required_json_array(object, "sources")?;
+            if sources.len() > 256 {
+                return Err("startup artifact source count exceeds its limit".to_owned());
+            }
+            for source in sources {
+                let source_status = source.get("status").and_then(Value::as_str);
+                if source.get("id").and_then(Value::as_str).is_none()
+                    || source.get("entries_seen").and_then(Value::as_u64).is_none()
+                    || source_status.is_none_or(|status| {
+                        !matches!(
+                            status,
+                            "complete"
+                                | "partial"
+                                | "not_present"
+                                | "inaccessible"
+                                | "unavailable"
+                                | "unsupported"
+                                | "not_checked"
+                                | "error"
+                        )
+                    })
+                {
+                    return Err("startup artifact source status row is malformed".to_owned());
+                }
+                if status == "complete" && source_status != Some("complete") {
+                    return Err(
+                        "complete startup artifact contains an incomplete source status".to_owned(),
+                    );
+                }
+                collect_diagnostics(source)?;
+                source_states.push(source.clone());
+            }
+            for key in [
+                "registry_entries",
+                "folder_entries",
+                "service_entries",
+                "scheduled_task_entries",
+                "scheduled_task_actions",
+            ] {
+                required_json_array(object, key)?;
+            }
+            for key in [
+                "wmi_event_filters",
+                "wmi_event_consumers",
+                "wmi_filter_consumer_bindings",
+            ] {
+                let present = object.get(key).is_some();
+                if (artifact.schema_version >= 6) != present
+                    || object.get(key).is_some_and(|value| !value.is_array())
+                {
+                    return Err(format!(
+                        "startup artifact collection {key} is missing or malformed for its schema version"
+                    ));
+                }
+            }
+        } else {
+            let xdg = required_json_object(object, "xdg_autostart")?;
+            let systemd = required_json_object(object, "systemd_units")?;
+            let legacy = required_json_object(object, "legacy_sources")?;
+            let component_version = artifact.schema_version - 1;
+            for (component, component_schema) in [
+                (xdg, "sideeffect.xdg_autostart_inventory"),
+                (systemd, "sideeffect.systemd_units"),
+                (legacy, "sideeffect.legacy_startup_inventory"),
+            ] {
+                if component.get("schema").and_then(Value::as_str) != Some(component_schema)
+                    || component.get("schema_version").and_then(Value::as_u64)
+                        != Some(component_version as u64)
+                    || component.get("platform").and_then(Value::as_str) != Some("linux")
+                    || !matches!(
+                        component.get("status").and_then(Value::as_str),
+                        Some("complete" | "partial")
+                    )
+                {
+                    return Err(
+                        "startup artifact nested component header or status is malformed"
+                            .to_owned(),
+                    );
+                }
+            }
+            if status == "complete"
+                && [xdg, systemd, legacy].iter().any(|component| {
+                    component.get("status").and_then(Value::as_str) != Some("complete")
+                })
+            {
+                return Err(
+                    "complete startup artifact contains an incomplete component status".to_owned(),
+                );
+            }
+            required_json_array(xdg, "entries")?;
+            required_json_array(systemd, "records")?;
+            required_json_array(legacy, "entries")?;
+            let xdg_directories = required_json_array(xdg, "directories")?;
+            let systemd_directories = required_json_array(systemd, "directories")?;
+            let legacy_sources = required_json_array(legacy, "sources")?;
+            for (rows, label) in [
+                (xdg_directories, "XDG"),
+                (systemd_directories, "systemd"),
+                (legacy_sources, "legacy"),
+            ] {
+                if rows.len() > 256 {
+                    return Err(format!(
+                        "startup artifact {label} source status count exceeds its limit"
+                    ));
+                }
+                for row in rows {
+                    if !row.is_object() {
+                        return Err(format!(
+                            "startup artifact {label} source status row is malformed"
+                        ));
+                    }
+                    collect_diagnostics(row)?;
+                    source_states.push(row.clone());
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        let row_arrays: &[&str] = if platform == "linux" {
+            &[
+                "xdg_autostart/entries",
+                "systemd_units/records",
+                "legacy_sources/entries",
+            ]
+        } else {
+            &[
+                "registry_entries",
+                "folder_entries",
+                "service_entries",
+                "scheduled_task_entries",
+                "scheduled_task_actions",
+                "wmi_event_filters",
+                "wmi_event_consumers",
+                "wmi_filter_consumer_bindings",
+            ]
+        };
+        let mut seen = 0usize;
+        for key in row_arrays {
+            let (array_name, parent) = if let Some((parent, name)) = key.split_once('/') {
+                (name, object.get(parent).and_then(Value::as_object))
+            } else {
+                (*key, Some(object))
+            };
+            let Some(parent) = parent else { continue };
+            let Some(value) = parent.get(array_name) else {
+                continue;
+            };
+            let array = value
+                .as_array()
+                .ok_or_else(|| "startup artifact row collection is malformed".to_owned())?;
+            for (index, row) in array.iter().enumerate() {
+                seen += 1;
+                if seen > MAX_STARTUP_QUERY_ROWS {
+                    return Err("startup artifact exceeds the 20000-row query limit".to_owned());
+                }
+                if started.elapsed() > MAX_QUERY_ELAPSED {
+                    return Err("startup query exceeded the 2000 ms execution limit".to_owned());
+                }
+                let row_object = row
+                    .as_object()
+                    .ok_or_else(|| "startup artifact contains a non-object row".to_owned())?;
+                let evidence = row_object.get("evidence").cloned().unwrap_or(Value::Null);
+                let component_name = key
+                    .split_once('/')
+                    .map_or(array_name, |(component, _)| component);
+                let row_source = row_object
+                    .get("evidence")
+                    .and_then(|v| v.get("source"))
+                    .and_then(Value::as_str)
+                    .or_else(|| row_object.get("source").and_then(Value::as_str))
+                    .unwrap_or(component_name);
+                let source_match = query.filters.source.as_deref().is_none_or(|filter| {
+                    filter == row_source || filter == array_name || filter == component_name
+                });
+                let field_match = match (
+                    query.filters.field.as_deref(),
+                    query.filters.value.as_deref(),
+                ) {
+                    (Some(field), Some(value)) => {
+                        row_object.get(field).and_then(Value::as_str) == Some(value)
+                    }
+                    _ => true,
+                };
+                if source_match && field_match {
+                    if rows.len() >= query.limit as usize {
+                        return Err(format!(
+                            "startup query matched more than its {}-row limit",
+                            query.limit
+                        ));
+                    }
+                    let pointer = if key.contains('/') {
+                        format!(
+                            "/{}",
+                            key.split('/')
+                                .map(|part| part.replace('~', "~0").replace('/', "~1"))
+                                .collect::<Vec<_>>()
+                                .join("/")
+                                + &format!("/{index}")
+                        )
+                    } else {
+                        format!(
+                            "/{}/{index}",
+                            array_name.replace('~', "~0").replace('/', "~1")
+                        )
+                    };
+                    if document.pointer(&pointer) != Some(row) {
+                        return Err("startup row evidence pointer did not resolve to its verified artifact row".to_owned());
+                    }
+                    rows.push(StartupQueryRow {
+                        source: row_source.to_owned(),
+                        json_pointer: pointer,
+                        evidence,
+                        row: row.clone(),
+                    });
+                }
+            }
+        }
+        let matched_count = rows.len();
+        Ok(StartupQuerySource {
+            role: SourceRole::Startup,
+            platform: platform.to_owned(),
+            status: source_status,
+            scope,
+            started_at_unix_ms,
+            ended_at_unix_ms,
+            diagnostic_codes,
+            inventory_status: Some(status.to_owned()),
+            inventory_diagnostics,
+            source_states,
+            artifact: Some(StartupQueryArtifact {
+                path: artifact.path.clone(),
+                schema: artifact.schema.clone(),
+                schema_version: artifact.schema_version,
+                byte_length: artifact.byte_length,
+                sha256: artifact.sha256.clone(),
+            }),
+            matched_count,
+            rows,
+        })
+    } else {
+        if bytes.is_some() {
+            return Err("startup artifact bytes have no manifest reference".to_owned());
+        }
+        Ok(StartupQuerySource {
+            role: SourceRole::Startup,
+            platform: platform.to_owned(),
+            status: source_status,
+            scope,
+            started_at_unix_ms,
+            ended_at_unix_ms,
+            diagnostic_codes,
+            inventory_status: None,
+            inventory_diagnostics: Vec::new(),
+            source_states: Vec::new(),
+            artifact: None,
+            matched_count: 0,
+            rows: Vec::new(),
+        })
+    }
+}
+
+pub fn multi_session_startup_query_result(
+    sessions: Vec<SessionStartupQueryResult>,
+    query: &StartupQuery,
+) -> Result<MultiSessionStartupQueryResult, String> {
+    if !(1..=MAX_QUERY_SESSIONS).contains(&sessions.len()) {
+        return Err(format!(
+            "startup query requires 1..={MAX_QUERY_SESSIONS} sessions"
+        ));
+    }
+    let mut ids = HashSet::new();
+    let mut matched_count = 0usize;
+    for session in &sessions {
+        if !ids.insert(session.session.session_id.as_str()) {
+            return Err("startup query contains duplicate session IDs".to_owned());
+        }
+        matched_count = matched_count
+            .checked_add(session.startup_source.matched_count)
+            .ok_or_else(|| "startup query result count overflow".to_owned())?;
+        if matched_count > MAX_MULTI_SESSION_RESULTS {
+            return Err("startup query exceeds its 5000-row aggregate limit".to_owned());
+        }
+    }
+    let complete = sessions.iter().all(|s| {
+        s.session.status == SessionStatus::Complete
+            && s.startup_source.status == SourceStatus::Complete
+            && s.startup_source.inventory_status.as_deref() == Some("complete")
+    });
+    Ok(MultiSessionStartupQueryResult {
+        schema: STARTUP_QUERY_RESULT_SCHEMA,
+        schema_version: STARTUP_QUERY_RESULT_SCHEMA_VERSION,
+        session_count: sessions.len(),
+        matched_count,
+        complete,
+        filter: query.filters.clone(),
+        limit: query.limit,
+        sessions,
+    })
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]

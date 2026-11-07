@@ -259,6 +259,109 @@ fn publish_session_with_id(
         .unwrap();
 }
 
+fn publish_startup_session(directory: &std::path::Path, session_id: &str) {
+    let startup = serde_json::to_vec(&json!({
+        "schema":"sideeffect.windows_startup_inventory", "schema_version":10, "platform":"windows",
+        "scope":"synthetic fixture only", "capture_started_at_unix_ms":1000,
+        "capture_ended_at_unix_ms":1001, "status":"partial",
+        "sources":[{"id":"registry_run_current_user","status":"partial","entries_seen":1,"diagnostics":[]}],
+        "registry_entries":[{"value_name":"Synthetic","command":"C:\\Tools\\App.exe","command_utf16_hex":"43003a005c0054006f006f006c0073005c004100700070002e00650078006500","evidence":{"source":"registry_run_current_user","value_index":0}}],
+        "folder_entries":[], "service_entries":[], "scheduled_task_entries":[], "scheduled_task_actions":[],
+        "wmi_event_filters":[], "wmi_event_consumers":[], "wmi_filter_consumer_bindings":[]
+    })).unwrap();
+    let artifact = SessionArtifactRef {
+        kind: ArtifactKind::WindowsStartup,
+        path: "startup.windows.json".into(),
+        schema: "sideeffect.windows_startup_inventory".into(),
+        schema_version: 10,
+        byte_length: startup.len() as u64,
+        sha256: digest(&startup),
+    };
+    let source = AuditSessionSource {
+        role: SourceRole::Startup,
+        collector: Some(collector_identity("windows", SourceRole::Startup)),
+        platform: "windows".into(),
+        scope: "synthetic fixture only".into(),
+        started_at_unix_ms: 1000,
+        ended_at_unix_ms: 1001,
+        status: SourceStatus::Partial,
+        applied_limits: vec![],
+        requested_settings: vec![],
+        effective_settings: vec![],
+        loss: None,
+        diagnostic_codes: vec!["synthetic_partial".into()],
+        artifacts: vec![artifact],
+    };
+    let mut manifest = AuditSessionManifest {
+        schema: AUDIT_SESSION_SCHEMA.into(),
+        schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+        session_id: session_id.into(),
+        platform: "windows".into(),
+        architecture: "x86_64".into(),
+        started_at_unix_ms: 1000,
+        ended_at_unix_ms: 1001,
+        interval_semantics: IntervalSemantics::BestEffortNonAtomic,
+        status: SessionStatus::Partial,
+        sources: vec![source],
+        host_context: Some(sideeffect::audit_session::HostContext {
+            os_name: sideeffect::audit_session::ContextFact {
+                status: sideeffect::audit_session::ContextFactStatus::Observed,
+                value: Some("Windows".into()),
+            },
+            os_version: sideeffect::audit_session::ContextFact {
+                status: sideeffect::audit_session::ContextFactStatus::Observed,
+                value: Some("synthetic fixture".into()),
+            },
+            privilege: sideeffect::audit_session::PrivilegeContext::NotElevated,
+        }),
+        coverage_manifest: None,
+    };
+    manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
+    manifest.validate().unwrap();
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    sideeffect::record::publish_private_windows_directory(
+        directory,
+        &[
+            ("session.json", manifest_bytes.as_slice()),
+            ("startup.windows.json", startup.as_slice()),
+        ],
+        16 * 1024 * 1024,
+    )
+    .unwrap();
+}
+
+#[test]
+fn startup_query_multi_session_matches_exact_windows_native_utf16_hex_field() {
+    let directory = TestDirectory::new();
+    let one = directory.0.join("startup-one");
+    let two = directory.0.join("startup-two");
+    publish_startup_session(&one, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    publish_startup_session(&two, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    let query = directory.0.join("startup-query.json");
+    fs::write(&query,br#"{"schema":"sideeffect.startup_query","schema_version":1,"filters":{"source":"registry_run_current_user","field":"command_utf16_hex","value":"43003a005c0054006f006f006c0073005c004100700070002e00650078006500"},"limit":10}"#).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["query", "--query"])
+        .arg(query)
+        .args(["--session"])
+        .arg(&one)
+        .args(["--session"])
+        .arg(&two)
+        .args(["--source", "startup"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["matched_count"], 2);
+    assert_eq!(
+        result["sessions"][0]["startup_source"]["rows"][0]["json_pointer"],
+        "/registry_entries/0"
+    );
+    assert_eq!(
+        result["sessions"][0]["startup_source"]["rows"][0]["evidence"]["source"],
+        "registry_run_current_user"
+    );
+}
+
 fn query(directory: &TestDirectory, session_path: &PathBuf) -> Output {
     let query_path = directory.0.join("query.json");
     fs::write(

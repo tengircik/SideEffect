@@ -196,6 +196,173 @@ fn write_private(directory: &Path, name: &str, bytes: &[u8]) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
+fn write_startup_session(path: &Path, id: &str, status: SourceStatus) {
+    fs::create_dir(path).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    let artifact_bytes = serde_json::to_vec(&json!({
+        "schema":"sideeffect.startup_inventory", "schema_version":3, "platform":"linux",
+        "scope":"curated_xdg_systemd_sysv_cron_sources", "capture_started_at_unix_ms":1000,
+        "capture_ended_at_unix_ms":1001, "status":"partial",
+        "xdg_autostart":{"schema":"sideeffect.xdg_autostart_inventory","schema_version":2,"platform":"linux","scope":"synthetic fixture","capture_started_at_unix_ms":1000,"capture_ended_at_unix_ms":1001,"status":"partial","entries":[{"scope":"user","source_path":"/synthetic/Alpha.desktop","keys":[]}],"directories":[]},
+        "systemd_units":{"schema":"sideeffect.systemd_units","schema_version":2,"platform":"linux","scope":"synthetic fixture","capture_started_at_unix_ms":1000,"capture_ended_at_unix_ms":1001,"status":"partial","records":[],"directories":[]},
+        "legacy_sources":{"schema":"sideeffect.legacy_startup_inventory","schema_version":2,"platform":"linux","scope":"synthetic fixture","capture_started_at_unix_ms":1000,"capture_ended_at_unix_ms":1001,"status":"partial","entries":[],"sources":[]}
+    })).unwrap();
+    let artifact = SessionArtifactRef {
+        kind: ArtifactKind::Startup,
+        path: "startup.json".into(),
+        schema: "sideeffect.startup_inventory".into(),
+        schema_version: 3,
+        byte_length: artifact_bytes.len() as u64,
+        sha256: hash(&artifact_bytes),
+    };
+    let source = AuditSessionSource {
+        role: SourceRole::Startup,
+        collector: Some(collector_identity("linux", SourceRole::Startup)),
+        platform: "linux".into(),
+        scope: "synthetic fixture only".into(),
+        started_at_unix_ms: 1000,
+        ended_at_unix_ms: 1001,
+        status,
+        applied_limits: vec![],
+        requested_settings: vec![],
+        effective_settings: vec![],
+        loss: None,
+        diagnostic_codes: vec!["synthetic_partial".into()],
+        artifacts: vec![artifact],
+    };
+    let mut manifest = AuditSessionManifest {
+        schema: AUDIT_SESSION_SCHEMA.into(),
+        schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+        session_id: id.into(),
+        platform: "linux".into(),
+        architecture: "x86_64".into(),
+        started_at_unix_ms: 1000,
+        ended_at_unix_ms: 1001,
+        interval_semantics: IntervalSemantics::BestEffortNonAtomic,
+        status: SessionStatus::Partial,
+        sources: vec![source],
+        host_context: Some(sideeffect::audit_session::HostContext {
+            os_name: sideeffect::audit_session::ContextFact {
+                status: sideeffect::audit_session::ContextFactStatus::Observed,
+                value: Some("Linux".into()),
+            },
+            os_version: sideeffect::audit_session::ContextFact {
+                status: sideeffect::audit_session::ContextFactStatus::Observed,
+                value: Some("synthetic fixture".into()),
+            },
+            privilege: sideeffect::audit_session::PrivilegeContext::NotElevated,
+        }),
+        coverage_manifest: None,
+    };
+    manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
+    manifest.validate().unwrap();
+    write_private(
+        path,
+        "session.json",
+        &serde_json::to_vec(&manifest).unwrap(),
+    );
+    write_private(path, "startup.json", &artifact_bytes);
+}
+
+#[test]
+fn startup_query_is_exact_case_sensitive_and_scoped_to_verified_rows() {
+    let directory = TestDirectory::new();
+    write_startup_session(
+        &directory.0.join("before"),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        SourceStatus::Partial,
+    );
+    write_startup_session(
+        &directory.0.join("after"),
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        SourceStatus::Partial,
+    );
+    let query = directory.0.join("startup-query.json");
+    fs::write(&query,br#"{"schema":"sideeffect.startup_query","schema_version":1,"filters":{"source":"xdg_autostart","field":"source_path","value":"/synthetic/Alpha.desktop"},"limit":10}"#).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["query", "--query"])
+        .arg(&query)
+        .args(["--session"])
+        .arg(directory.0.join("before"))
+        .args(["--session"])
+        .arg(directory.0.join("after"))
+        .args(["--source", "startup"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["schema"], "sideeffect.startup_query_result");
+    assert_eq!(result["matched_count"], 2);
+    assert_eq!(
+        result["sessions"][0]["startup_source"]["rows"][0]["row"]["source_path"],
+        "/synthetic/Alpha.desktop"
+    );
+    assert_eq!(
+        result["sessions"][0]["startup_source"]["rows"][0]["json_pointer"],
+        "/xdg_autostart/entries/0"
+    );
+    let insensitive = directory.0.join("case-query.json");
+    fs::write(&insensitive,br#"{"schema":"sideeffect.startup_query","schema_version":1,"filters":{"field":"source_path","value":"/synthetic/alpha.desktop"}}"#).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["query", "--query"])
+        .arg(insensitive)
+        .args(["--session"])
+        .arg(directory.0.join("before"))
+        .args(["--source", "startup"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["matched_count"], 0);
+    assert_eq!(result["complete"], false);
+}
+
+#[test]
+fn startup_query_rejects_unknown_oversized_queries_and_keeps_missing_source_unknown() {
+    let directory = TestDirectory::new();
+    write_session(&directory.0.join("runtime-only"), None);
+    let query = directory.0.join("startup-query.json");
+    fs::write(
+        &query,
+        br#"{"schema":"sideeffect.startup_query","schema_version":1,"unexpected":true}"#,
+    )
+    .unwrap();
+    let run = |query_path: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+            .args(["query", "--query"])
+            .arg(query_path)
+            .args(["--session"])
+            .arg(directory.0.join("runtime-only"))
+            .args(["--source", "startup"])
+            .output()
+            .unwrap()
+    };
+    let unknown = run(&query);
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown field"));
+    fs::write(&query, vec![b' '; sideeffect::query::MAX_QUERY_BYTES + 1]).unwrap();
+    let oversized = run(&query);
+    assert_eq!(oversized.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&oversized.stderr).contains("limit"));
+    fs::write(
+        &query,
+        br#"{"schema":"sideeffect.startup_query","schema_version":1}"#,
+    )
+    .unwrap();
+    let missing = run(&query);
+    assert_eq!(missing.status.code(), Some(2));
+    let result: Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(result["matched_count"], 0);
+    assert_eq!(
+        result["sessions"][0]["startup_source"]["status"],
+        "not_checked"
+    );
+    assert_eq!(
+        result["sessions"][0]["startup_source"]["artifact"],
+        Value::Null
+    );
+}
+
 fn query(directory: &TestDirectory, session_name: &str) -> Output {
     let session = directory.0.join(session_name);
     let query = directory.0.join("query.json");

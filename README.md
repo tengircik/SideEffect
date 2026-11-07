@@ -498,3 +498,7 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) and the repository's [agent guidance](AG
 ## License
 
 SideEffect is licensed under the [Apache License 2.0](LICENSE).
+
+### Startup session queries
+
+Query startup inventory rows with the separate `sideeffect.startup_query` v1 contract and `--source startup`. Filters compare a native artifact row field by exact, case-sensitive string equality; field names and source selectors remain specific to the artifact schema. On Windows, use artifact-provided UTF-16LE hexadecimal fields when exact code-unit matching is needed. Results retain the complete source row, evidence, artifact digest, session/source status, and a JSON pointer. A zero-match result does not establish that startup configuration is absent.

@@ -151,3 +151,5 @@ Before calling SideEffect 1.0 cross-platform, a native Windows user must be able
 - JSON schema versioning and compatibility policy.
 - License compatibility, packaging, and whether/how an external `strace` dependency is pinned or installed. No licensing or redistribution conclusion is made here.
 - Which normalization rules are sufficiently reliable for v0 and how ambiguous path resolution is presented.
+
+Startup session query uses a separate `sideeffect.startup_query` v1 schema. It performs exact case-sensitive matching against native startup artifact row fields and retains evidence, artifact digests, and verified row pointers. Linux byte hex and Windows UTF-16LE hex remain source-faithful search inputs; rows and identities are not normalized across operating systems. Partial/missing sources remain explicit, and zero matches do not establish absence.

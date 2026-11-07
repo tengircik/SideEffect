@@ -104,7 +104,7 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect model-query-preview --question <question> <strace-trace-file>\n\
        sideeffect model-query --question <question> [--runtime <llama-completion>] --confirm-sha256 <preview-digest> <strace-trace-file>\n\
        sideeffect query --query <query.json> --trace <trace> | --windows-runtime <capture.json>\n\
-       sideeffect query --query <query.json> --session <session-directory> --source runtime|selected_root\n\
+       sideeffect query --query <query.json> --session <session-directory> --source runtime|selected_root|startup\n\
        sideeffect model list | show <id> | install <id> | setup <id> [--runtime <existing-file>] | add | select <task> <id> | remove <id>\n\
        sideeffect model runtime set <task> <existing-file> | show [task] | clear <task>\n\
        sideeffect model doctor --task evidence|explanation|query [--runtime <task-runtime>] [--backend auto|cpu|cuda]\n\
@@ -1888,7 +1888,7 @@ fn print_version() {
 
 fn print_usage() {
     println!(
-        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)\n       sideeffect query --query <query.json> --trace <trace> [--format json|text]\n       sideeffect query --query <query.json> --windows-runtime <capture.json> [--format json|text] (native Windows)\n       sideeffect query --query <query.json> --session <session-dir> --source runtime|selected_root [--format json|text]\n       sideeffect graph --trace <strace-trace-file> [--format json|text|html] [--output <new-report.html>] [--event-kind <kind> | --process-observation <id>]\n       sideeffect graph --windows-runtime <capture.json> [--startup <startup.json>] [--format json|text|html] [--output <new-report.html>] [--event-kind <kind> | --process-observation <id>] (native Windows)\n       sideeffect timeline --trace <strace-trace-file> [--format json|text|html] [--output <new-report.html>] [--event-kind <kind>] [--process-observation <id>]\n       sideeffect timeline --windows-runtime <capture.json> [--format json|text|html] [--output <new-report.html>] [--event-kind <kind>] [--process-observation <id>] (native Windows)\n\nProvenance:\n       sideeffect provenance keygen <private-key.pk8> <public-key.hex>\n       sideeffect provenance key-check <private-key.pk8> <public-key.hex>\n       sideeffect provenance sign-session <session-dir> --private-key <private-key.pk8> --output <signature.json>\n       sideeffect provenance verify-session <session-dir> --signature <signature.json> --public-key <public-key.hex>"
+        "{USAGE}\n\nEvents:\n       sideeffect events --trace <strace-trace-file>\n       sideeffect events --windows-runtime <capture.json> (native Windows)\n       sideeffect query --query <query.json> --trace <trace> [--format json|text]\n       sideeffect query --query <query.json> --windows-runtime <capture.json> [--format json|text] (native Windows)\n       sideeffect query --query <query.json> --session <session-dir> --source runtime|selected_root|startup [--format json|text]\n       sideeffect graph --trace <strace-trace-file> [--format json|text|html] [--output <new-report.html>] [--event-kind <kind> | --process-observation <id>]\n       sideeffect graph --windows-runtime <capture.json> [--startup <startup.json>] [--format json|text|html] [--output <new-report.html>] [--event-kind <kind> | --process-observation <id>] (native Windows)\n       sideeffect timeline --trace <strace-trace-file> [--format json|text|html] [--output <new-report.html>] [--event-kind <kind>] [--process-observation <id>]\n       sideeffect timeline --windows-runtime <capture.json> [--format json|text|html] [--output <new-report.html>] [--event-kind <kind>] [--process-observation <id>] (native Windows)\n\nProvenance:\n       sideeffect provenance keygen <private-key.pk8> <public-key.hex>\n       sideeffect provenance key-check <private-key.pk8> <public-key.hex>\n       sideeffect provenance sign-session <session-dir> --private-key <private-key.pk8> --output <signature.json>\n       sideeffect provenance verify-session <session-dir> --signature <signature.json> --public-key <public-key.hex>"
     );
 }
 
@@ -1928,7 +1928,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect events --trace TRACE\n       sideeffect events --windows-runtime CAPTURE.json (native Windows)\nAdapts one local runtime source into a versioned common event envelope and writes JSON only. Source-local order and timestamps are preserved; no cross-platform ordering, parentage, ownership, or causation is inferred. Partial or unknown source status exits with status 2. Windows runtime input is strictly bounded and schema-validated before adaptation."
         }
         "query" => {
-            "Usage: sideeffect query --query QUERY.json --trace TRACE [--format json|text]\n       sideeffect query --query QUERY.json --windows-runtime CAPTURE.json [--format json|text] (native Windows)\n       sideeffect query --query QUERY.json --session SESSION_DIR --source runtime|selected_root [--format json|text]\n       sideeffect query --query QUERY.json --session SESSION_DIR --session SESSION_DIR --source runtime|selected_root [--format json|text] (2..16 sessions)\nRuns a versioned, read-only exact-filter query over runtime evidence or selected-root inventory artifacts in explicitly selected verified sessions. Event query schema v2 adds path_exact (exact equality); v3 adds path_prefix (case-sensitive literal string starts_with). Both apply only to observed Linux lexical hints or raw-payload-validated Windows ETW FileIo names. Prefix matching can match sibling spellings such as /tmp/a and /tmp/abc; it does not mean directory containment. Neither filter normalizes, case-folds, resolves, or globs paths; unsupported/pathless rows cannot match, and zero matches do not establish absence. Query schemas v1/v2 remain accepted for their original filters. Other event filters are exact event_kind, operation_kind, syscall outcome, and source-local evidence locators; process_observation_id is supported for one runtime source only. Evidence locators match the complete source-native tuple and are rejected across sessions. Inventory query schema v1 accepts exact native-encoding root_path_hex and entry_name_hex filters; Linux values encode bytes and Windows values encode UTF-16LE. Query JSON is capped at 16 KiB, each path filter at 8 KiB, matching rows at 5,000, multi-session verified artifact bytes at 256 MiB, total work at 10 seconds checked between sessions, and serialized output at 8 MiB. Selected-root v1/v2 documents are strictly validated with 10,000-entry and 8 MiB aggregate encoded-name caps. Results retain session/source status, diagnostics, artifact digests, and direct-child entry ordinals. Missing and partial sources remain not checked or partial. Invalid sessions or malformed documents fail the request. Partial or unknown evidence exits with status 2."
+            "Usage: sideeffect query --query QUERY.json --trace TRACE [--format json|text]\n       sideeffect query --query QUERY.json --windows-runtime CAPTURE.json [--format json|text] (native Windows)\n       sideeffect query --query QUERY.json --session SESSION_DIR --source runtime|selected_root|startup [--format json|text]\n       sideeffect query --query QUERY.json --session SESSION_DIR --session SESSION_DIR --source runtime|selected_root|startup [--format json|text] (2..16 sessions)\nRuns a versioned, read-only exact-filter query over runtime evidence selected-root snapshots, or startup inventory rows in explicitly selected verified sessions. Event query schema v2 adds path_exact (exact equality); v3 adds path_prefix (case-sensitive literal string starts_with). Both apply only to observed Linux lexical hints or raw-payload-validated Windows ETW FileIo names. Prefix matching can match sibling spellings such as /tmp/a and /tmp/abc; it does not mean directory containment. Neither filter normalizes, case-folds, resolves, or globs paths; unsupported/pathless rows cannot match, and zero matches do not establish absence. Query schemas v1/v2 remain accepted for their original filters. Other event filters are exact event_kind, operation_kind, syscall outcome, and source-local evidence locators; process_observation_id is supported for one runtime source only. Evidence locators match the complete source-native tuple and are rejected across sessions. Inventory query schema v1 accepts exact native-encoding root_path_hex and entry_name_hex filters; Linux values encode bytes and Windows values encode UTF-16LE. Startup query uses a separate sideeffect.startup_query v1 contract with exact case-sensitive UTF-8 string equality over a native row field and optional native source/table selector; Windows raw UTF-16 fields can be selected through their artifact-provided lowercase hexadecimal values. It preserves full matched rows, source evidence, and RFC 6901 JSON pointers without normalizing identities across platforms. Startup artifacts are capped at 64 MiB, traversal at 20,000 rows, aggregate verified artifacts at 256 MiB, total work at 10 seconds, and output at 8 MiB. Query JSON is capped at 16 KiB, each path filter at 8 KiB, matching rows at 5,000, multi-session verified artifact bytes at 256 MiB, total work at 10 seconds checked between sessions, and serialized output at 8 MiB. Selected-root v1/v2 documents are strictly validated with 10,000-entry and 8 MiB aggregate encoded-name caps. Results retain session/source status, diagnostics, artifact digests, and direct-child entry ordinals. Missing and partial sources remain not checked or partial. Invalid sessions or malformed documents fail the request. Partial or unknown evidence exits with status 2."
         }
         "graph" => {
             "Usage: sideeffect graph --trace TRACE [--format json|text|html] [--output REPORT.html] [--event-kind KIND | --process-observation ID]\n       sideeffect graph --windows-runtime CAPTURE.json [--startup STARTUP.json] [--format json|text|html] [--output REPORT.html] [--event-kind KIND | --process-observation ID] (native Windows)\nBuilds a bounded source-local graph of event rows, process observations, reported PID context, and evidence-linked relationships. Optional Windows --startup adds exact-path SCM service-to-process-start candidates with references into both inputs; a candidate does not show that a service launched or caused a process. JSON remains the default; --format text writes an 8 MiB-bounded ASCII-only terminal summary to stdout. --format html requires --output and writes a bounded static offline HTML report without replacing existing files. The report uses a restrictive CSP, has no scripts or external assets, and escapes source values. --event-kind selects exact event-kind matches. --process-observation selects a source-local ProcessObservation ID (not a PID or cross-capture ID) and retains events linked to that observation plus its direct process relationships. Retained links preserve their status and basis; diagnostics and source status remain for the full input. An empty event selection is not evidence of absence. PID-only context nodes are kept separate and never merged into process instances. Edges do not establish ownership, causation, or a complete process tree. Partial or unknown source status exits with status 2."
@@ -3987,14 +3987,17 @@ fn query_command(arguments: &[OsString]) -> Result<ExitCode, String> {
             if session_source.is_some() {
                 return Err("duplicate query --source option".to_owned());
             }
-            if value != "runtime" && value != "selected_root" {
-                return Err("query --source supports only 'runtime' or 'selected_root'".to_owned());
+            if value != "runtime" && value != "selected_root" && value != "startup" {
+                return Err(
+                    "query --source supports only 'runtime', 'selected_root', or 'startup'"
+                        .to_owned(),
+                );
             }
-            session_source = Some(if value == "runtime" {
-                "runtime"
-            } else {
-                "selected_root"
-            });
+            session_source = Some(
+                value
+                    .to_str()
+                    .ok_or_else(|| "query source must be UTF-8".to_owned())?,
+            );
         } else if flag == "--format" {
             if format_seen {
                 return Err("duplicate query --format option".to_owned());
@@ -4018,7 +4021,7 @@ fn query_command(arguments: &[OsString]) -> Result<ExitCode, String> {
     let query_bytes = read_input_file(
         Path::new(query_path),
         sideeffect::query::MAX_QUERY_BYTES,
-        if session_source == Some("selected_root") {
+        if matches!(session_source, Some("selected_root" | "startup")) {
             "inventory query"
         } else {
             "event query"
@@ -4034,6 +4037,20 @@ fn query_command(arguments: &[OsString]) -> Result<ExitCode, String> {
         let result = query_verified_session_selected_roots(&session_paths, &query)?;
         let complete = result.complete;
         write_inventory_query_result(&result, output_format)?;
+        return Ok(if complete {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(2)
+        });
+    }
+    if session_source == Some("startup") {
+        if source.is_some() {
+            return Err("startup inventory queries require verified --session inputs".to_owned());
+        }
+        let query = sideeffect::query::StartupQuery::from_json(&query_bytes)?;
+        let result = query_verified_session_startups(&session_paths, &query)?;
+        let complete = result.complete;
+        write_startup_query_result(&result, output_format)?;
         return Ok(if complete {
             ExitCode::SUCCESS
         } else {
@@ -4321,6 +4338,169 @@ fn query_verified_session_selected_roots(
         ));
     }
     sideeffect::query::multi_session_inventory_query_result(sessions, query)
+}
+
+fn query_verified_session_startups(
+    session_paths: &[&OsString],
+    query: &sideeffect::query::StartupQuery,
+) -> Result<sideeffect::query::MultiSessionStartupQueryResult, String> {
+    use std::collections::HashSet;
+    if !(1..=sideeffect::query::MAX_QUERY_SESSIONS).contains(&session_paths.len()) {
+        return Err(format!(
+            "startup query requires 1..={} sessions",
+            sideeffect::query::MAX_QUERY_SESSIONS
+        ));
+    }
+    let started = Instant::now();
+    let mut sessions = Vec::with_capacity(session_paths.len());
+    let mut ids = HashSet::with_capacity(session_paths.len());
+    let mut aggregate_bytes = 0u64;
+    for session_path in session_paths {
+        if started.elapsed() > sideeffect::query::MAX_MULTI_SESSION_ELAPSED {
+            return Err("startup query exceeded the 10000 ms total execution limit".to_owned());
+        }
+        let verified = read_verified_audit_session(Path::new(session_path))?;
+        let manifest = verified.manifest();
+        if manifest.platform != native_query_platform() {
+            return Err("startup query platform does not match this native reader".to_owned());
+        }
+        if !ids.insert(manifest.session_id.clone()) {
+            return Err("startup query contains duplicate session IDs".to_owned());
+        }
+        let source = manifest
+            .sources
+            .iter()
+            .find(|source| source.role == sideeffect::audit_session::SourceRole::Startup);
+        let artifact = source.and_then(|source| {
+            source.artifacts.iter().find(|item| {
+                matches!(
+                    item.kind,
+                    sideeffect::audit_session::ArtifactKind::Startup
+                        | sideeffect::audit_session::ArtifactKind::WindowsStartup
+                )
+            })
+        });
+        let artifact_bytes = artifact.and_then(|reference| {
+            verified
+                .artifacts()
+                .iter()
+                .find(|item| item.kind() == reference.kind)
+                .map(|item| item.bytes())
+        });
+        if let Some(artifact) = artifact {
+            aggregate_bytes = aggregate_bytes
+                .checked_add(artifact.byte_length)
+                .ok_or_else(|| "startup query input byte count overflow".to_owned())?;
+        }
+        if aggregate_bytes > sideeffect::query::MAX_MULTI_SESSION_INPUT_BYTES {
+            return Err(
+                "startup query input exceeds the 268435456-byte aggregate limit".to_owned(),
+            );
+        }
+        let startup_source = sideeffect::query::query_startup_artifact(
+            sideeffect::query::StartupQueryInput {
+                platform: &manifest.platform,
+                source_status: source.map_or(
+                    sideeffect::audit_session::SourceStatus::NotChecked,
+                    |item| item.status,
+                ),
+                scope: source.map(|item| item.scope.clone()),
+                started_at_unix_ms: source.map(|item| item.started_at_unix_ms),
+                ended_at_unix_ms: source.map(|item| item.ended_at_unix_ms),
+                diagnostic_codes: source
+                    .map_or_else(Vec::new, |item| item.diagnostic_codes.clone()),
+                artifact,
+                bytes: artifact_bytes,
+            },
+            query,
+        )?;
+        sessions.push(sideeffect::query::SessionStartupQueryResult {
+            session: sideeffect::query::SessionQueryIdentity {
+                session_id: manifest.session_id.clone(),
+                manifest_schema_version: manifest.schema_version,
+                platform: manifest.platform.clone(),
+                status: manifest.status,
+                started_at_unix_ms: manifest.started_at_unix_ms,
+                ended_at_unix_ms: manifest.ended_at_unix_ms,
+            },
+            startup_source,
+        });
+    }
+    if started.elapsed() > sideeffect::query::MAX_MULTI_SESSION_ELAPSED {
+        return Err("startup query exceeded the 10000 ms total execution limit".to_owned());
+    }
+    sideeffect::query::multi_session_startup_query_result(sessions, query)
+}
+
+fn write_startup_query_result(
+    result: &sideeffect::query::MultiSessionStartupQueryResult,
+    output_format: &str,
+) -> Result<(), String> {
+    if output_format == "json" {
+        let mut output = CappedBuffer::new(sideeffect::query::MAX_QUERY_OUTPUT_BYTES);
+        serde_json::to_writer_pretty(&mut output, result).map_err(|error| {
+            if output.exceeded {
+                format!(
+                    "startup query output exceeds the {}-byte limit",
+                    sideeffect::query::MAX_QUERY_OUTPUT_BYTES
+                )
+            } else {
+                format!("could not serialize startup query result: {error}")
+            }
+        })?;
+        output
+            .write_all(b"\n")
+            .map_err(|_| "startup query output exceeds the 8 MiB limit".to_owned())?;
+        write_buffer(&output, "startup query result")
+    } else {
+        let mut output = CappedBuffer::new(sideeffect::query::MAX_QUERY_OUTPUT_BYTES);
+        let formatted = (|| -> io::Result<()> {
+            writeln!(
+                output,
+                "Startup inventory query: sessions={} matches={} completeness={}",
+                result.session_count,
+                result.matched_count,
+                if result.complete {
+                    "complete"
+                } else {
+                    "partial or unknown"
+                }
+            )?;
+            for session in &result.sessions {
+                let source = &session.startup_source;
+                write!(output, "Session ")?;
+                write_terminal_safe_text(&mut output, &session.session.session_id)?;
+                write!(output, " (")?;
+                write_terminal_safe_text(&mut output, &session.session.platform)?;
+                writeln!(
+                    output,
+                    "): source={:?}, inventory={}, matches={}",
+                    source.status,
+                    source
+                        .inventory_status
+                        .as_deref()
+                        .unwrap_or("not available"),
+                    source.matched_count
+                )?;
+                for row in &source.rows {
+                    write!(output, "  ")?;
+                    write_terminal_safe_text(&mut output, &row.source)?;
+                    write!(output, " ")?;
+                    write_terminal_safe_text(&mut output, &row.json_pointer)?;
+                    writeln!(output)?;
+                }
+            }
+            Ok(())
+        })();
+        if formatted.is_err() {
+            return Err(if output.exceeded {
+                "startup query output exceeds the 8 MiB limit".to_owned()
+            } else {
+                "could not format startup query result".to_owned()
+            });
+        }
+        write_buffer(&output, "startup query result")
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -7838,6 +8018,18 @@ fn terminal_safe_text(value: &str) -> String {
     escaped
 }
 
+fn write_terminal_safe_text(output: &mut CappedBuffer, value: &str) -> io::Result<()> {
+    for character in value.chars() {
+        if character.is_ascii() && !character.is_control() && character != '\\' {
+            let mut encoded = [0; 4];
+            output.write_all(character.encode_utf8(&mut encoded).as_bytes())?;
+        } else {
+            write!(output, "\\u{{{:x}}}", character as u32)?;
+        }
+    }
+    Ok(())
+}
+
 fn inspect_bundle_with_format(format: &OsString, path: &OsString) -> Result<ExitCode, String> {
     if !matches!(format.to_str(), Some("json" | "text")) {
         return Err("inspect format must be either 'json' or 'text'".to_owned());
@@ -8709,6 +8901,7 @@ mod tests {
     };
     use super::{
         CappedBuffer, MAX_REPORT_BYTES, read_limited, read_trace_file, write_event_query_text,
+        write_startup_query_result,
     };
     #[cfg(windows)]
     use sha2::{Digest, Sha256};
@@ -8722,6 +8915,61 @@ mod tests {
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
     struct TempTrace(PathBuf);
+
+    #[test]
+    fn startup_text_output_stops_at_the_bounded_buffer() {
+        use sideeffect::audit_session::{SessionStatus, SourceRole, SourceStatus};
+        use sideeffect::query::{
+            MultiSessionStartupQueryResult, STARTUP_QUERY_RESULT_SCHEMA,
+            STARTUP_QUERY_RESULT_SCHEMA_VERSION, SessionQueryIdentity, SessionStartupQueryResult,
+            StartupQueryFilters, StartupQueryRow, StartupQuerySource,
+        };
+
+        let row_source = "é".repeat(1_500_000);
+        let source = StartupQuerySource {
+            role: SourceRole::Startup,
+            platform: "linux".to_owned(),
+            status: SourceStatus::Partial,
+            scope: Some("synthetic fixture".to_owned()),
+            started_at_unix_ms: Some(1),
+            ended_at_unix_ms: Some(2),
+            diagnostic_codes: vec![],
+            inventory_status: Some("partial".to_owned()),
+            inventory_diagnostics: vec![],
+            source_states: vec![],
+            artifact: None,
+            matched_count: 1,
+            rows: vec![StartupQueryRow {
+                source: row_source,
+                json_pointer: "/registry_entries/0".to_owned(),
+                evidence: serde_json::Value::Null,
+                row: serde_json::Value::Null,
+            }],
+        };
+        let result = MultiSessionStartupQueryResult {
+            schema: STARTUP_QUERY_RESULT_SCHEMA,
+            schema_version: STARTUP_QUERY_RESULT_SCHEMA_VERSION,
+            session_count: 1,
+            matched_count: 1,
+            complete: false,
+            filter: StartupQueryFilters::default(),
+            limit: 1,
+            sessions: vec![SessionStartupQueryResult {
+                session: SessionQueryIdentity {
+                    session_id: "synthetic-session".to_owned(),
+                    manifest_schema_version: 15,
+                    platform: "linux".to_owned(),
+                    status: SessionStatus::Partial,
+                    started_at_unix_ms: 1,
+                    ended_at_unix_ms: 2,
+                },
+                startup_source: source,
+            }],
+        };
+
+        let error = write_startup_query_result(&result, "text").unwrap_err();
+        assert!(error.contains("8 MiB limit"));
+    }
 
     impl TempTrace {
         fn with_contents(contents: &[u8]) -> Self {

@@ -810,3 +810,7 @@ cargo test --locked --all-targets
 ```
 
 `rustfmt` and `clippy` components are needed for the first two commands. Follow the repository's contribution guide for the current tested workflows and their limits.
+
+## Startup inventory query
+
+`query --session DIR --source startup` and the multi-session form select the manifest-verified startup artifact for each session. Query files use the separate `sideeffect.startup_query` v1 contract. Filters perform exact, case-sensitive equality over UTF-8 JSON string fields in native rows, optionally limited by an artifact-native source/table name. Windows callers can target artifact-provided lowercase UTF-16LE hex fields for exact code-unit matching. The result preserves complete native rows, source evidence, artifact schema/version/length/SHA-256, and an RFC 6901 JSON pointer checked against the verified artifact. Linux startup v2/v3 and Windows startup v4-v10 artifacts are supported. Limits are 64 MiB per artifact, 20,000 traversed rows, 16 KiB per selector string, 256 MiB aggregate artifact bytes, 5,000 matches, 10 seconds cooperative total work, and 8 MiB serialized output. Source and artifact statuses remain visible; zero matches do not establish absence.

@@ -256,3 +256,5 @@ Potential future work requires separate scoping and evidence:
 - stronger process causality or provenance claims;
 
 These items are not implied by existing releases. The roadmap evaluates bounded local options where appropriate; it does not authorize continuous monitoring, cloud upload, automatic privilege escalation, complete observation, or causal certainty.
+
+The deterministic startup session query is implemented as a separate `sideeffect.startup_query` v1 contract. It supports verified Linux startup v2/v3 and Windows startup v4-v10 artifacts, exact case-sensitive string-field filters, native source selectors, intact row evidence, and bounded multi-session input. It does not normalize identities across operating systems; zero matches do not establish absence. The requested local LLM query-planning work remains deferred.
