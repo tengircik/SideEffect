@@ -495,6 +495,7 @@ fn validate_known_fields(v: &Value) -> Result<(), StartupDiffError> {
         "record_locator",
         "keys",
         "code",
+        "diagnostic_code",
         "message",
         "item_index",
         "win32_error",
@@ -519,6 +520,7 @@ fn validate_known_fields(v: &Value) -> Result<(), StartupDiffError> {
         "display_path",
         "service_name",
         "display_name",
+        "delayed_auto_start",
         "start_type",
         "start_type_code",
         "account",
@@ -2378,6 +2380,8 @@ mod tests {
         };
         before["service_entries"] = json!([service(json!({"status":"observed","value":false}))]);
         after["service_entries"] = json!([service(json!({"status":"observed","value":true}))]);
+        validate(&before, Kind::Windows).unwrap();
+        validate(&after, Kind::Windows).unwrap();
         let report = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
         assert_eq!(report.counts.changed, 1);
         assert_eq!(report.deltas[0].changed_fields, ["delayed_auto_start"]);
@@ -2416,6 +2420,8 @@ mod tests {
         service["evidence"]["source"] =
             json!("EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W");
         after["service_entries"] = json!([service]);
+        validate(&before, Kind::Windows).unwrap();
+        validate(&after, Kind::Windows).unwrap();
         let report = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
         assert_eq!(report.status, StartupDiffStatus::Partial);
         assert!(report.deltas.is_empty());
