@@ -11,6 +11,16 @@ use std::fmt;
 const MAX_INPUT: usize = 64 * 1024 * 1024;
 const MAX_ROWS: usize = 32_768;
 const MAX_DELTAS: usize = 16_384;
+const SYSTEMD_DEPENDENCY_DIRECTIVES: &[&str] = &[
+    "Requires",
+    "Requisite",
+    "Wants",
+    "BindsTo",
+    "PartOf",
+    "Upholds",
+    "Conflicts",
+];
+const SYSTEMD_ORDERING_DIRECTIVES: &[&str] = &["Before", "After"];
 const MAX_DEPTH: usize = 32;
 const MAX_NODES: usize = 1_000_000;
 const MAX_COLLECTION: usize = 65_536;
@@ -1987,6 +1997,14 @@ fn linux_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
         ]);
         let facts = vec![
             ("directives", digest(&value(&e["directives"]))),
+            (
+                "dependency_directives",
+                systemd_directive_group_digest(e, SYSTEMD_DEPENDENCY_DIRECTIVES),
+            ),
+            (
+                "ordering_directives",
+                systemd_directive_group_digest(e, SYSTEMD_ORDERING_DIRECTIVES),
+            ),
             ("symlink_target", digest(&value(&e["symlink_target"]))),
             ("startup_state", startup_state_fact(e)),
         ];
@@ -2021,6 +2039,35 @@ fn linux_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
     }
     Ok(rows)
 }
+
+/// Hash only the selected systemd directive group, retaining occurrence order
+/// and duplicates so repeated or empty reset assignments remain distinguishable.
+/// The comparison result exposes only the static group label, never these values.
+fn systemd_directive_group_digest(record: &Value, keys: &[&str]) -> String {
+    let selected = record
+        .get("directives")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|directive| {
+            directive.get("section").and_then(Value::as_str) == Some("Unit")
+                && directive
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .is_some_and(|key| keys.contains(&key))
+        })
+        .map(|directive| {
+            serde_json::json!({
+                "section": directive.get("section"),
+                "key": directive.get("key"),
+                "value": directive.get("value"),
+                "value_hex": directive.get("value_hex"),
+            })
+        })
+        .collect::<Vec<_>>();
+    digest(&value(&serde_json::Value::Array(selected)))
+}
+
 fn linux_component_complete(v: &Value) -> bool {
     v["status"] == "complete"
 }
@@ -2333,6 +2380,177 @@ mod tests {
         value["systemd_units"]["schema_version"] = json!(2);
         value["legacy_sources"]["schema_version"] = json!(2);
         value
+    }
+
+    fn systemd_directive(key: &str, value: &str, line: usize) -> Value {
+        json!({
+            "section":"Unit",
+            "key":key,
+            "value":value,
+            "value_hex":null,
+            "line":line,
+            "byte_offset":line * 8,
+            "byte_length":value.len(),
+            "line_sha256":format!("line-{line}")
+        })
+    }
+
+    fn systemd_record(directives: Vec<Value>, has_state: bool) -> Value {
+        let mut record = json!({
+            "scope":"system",
+            "source_path":"/etc/systemd/system/example.service",
+            "source_path_bytes_hex":"2f6574632f73797374656d642f73797374656d2f6578616d706c652e73657276696365",
+            "record_type":"unit_file",
+            "symlink_target":null,
+            "directives":directives
+        });
+        if has_state {
+            record["startup_state"] = startup_state();
+        }
+        record
+    }
+
+    fn compare_systemd_records(
+        before_record: Value,
+        after_record: Value,
+        before_partial: bool,
+        after_v3: bool,
+    ) -> StartupInventoryDiff {
+        let mut before = linux();
+        before["systemd_units"]["records"] = json!([before_record]);
+        if before_partial {
+            before["status"] = json!("partial");
+            before["systemd_units"]["status"] = json!("partial");
+        }
+        let mut after = if after_v3 { linux_v3() } else { linux() };
+        after["systemd_units"]["records"] = json!([after_record]);
+        compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap()
+    }
+
+    #[test]
+    fn systemd_requirement_directive_changes_use_static_dependency_label_only() {
+        let diff = compare_systemd_records(
+            systemd_record(
+                vec![systemd_directive("Requires", "alpha.service", 1)],
+                false,
+            ),
+            systemd_record(
+                vec![systemd_directive("Requires", "beta.service", 1)],
+                false,
+            ),
+            false,
+            false,
+        );
+        assert_eq!(diff.deltas.len(), 1);
+        assert_eq!(
+            diff.deltas[0].changed_fields,
+            ["directives", "dependency_directives"]
+        );
+        let output = serde_json::to_string(&diff).unwrap();
+        assert!(!output.contains("alpha.service"));
+        assert!(!output.contains("beta.service"));
+    }
+
+    #[test]
+    fn systemd_ordering_changes_are_separate_from_requirement_changes() {
+        let diff = compare_systemd_records(
+            systemd_record(vec![systemd_directive("After", "alpha.service", 1)], false),
+            systemd_record(vec![systemd_directive("Before", "alpha.service", 1)], false),
+            false,
+            false,
+        );
+        assert_eq!(diff.deltas.len(), 1);
+        assert_eq!(
+            diff.deltas[0].changed_fields,
+            ["directives", "ordering_directives"]
+        );
+        assert!(
+            !diff.deltas[0]
+                .changed_fields
+                .contains(&"dependency_directives")
+        );
+    }
+
+    #[test]
+    fn unrelated_or_non_unit_directives_keep_only_the_general_label() {
+        let diff = compare_systemd_records(
+            systemd_record(vec![systemd_directive("Description", "first", 1)], false),
+            systemd_record(vec![systemd_directive("Description", "second", 1)], false),
+            false,
+            false,
+        );
+        assert_eq!(diff.deltas.len(), 1);
+        assert_eq!(diff.deltas[0].changed_fields, ["directives"]);
+
+        let mut invalid_section = systemd_directive("After", "alpha.service", 1);
+        invalid_section["section"] = json!("Service");
+        let mut other_invalid_section = invalid_section.clone();
+        other_invalid_section["value"] = json!("beta.service");
+        let diff = compare_systemd_records(
+            systemd_record(vec![invalid_section], false),
+            systemd_record(vec![other_invalid_section], false),
+            false,
+            false,
+        );
+        assert_eq!(diff.deltas.len(), 1);
+        assert_eq!(diff.deltas[0].changed_fields, ["directives"]);
+    }
+
+    #[test]
+    fn systemd_duplicate_and_empty_reset_lines_are_compared_as_source_facts() {
+        let before = systemd_record(
+            vec![
+                systemd_directive("Requires", "alpha.service", 1),
+                systemd_directive("Requires", "beta.service", 2),
+            ],
+            false,
+        );
+        let same = compare_systemd_records(before.clone(), before.clone(), false, false);
+        assert_eq!(same.counts.changed, 0);
+
+        let reset = compare_systemd_records(
+            before,
+            systemd_record(
+                vec![
+                    systemd_directive("Requires", "alpha.service", 1),
+                    systemd_directive("Requires", "", 2),
+                ],
+                false,
+            ),
+            false,
+            false,
+        );
+        assert_eq!(reset.deltas.len(), 1);
+        assert!(
+            reset.deltas[0]
+                .changed_fields
+                .contains(&"dependency_directives")
+        );
+        let output = serde_json::to_string(&reset).unwrap();
+        assert!(!output.contains("alpha.service"));
+        assert!(!output.contains("beta.service"));
+    }
+
+    #[test]
+    fn systemd_relationship_change_remains_partial_or_compatible_across_versions() {
+        let before = systemd_record(vec![systemd_directive("Wants", "alpha.service", 1)], false);
+        let after = systemd_record(vec![systemd_directive("Wants", "beta.service", 1)], true);
+
+        let partial = compare_systemd_records(before.clone(), after.clone(), true, true);
+        assert_eq!(partial.status, StartupDiffStatus::Partial);
+        assert!(
+            partial.deltas[0]
+                .changed_fields
+                .contains(&"dependency_directives")
+        );
+
+        let mixed_versions = compare_systemd_records(before, after, false, true);
+        assert_eq!(mixed_versions.status, StartupDiffStatus::Complete);
+        assert!(
+            mixed_versions.deltas[0]
+                .changed_fields
+                .contains(&"dependency_directives")
+        );
     }
 
     fn windows_v5() -> Value {
