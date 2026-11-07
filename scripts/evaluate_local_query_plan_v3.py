@@ -32,6 +32,7 @@ MAX_FIXTURE_BYTES = 128 * 1024
 MAX_FIXTURE_TOTAL_BYTES = 512 * 1024
 MAX_MODEL_BYTES = v2.MAX_MODEL_BYTES
 MAX_CHILD_OUTPUT_BYTES = v2.MAX_CHILD_OUTPUT_BYTES
+MAX_SIDEEFFECT_BYTES = 256 * 1024 * 1024
 PREVIEW_TIMEOUT_SECONDS = 30
 ANALYSIS_TIMEOUT_SECONDS = 120
 EXPECTED_CASES = 120
@@ -149,6 +150,32 @@ def _verify_pinned_file(path: Path, expected_sha256: str, byte_limit: int, label
     return digest, size
 
 
+def _hash_regular_file(path: Path, byte_limit: int, label: str) -> tuple[str, int]:
+    """Hash a bounded regular non-symlink artifact without loading it into memory."""
+    try:
+        safe_path = v2._reject_symlink_components(path, label)
+        fd = v2._open_regular_nofollow(safe_path)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"{label} must be a readable regular non-symlink file ({type(error).__name__})") from None
+    hasher = hashlib.sha256()
+    size = 0
+    try:
+        initial_size = os.fstat(fd).st_size
+        if initial_size > byte_limit:
+            raise ValueError(f"{label} exceeds the {byte_limit}-byte limit")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            while chunk := stream.read(1024 * 1024):
+                size += len(chunk)
+                if size > byte_limit:
+                    raise ValueError(f"{label} exceeds the {byte_limit}-byte limit")
+                hasher.update(chunk)
+        if size != initial_size or os.fstat(fd).st_size != initial_size:
+            raise ValueError(f"{label} changed size while it was being hashed")
+    finally:
+        os.close(fd)
+    return hasher.hexdigest(), size
+
+
 def _validate_preview(preview: dict[str, Any], case: dict[str, Any], trace_bytes: bytes,
                       model_sha256: str) -> dict[str, dict[str, Any]]:
     if (preview.get("schema") != "sideeffect.local_query_plan_preview"
@@ -241,8 +268,8 @@ def _evaluate_cases(corpus: dict[str, Any], trace_paths: dict[str, Path], sideef
         record: dict[str, Any] = {"id": case["id"], "intent_group": case["intent_group"],
                                   "class": case["class"], "behavior": case["behavior"],
                                   "status": "invalid", "preview_valid": False,
-                                  "plan_exact_match": False, "result_exact_match": False,
-                                  "abstention_correct": False, "false_filter_on_abstain": False}
+                                  "plan_exact_match": None, "result_exact_match": None,
+                                  "abstention_correct": None, "false_filter_on_abstain": None}
         analysis_started: float | None = None
         try:
             preview_result, preview_seconds = v2.run_bounded(
@@ -379,7 +406,7 @@ def _metrics(cases: list[dict[str, Any]], corpus: dict[str, Any], preview_only: 
     }
 
 
-def _write_report(path: Path, report: dict[str, Any]) -> None:
+def _write_report(path: Path, report: dict[str, Any]) -> str:
     resolved = path.resolve(strict=False)
     try:
         resolved.relative_to(REPOSITORY.resolve(strict=True))
@@ -396,6 +423,15 @@ def _write_report(path: Path, report: dict[str, Any]) -> None:
     fd = os.open(resolved, flags, 0o600)
     with os.fdopen(fd, "wb") as stream:
         stream.write(raw)
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _repository_revision() -> str | None:
+    """Collect Git provenance when available, without making it a run prerequisite."""
+    try:
+        return v2.repository_provenance(REPOSITORY, require_clean=False)["repository_revision"]
+    except (OSError, ValueError, subprocess.SubprocessError, KeyError):
+        return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -423,6 +459,9 @@ def main(argv: list[str] | None = None) -> int:
         sideeffect = v2._reject_symlink_components(args.sideeffect, "SideEffect executable")
         if not sideeffect.is_file():
             raise ValueError("SideEffect executable is unavailable")
+        sideeffect_sha256, sideeffect_size = _hash_regular_file(
+            sideeffect, MAX_SIDEEFFECT_BYTES, "SideEffect executable"
+        )
         runtime_sha256 = None
         if not args.preview_only:
             runtime_sha256, _ = _verify_pinned_file(args.runtime, args.expected_runtime_sha256,
@@ -444,7 +483,7 @@ def main(argv: list[str] | None = None) -> int:
         if selection.returncode != 0:
             raise ValueError("isolated query-model selection failed")
 
-        provenance = v2.repository_provenance(REPOSITORY, require_clean=False)
+        repository_revision = _repository_revision()
         cases = _evaluate_cases(corpus, trace_paths, sideeffect, env, model_sha256,
                                 args.runtime, args.preview_only)
         report = {
@@ -452,16 +491,21 @@ def main(argv: list[str] | None = None) -> int:
             "schema_version": 1, "qualification": "not_assessed",
             "independent_label_review": "not_verified", "hidden_holdout": False,
             "corpus_sha256": corpus_sha256, "model_sha256": model_sha256,
+            "sideeffect_sha256": sideeffect_sha256, "sideeffect_size_bytes": sideeffect_size,
             "model_size_bytes": model_size, "runtime_sha256": runtime_sha256,
             "runtime_version": RUNTIME_VERSION if runtime_sha256 else None,
             "runtime_source_revision": RUNTIME_REVISION if runtime_sha256 else None,
-            "repository_revision": provenance["repository_revision"],
+            "repository_revision": repository_revision,
+            "repository_revision_status": "available" if repository_revision else "unavailable",
             "evaluator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "inference_performed": not args.preview_only,
             "metrics": _metrics(cases, corpus, args.preview_only), "cases": cases,
         }
         if args.report:
-            _write_report(args.report, report)
-        print(json.dumps(report, indent=2, ensure_ascii=True))
+            report_sha256 = _write_report(args.report, report)
+            print(json.dumps({"report_written": True, "report_sha256": report_sha256}))
+        else:
+            print(json.dumps(report, indent=2, ensure_ascii=True))
         return 0 if all(case["preview_valid"] for case in cases) else 2
     except subprocess.TimeoutExpired:
         parser.error("bounded subprocess timed out")

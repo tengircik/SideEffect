@@ -48,6 +48,22 @@ class V3EvaluatorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "byte limit"):
                 v3._verify_pinned_file(path, hashlib.sha256(raw).hexdigest(), 4, "model")
 
+    def test_hashes_sideeffect_binary_with_a_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sideeffect"
+            raw = b"synthetic cli bytes"
+            path.write_bytes(raw)
+            self.assertEqual(
+                v3._hash_regular_file(path, 1024, "SideEffect executable"),
+                (hashlib.sha256(raw).hexdigest(), len(raw)),
+            )
+            with self.assertRaisesRegex(ValueError, "byte limit"):
+                v3._hash_regular_file(path, 4, "SideEffect executable")
+
+    def test_repository_provenance_is_optional_for_non_git_mounts(self) -> None:
+        with patch.object(v2, "repository_provenance", side_effect=v2.subprocess.CalledProcessError(128, "git")):
+            self.assertIsNone(v3._repository_revision())
+
     def _abstain_case(self) -> dict:
         return copy.deepcopy(next(case for case in self.corpus["cases"]
                                   if case["behavior"] == "must_abstain"))
@@ -101,6 +117,8 @@ class V3EvaluatorTests(unittest.TestCase):
             self.assertEqual(records[0]["status"], "preview_valid")
             metrics = v3._metrics(records, self.corpus, True)
             self.assertEqual(metrics["valid_previews"], 1)
+            self.assertIsNone(records[0]["plan_exact_match"])
+            self.assertIsNone(records[0]["result_exact_match"])
 
     def test_full_runner_uses_digest_confirmation_and_counts_abstain_filter(self) -> None:
         case = self._abstain_case()
