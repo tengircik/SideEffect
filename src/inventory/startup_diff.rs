@@ -349,14 +349,18 @@ fn validate(v: &Value, k: Kind) -> Result<(), StartupDiffError> {
         Kind::Windows => (
             WINDOWS,
             "windows",
-            if windows_has_wmi && version >= 8 {
+            if windows_has_wmi && version >= 9 {
+                "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_and_load_order_group_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+            } else if windows_has_wmi && version >= 8 {
                 "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
             } else if windows_has_wmi {
                 "current_user_and_accessible_machine_run_keys_startup_folders_services_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+            } else if version >= 9 {
+                "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_and_load_order_group_configuration_and_current_token_visible_tasks"
             } else {
                 "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks"
             },
-            &[4_u64, 5, 6, 7, 8][..],
+            &[4_u64, 5, 6, 7, 8, 9][..],
         ),
     };
     if text(v, "schema")? != schema || !versions.contains(&version) {
@@ -520,6 +524,8 @@ fn validate_known_fields(v: &Value) -> Result<(), StartupDiffError> {
         "display_path",
         "service_name",
         "display_name",
+        "dependencies",
+        "load_order_group",
         "delayed_auto_start",
         "start_type",
         "start_type_code",
@@ -788,6 +794,67 @@ fn validate_delayed_auto_start(value: &Value) -> Result<(), StartupDiffError> {
                     | "service_delayed_auto_start_response_invalid"
                     | "service_delayed_auto_start_budget_exceeded"
                     | "service_delayed_auto_start_deadline_exceeded"
+            ) {
+                return Err(StartupDiffError::MalformedInput);
+            }
+        }
+        _ => return Err(StartupDiffError::MalformedInput),
+    }
+    Ok(())
+}
+
+fn validate_service_dependencies(value: &Value) -> Result<(), StartupDiffError> {
+    match text(value, "status")? {
+        "observed" => {
+            keys(value, &["status", "entries"])?;
+            let entries = arr(value, "entries")?;
+            if entries.len() > 4_096 {
+                return Err(StartupDiffError::LimitExceeded);
+            }
+            for entry in entries {
+                keys(entry, &["kind", "name"])?;
+                if !matches!(text(entry, "kind")?, "service" | "load_order_group") {
+                    return Err(StartupDiffError::MalformedInput);
+                }
+                let name = text(entry, "name")?;
+                check_str(entry, "name", 32_768)?;
+                if name.is_empty() || name.starts_with('+') {
+                    return Err(StartupDiffError::MalformedInput);
+                }
+            }
+        }
+        "unknown" => {
+            keys(value, &["status", "diagnostic_code"])?;
+            if text(value, "diagnostic_code")? != "service_dependencies_response_invalid"
+                && text(value, "diagnostic_code")? != "service_dependencies_limit_exceeded"
+                && text(value, "diagnostic_code")? != "service_dependency_budget_exceeded"
+            {
+                return Err(StartupDiffError::MalformedInput);
+            }
+        }
+        _ => return Err(StartupDiffError::MalformedInput),
+    }
+    Ok(())
+}
+
+fn validate_service_load_order_group(value: &Value) -> Result<(), StartupDiffError> {
+    match text(value, "status")? {
+        "observed" => {
+            keys(value, &["status", "value"])?;
+            if !value["value"].is_null() {
+                check_str(value, "value", 32_768)?;
+                if text(value, "value")?.is_empty() {
+                    return Err(StartupDiffError::MalformedInput);
+                }
+            }
+        }
+        "unknown" => {
+            keys(value, &["status", "diagnostic_code"])?;
+            if !matches!(
+                text(value, "diagnostic_code")?,
+                "service_load_order_group_response_invalid"
+                    | "service_load_order_group_limit_exceeded"
+                    | "service_load_order_group_budget_exceeded"
             ) {
                 return Err(StartupDiffError::MalformedInput);
             }
@@ -1097,6 +1164,7 @@ fn validate_windows(v: &Value, version: u64) -> Result<(), StartupDiffError> {
     let has_wmi = windows_has_wmi_contract(v, version);
     let has_service_observation = version >= 7;
     let has_delayed_auto_start = version >= 8;
+    let has_service_dependencies = version >= 9;
     let mut all = vec![
         ("sources", 8192usize),
         ("registry_entries", 8192),
@@ -1333,6 +1401,9 @@ fn validate_windows(v: &Value, version: u64) -> Result<(), StartupDiffError> {
         if has_delayed_auto_start {
             fields.push("delayed_auto_start");
         }
+        if has_service_dependencies {
+            fields.extend(["dependencies", "load_order_group"]);
+        }
         startup_row_keys(e, &fields, has_states)?;
         if has_states {
             validate_startup_state(&e["startup_state"])?;
@@ -1342,6 +1413,10 @@ fn validate_windows(v: &Value, version: u64) -> Result<(), StartupDiffError> {
         }
         if has_delayed_auto_start {
             validate_delayed_auto_start(&e["delayed_auto_start"])?;
+        }
+        if has_service_dependencies {
+            validate_service_dependencies(&e["dependencies"])?;
+            validate_service_load_order_group(&e["load_order_group"])?;
         }
         for f in [
             "service_name",
@@ -1624,6 +1699,32 @@ fn compare(l: &Value, r: &Value, k: Kind) -> Result<StartupInventoryDiff, Startu
     } else {
         false
     };
+    let service_dependencies_incomparable = if k == Kind::Windows {
+        let before_version = num(l, "schema_version")?;
+        let after_version = num(r, "schema_version")?;
+        let has_services =
+            !arr(l, "service_entries")?.is_empty() || !arr(r, "service_entries")?.is_empty();
+        has_services && (before_version >= 9) != (after_version >= 9)
+    } else {
+        false
+    };
+    let service_dependencies_unknown = k == Kind::Windows
+        && [l, r].into_iter().any(|doc| {
+            num(doc, "schema_version").is_ok_and(|version| version >= 9)
+                && arr(doc, "service_entries").is_ok_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry["dependencies"]["status"] != "observed"
+                            || entry["load_order_group"]["status"] != "observed"
+                    })
+                })
+        });
+    let compare_service_dependencies = !service_dependencies_incomparable
+        && !service_dependencies_unknown
+        && k == Kind::Windows
+        && num(l, "schema_version")? >= 9
+        && num(r, "schema_version")? >= 9;
+    let service_dependency_presence_comparable =
+        !service_dependencies_incomparable && !service_dependencies_unknown;
     let (mut a, mut b, mut complete, mut lossy) = if k == Kind::Linux {
         (
             linux_rows(l)?,
@@ -1637,17 +1738,25 @@ fn compare(l: &Value, r: &Value, k: Kind) -> Result<StartupInventoryDiff, Startu
                 l,
                 !service_state_incomparable,
                 !delayed_auto_start_incomparable,
+                compare_service_dependencies,
+                service_dependency_presence_comparable,
             )?,
             windows_rows(
                 r,
                 !service_state_incomparable,
                 !delayed_auto_start_incomparable,
+                compare_service_dependencies,
+                service_dependency_presence_comparable,
             )?,
             windows_complete(l) && windows_complete(r),
             0usize,
         )
     };
-    if service_state_incomparable || delayed_auto_start_incomparable {
+    if service_state_incomparable
+        || delayed_auto_start_incomparable
+        || service_dependencies_incomparable
+        || service_dependencies_unknown
+    {
         complete = false;
     }
     if k == Kind::Linux {
@@ -1684,6 +1793,12 @@ fn compare(l: &Value, r: &Value, k: Kind) -> Result<StartupInventoryDiff, Startu
         }
         if delayed_auto_start_incomparable {
             diagnostics.insert("delayed-auto-start configuration is not present on both snapshots");
+        }
+        if service_dependencies_incomparable {
+            diagnostics.insert("service dependency configuration is not present on both snapshots");
+        }
+        if service_dependencies_unknown {
+            diagnostics.insert("service dependency or load-order group configuration is unknown");
         }
         let unkeyed = [l, r]
             .into_iter()
@@ -1943,6 +2058,8 @@ fn windows_rows(
     v: &Value,
     compare_service_observation: bool,
     compare_delayed_auto_start: bool,
+    compare_service_dependencies: bool,
+    service_dependency_presence_comparable: bool,
 ) -> Result<Vec<Row>, StartupDiffError> {
     let mut rows = Vec::new();
     for (i, e) in arr(v, "registry_entries")?.iter().enumerate() {
@@ -2013,12 +2130,20 @@ fn windows_rows(
                 value(&e["delayed_auto_start"]["value"]),
             ));
         }
+        if compare_service_dependencies
+            && num(v, "schema_version")? >= 9
+            && e["dependencies"]["status"] == "observed"
+            && e["load_order_group"]["status"] == "observed"
+        {
+            facts.push(("dependencies", value(&e["dependencies"]["entries"])));
+            facts.push(("load_order_group", value(&e["load_order_group"]["value"])));
+        }
         rows.push(Row {
             category: "service_configuration",
             key,
             facts,
             refs: vec![ptr("/service_entries", i)],
-            complete: source_complete(v, id),
+            complete: source_complete(v, id) && service_dependency_presence_comparable,
             lossy_identity: false,
         });
     }
@@ -2253,6 +2378,15 @@ mod tests {
         value
     }
 
+    fn windows_v9() -> Value {
+        let mut value = windows_v8();
+        value["schema_version"] = json!(9);
+        value["scope"] = json!(
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_and_load_order_group_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+        );
+        value
+    }
+
     #[test]
     fn startup_state_contract_requires_direct_evidence_for_known_dimensions() {
         let state = startup_state();
@@ -2428,6 +2562,200 @@ mod tests {
         assert!(report.diagnostics.iter().any(|diagnostic| {
             *diagnostic == "delayed-auto-start configuration is not present on both snapshots"
         }));
+    }
+
+    #[test]
+    fn windows_v9_compares_only_observed_dependency_and_load_order_group_configuration() {
+        let service = |dependencies: Value, group: Value| {
+            json!({
+                "service_name":"ExampleSvc",
+                "display_name":"Example service",
+                "start_type":"automatic",
+                "start_type_code":2,
+                "account":"LocalSystem",
+                "binary_path":"C:\\Example\\svc.exe",
+                "startup_state":startup_state(),
+                "service_observation":{"status":"known","state":"stopped","raw_state_code":1},
+                "delayed_auto_start":{"status":"observed","value":false},
+                "dependencies":dependencies,
+                "load_order_group":group,
+                "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W","service_index":0}
+            })
+        };
+        let mut before = windows_v9();
+        let mut after = windows_v9();
+        before["service_entries"] = json!([service(
+            json!({"status":"observed","entries":[{"kind":"service","name":"BaseSvc"}]}),
+            json!({"status":"observed","value":null})
+        )]);
+        after["service_entries"] = json!([service(
+            json!({"status":"observed","entries":[{"kind":"load_order_group","name":"CoreGroup"}]}),
+            json!({"status":"observed","value":"NetworkGroup"})
+        )]);
+        validate_service_dependencies(&before["service_entries"][0]["dependencies"]).unwrap();
+        validate_service_load_order_group(&before["service_entries"][0]["load_order_group"])
+            .unwrap();
+        validate_service_observation(&before["service_entries"][0]["service_observation"]).unwrap();
+        validate_delayed_auto_start(&before["service_entries"][0]["delayed_auto_start"]).unwrap();
+        validate_startup_state(&before["service_entries"][0]["startup_state"]).unwrap();
+        for field in [
+            "service_name",
+            "display_name",
+            "start_type",
+            "account",
+            "binary_path",
+        ] {
+            check_str(&before["service_entries"][0], field, 131072).unwrap();
+        }
+        startup_row_keys(
+            &before["service_entries"][0],
+            &[
+                "service_name",
+                "display_name",
+                "start_type",
+                "start_type_code",
+                "account",
+                "binary_path",
+                "evidence",
+                "service_observation",
+                "delayed_auto_start",
+                "dependencies",
+                "load_order_group",
+            ],
+            true,
+        )
+        .unwrap();
+        let service_evidence = &before["service_entries"][0]["evidence"];
+        keys(service_evidence, &["source", "service_index"]).unwrap();
+        check_str(service_evidence, "source", 256).unwrap();
+        assert_eq!(
+            text(service_evidence, "source").unwrap(),
+            "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W"
+        );
+        assert_eq!(num(service_evidence, "service_index").unwrap(), 0);
+        let mut no_services = before.clone();
+        no_services["service_entries"] = json!([]);
+        validate(&parse(&bytes(&no_services)).unwrap(), Kind::Windows).unwrap();
+        validate(&parse(&bytes(&before)).unwrap(), Kind::Windows).unwrap();
+        validate(&parse(&bytes(&after)).unwrap(), Kind::Windows).unwrap();
+        let report = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
+        assert_eq!(report.status, StartupDiffStatus::Complete);
+        assert_eq!(report.deltas.len(), 1);
+        assert!(report.deltas[0].changed_fields.contains(&"dependencies"));
+        assert!(
+            report.deltas[0]
+                .changed_fields
+                .contains(&"load_order_group")
+        );
+    }
+
+    #[test]
+    fn windows_v9_unknown_and_mixed_schema_facts_suppress_service_presence_claims() {
+        let service = |dependency_status: Value| {
+            json!({
+                "service_name":"ExampleSvc",
+                "display_name":"Example service",
+                "start_type":"automatic",
+                "start_type_code":2,
+                "account":"LocalSystem",
+                "binary_path":"C:\\Example\\svc.exe",
+                "startup_state":startup_state(),
+                "service_observation":{"status":"known","state":"stopped","raw_state_code":1},
+                "delayed_auto_start":{"status":"observed","value":false},
+                "dependencies":dependency_status,
+                "load_order_group":{"status":"observed","value":null},
+                "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W","service_index":0}
+            })
+        };
+        let mut unknown_before = windows_v9();
+        let mut unknown_after = windows_v9();
+        unknown_before["service_entries"] = json!([service(json!({
+            "status":"unknown","diagnostic_code":"service_dependencies_response_invalid"
+        }))]);
+        unknown_after["service_entries"] = json!([]);
+        validate(&parse(&bytes(&unknown_before)).unwrap(), Kind::Windows).unwrap();
+        validate(&parse(&bytes(&unknown_after)).unwrap(), Kind::Windows).unwrap();
+        let unknown =
+            compare_startup_inventory_json(&bytes(&unknown_before), &bytes(&unknown_after))
+                .unwrap();
+        assert_eq!(unknown.status, StartupDiffStatus::Partial);
+        assert!(unknown.deltas.is_empty());
+        assert_eq!(
+            unknown
+                .counts
+                .unmatched_rows_suppressed_for_incomplete_source,
+            1
+        );
+
+        let mut v8 = windows_v8();
+        v8["service_entries"] = json!([{
+            "service_name":"ExampleSvc",
+            "display_name":"Example service",
+            "start_type":"automatic",
+            "start_type_code":2,
+            "account":"LocalSystem",
+            "binary_path":"C:\\Example\\svc.exe",
+            "startup_state":startup_state(),
+            "service_observation":{"status":"known","state":"stopped","raw_state_code":1},
+            "delayed_auto_start":{"status":"observed","value":false},
+            "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W","service_index":0}
+        }]);
+        let mixed = compare_startup_inventory_json(&bytes(&v8), &bytes(&unknown_after)).unwrap();
+        assert_eq!(mixed.status, StartupDiffStatus::Partial);
+        assert!(mixed.deltas.is_empty());
+        assert_eq!(
+            mixed.counts.unmatched_rows_suppressed_for_incomplete_source,
+            1
+        );
+    }
+
+    #[test]
+    fn windows_v9_rejects_invalid_dependency_kind_and_untrusted_group_marker() {
+        let mut invalid = windows_v9();
+        invalid["service_entries"] = json!([{
+            "service_name":"ExampleSvc",
+            "display_name":"Example service",
+            "start_type":"automatic",
+            "start_type_code":2,
+            "account":null,
+            "binary_path":null,
+            "startup_state":startup_state(),
+            "service_observation":{"status":"known","state":"stopped","raw_state_code":1},
+            "delayed_auto_start":{"status":"observed","value":false},
+            "dependencies":{"status":"observed","entries":[{"kind":"command","name":"<script>"}]},
+            "load_order_group":{"status":"observed","value":null},
+            "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W","service_index":0}
+        }]);
+        assert_eq!(
+            validate(&parse(&bytes(&invalid)).unwrap(), Kind::Windows),
+            Err(StartupDiffError::MalformedInput)
+        );
+        invalid["service_entries"][0]["dependencies"]["entries"][0]["kind"] = json!("service");
+        invalid["service_entries"][0]["dependencies"]["entries"][0]["name"] = json!("+Group");
+        assert_eq!(
+            validate(&parse(&bytes(&invalid)).unwrap(), Kind::Windows),
+            Err(StartupDiffError::MalformedInput)
+        );
+    }
+
+    #[test]
+    fn windows_v9_allows_historical_optional_wmi_absence_with_its_exact_scope() {
+        let mut value = windows_v9();
+        value["scope"] = json!(
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_and_load_order_group_configuration_and_current_token_visible_tasks"
+        );
+        for field in [
+            "wmi_event_filters",
+            "wmi_event_consumers",
+            "wmi_filter_consumer_bindings",
+        ] {
+            value.as_object_mut().unwrap().remove(field);
+        }
+        value["sources"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|source| source["id"] != "wmi_permanent_event_subscriptions");
+        validate(&parse(&bytes(&value)).unwrap(), Kind::Windows).unwrap();
     }
 
     #[test]

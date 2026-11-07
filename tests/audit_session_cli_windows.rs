@@ -225,7 +225,7 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
     assert_eq!(review["sources"].as_array().unwrap().len(), 7);
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(session.join("session.json")).unwrap()).unwrap();
-    assert_eq!(manifest["schema_version"], 13);
+    assert_eq!(manifest["schema_version"], 14);
     let startup_source = manifest["sources"]
         .as_array()
         .unwrap()
@@ -238,10 +238,10 @@ fn windows_session_collects_each_inventory_role_and_inspector_preserves_scope() 
             .unwrap()
             .contains("WMI permanent event subscriptions")
     );
-    assert_eq!(startup_source["artifacts"][0]["schema_version"], 8);
+    assert_eq!(startup_source["artifacts"][0]["schema_version"], 9);
     let startup: serde_json::Value =
         serde_json::from_slice(&fs::read(session.join("startup.windows.json")).unwrap()).unwrap();
-    assert_eq!(startup["schema_version"], 8);
+    assert_eq!(startup["schema_version"], 9);
     assert!(
         startup["sources"]
             .as_array()

@@ -394,7 +394,7 @@ pub fn summarize_windows_startup_behavior(
             version: 2,
             basis: "exact_equality_of_drive_rooted_windows_path_strings",
         },
-        platform_adapter: "windows_startup_inventory_v4_v5_v6_v7_or_v8_windows_runtime_capture_v3",
+        platform_adapter: "windows_startup_inventory_v4_v5_v6_v7_v8_or_v9_windows_runtime_capture_v3",
         capture_completeness: "unknown",
         status: if partial { "partial" } else { "complete" },
         association_status: if associations.is_empty() {
@@ -470,7 +470,7 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
         .ok_or_else(|| "Windows startup inventory must be a JSON object".to_owned())?;
     let schema_version = object.get("schema_version").and_then(Value::as_u64);
     if object.get("schema").and_then(Value::as_str) != Some(WINDOWS_STARTUP_INVENTORY_SCHEMA)
-        || !matches!(schema_version, Some(4..=8))
+        || !matches!(schema_version, Some(4..=9))
         || object.get("platform").and_then(Value::as_str) != Some("windows")
     {
         return Err("unsupported Windows startup inventory schema or platform".to_owned());
@@ -500,7 +500,7 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
         .filter(|field| object.contains_key(**field))
         .count();
     if schema_version == Some(6) && wmi_field_count != WMI_FIELDS.len()
-        || matches!(schema_version, Some(7 | 8))
+        || matches!(schema_version, Some(7..=9))
             && wmi_field_count != 0
             && wmi_field_count != WMI_FIELDS.len()
     {
@@ -556,7 +556,8 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
                 entry,
                 schema_version.is_some_and(|v| v >= 5),
                 schema_version.is_some_and(|v| v >= 7),
-                schema_version == Some(8),
+                schema_version.is_some_and(|v| v >= 8),
+                schema_version.is_some_and(|v| v >= 9),
             )?;
         }
     }
@@ -1159,6 +1160,7 @@ fn validate_inventory_row(
     has_states: bool,
     has_service_observation: bool,
     has_delayed_auto_start: bool,
+    has_service_dependencies: bool,
 ) -> Result<(), String> {
     let label = format!("Windows startup inventory {field}[{index}]");
     let object = value
@@ -1231,6 +1233,9 @@ fn validate_inventory_row(
     if field == "service_entries" && has_delayed_auto_start {
         required.push("delayed_auto_start");
     }
+    if field == "service_entries" && has_service_dependencies {
+        required.extend(["dependencies", "load_order_group"]);
+    }
     validate_object_fields(object, &required, optional, &label)?;
     if row_has_states {
         validate_startup_state_value(object.get("startup_state"), &label)?;
@@ -1240,6 +1245,10 @@ fn validate_inventory_row(
     }
     if field == "service_entries" && has_delayed_auto_start {
         validate_delayed_auto_start_value(object.get("delayed_auto_start"), &label)?;
+    }
+    if field == "service_entries" && has_service_dependencies {
+        validate_service_dependencies_value(object.get("dependencies"), &label)?;
+        validate_load_order_group_value(object.get("load_order_group"), &label)?;
     }
     match field {
         "sources" => {
@@ -1647,6 +1656,139 @@ fn validate_delayed_auto_start_value(value: Option<&Value>, label: &str) -> Resu
             }
         }
         _ => Err(format!("{label}.delayed_auto_start.value must be boolean")),
+    }
+}
+
+fn validate_service_dependencies_value(value: Option<&Value>, label: &str) -> Result<(), String> {
+    let object = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{label}.dependencies must be an object"))?;
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{label}.dependencies.status must be text"))?;
+    match status {
+        "observed" => {
+            if object.len() != 2 || !object.contains_key("entries") {
+                return Err(format!(
+                    "{label}.dependencies has missing or unknown fields"
+                ));
+            }
+            let entries = object
+                .get("entries")
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("{label}.dependencies.entries must be an array"))?;
+            if entries.len() > 4096 {
+                return Err(format!("{label}.dependencies exceeds the row limit"));
+            }
+            for (index, entry) in entries.iter().enumerate() {
+                let entry = entry
+                    .as_object()
+                    .ok_or_else(|| format!("{label}.dependencies[{index}] must be an object"))?;
+                if entry.len() != 2
+                    || entry
+                        .keys()
+                        .any(|key| !["kind", "name"].contains(&key.as_str()))
+                {
+                    return Err(format!(
+                        "{label}.dependencies[{index}] has missing or unknown fields"
+                    ));
+                }
+                let kind = entry
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("{label}.dependencies[{index}].kind must be text"))?;
+                if !matches!(kind, "service" | "load_order_group") {
+                    return Err(format!("{label}.dependencies[{index}].kind is unsupported"));
+                }
+                let name = entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("{label}.dependencies[{index}].name must be text"))?;
+                if name.is_empty() || name.len() > MAX_ACTION_FIELD_BYTES || name.starts_with('+') {
+                    return Err(format!("{label}.dependencies[{index}].name is invalid"));
+                }
+            }
+            Ok(())
+        }
+        "unknown" => {
+            if object.len() != 2 || !object.contains_key("diagnostic_code") {
+                return Err(format!(
+                    "{label}.dependencies has missing or unknown fields"
+                ));
+            }
+            let code = object
+                .get("diagnostic_code")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{label}.dependencies.diagnostic_code must be text"))?;
+            if matches!(
+                code,
+                "service_dependencies_response_invalid"
+                    | "service_dependencies_limit_exceeded"
+                    | "service_dependency_budget_exceeded"
+            ) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{label}.dependencies has an unsupported diagnostic"
+                ))
+            }
+        }
+        _ => Err(format!("{label}.dependencies has an unsupported status")),
+    }
+}
+
+fn validate_load_order_group_value(value: Option<&Value>, label: &str) -> Result<(), String> {
+    let object = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{label}.load_order_group must be an object"))?;
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{label}.load_order_group.status must be text"))?;
+    match status {
+        "observed" => {
+            if object.len() != 2 || !object.contains_key("value") {
+                return Err(format!(
+                    "{label}.load_order_group has missing or unknown fields"
+                ));
+            }
+            match object.get("value") {
+                Some(Value::Null) => Ok(()),
+                Some(Value::String(value))
+                    if !value.is_empty() && value.len() <= MAX_ACTION_FIELD_BYTES =>
+                {
+                    Ok(())
+                }
+                _ => Err(format!("{label}.load_order_group.value is invalid")),
+            }
+        }
+        "unknown" => {
+            if object.len() != 2 || !object.contains_key("diagnostic_code") {
+                return Err(format!(
+                    "{label}.load_order_group has missing or unknown fields"
+                ));
+            }
+            let code = object
+                .get("diagnostic_code")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{label}.load_order_group.diagnostic_code must be text"))?;
+            if matches!(
+                code,
+                "service_load_order_group_response_invalid"
+                    | "service_load_order_group_limit_exceeded"
+                    | "service_load_order_group_budget_exceeded"
+            ) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{label}.load_order_group has an unsupported diagnostic"
+                ))
+            }
+        }
+        _ => Err(format!(
+            "{label}.load_order_group has an unsupported status"
+        )),
     }
 }
 
@@ -2419,7 +2561,7 @@ mod tests {
             .is_ok()
         );
 
-        startup["schema_version"] = Value::from(9);
+        startup["schema_version"] = Value::from(10);
         assert!(
             summarize_windows_startup_behavior(
                 &serde_json::to_vec(&startup).unwrap(),
@@ -2521,7 +2663,7 @@ mod tests {
         assert_eq!(summary.association_status, "insufficient_evidence");
         assert_eq!(
             summary.platform_adapter,
-            "windows_startup_inventory_v4_v5_v6_v7_or_v8_windows_runtime_capture_v3"
+            "windows_startup_inventory_v4_v5_v6_v7_v8_or_v9_windows_runtime_capture_v3"
         );
         assert_eq!(
             summary.inputs.startup_inventory.source_format,

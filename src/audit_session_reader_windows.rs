@@ -704,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_v6_v7_and_v8_headers_are_verified_only_for_the_declared_native_version() {
+    fn startup_v6_through_v9_headers_are_verified_only_for_the_declared_native_version() {
         let reference = crate::audit_session::SessionArtifactRef {
             kind: ArtifactKind::WindowsStartup,
             path: "startup.windows.json".to_owned(),
@@ -724,6 +724,25 @@ mod tests {
             verify_schema(
                 &reference,
                 br#"{"schema":"sideeffect.windows_startup_inventory","schema_version":5}"#
+            ),
+            Err(SessionReadError::ArtifactSchemaMismatch(_))
+        ));
+
+        let v9_reference = crate::audit_session::SessionArtifactRef {
+            schema_version: 9,
+            ..reference.clone()
+        };
+        assert!(
+            verify_schema(
+                &v9_reference,
+                br#"{"schema":"sideeffect.windows_startup_inventory","schema_version":9}"#
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            verify_schema(
+                &v9_reference,
+                br#"{"schema":"sideeffect.windows_startup_inventory","schema_version":8}"#
             ),
             Err(SessionReadError::ArtifactSchemaMismatch(_))
         ));

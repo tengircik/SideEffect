@@ -55,6 +55,8 @@ const MAX_AGGREGATE_SERVICE_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SERVICE_ENTRIES: usize = 8_192;
 const MAX_SERVICE_STRING_UNITS: usize = 32_768;
 const MAX_AGGREGATE_SERVICE_STRING_UNITS: usize = 4 * 1024 * 1024;
+const MAX_SERVICE_DEPENDENCIES_PER_SERVICE: usize = 4_096;
+const MAX_AGGREGATE_SERVICE_DEPENDENCIES: usize = 65_536;
 const MAX_SERVICE_DIAGNOSTICS: usize = 256;
 const MAX_TASK_FOLDER_DEPTH: usize = 16;
 const MAX_TASK_FOLDERS: usize = 1_024;
@@ -472,7 +474,35 @@ pub struct WindowsServiceStartupEntry {
     pub service_observation: Option<WindowsServiceObservation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delayed_auto_start: Option<WindowsDelayedAutoStart>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependencies: Option<WindowsServiceDependencies>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_order_group: Option<WindowsServiceLoadOrderGroup>,
     pub evidence: WindowsServiceStartupEvidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WindowsServiceDependency {
+    pub kind: &'static str,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WindowsServiceDependencies {
+    Observed {
+        entries: Vec<WindowsServiceDependency>,
+    },
+    Unknown {
+        diagnostic_code: &'static str,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WindowsServiceLoadOrderGroup {
+    Observed { value: Option<String> },
+    Unknown { diagnostic_code: &'static str },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -866,22 +896,27 @@ fn now_ms() -> u128 {
 }
 
 pub fn collect_windows_startup() -> WindowsStartupInventoryDocument {
-    collect_windows_startup_with_contract(true, 8, true, true)
+    collect_windows_startup_with_contract(true, 9, true, true, true)
 }
 
 /// Session schema v9 pins startup artifacts to v5.
 pub(crate) fn collect_windows_startup_v5() -> WindowsStartupInventoryDocument {
-    collect_windows_startup_with_contract(false, 5, false, false)
+    collect_windows_startup_with_contract(false, 5, false, false, false)
 }
 
 /// Session schemas v10-v11 retain the standalone startup v6 contract.
 pub(crate) fn collect_windows_startup_v6() -> WindowsStartupInventoryDocument {
-    collect_windows_startup_with_contract(true, 6, false, false)
+    collect_windows_startup_with_contract(true, 6, false, false, false)
 }
 
 /// Session schema v12 retains the standalone startup v7 contract.
 pub(crate) fn collect_windows_startup_v7() -> WindowsStartupInventoryDocument {
-    collect_windows_startup_with_contract(true, 7, true, false)
+    collect_windows_startup_with_contract(true, 7, true, false, false)
+}
+
+/// Session schema v13 retains the standalone startup v8 contract.
+pub(crate) fn collect_windows_startup_v8() -> WindowsStartupInventoryDocument {
+    collect_windows_startup_with_contract(true, 8, true, true, false)
 }
 
 fn collect_windows_startup_with_contract(
@@ -889,6 +924,7 @@ fn collect_windows_startup_with_contract(
     schema_version: u32,
     include_service_observation: bool,
     include_delayed_auto_start: bool,
+    include_service_dependencies: bool,
 ) -> WindowsStartupInventoryDocument {
     let started_at = now_ms();
     let started = Instant::now();
@@ -970,6 +1006,7 @@ fn collect_windows_startup_with_contract(
         started,
         include_service_observation,
         include_delayed_auto_start,
+        include_service_dependencies,
     );
     sources.push(service_source);
     service_entries.extend(services);
@@ -995,7 +1032,9 @@ fn collect_windows_startup_with_contract(
         schema: "sideeffect.windows_startup_inventory",
         schema_version,
         platform: "windows",
-        scope: if include_delayed_auto_start {
+        scope: if include_service_dependencies {
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_and_load_order_group_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+        } else if include_delayed_auto_start {
             "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
         } else if include_wmi {
             "current_user_and_accessible_machine_run_keys_startup_folders_services_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
@@ -1033,6 +1072,16 @@ enum ServiceStringError {
     Unterminated,
     OverLimit,
     MalformedUtf16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceMultiSzError {
+    OutsideBuffer,
+    Misaligned,
+    Unterminated,
+    OverLimit,
+    MalformedUtf16,
+    EmptyDependency,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1100,12 +1149,14 @@ fn collect_service_start_configuration(
     started: Instant,
     include_service_observation: bool,
     include_delayed_auto_start: bool,
+    include_service_dependencies: bool,
 ) -> (WindowsStartupSource, Vec<WindowsServiceStartupEntry>) {
     let mut diagnostics = Vec::new();
     let mut entries = Vec::new();
     let mut status = WindowsStartupStatus::Complete;
     let mut aggregate_config_bytes = 0usize;
     let mut aggregate_string_units = 0usize;
+    let mut aggregate_dependency_entries = 0usize;
     let mut enumerated = 0usize;
     let manager = unsafe {
         OpenSCManagerW(
@@ -1379,6 +1430,9 @@ fn collect_service_start_configuration(
                 enumerated += 1;
                 continue;
             }
+            // QueryServiceConfigW documents `pcbBytesNeeded` for the
+            // insufficient-buffer case. The first call supplied the bounded
+            // required size; use that allocated span for every returned pointer.
             aggregate_config_bytes += config_bytes;
             let config_base = config_buffer.as_ptr().cast::<u8>();
             let config = unsafe { &*config_buffer.as_ptr().cast::<QueryServiceConfigW>() };
@@ -1485,6 +1539,103 @@ fn collect_service_start_configuration(
             } else {
                 None
             };
+            let (dependencies, load_order_group) = if include_service_dependencies {
+                let dependency_result = parse_service_dependencies(
+                    config_base,
+                    config_bytes,
+                    config.dependencies,
+                    MAX_SERVICE_STRING_UNITS,
+                    MAX_SERVICE_DEPENDENCIES_PER_SERVICE.min(
+                        MAX_AGGREGATE_SERVICE_DEPENDENCIES
+                            .saturating_sub(aggregate_dependency_entries),
+                    ),
+                );
+                let group_result = bounded_optional_wide_in_buffer(
+                    config_base,
+                    config_bytes,
+                    config.load_order_group,
+                    MAX_SERVICE_STRING_UNITS,
+                );
+                let dependency_units = dependency_result.as_ref().map_or(0, |values| {
+                    values
+                        .iter()
+                        .map(|value| value.name.encode_utf16().count())
+                        .sum()
+                });
+                let group_units = group_result
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .map_or(0, |value| value.encode_utf16().count());
+                let strings_exceed_budget = aggregate_string_units
+                    .saturating_add(dependency_units)
+                    .saturating_add(group_units)
+                    > MAX_AGGREGATE_SERVICE_STRING_UNITS;
+                if strings_exceed_budget {
+                    status = WindowsStartupStatus::Partial;
+                } else {
+                    aggregate_string_units = aggregate_string_units
+                        .saturating_add(dependency_units)
+                        .saturating_add(group_units);
+                    if let Ok(dependencies) = &dependency_result {
+                        aggregate_dependency_entries =
+                            aggregate_dependency_entries.saturating_add(dependencies.len());
+                    }
+                }
+                let dependencies = match dependency_result {
+                    Ok(entries) if !strings_exceed_budget => {
+                        Some(WindowsServiceDependencies::Observed { entries })
+                    }
+                    result => {
+                        status = WindowsStartupStatus::Partial;
+                        let code = if strings_exceed_budget {
+                            "service_dependency_budget_exceeded"
+                        } else {
+                            service_multisz_error_code(result.expect_err("error branch"))
+                        };
+                        push_service_diagnostic(
+                            &mut diagnostics,
+                            diagnostic(
+                                code,
+                                Some(enumerated),
+                                "Windows could not establish this service's configured dependencies; the field remains unknown.",
+                            ),
+                        );
+                        Some(WindowsServiceDependencies::Unknown {
+                            diagnostic_code: code,
+                        })
+                    }
+                };
+                let load_order_group = match group_result {
+                    Ok(value) if !strings_exceed_budget => {
+                        Some(WindowsServiceLoadOrderGroup::Observed {
+                            value: value.filter(|value| !value.is_empty()),
+                        })
+                    }
+                    result => {
+                        status = WindowsStartupStatus::Partial;
+                        let code = if strings_exceed_budget {
+                            "service_load_order_group_budget_exceeded"
+                        } else {
+                            service_string_error_code(result.expect_err("error branch"))
+                        };
+                        push_service_diagnostic(
+                            &mut diagnostics,
+                            diagnostic(
+                                code,
+                                Some(enumerated),
+                                "Windows could not establish this service's load-order group membership; the field remains unknown.",
+                            ),
+                        );
+                        Some(WindowsServiceLoadOrderGroup::Unknown {
+                            diagnostic_code: code,
+                        })
+                    }
+                };
+                (dependencies, load_order_group)
+            } else {
+                (None, None)
+            };
             entries.push(WindowsServiceStartupEntry {
                 service_name: name,
                 display_name: display,
@@ -1496,6 +1647,8 @@ fn collect_service_start_configuration(
                 service_observation: include_service_observation
                     .then(|| WindowsServiceObservation::from_scm_state(item.status.current_state)),
                 delayed_auto_start,
+                dependencies,
+                load_order_group,
                 evidence: WindowsServiceStartupEvidence {
                     source: if include_delayed_auto_start {
                         "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W"
@@ -2764,6 +2917,143 @@ fn bounded_optional_wide_in_buffer(
         Err(ServiceStringError::OverLimit)
     } else {
         Err(ServiceStringError::Unterminated)
+    }
+}
+
+fn parse_service_dependencies(
+    base: *const u8,
+    buffer_bytes: usize,
+    value: *const u16,
+    maximum_units: usize,
+    maximum_entries: usize,
+) -> Result<Vec<WindowsServiceDependency>, ServiceMultiSzError> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let base_address = base as usize;
+    let address = value as usize;
+    let Some(offset) = address.checked_sub(base_address) else {
+        return Err(ServiceMultiSzError::OutsideBuffer);
+    };
+    if offset >= buffer_bytes {
+        return Err(ServiceMultiSzError::OutsideBuffer);
+    }
+    if offset % std::mem::align_of::<u16>() != 0 {
+        return Err(ServiceMultiSzError::Misaligned);
+    }
+    let available_units = (buffer_bytes - offset) / std::mem::size_of::<u16>();
+    let maximum_units = maximum_units.min(available_units);
+    let mut entries = Vec::new();
+    let mut cursor = 0usize;
+    let mut total_units = 0usize;
+    loop {
+        if cursor >= maximum_units {
+            return Err(if available_units > maximum_units {
+                ServiceMultiSzError::OverLimit
+            } else {
+                ServiceMultiSzError::Unterminated
+            });
+        }
+        let first = unsafe { std::ptr::read_unaligned(value.add(cursor)) };
+        if first == 0 {
+            // A pointer to an empty string is documented as no dependencies.
+            return Ok(entries);
+        }
+        let start = cursor;
+        while cursor < maximum_units {
+            let unit = unsafe { std::ptr::read_unaligned(value.add(cursor)) };
+            if unit == 0 {
+                break;
+            }
+            cursor += 1;
+        }
+        if cursor >= maximum_units {
+            return Err(if available_units > maximum_units {
+                ServiceMultiSzError::OverLimit
+            } else {
+                ServiceMultiSzError::Unterminated
+            });
+        }
+        let units = cursor - start;
+        if units == 0 {
+            return Err(ServiceMultiSzError::EmptyDependency);
+        }
+        let mut dependency = Vec::with_capacity(units);
+        for index in start..cursor {
+            dependency.push(unsafe { std::ptr::read_unaligned(value.add(index)) });
+        }
+        let next = cursor + 1;
+        let next_unit = if next < maximum_units {
+            unsafe { std::ptr::read_unaligned(value.add(next)) }
+        } else {
+            return Err(if available_units > maximum_units {
+                ServiceMultiSzError::OverLimit
+            } else {
+                ServiceMultiSzError::Unterminated
+            });
+        };
+        if next_unit == 0 {
+            let name =
+                String::from_utf16(&dependency).map_err(|_| ServiceMultiSzError::MalformedUtf16)?;
+            let (kind, name) = if let Some(group) = name.strip_prefix('+') {
+                if group.is_empty() {
+                    return Err(ServiceMultiSzError::EmptyDependency);
+                }
+                ("load_order_group", group.to_owned())
+            } else {
+                ("service", name)
+            };
+            if entries.len() >= maximum_entries {
+                return Err(ServiceMultiSzError::OverLimit);
+            }
+            total_units = total_units.saturating_add(units);
+            if total_units > maximum_units {
+                return Err(ServiceMultiSzError::OverLimit);
+            }
+            entries.push(WindowsServiceDependency { kind, name });
+            return Ok(entries);
+        }
+        let name =
+            String::from_utf16(&dependency).map_err(|_| ServiceMultiSzError::MalformedUtf16)?;
+        let (kind, name) = if let Some(group) = name.strip_prefix('+') {
+            if group.is_empty() {
+                return Err(ServiceMultiSzError::EmptyDependency);
+            }
+            ("load_order_group", group.to_owned())
+        } else {
+            ("service", name)
+        };
+        if entries.len() >= maximum_entries {
+            return Err(ServiceMultiSzError::OverLimit);
+        }
+        total_units = total_units.saturating_add(units);
+        if total_units > maximum_units {
+            return Err(ServiceMultiSzError::OverLimit);
+        }
+        entries.push(WindowsServiceDependency { kind, name });
+        cursor = next;
+    }
+}
+
+fn service_multisz_error_code(error: ServiceMultiSzError) -> &'static str {
+    match error {
+        ServiceMultiSzError::OutsideBuffer
+        | ServiceMultiSzError::Misaligned
+        | ServiceMultiSzError::Unterminated
+        | ServiceMultiSzError::MalformedUtf16
+        | ServiceMultiSzError::EmptyDependency => "service_dependencies_response_invalid",
+        ServiceMultiSzError::OverLimit => "service_dependencies_limit_exceeded",
+    }
+}
+
+fn service_string_error_code(error: ServiceStringError) -> &'static str {
+    match error {
+        ServiceStringError::Missing
+        | ServiceStringError::OutsideBuffer
+        | ServiceStringError::Misaligned
+        | ServiceStringError::Unterminated
+        | ServiceStringError::MalformedUtf16 => "service_load_order_group_response_invalid",
+        ServiceStringError::OverLimit => "service_load_order_group_limit_exceeded",
     }
 }
 
@@ -4119,6 +4409,203 @@ mod tests {
             ),
             Err(ServiceStringError::MalformedUtf16)
         );
+    }
+
+    #[test]
+    fn service_dependency_multisz_separates_service_names_and_group_names() {
+        let units = "AlphaSvc\0+NetworkGroup\0\0"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                units.as_ptr().cast::<u8>(),
+                units.len() * std::mem::size_of::<u16>(),
+            )
+        };
+        let parsed = parse_service_dependencies(
+            bytes.as_ptr(),
+            bytes.len(),
+            units.as_ptr(),
+            MAX_SERVICE_STRING_UNITS,
+            MAX_SERVICE_DEPENDENCIES_PER_SERVICE,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            [
+                WindowsServiceDependency {
+                    kind: "service",
+                    name: "AlphaSvc".to_owned(),
+                },
+                WindowsServiceDependency {
+                    kind: "load_order_group",
+                    name: "NetworkGroup".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(WindowsServiceDependencies::Observed { entries: parsed }).unwrap(),
+            serde_json::json!({
+                "status":"observed",
+                "entries":[
+                    {"kind":"service","name":"AlphaSvc"},
+                    {"kind":"load_order_group","name":"NetworkGroup"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn service_dependency_multisz_treats_empty_and_null_as_observed_none() {
+        let empty_string = [0u16];
+        let empty_string_bytes = unsafe {
+            std::slice::from_raw_parts(
+                empty_string.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(&empty_string),
+            )
+        };
+        assert!(
+            parse_service_dependencies(
+                empty_string_bytes.as_ptr(),
+                empty_string_bytes.len(),
+                empty_string.as_ptr(),
+                16,
+                4,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let empty = [0u16, 0];
+        let bytes = unsafe {
+            std::slice::from_raw_parts(empty.as_ptr().cast::<u8>(), std::mem::size_of_val(&empty))
+        };
+        assert!(
+            parse_service_dependencies(bytes.as_ptr(), bytes.len(), empty.as_ptr(), 16, 4,)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            parse_service_dependencies(bytes.as_ptr(), bytes.len(), std::ptr::null(), 16, 4)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn service_dependency_parser_rejects_malformed_pointers_strings_and_limits() {
+        let valid = "Svc\0\0".encode_utf16().collect::<Vec<_>>();
+        let valid_bytes = unsafe {
+            std::slice::from_raw_parts(
+                valid.as_ptr().cast::<u8>(),
+                valid.len() * std::mem::size_of::<u16>(),
+            )
+        };
+        let outside = unsafe { valid.as_ptr().add(valid.len()) };
+        assert_eq!(
+            parse_service_dependencies(valid_bytes.as_ptr(), valid_bytes.len(), outside, 16, 4,),
+            Err(ServiceMultiSzError::OutsideBuffer)
+        );
+        let misaligned = unsafe { valid_bytes.as_ptr().add(1).cast::<u16>() };
+        assert_eq!(
+            parse_service_dependencies(valid_bytes.as_ptr(), valid_bytes.len(), misaligned, 16, 4,),
+            Err(ServiceMultiSzError::Misaligned)
+        );
+        let unterminated = "Svc\0".encode_utf16().collect::<Vec<_>>();
+        let unterminated_bytes = unsafe {
+            std::slice::from_raw_parts(
+                unterminated.as_ptr().cast::<u8>(),
+                unterminated.len() * std::mem::size_of::<u16>(),
+            )
+        };
+        assert_eq!(
+            parse_service_dependencies(
+                unterminated_bytes.as_ptr(),
+                unterminated_bytes.len(),
+                unterminated.as_ptr(),
+                16,
+                4,
+            ),
+            Err(ServiceMultiSzError::Unterminated)
+        );
+        assert_eq!(
+            parse_service_dependencies(
+                valid_bytes.as_ptr(),
+                valid_bytes.len(),
+                valid.as_ptr(),
+                2,
+                4,
+            ),
+            Err(ServiceMultiSzError::OverLimit)
+        );
+        assert_eq!(
+            parse_service_dependencies(
+                valid_bytes.as_ptr(),
+                valid_bytes.len(),
+                valid.as_ptr(),
+                16,
+                0,
+            ),
+            Err(ServiceMultiSzError::OverLimit)
+        );
+        let malformed = [0xd800u16, 0, 0];
+        let malformed_bytes = unsafe {
+            std::slice::from_raw_parts(
+                malformed.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(&malformed),
+            )
+        };
+        assert_eq!(
+            parse_service_dependencies(
+                malformed_bytes.as_ptr(),
+                malformed_bytes.len(),
+                malformed.as_ptr(),
+                16,
+                4,
+            ),
+            Err(ServiceMultiSzError::MalformedUtf16)
+        );
+        let empty_group = "+\0\0".encode_utf16().collect::<Vec<_>>();
+        let empty_group_bytes = unsafe {
+            std::slice::from_raw_parts(
+                empty_group.as_ptr().cast::<u8>(),
+                empty_group.len() * std::mem::size_of::<u16>(),
+            )
+        };
+        assert_eq!(
+            parse_service_dependencies(
+                empty_group_bytes.as_ptr(),
+                empty_group_bytes.len(),
+                empty_group.as_ptr(),
+                16,
+                4,
+            ),
+            Err(ServiceMultiSzError::EmptyDependency)
+        );
+    }
+
+    #[test]
+    fn service_dependency_values_are_inert_and_diagnostics_do_not_echo_them() {
+        let payload = "<script>not executable</script>\0\0"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                payload.as_ptr().cast::<u8>(),
+                payload.len() * std::mem::size_of::<u16>(),
+            )
+        };
+        let parsed = parse_service_dependencies(
+            bytes.as_ptr(),
+            bytes.len(),
+            payload.as_ptr(),
+            MAX_SERVICE_STRING_UNITS,
+            MAX_SERVICE_DEPENDENCIES_PER_SERVICE,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(json.contains("<script>not executable</script>"));
+        let diagnostic = service_multisz_error_code(ServiceMultiSzError::Unterminated);
+        assert!(!diagnostic.contains("script"));
     }
 
     #[test]

@@ -33,7 +33,7 @@ fn windows_startup_command_reports_native_startup_sources() {
     let bytes = fs::read(&output).unwrap();
     let document: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(document["schema"], "sideeffect.windows_startup_inventory");
-    assert_eq!(document["schema_version"], 8);
+    assert_eq!(document["schema_version"], 9);
     assert_eq!(document["platform"], "windows");
     match document["status"].as_str().unwrap() {
         "complete" => assert_eq!(first.status.code(), Some(0)),
@@ -45,7 +45,7 @@ fn windows_startup_command_reports_native_startup_sources() {
     }
     assert_eq!(
         document["scope"],
-        "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+        "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_and_load_order_group_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
     );
     let sources = document["sources"].as_array().unwrap();
     for required in [
@@ -88,6 +88,27 @@ fn windows_startup_command_reports_native_startup_sources() {
     assert!(service_source["entries_seen"].as_u64().unwrap() > 0);
     assert!(!document["service_entries"].as_array().unwrap().is_empty());
     for service in document["service_entries"].as_array().unwrap() {
+        assert!(matches!(
+            service["dependencies"]["status"].as_str(),
+            Some("observed" | "unknown")
+        ));
+        assert!(matches!(
+            service["load_order_group"]["status"].as_str(),
+            Some("observed" | "unknown")
+        ));
+        if service["dependencies"]["status"] == "observed" {
+            for dependency in service["dependencies"]["entries"].as_array().unwrap() {
+                assert!(matches!(
+                    dependency["kind"].as_str(),
+                    Some("service" | "load_order_group")
+                ));
+                assert!(
+                    dependency["name"]
+                        .as_str()
+                        .is_some_and(|name| !name.is_empty())
+                );
+            }
+        }
         let observation = service["service_observation"].as_object().unwrap();
         let raw = observation["raw_state_code"].as_u64().unwrap();
         match observation["status"].as_str().unwrap() {
@@ -106,6 +127,17 @@ fn windows_startup_command_reports_native_startup_sources() {
             service["startup_state"]["observed"]
         );
     }
+    let services = document["service_entries"].as_array().unwrap();
+    assert!(
+        services
+            .iter()
+            .any(|service| service["dependencies"]["status"] == "observed")
+    );
+    assert!(
+        services
+            .iter()
+            .any(|service| service["load_order_group"]["status"] == "observed")
+    );
     let scheduled_tasks = sources
         .iter()
         .find(|source| source["id"] == "scheduled_task_triggers")
