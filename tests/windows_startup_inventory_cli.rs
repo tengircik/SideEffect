@@ -155,7 +155,7 @@ fn windows_startup_command_reports_native_startup_sources() {
         assert!(entry["account"].is_null() || entry["account"].is_string());
         assert_eq!(
             entry["evidence"]["source"],
-            "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW"
+            "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W"
         );
     }
     let task_entries = document["scheduled_task_entries"].as_array().unwrap();
