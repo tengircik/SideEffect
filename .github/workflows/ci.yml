@@ -278,6 +278,21 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
+      - name: Parse Windows local runtime installer
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD 'scripts/install_sideeffect_llama_runtime_windows.ps1'),
+            [ref] $tokens,
+            [ref] $parseErrors
+          ) | Out-Null
+          if ($parseErrors.Count -gt 0) {
+            $parseErrors | Format-List *
+            exit 1
+          }
+
       - name: Report Windows version
         shell: pwsh
         run: |

@@ -2,11 +2,29 @@
 
 **Status:** optional experimental workflow. No model is approved for answer quality, and this guide does not certify a runtime as safe. SideEffect's inventory, capture, inspection, comparison, and deterministic explanation commands work without a local model.
 
-This guide describes the existing native Windows explanation path. SideEffect does not install llama.cpp or run a model during setup. You choose whether to obtain the source, build the executable, and install model weights. Treat the runtime and its libraries as executable code that runs with your Windows user's permissions.
+This guide describes the existing native Windows explanation path. The SideEffect CLI does not install llama.cpp or run a model during setup. You may obtain the source and build it yourself, or use the optional repository helper below to download one pinned upstream package after explicit confirmation. Model weights are installed separately. Treat the runtime and its libraries as executable code that runs with your Windows user's permissions.
 
 ## Runtime build
 
 The explanation command expects llama.cpp's `llama-completion` executable built from [source revision `19cce6919992fdffd92e0ac152caaf1e2b8f254e`](https://github.com/ggml-org/llama.cpp/tree/19cce6919992fdffd92e0ac152caaf1e2b8f254e) with CUDA enabled. The repository's evaluation record identifies this revision and the build option; it does not provide a Windows driver/Toolkit support matrix or authenticate any binary. Check the current NVIDIA and llama.cpp requirements for your GPU, Windows version, compiler, CUDA Toolkit, and driver before building. SideEffect does not install or update those prerequisites.
+
+### Optional pinned Windows runtime download
+
+The repository includes [`scripts/install_sideeffect_llama_runtime_windows.ps1`](../scripts/install_sideeffect_llama_runtime_windows.ps1) for users who prefer the upstream prebuilt Windows x64 package over building from source. It offers only the pinned `b11938` release, whose signed source commit matches the explanation runtime check (`19cce6919992fdffd92e0ac152caaf1e2b8f254e`). The script downloads from the [official llama.cpp release](https://github.com/ggml-org/llama.cpp/releases/tag/b11938), verifies exact archive sizes and SHA-256 digests, applies bounded ZIP extraction under the current user's `%LOCALAPPDATA%`, refuses existing destinations, and prints the command to register the extracted `llama-completion.exe`. Upstream lists [build provenance attestations](https://github.com/ggml-org/llama.cpp/attestations/60617910), but this helper does not verify them. It never executes extracted files, changes the SideEffect model registry, or requests administrator access. The pinned hash verifies bytes; it does not by itself authenticate who built the binary.
+
+The CPU package downloads 24,260,998 bytes (about 24 MB). CUDA downloads two separate official assets—the 279,447,765-byte llama.cpp CUDA build and the 391,443,627-byte CUDA runtime-library bundle—for 670,891,392 bytes total (about 671 MB); aggregate archive extraction and the merged runtime files are capped at 2 GiB. CUDA DLLs are placed beside the runtime executable, while any bundled license/notice files are retained under `third-party-notices\cuda-runtime`. The CUDA package includes NVIDIA runtime libraries, so review both the [llama.cpp MIT license](https://github.com/ggml-org/llama.cpp/blob/b11938/LICENSE) and the versioned [NVIDIA CUDA 12.4.0 EULA](https://docs.nvidia.com/cuda/archive/12.4.0/eula/index.html) before choosing it. The bundle does not install a display driver. CUDA availability, runtime compatibility, VRAM sufficiency, and inference success still require separate checks. SideEffect's `model runtime set` records a hash of `llama-completion.exe`; it does not reverify adjacent DLL hashes before inference, so keep the entire extracted directory under your control.
+
+From the repository root, choose exactly one backend. The script shows the pinned source, digests, download size, and license links before asking for a backend-specific confirmation; declining or entering different text makes no request.
+
+```powershell
+# CPU (about 24 MB):
+powershell.exe -NoProfile -File .\scripts\install_sideeffect_llama_runtime_windows.ps1 -Backend cpu
+
+# Or CUDA (about 671 MB; includes NVIDIA runtime libraries):
+powershell.exe -NoProfile -File .\scripts\install_sideeffect_llama_runtime_windows.ps1 -Backend cuda
+```
+
+After it completes, review and copy the exact `sideeffect model runtime set explanation ...` command printed by the script. Then, if you trust the runtime and choose to execute it, run `sideeffect.exe model doctor --task explanation --backend auto` to check the reported revision and device listing. The doctor executes the selected runtime; it does not load model weights or assess answer quality. The script will not overwrite an existing pinned install. Remove only the exact `Installed directory` path printed by the installer if you deliberately want to reinstall; SideEffect's registry is changed only by the explicit `model runtime set` command.
 
 If you choose to build the runtime, obtain the llama.cpp source using your usual reviewed process, check out the pinned commit, verify the checkout, and build the `llama-completion` target. These commands fetch source and build the executable locally only when you choose to run them; SideEffect does not run them:
 

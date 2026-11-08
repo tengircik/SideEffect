@@ -468,6 +468,7 @@ Local-model analysis is optional and experimental; no model is approved for answ
 - [Product scope](docs/PRODUCT.md)
 - [Optional local model setup and readiness checks](docs/LOCAL_MODEL_DOCTOR.md)
 - [Windows local explanation model setup](docs/LOCAL_MODEL_WINDOWS_SETUP.md)
+- [Pinned Windows llama.cpp runtime installer](scripts/install_sideeffect_llama_runtime_windows.ps1)
 - [Local model evaluation and external holdout protocol](docs/LOCAL_QUERY_PLAN_EVALUATION.md)
 - [Bounded Windows GPU memory sampling for local models](docs/WINDOWS_LOCAL_MODEL_GPU_MEMORY_MEASUREMENT.md)
 - [Architecture](docs/ARCHITECTURE.md)
