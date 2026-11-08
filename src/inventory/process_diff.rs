@@ -2051,7 +2051,7 @@ mod tests {
         let windows_bytes = serde_json::to_vec(&windows()).unwrap();
         let windows_artifact = crate::audit_session::SessionArtifactRef {
             kind: crate::audit_session::ArtifactKind::WindowsProcesses,
-            path: "processes.json".to_owned(),
+            path: "processes.windows.json".to_owned(),
             schema: WINDOWS.to_owned(),
             schema_version: 3,
             byte_length: windows_bytes.len() as u64,

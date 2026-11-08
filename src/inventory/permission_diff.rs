@@ -272,6 +272,15 @@ fn parse_bounded_json(bytes: &[u8]) -> Result<Value, PermissionDiffError> {
     Ok(value)
 }
 
+/// Parse and validate a selected-path permission inventory using the same
+/// strict native schema contracts as the permission comparator.
+pub(crate) fn parse_validated_inventory(bytes: &[u8]) -> Result<Value, PermissionDiffError> {
+    let value = parse_bounded_json(bytes)?;
+    let inventory_kind = kind(&value)?;
+    validate(&value, inventory_kind)?;
+    Ok(value)
+}
+
 fn kind(v: &Value) -> Result<Kind, PermissionDiffError> {
     match v.get("schema").and_then(Value::as_str) {
         Some(LINUX) => Ok(Kind::Linux),
@@ -1811,6 +1820,90 @@ mod tests {
         );
         let encoded = serde_json::to_string(&result).unwrap();
         assert!(!encoded.contains("\"bytes_hex\""));
+    }
+
+    #[test]
+    fn permission_query_matches_native_path_encoding_and_retains_rows() {
+        let query_bytes = serde_json::to_vec(&serde_json::json!({
+            "schema": crate::query::PERMISSION_QUERY_SCHEMA,
+            "schema_version": crate::query::PERMISSION_QUERY_SCHEMA_VERSION,
+            "path_hex": "2f746d702f66697874757265",
+            "limit": 5
+        }))
+        .unwrap();
+        let query = crate::query::PermissionQuery::from_json(&query_bytes).unwrap();
+        let uppercase =
+            br#"{"schema":"sideeffect.permission_query","schema_version":1,"path_hex":"2F"}"#;
+        assert!(crate::query::PermissionQuery::from_json(uppercase).is_err());
+        let linux_bytes = serde_json::to_vec(&linux(
+            "complete",
+            vec![linux_row("2f746d702f66697874757265", 0o640)],
+        ))
+        .unwrap();
+        let linux_artifact = crate::audit_session::SessionArtifactRef {
+            kind: crate::audit_session::ArtifactKind::Permissions,
+            path: "permissions.json".to_owned(),
+            schema: LINUX.to_owned(),
+            schema_version: 1,
+            byte_length: linux_bytes.len() as u64,
+            sha256: "a".repeat(64),
+        };
+        let linux_result = crate::query::query_permission_artifact(
+            crate::query::PermissionQueryInput {
+                platform: "linux",
+                source_status: crate::audit_session::SourceStatus::Complete,
+                scope: None,
+                started_at_unix_ms: None,
+                ended_at_unix_ms: None,
+                diagnostic_codes: Vec::new(),
+                artifact: Some(&linux_artifact),
+                bytes: Some(&linux_bytes),
+            },
+            &query,
+        )
+        .unwrap();
+        assert_eq!(linux_result.matched_count, 1);
+        assert_eq!(linux_result.rows[0].row["mode"], 0o640);
+        assert_eq!(linux_result.rows[0].json_pointer, "/objects/0");
+        assert_eq!(linux_result.rows[0].path_encoding, "linux_path_bytes");
+
+        let windows_bytes = serde_json::to_vec(&windows(
+            "complete",
+            vec![windows_row(
+                "43003a005c0066006900780074007500720065002e00740078007400",
+                10,
+            )],
+        ))
+        .unwrap();
+        let windows_artifact = crate::audit_session::SessionArtifactRef {
+            kind: crate::audit_session::ArtifactKind::WindowsPermissions,
+            path: "permissions.windows.json".to_owned(),
+            schema: WINDOWS.to_owned(),
+            schema_version: 1,
+            byte_length: windows_bytes.len() as u64,
+            sha256: "b".repeat(64),
+        };
+        let mut windows_query = query;
+        windows_query.path_hex =
+            "43003a005c0066006900780074007500720065002e00740078007400".to_owned();
+        let windows_result = crate::query::query_permission_artifact(
+            crate::query::PermissionQueryInput {
+                platform: "windows",
+                source_status: crate::audit_session::SourceStatus::Complete,
+                scope: None,
+                started_at_unix_ms: None,
+                ended_at_unix_ms: None,
+                diagnostic_codes: Vec::new(),
+                artifact: Some(&windows_artifact),
+                bytes: Some(&windows_bytes),
+            },
+            &windows_query,
+        )
+        .unwrap();
+        assert_eq!(windows_result.matched_count, 1);
+        assert_eq!(windows_result.rows[0].row["metadata"]["size_bytes"], 10);
+        assert_eq!(windows_result.rows[0].json_pointer, "/objects/0");
+        assert_eq!(windows_result.rows[0].path_encoding, "windows_path_utf16le");
     }
 
     fn compare_permission_fixture(a: &Value, b: &Value) -> PermissionDiff {

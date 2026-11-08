@@ -13,7 +13,7 @@ mod packages;
 mod packages_windows;
 mod path_executable_diff;
 mod path_executables;
-mod permission_diff;
+pub(crate) mod permission_diff;
 #[cfg(target_os = "linux")]
 mod permissions;
 #[cfg(windows)]

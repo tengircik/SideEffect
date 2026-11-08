@@ -56,6 +56,12 @@ pub const PROCESS_QUERY_SCHEMA: &str = "sideeffect.process_query";
 pub const PROCESS_QUERY_SCHEMA_VERSION: u32 = 1;
 pub const PROCESS_QUERY_RESULT_SCHEMA: &str = "sideeffect.process_query_result";
 pub const PROCESS_QUERY_RESULT_SCHEMA_VERSION: u32 = 1;
+pub const PERMISSION_QUERY_SCHEMA: &str = "sideeffect.permission_query";
+pub const PERMISSION_QUERY_SCHEMA_VERSION: u32 = 1;
+pub const PERMISSION_QUERY_RESULT_SCHEMA: &str = "sideeffect.permission_query_result";
+pub const PERMISSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 1;
+pub const MAX_PERMISSION_QUERY_BYTES: usize = 66 * 1024;
+pub const MAX_PERMISSION_PATH_HEX_BYTES: usize = 65_534;
 pub const MAX_STARTUP_QUERY_ROWS: usize = 20_000;
 pub const MAX_STARTUP_QUERY_STRING_BYTES: usize = 16 * 1024;
 pub const MAX_PACKAGE_QUERY_ROWS: usize = 200_000;
@@ -1689,7 +1695,7 @@ pub fn query_process_artifact(
         ),
         "windows" => (
             ArtifactKind::WindowsProcesses,
-            "processes.json",
+            "processes.windows.json",
             "sideeffect.windows_process_inventory",
             3..=4,
         ),
@@ -1833,6 +1839,325 @@ pub fn multi_session_process_query_result(
         matched_count,
         complete,
         filter: query.filters.clone(),
+        limit: query.limit,
+        sessions,
+    })
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionQuery {
+    pub schema: String,
+    pub schema_version: u32,
+    pub path_hex: String,
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+}
+
+impl PermissionQuery {
+    pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_PERMISSION_QUERY_BYTES {
+            return Err(format!(
+                "permission query input exceeds the {MAX_PERMISSION_QUERY_BYTES}-byte limit"
+            ));
+        }
+        let query: Self = serde_json::from_slice(bytes)
+            .map_err(|error| format!("invalid permission query JSON: {error}"))?;
+        if query.schema != PERMISSION_QUERY_SCHEMA
+            || query.schema_version != PERMISSION_QUERY_SCHEMA_VERSION
+        {
+            return Err(format!(
+                "permission query schema must be {PERMISSION_QUERY_SCHEMA} version {PERMISSION_QUERY_SCHEMA_VERSION}"
+            ));
+        }
+        if query.limit == 0 || query.limit as usize > MAX_QUERY_RESULTS {
+            return Err(format!(
+                "permission query limit must be between 1 and {MAX_QUERY_RESULTS}"
+            ));
+        }
+        if query.path_hex.is_empty()
+            || query.path_hex.len() > MAX_PERMISSION_PATH_HEX_BYTES
+            || query.path_hex.len() % 2 != 0
+            || !query
+                .path_hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(format!(
+                "permission query path_hex must be non-empty, even-length lowercase hexadecimal and at most {MAX_PERMISSION_PATH_HEX_BYTES} bytes"
+            ));
+        }
+        Ok(query)
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PermissionQueryArtifact {
+    pub path: String,
+    pub schema: String,
+    pub schema_version: u32,
+    pub byte_length: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PermissionQueryRow {
+    pub json_pointer: String,
+    pub path_encoding: String,
+    pub evidence: serde_json::Value,
+    pub row: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PermissionQuerySource {
+    pub role: SourceRole,
+    pub platform: String,
+    pub status: SourceStatus,
+    pub scope: Option<String>,
+    pub started_at_unix_ms: Option<u128>,
+    pub ended_at_unix_ms: Option<u128>,
+    pub inventory_status: Option<String>,
+    pub diagnostic_codes: Vec<String>,
+    pub diagnostics: Vec<serde_json::Value>,
+    pub artifact: Option<PermissionQueryArtifact>,
+    pub matched_count: usize,
+    pub rows: Vec<PermissionQueryRow>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionPermissionQueryResult {
+    pub session: SessionQueryIdentity,
+    pub permission_source: PermissionQuerySource,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MultiSessionPermissionQueryResult {
+    pub schema: &'static str,
+    pub schema_version: u32,
+    pub session_count: usize,
+    pub matched_count: usize,
+    pub complete: bool,
+    pub path_hex: String,
+    pub limit: u32,
+    pub sessions: Vec<SessionPermissionQueryResult>,
+}
+
+pub struct PermissionQueryInput<'a> {
+    pub platform: &'a str,
+    pub source_status: SourceStatus,
+    pub scope: Option<String>,
+    pub started_at_unix_ms: Option<u128>,
+    pub ended_at_unix_ms: Option<u128>,
+    pub diagnostic_codes: Vec<String>,
+    pub artifact: Option<&'a SessionArtifactRef>,
+    pub bytes: Option<&'a [u8]>,
+}
+
+pub fn query_permission_artifact(
+    input: PermissionQueryInput<'_>,
+    query: &PermissionQuery,
+) -> Result<PermissionQuerySource, String> {
+    let PermissionQueryInput {
+        platform,
+        source_status,
+        scope,
+        started_at_unix_ms,
+        ended_at_unix_ms,
+        mut diagnostic_codes,
+        artifact,
+        bytes,
+    } = input;
+    if !matches!(platform, "linux" | "windows") {
+        return Err("permission query session platform is unsupported".to_owned());
+    }
+    let Some(artifact) = artifact else {
+        if bytes.is_some() {
+            return Err("permission artifact bytes have no manifest reference".to_owned());
+        }
+        return Ok(PermissionQuerySource {
+            role: SourceRole::Permissions,
+            platform: platform.to_owned(),
+            status: source_status,
+            scope,
+            started_at_unix_ms,
+            ended_at_unix_ms,
+            inventory_status: None,
+            diagnostic_codes,
+            diagnostics: Vec::new(),
+            artifact: None,
+            matched_count: 0,
+            rows: Vec::new(),
+        });
+    };
+    let bytes =
+        bytes.ok_or_else(|| "verified permission artifact bytes are unavailable".to_owned())?;
+    if bytes.len() as u64 != artifact.byte_length
+        || bytes.len() > crate::audit_session::MAX_SESSION_ARTIFACT_BYTES as usize
+    {
+        return Err(
+            "permission artifact bytes do not match the verified manifest length".to_owned(),
+        );
+    }
+    let (expected_kind, schema) = if platform == "linux" {
+        (ArtifactKind::Permissions, "sideeffect.permission_inventory")
+    } else {
+        (
+            ArtifactKind::WindowsPermissions,
+            "sideeffect.windows_permission_inventory",
+        )
+    };
+    let expected_path = if platform == "linux" {
+        "permissions.json"
+    } else {
+        "permissions.windows.json"
+    };
+    if artifact.kind != expected_kind
+        || artifact.path != expected_path
+        || artifact.schema != schema
+        || artifact.schema_version != 1
+    {
+        return Err("permission artifact contract does not match its session manifest".to_owned());
+    }
+    let document = crate::inventory::permission_diff::parse_validated_inventory(bytes)
+        .map_err(|_| "permission artifact is malformed or has an unsupported schema".to_owned())?;
+    if document.get("platform").and_then(serde_json::Value::as_str) != Some(platform)
+        || document.get("schema").and_then(serde_json::Value::as_str) != Some(schema)
+        || document
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+    {
+        return Err(
+            "permission artifact header does not match its verified native contract".to_owned(),
+        );
+    }
+    let inventory_status = document
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "permission artifact status is missing".to_owned())?
+        .to_owned();
+    let diagnostics = document
+        .get("diagnostics")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "permission artifact diagnostics are malformed".to_owned())?;
+    diagnostic_codes.extend(diagnostics.iter().filter_map(|item| {
+        item.get("code")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    }));
+    diagnostic_codes.sort();
+    diagnostic_codes.dedup();
+    let objects = document
+        .get("objects")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "permission artifact objects are malformed".to_owned())?;
+    let field = if platform == "linux" {
+        ("path_bytes_hex", "linux_path_bytes")
+    } else {
+        ("path_utf16_hex", "windows_path_utf16le")
+    };
+    let mut rows = Vec::new();
+    for (index, row) in objects.iter().enumerate() {
+        if row.get(field.0).and_then(serde_json::Value::as_str) != Some(query.path_hex.as_str()) {
+            continue;
+        }
+        if rows.len() >= query.limit as usize {
+            return Err(format!(
+                "permission query matched more than its {}-row limit; narrow the filter",
+                query.limit
+            ));
+        }
+        let evidence = if platform == "linux" {
+            serde_json::json!({"object_index":index,"path_field":field.0})
+        } else {
+            serde_json::json!({"object_index":index,"path_field":field.0,"path_encoding":field.1})
+        };
+        rows.push(PermissionQueryRow {
+            json_pointer: format!("/objects/{index}"),
+            path_encoding: field.1.to_owned(),
+            evidence,
+            row: row.clone(),
+        });
+    }
+    let scope = document
+        .get("scope")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "permission artifact scope is missing".to_owned())?
+        .to_owned();
+    let (started, ended) = if platform == "linux" {
+        let captured = document
+            .get("captured_at_unix_ms")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| "permission capture timestamp is missing".to_owned())?;
+        (Some(u128::from(captured)), Some(u128::from(captured)))
+    } else {
+        (
+            document
+                .get("capture_started_at_unix_ms")
+                .and_then(serde_json::Value::as_u64)
+                .map(u128::from),
+            document
+                .get("capture_ended_at_unix_ms")
+                .and_then(serde_json::Value::as_u64)
+                .map(u128::from),
+        )
+    };
+    Ok(PermissionQuerySource {
+        role: SourceRole::Permissions,
+        platform: platform.to_owned(),
+        status: source_status,
+        scope: Some(scope),
+        started_at_unix_ms: started_at_unix_ms.or(started),
+        ended_at_unix_ms: ended_at_unix_ms.or(ended),
+        inventory_status: Some(inventory_status),
+        diagnostic_codes,
+        diagnostics: diagnostics.clone(),
+        artifact: Some(PermissionQueryArtifact {
+            path: artifact.path.clone(),
+            schema: artifact.schema.clone(),
+            schema_version: artifact.schema_version,
+            byte_length: artifact.byte_length,
+            sha256: artifact.sha256.clone(),
+        }),
+        matched_count: rows.len(),
+        rows,
+    })
+}
+
+pub fn multi_session_permission_query_result(
+    sessions: Vec<SessionPermissionQueryResult>,
+    query: &PermissionQuery,
+) -> Result<MultiSessionPermissionQueryResult, String> {
+    if !(1..=MAX_QUERY_SESSIONS).contains(&sessions.len()) {
+        return Err(format!(
+            "permission query requires 1..={MAX_QUERY_SESSIONS} sessions"
+        ));
+    }
+    let mut ids = HashSet::new();
+    let mut matched_count = 0usize;
+    for session in &sessions {
+        if !ids.insert(session.session.session_id.as_str()) {
+            return Err("permission query contains duplicate session IDs".to_owned());
+        }
+        matched_count = matched_count
+            .checked_add(session.permission_source.matched_count)
+            .ok_or_else(|| "permission query result count overflow".to_owned())?;
+        if matched_count > MAX_QUERY_RESULTS {
+            return Err("permission query exceeds its 5000-row aggregate limit".to_owned());
+        }
+    }
+    let complete = sessions.iter().all(|item| {
+        item.session.status == SessionStatus::Complete
+            && item.permission_source.status == SourceStatus::Complete
+            && item.permission_source.inventory_status.as_deref() == Some("complete")
+    });
+    Ok(MultiSessionPermissionQueryResult {
+        schema: PERMISSION_QUERY_RESULT_SCHEMA,
+        schema_version: PERMISSION_QUERY_RESULT_SCHEMA_VERSION,
+        session_count: sessions.len(),
+        matched_count,
+        complete,
+        path_hex: query.path_hex.clone(),
         limit: query.limit,
         sessions,
     })
