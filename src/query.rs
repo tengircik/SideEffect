@@ -48,8 +48,17 @@ pub const STARTUP_QUERY_SCHEMA: &str = "sideeffect.startup_query";
 pub const STARTUP_QUERY_SCHEMA_VERSION: u32 = 1;
 pub const STARTUP_QUERY_RESULT_SCHEMA: &str = "sideeffect.startup_query_result";
 pub const STARTUP_QUERY_RESULT_SCHEMA_VERSION: u32 = 1;
+pub const PACKAGE_QUERY_SCHEMA: &str = "sideeffect.package_query";
+pub const PACKAGE_QUERY_SCHEMA_VERSION: u32 = 1;
+pub const PACKAGE_QUERY_RESULT_SCHEMA: &str = "sideeffect.package_query_result";
+pub const PACKAGE_QUERY_RESULT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_STARTUP_QUERY_ROWS: usize = 20_000;
 pub const MAX_STARTUP_QUERY_STRING_BYTES: usize = 16 * 1024;
+pub const MAX_PACKAGE_QUERY_ROWS: usize = 200_000;
+pub const MAX_LINUX_PACKAGE_QUERY_DIAGNOSTICS: usize = 200_000;
+pub const MAX_WINDOWS_SOFTWARE_SOURCE_DIAGNOSTICS: usize = 65_536;
+pub const MAX_WINDOWS_SOFTWARE_QUERY_DIAGNOSTICS: usize = 262_144;
+pub const MAX_PACKAGE_QUERY_STRING_BYTES: usize = 16 * 1024;
 const MAX_FILTER_TEXT_BYTES: usize = 128;
 
 /// Exact, case-sensitive equality over a string field in one native startup row.
@@ -646,6 +655,861 @@ pub fn multi_session_startup_query_result(
     })
 }
 
+/// A strict exact query over package rows retained in verified audit sessions.
+/// `source` is the Linux package-manager source ID or Windows registry source ID;
+/// the other filters name the native row fields without normalization.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageQueryFilters {
+    pub source: Option<String>,
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub publisher: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageQuery {
+    pub schema: String,
+    pub schema_version: u32,
+    #[serde(default)]
+    pub filters: PackageQueryFilters,
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+}
+
+impl PackageQuery {
+    pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_QUERY_BYTES {
+            return Err(format!(
+                "package query input exceeds the {MAX_QUERY_BYTES}-byte limit"
+            ));
+        }
+        let query: Self = serde_json::from_slice(bytes)
+            .map_err(|error| format!("invalid package query JSON: {error}"))?;
+        if query.schema != PACKAGE_QUERY_SCHEMA
+            || query.schema_version != PACKAGE_QUERY_SCHEMA_VERSION
+        {
+            return Err(format!(
+                "package query schema must be {PACKAGE_QUERY_SCHEMA} version {PACKAGE_QUERY_SCHEMA_VERSION}"
+            ));
+        }
+        if query.limit == 0 || query.limit as usize > MAX_QUERY_RESULTS {
+            return Err(format!(
+                "package query limit must be between 1 and {MAX_QUERY_RESULTS}"
+            ));
+        }
+        for (label, value) in [
+            ("source", query.filters.source.as_deref()),
+            ("name", query.filters.name.as_deref()),
+            ("version", query.filters.version.as_deref()),
+            ("publisher", query.filters.publisher.as_deref()),
+        ] {
+            if value.is_some_and(|value| {
+                value.is_empty() || value.len() > MAX_PACKAGE_QUERY_STRING_BYTES
+            }) {
+                return Err(format!(
+                    "package query {label} must be non-empty and at most {MAX_PACKAGE_QUERY_STRING_BYTES} UTF-8 bytes"
+                ));
+            }
+        }
+        Ok(query)
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PackageQueryArtifact {
+    pub path: String,
+    pub schema: String,
+    pub schema_version: u32,
+    pub byte_length: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PackageQueryRow {
+    pub source: String,
+    pub json_pointer: String,
+    pub evidence: serde_json::Value,
+    pub row: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PackageQuerySource {
+    pub role: SourceRole,
+    pub platform: String,
+    pub status: SourceStatus,
+    pub scope: Option<String>,
+    pub started_at_unix_ms: Option<u128>,
+    pub ended_at_unix_ms: Option<u128>,
+    pub diagnostic_codes: Vec<String>,
+    pub inventory_status: Option<String>,
+    pub inventory_diagnostics: Vec<serde_json::Value>,
+    pub source_states: Vec<serde_json::Value>,
+    pub artifact: Option<PackageQueryArtifact>,
+    pub matched_count: usize,
+    pub rows: Vec<PackageQueryRow>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionPackageQueryResult {
+    pub session: SessionQueryIdentity,
+    pub package_source: PackageQuerySource,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MultiSessionPackageQueryResult {
+    pub schema: &'static str,
+    pub schema_version: u32,
+    pub session_count: usize,
+    pub matched_count: usize,
+    pub complete: bool,
+    pub filter: PackageQueryFilters,
+    pub limit: u32,
+    pub sessions: Vec<SessionPackageQueryResult>,
+}
+
+pub struct PackageQueryInput<'a> {
+    pub platform: &'a str,
+    pub source_status: SourceStatus,
+    pub scope: Option<String>,
+    pub started_at_unix_ms: Option<u128>,
+    pub ended_at_unix_ms: Option<u128>,
+    pub diagnostic_codes: Vec<String>,
+    pub artifact: Option<&'a SessionArtifactRef>,
+    pub bytes: Option<&'a [u8]>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxPackageDocument {
+    schema: String,
+    schema_version: u32,
+    platform: String,
+    scope: String,
+    captured_at_unix_ms: u128,
+    status: LinuxPackageInventoryStatus,
+    sources: BoundedSequence<LinuxPackageSource, 16>,
+    packages: BoundedSequence<LinuxPackageRow, MAX_PACKAGE_QUERY_ROWS>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, Hash, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum LinuxPackageInventoryStatus {
+    Complete,
+    Partial,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxPackageSource {
+    id: String,
+    status: LinuxPackageSourceStatus,
+    exit_code: Option<i32>,
+    records_seen: usize,
+    diagnostics: BoundedSequence<LinuxPackageDiagnostic, MAX_LINUX_PACKAGE_QUERY_DIAGNOSTICS>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum LinuxPackageSourceStatus {
+    Complete,
+    Partial,
+    NotChecked,
+    Unsupported,
+    NotApplicable,
+    Unavailable,
+    AccessDenied,
+    Failed,
+    TimedOut,
+    OutputLimitExceeded,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxPackageDiagnostic {
+    code: String,
+    line: Option<usize>,
+    byte_offset: Option<usize>,
+    byte_length: Option<usize>,
+    record_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxPackageRow {
+    source_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    architecture: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status_abbrev: Option<String>,
+    evidence: LinuxPackageEvidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxPackageEvidence {
+    line: usize,
+    byte_offset: usize,
+    byte_length: usize,
+    record_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_record: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_record_hex: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WindowsSoftwareDocument {
+    schema: String,
+    schema_version: u32,
+    platform: String,
+    scope: String,
+    capture_started_at_unix_ms: u128,
+    capture_ended_at_unix_ms: u128,
+    status: WindowsSoftwareStatus,
+    sources: BoundedSequence<WindowsSoftwareSource, 4>,
+    registrations: BoundedSequence<WindowsSoftwareRegistration, 8_192>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum WindowsSoftwareStatus {
+    Complete,
+    Partial,
+    NotPresent,
+    Inaccessible,
+    Error,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WindowsSoftwareSource {
+    id: String,
+    status: WindowsSoftwareStatus,
+    registrations_seen: usize,
+    hive: String,
+    registry_key: String,
+    registry_view: WindowsRegistryView,
+    diagnostics:
+        BoundedSequence<WindowsSoftwareDiagnostic, MAX_WINDOWS_SOFTWARE_SOURCE_DIAGNOSTICS>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, Hash, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum WindowsRegistryView {
+    Native,
+    Wow64_32,
+    Wow64_64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WindowsSoftwareDiagnostic {
+    code: String,
+    registration_index: Option<usize>,
+    value_name: Option<String>,
+    message: String,
+    win32_error: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WindowsSoftwareRegistration {
+    registry_subkey: String,
+    registry_subkey_utf16_hex: String,
+    display_name: Option<String>,
+    values: BoundedSequence<WindowsSoftwareValue, 8>,
+    evidence: WindowsSoftwareEvidence,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WindowsSoftwareValue {
+    name: String,
+    registry_type: u32,
+    type_name: String,
+    text: Option<String>,
+    raw_data_hex: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WindowsSoftwareEvidence {
+    source: String,
+    hive: String,
+    registry_view: WindowsRegistryView,
+    registry_key: String,
+    registration_index: usize,
+    registry_subkey: String,
+}
+
+/// Query rows from a source artifact whose bytes were already verified by the
+/// platform audit-session reader. Every input document is strictly validated,
+/// including rows that do not match the requested filters.
+pub fn query_package_artifact(
+    input: PackageQueryInput<'_>,
+    query: &PackageQuery,
+) -> Result<PackageQuerySource, String> {
+    let PackageQueryInput {
+        platform,
+        source_status,
+        scope,
+        started_at_unix_ms,
+        ended_at_unix_ms,
+        diagnostic_codes,
+        artifact,
+        bytes,
+    } = input;
+    if !matches!(platform, "linux" | "windows") {
+        return Err("package query session platform is unsupported".to_owned());
+    }
+    if platform == "linux" && query.filters.publisher.is_some() {
+        return Err("package publisher filter is not supported for Linux package rows".to_owned());
+    }
+    let Some(artifact) = artifact else {
+        if bytes.is_some() {
+            return Err("package artifact bytes have no manifest reference".to_owned());
+        }
+        return Ok(PackageQuerySource {
+            role: SourceRole::Packages,
+            platform: platform.to_owned(),
+            status: source_status,
+            scope,
+            started_at_unix_ms,
+            ended_at_unix_ms,
+            diagnostic_codes,
+            inventory_status: None,
+            inventory_diagnostics: Vec::new(),
+            source_states: Vec::new(),
+            artifact: None,
+            matched_count: 0,
+            rows: Vec::new(),
+        });
+    };
+    let bytes =
+        bytes.ok_or_else(|| "verified package artifact bytes are unavailable".to_owned())?;
+    if bytes.len() as u64 != artifact.byte_length
+        || bytes.len() > crate::audit_session::MAX_SESSION_ARTIFACT_BYTES as usize
+    {
+        return Err("package artifact bytes do not match the verified manifest length".to_owned());
+    }
+    let mut rows = Vec::new();
+    let mut inventory_diagnostics = Vec::new();
+    let mut source_states = Vec::new();
+    let inventory_status = match platform {
+        "linux" => {
+            if artifact.kind != ArtifactKind::Packages
+                || artifact.schema != "sideeffect.inventory"
+                || artifact.schema_version != 2
+                || artifact.path != "packages.json"
+            {
+                return Err(
+                    "Linux package artifact contract does not match its session manifest"
+                        .to_owned(),
+                );
+            }
+            let document: LinuxPackageDocument = serde_json::from_slice(bytes).map_err(|_| {
+                "Linux package artifact is malformed or has unsupported fields".to_owned()
+            })?;
+            if document.schema != "sideeffect.inventory"
+                || document.schema_version != 2
+                || document.platform != "linux"
+                || document.scope.is_empty()
+            {
+                return Err("Linux package artifact header is malformed".to_owned());
+            }
+            let mut source_map = std::collections::HashMap::new();
+            let mut diag_count = 0usize;
+            for source in &document.sources.0 {
+                if !matches!(
+                    source.id.as_str(),
+                    "dpkg_query"
+                        | "rpm_query"
+                        | "pacman_query"
+                        | "apk_info"
+                        | "flatpak"
+                        | "xbps_query"
+                        | "nix"
+                        | "guix"
+                        | "snap"
+                ) || source.records_seen > MAX_PACKAGE_QUERY_ROWS
+                    || source_map
+                        .insert(source.id.as_str(), source.status)
+                        .is_some()
+                {
+                    return Err(
+                        "Linux package artifact contains invalid or duplicate source IDs"
+                            .to_owned(),
+                    );
+                }
+                if document.status == LinuxPackageInventoryStatus::Complete
+                    && !matches!(
+                        source.status,
+                        LinuxPackageSourceStatus::Complete
+                            | LinuxPackageSourceStatus::NotApplicable
+                    )
+                {
+                    return Err(
+                        "complete Linux package artifact contains an incomplete source".to_owned(),
+                    );
+                }
+                diag_count = diag_count
+                    .checked_add(source.diagnostics.0.len())
+                    .ok_or_else(|| "package diagnostic count overflow".to_owned())?;
+                if diag_count > MAX_LINUX_PACKAGE_QUERY_DIAGNOSTICS {
+                    return Err(
+                        "Linux package artifact diagnostics exceed their query limit".to_owned(),
+                    );
+                }
+                inventory_diagnostics.extend(
+                    source
+                        .diagnostics
+                        .0
+                        .iter()
+                        .map(serde_json::to_value)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|_| "could not serialize package diagnostic".to_owned())?,
+                );
+                source_states.push(
+                    serde_json::to_value(source)
+                        .map_err(|_| "could not serialize package source state".to_owned())?,
+                );
+            }
+            let mut row_counts = std::collections::HashMap::<&str, usize>::new();
+            for (index, row) in document.packages.0.iter().enumerate() {
+                let source_status = source_map
+                    .get(row.source_id.as_str())
+                    .ok_or_else(|| "Linux package row refers to an unknown source".to_owned())?;
+                let ev = &row.evidence;
+                *row_counts.entry(row.source_id.as_str()).or_default() += 1;
+                let evidence_bytes = ev
+                    .raw_record
+                    .as_ref()
+                    .map(|raw| raw.as_bytes().to_vec())
+                    .or_else(|| ev.raw_record_hex.as_deref().and_then(decode_lower_hex));
+                if ev.line == 0
+                    || ev.byte_length == 0
+                    || ev.byte_offset.saturating_add(ev.byte_length)
+                        > crate::limits::MAX_INVENTORY_STDOUT_BYTES
+                    || ev.line > MAX_PACKAGE_QUERY_ROWS
+                    || ev.byte_offset.checked_add(ev.byte_length).is_none()
+                    || ev.record_sha256.len() != 64
+                    || !ev
+                        .record_sha256
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    || ev.raw_record_hex.as_ref().is_some_and(|hex| {
+                        hex.is_empty()
+                            || hex.len() % 2 != 0
+                            || hex.len() > 2 * crate::limits::MAX_INVENTORY_ROW_BYTES
+                            || !hex
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    })
+                    || ev
+                        .raw_record
+                        .as_ref()
+                        .is_some_and(|raw| raw.len() > crate::limits::MAX_INVENTORY_ROW_BYTES)
+                    || (ev.raw_record.is_some() == ev.raw_record_hex.is_some())
+                    || evidence_bytes.as_ref().is_some_and(|raw| {
+                        raw.len() != ev.byte_length
+                            || crate::fingerprint::sha256_hex(raw) != ev.record_sha256
+                    })
+                    || (*source_status != LinuxPackageSourceStatus::Complete
+                        && *source_status != LinuxPackageSourceStatus::Partial)
+                {
+                    return Err(
+                        "Linux package row evidence or source status is malformed".to_owned()
+                    );
+                }
+                if query
+                    .filters
+                    .source
+                    .as_deref()
+                    .is_none_or(|value| value == row.source_id)
+                    && query
+                        .filters
+                        .name
+                        .as_deref()
+                        .is_none_or(|value| row.name.as_deref() == Some(value))
+                    && query
+                        .filters
+                        .version
+                        .as_deref()
+                        .is_none_or(|value| row.version.as_deref() == Some(value))
+                {
+                    if rows.len() >= query.limit as usize {
+                        return Err(
+                            "package query matched more than its requested row limit".to_owned()
+                        );
+                    }
+                    let value = serde_json::to_value(row)
+                        .map_err(|_| "could not serialize Linux package row".to_owned())?;
+                    rows.push(PackageQueryRow {
+                        source: row.source_id.clone(),
+                        json_pointer: format!("/packages/{index}"),
+                        evidence: value
+                            .get("evidence")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        row: value,
+                    });
+                }
+            }
+            if document.sources.0.iter().any(|source| {
+                row_counts.get(source.id.as_str()).copied().unwrap_or(0) > source.records_seen
+            }) {
+                return Err(
+                    "Linux package source record count is smaller than its retained rows"
+                        .to_owned(),
+                );
+            }
+            match document.status {
+                LinuxPackageInventoryStatus::Complete => "complete",
+                LinuxPackageInventoryStatus::Partial => "partial",
+            }
+            .to_owned()
+        }
+        "windows" => {
+            if artifact.kind != ArtifactKind::WindowsSoftware
+                || artifact.schema != "sideeffect.windows_software_inventory"
+                || artifact.schema_version != 1
+                || artifact.path != "software.windows.json"
+            {
+                return Err(
+                    "Windows software artifact contract does not match its session manifest"
+                        .to_owned(),
+                );
+            }
+            let document: WindowsSoftwareDocument =
+                serde_json::from_slice(bytes).map_err(|_| {
+                    "Windows software artifact is malformed or has unsupported fields".to_owned()
+                })?;
+            if document.schema != "sideeffect.windows_software_inventory"
+                || document.schema_version != 1
+                || document.platform != "windows"
+                || document.scope.is_empty()
+                || document.capture_ended_at_unix_ms < document.capture_started_at_unix_ms
+            {
+                return Err("Windows software artifact header is malformed".to_owned());
+            }
+            let mut source_ids = std::collections::HashMap::new();
+            let mut diag_count = 0usize;
+            for source in &document.sources.0 {
+                let expected_id = match (source.hive.as_str(), source.registry_view) {
+                    ("HKEY_CURRENT_USER", WindowsRegistryView::Native) => {
+                        "current_user_native_uninstall"
+                    }
+                    ("HKEY_CURRENT_USER", WindowsRegistryView::Wow64_32) => {
+                        "current_user_32_uninstall"
+                    }
+                    ("HKEY_LOCAL_MACHINE", WindowsRegistryView::Wow64_64) => {
+                        "local_machine_64_uninstall"
+                    }
+                    ("HKEY_LOCAL_MACHINE", WindowsRegistryView::Wow64_32) => {
+                        "local_machine_32_uninstall"
+                    }
+                    _ => return Err("Windows software source hive/view is unsupported".to_owned()),
+                };
+                if source.id != expected_id
+                    || source.registry_key
+                        != "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall"
+                    || source.registrations_seen > 8_192
+                    || source_ids
+                        .insert(
+                            (source.hive.as_str(), source.registry_view),
+                            source.id.as_str(),
+                        )
+                        .is_some()
+                {
+                    return Err(
+                        "Windows software artifact contains invalid or duplicate source identities"
+                            .to_owned(),
+                    );
+                }
+                if document.status == WindowsSoftwareStatus::Complete
+                    && !matches!(
+                        source.status,
+                        WindowsSoftwareStatus::Complete | WindowsSoftwareStatus::NotPresent
+                    )
+                {
+                    return Err(
+                        "complete Windows software artifact contains an incomplete source"
+                            .to_owned(),
+                    );
+                }
+                diag_count = diag_count
+                    .checked_add(source.diagnostics.0.len())
+                    .ok_or_else(|| "package diagnostic count overflow".to_owned())?;
+                if diag_count > MAX_WINDOWS_SOFTWARE_QUERY_DIAGNOSTICS {
+                    return Err(
+                        "Windows software artifact diagnostics exceed their query limit".to_owned(),
+                    );
+                }
+                if source.diagnostics.0.iter().any(|diagnostic| {
+                    diagnostic.code.len() > 128
+                        || diagnostic.message.len() > 4_096
+                        || diagnostic
+                            .value_name
+                            .as_ref()
+                            .is_some_and(|name| name.len() > 128)
+                        || diagnostic
+                            .registration_index
+                            .is_some_and(|ordinal| ordinal >= 8_192)
+                        || diagnostic.win32_error == Some(0)
+                }) {
+                    return Err("Windows software source diagnostic is malformed".to_owned());
+                }
+                inventory_diagnostics.extend(
+                    source
+                        .diagnostics
+                        .0
+                        .iter()
+                        .map(serde_json::to_value)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|_| "could not serialize software diagnostic".to_owned())?,
+                );
+                source_states.push(
+                    serde_json::to_value(source)
+                        .map_err(|_| "could not serialize software source state".to_owned())?,
+                );
+            }
+            if source_ids.len() != 4
+                || source_ids.values().any(|id| id.is_empty())
+                || document
+                    .sources
+                    .0
+                    .iter()
+                    .map(|source| source.registrations_seen)
+                    .sum::<usize>()
+                    > 8_192
+                || (document.status == WindowsSoftwareStatus::Complete)
+                    != document.sources.0.iter().all(|source| {
+                        matches!(
+                            source.status,
+                            WindowsSoftwareStatus::Complete | WindowsSoftwareStatus::NotPresent
+                        )
+                    })
+            {
+                return Err(
+                    "Windows software source set or aggregate status is malformed".to_owned(),
+                );
+            }
+            let mut seen_ordinals = std::collections::HashSet::new();
+            for (index, row) in document.registrations.0.iter().enumerate() {
+                let ev = &row.evidence;
+                let source_id = source_ids
+                    .get(&(ev.hive.as_str(), ev.registry_view))
+                    .ok_or_else(|| {
+                        "Windows software row refers to an unknown registry source".to_owned()
+                    })?;
+                let source_state = document
+                    .sources
+                    .0
+                    .iter()
+                    .find(|source| source.id == *source_id)
+                    .ok_or_else(|| "Windows software row refers to an unknown source".to_owned())?;
+                if ev.registration_index >= 8_192
+                    || ev.registration_index >= source_state.registrations_seen
+                    || source_state.status == WindowsSoftwareStatus::NotPresent
+                    || !seen_ordinals.insert((
+                        ev.hive.as_str(),
+                        ev.registry_view,
+                        ev.registration_index,
+                    ))
+                    || ev.source != "RegEnumKeyExW/RegQueryValueExW"
+                    || ev.registry_key != "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall"
+                    || ev.registry_subkey != row.registry_subkey
+                    || row.registry_subkey_utf16_hex.is_empty()
+                    || row.registry_subkey_utf16_hex.len() % 4 != 0
+                    || !row
+                        .registry_subkey_utf16_hex
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return Err("Windows software registration evidence is malformed".to_owned());
+                }
+                let mut value_names = std::collections::HashSet::new();
+                for value in &row.values.0 {
+                    if !matches!(
+                        value.name.as_str(),
+                        "DisplayName"
+                            | "DisplayVersion"
+                            | "Publisher"
+                            | "InstallLocation"
+                            | "InstallDate"
+                            | "UninstallString"
+                            | "QuietUninstallString"
+                            | "DisplayIcon"
+                    ) || !value_names.insert(value.name.as_str())
+                        || value.raw_data_hex.len() % 2 != 0
+                        || !value
+                            .raw_data_hex
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                        || (value.registry_type == 1 && value.type_name != "REG_SZ")
+                        || (value.registry_type == 2 && value.type_name != "REG_EXPAND_SZ")
+                        || (!matches!(value.registry_type, 1 | 2)
+                            && value.type_name != "unsupported")
+                    {
+                        return Err("Windows software registration value is malformed".to_owned());
+                    }
+                }
+                let display_version = row
+                    .values
+                    .0
+                    .iter()
+                    .find(|value| value.name == "DisplayVersion")
+                    .and_then(|value| value.text.as_deref());
+                let publisher = row
+                    .values
+                    .0
+                    .iter()
+                    .find(|value| value.name == "Publisher")
+                    .and_then(|value| value.text.as_deref());
+                if query
+                    .filters
+                    .source
+                    .as_deref()
+                    .is_none_or(|value| value == *source_id)
+                    && query
+                        .filters
+                        .name
+                        .as_deref()
+                        .is_none_or(|value| row.display_name.as_deref() == Some(value))
+                    && query
+                        .filters
+                        .version
+                        .as_deref()
+                        .is_none_or(|value| display_version == Some(value))
+                    && query
+                        .filters
+                        .publisher
+                        .as_deref()
+                        .is_none_or(|value| publisher == Some(value))
+                {
+                    if rows.len() >= query.limit as usize {
+                        return Err(
+                            "package query matched more than its requested row limit".to_owned()
+                        );
+                    }
+                    let value = serde_json::to_value(row)
+                        .map_err(|_| "could not serialize Windows software row".to_owned())?;
+                    rows.push(PackageQueryRow {
+                        source: (*source_id).to_owned(),
+                        json_pointer: format!("/registrations/{index}"),
+                        evidence: value
+                            .get("evidence")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        row: value,
+                    });
+                }
+            }
+            match document.status {
+                WindowsSoftwareStatus::Complete => "complete",
+                WindowsSoftwareStatus::Partial => "partial",
+                WindowsSoftwareStatus::NotPresent => "not_present",
+                WindowsSoftwareStatus::Inaccessible => "inaccessible",
+                WindowsSoftwareStatus::Error => "error",
+            }
+            .to_owned()
+        }
+        _ => return Err("package query session platform is unsupported".to_owned()),
+    };
+    let artifact_meta = PackageQueryArtifact {
+        path: artifact.path.clone(),
+        schema: artifact.schema.clone(),
+        schema_version: artifact.schema_version,
+        byte_length: artifact.byte_length,
+        sha256: artifact.sha256.clone(),
+    };
+    Ok(PackageQuerySource {
+        role: SourceRole::Packages,
+        platform: platform.to_owned(),
+        status: source_status,
+        scope,
+        started_at_unix_ms,
+        ended_at_unix_ms,
+        diagnostic_codes,
+        inventory_status: Some(inventory_status),
+        inventory_diagnostics,
+        source_states,
+        artifact: Some(artifact_meta),
+        matched_count: rows.len(),
+        rows,
+    })
+}
+
+fn decode_lower_hex(value: &str) -> Option<Vec<u8>> {
+    if value.len() % 2 != 0
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let nibble = |byte: u8| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                _ => None,
+            };
+            Some((nibble(pair[0])? << 4) | nibble(pair[1])?)
+        })
+        .collect()
+}
+
+pub fn multi_session_package_query_result(
+    sessions: Vec<SessionPackageQueryResult>,
+    query: &PackageQuery,
+) -> Result<MultiSessionPackageQueryResult, String> {
+    if !(1..=MAX_QUERY_SESSIONS).contains(&sessions.len()) {
+        return Err(format!(
+            "package query requires 1..={MAX_QUERY_SESSIONS} sessions"
+        ));
+    }
+    let mut ids = HashSet::new();
+    let mut matched_count = 0usize;
+    for session in &sessions {
+        if !ids.insert(session.session.session_id.as_str()) {
+            return Err("package query contains duplicate session IDs".to_owned());
+        }
+        matched_count = matched_count
+            .checked_add(session.package_source.matched_count)
+            .ok_or_else(|| "package query result count overflow".to_owned())?;
+        if matched_count > MAX_MULTI_SESSION_RESULTS {
+            return Err("package query exceeds its 5000-row aggregate limit".to_owned());
+        }
+    }
+    let complete = sessions.iter().all(|item| {
+        item.session.status == SessionStatus::Complete
+            && item.package_source.status == SourceStatus::Complete
+            && item.package_source.inventory_status.as_deref() == Some("complete")
+    });
+    Ok(MultiSessionPackageQueryResult {
+        schema: PACKAGE_QUERY_RESULT_SCHEMA,
+        schema_version: PACKAGE_QUERY_RESULT_SCHEMA_VERSION,
+        session_count: sessions.len(),
+        matched_count,
+        complete,
+        filter: query.filters.clone(),
+        limit: query.limit,
+        sessions,
+    })
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InventoryQueryFilters {
@@ -896,7 +1760,7 @@ struct RootSnapshotLimits {
     deadline_seconds: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 struct BoundedSequence<T, const MAX: usize>(Vec<T>);
 
 impl<'de, T: Deserialize<'de>, const MAX: usize> Deserialize<'de> for BoundedSequence<T, MAX> {

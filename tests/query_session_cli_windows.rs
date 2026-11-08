@@ -15,7 +15,7 @@ use sideeffect::windows_runtime::{
     WINDOWS_RUNTIME_CAPTURE_SCHEMA, WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION, WindowsRuntimeCapture,
 };
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -518,6 +518,184 @@ fn write_selected_root_session(
         32 * 1024 * 1024,
     )
     .unwrap();
+}
+
+fn write_package_session(directory: &Path, session_id: &str, source_status: SourceStatus) {
+    let status = if source_status == SourceStatus::Complete {
+        "complete"
+    } else {
+        "partial"
+    };
+    let artifact_bytes = serde_json::to_vec(&json!({
+        "schema":"sideeffect.windows_software_inventory", "schema_version":1, "platform":"windows",
+        "scope":"synthetic fixture only", "capture_started_at_unix_ms":1000,"capture_ended_at_unix_ms":1001,
+        "status":status,
+        "sources":[
+            {"id":"current_user_native_uninstall","status":status,"registrations_seen":1,"hive":"HKEY_CURRENT_USER","registry_key":"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall","registry_view":"native","diagnostics":[]},
+            {"id":"current_user_32_uninstall","status":"not_present","registrations_seen":0,"hive":"HKEY_CURRENT_USER","registry_key":"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall","registry_view":"wow64_32","diagnostics":[]},
+            {"id":"local_machine_64_uninstall","status":"not_present","registrations_seen":0,"hive":"HKEY_LOCAL_MACHINE","registry_key":"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall","registry_view":"wow64_64","diagnostics":[]},
+            {"id":"local_machine_32_uninstall","status":"not_present","registrations_seen":0,"hive":"HKEY_LOCAL_MACHINE","registry_key":"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall","registry_view":"wow64_32","diagnostics":[]}
+        ],
+        "registrations":[{"registry_subkey":"AlphaKey","registry_subkey_utf16_hex":"41006c007000680061004b0065007900","display_name":"Alpha","values":[{"name":"DisplayName","registry_type":1,"type_name":"REG_SZ","text":"Alpha","raw_data_hex":"41006c00700068006100"},{"name":"DisplayVersion","registry_type":1,"type_name":"REG_SZ","text":"1.2","raw_data_hex":"31002e003200"},{"name":"Publisher","registry_type":1,"type_name":"REG_SZ","text":"Acme","raw_data_hex":"410063006d006500"}],"evidence":{"source":"RegEnumKeyExW/RegQueryValueExW","hive":"HKEY_CURRENT_USER","registry_view":"native","registry_key":"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall","registration_index":0,"registry_subkey":"AlphaKey"}}]
+    })).unwrap();
+    let artifact = SessionArtifactRef {
+        kind: ArtifactKind::WindowsSoftware,
+        path: "software.windows.json".to_owned(),
+        schema: "sideeffect.windows_software_inventory".to_owned(),
+        schema_version: 1,
+        byte_length: artifact_bytes.len() as u64,
+        sha256: digest(&artifact_bytes),
+    };
+    let source = AuditSessionSource {
+        role: SourceRole::Packages,
+        collector: Some(collector_identity("windows", SourceRole::Packages)),
+        platform: "windows".to_owned(),
+        scope: "synthetic fixture only".to_owned(),
+        started_at_unix_ms: 1000,
+        ended_at_unix_ms: 1001,
+        status: source_status,
+        applied_limits: vec![],
+        requested_settings: vec![],
+        effective_settings: vec![],
+        loss: None,
+        diagnostic_codes: if source_status == SourceStatus::Complete {
+            vec![]
+        } else {
+            vec!["synthetic_partial".to_owned()]
+        },
+        artifacts: vec![artifact],
+    };
+    let mut manifest = AuditSessionManifest {
+        schema: AUDIT_SESSION_SCHEMA.to_owned(),
+        schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+        session_id: session_id.to_owned(),
+        platform: "windows".to_owned(),
+        architecture: "x86_64".to_owned(),
+        started_at_unix_ms: 1000,
+        ended_at_unix_ms: 1001,
+        interval_semantics: IntervalSemantics::BestEffortNonAtomic,
+        status: if source_status == SourceStatus::Complete {
+            SessionStatus::Complete
+        } else {
+            SessionStatus::Partial
+        },
+        sources: vec![source],
+        host_context: Some(sideeffect::audit_session::HostContext {
+            os_name: sideeffect::audit_session::ContextFact {
+                status: sideeffect::audit_session::ContextFactStatus::Observed,
+                value: Some("Windows".to_owned()),
+            },
+            os_version: sideeffect::audit_session::ContextFact {
+                status: sideeffect::audit_session::ContextFactStatus::Observed,
+                value: Some("synthetic fixture".to_owned()),
+            },
+            privilege: sideeffect::audit_session::PrivilegeContext::NotElevated,
+        }),
+        coverage_manifest: None,
+    };
+    manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
+    let manifest = serde_json::to_vec(&manifest).unwrap();
+    sideeffect::record::publish_private_windows_directory(
+        directory,
+        &[
+            ("session.json", manifest.as_slice()),
+            ("software.windows.json", artifact_bytes.as_slice()),
+        ],
+        32 * 1024 * 1024,
+    )
+    .unwrap();
+}
+
+fn package_query(directory: &TestDirectory, sessions: &[&PathBuf], query_json: &[u8]) -> Output {
+    let query_path = directory.0.join("package-query.json");
+    fs::write(&query_path, query_json).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sideeffect"));
+    command.args(["query", "--query"]).arg(query_path);
+    for session in sessions {
+        command.args(["--session"]).arg(session);
+    }
+    command.args(["--source", "packages"]);
+    command.output().unwrap()
+}
+
+#[test]
+fn package_query_filters_windows_registrations_exactly_and_retains_evidence() {
+    let directory = TestDirectory::new();
+    let session = directory.0.join("software-session");
+    write_package_session(
+        &session,
+        "11111111111111111111111111111111",
+        SourceStatus::Complete,
+    );
+    let query = br#"{"schema":"sideeffect.package_query","schema_version":1,"filters":{"source":"current_user_native_uninstall","name":"Alpha","version":"1.2","publisher":"Acme"},"limit":5}"#;
+    let output = package_query(&directory, &[&session], query);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["schema"], "sideeffect.package_query_result");
+    assert_eq!(result["matched_count"], 1);
+    assert_eq!(
+        result["sessions"][0]["package_source"]["rows"][0]["row"]["display_name"],
+        "Alpha"
+    );
+    assert_eq!(
+        result["sessions"][0]["package_source"]["rows"][0]["json_pointer"],
+        "/registrations/0"
+    );
+    assert_eq!(
+        result["sessions"][0]["package_source"]["artifact"]["sha256"],
+        digest(&fs::read(session.join("software.windows.json")).unwrap())
+    );
+    let no_case_match =
+        br#"{"schema":"sideeffect.package_query","schema_version":1,"filters":{"name":"alpha"}}"#;
+    let output = package_query(&directory, &[&session], no_case_match);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["matched_count"],
+        0
+    );
+}
+
+#[test]
+fn package_query_preserves_windows_partial_status_and_rejects_duplicate_ids() {
+    let directory = TestDirectory::new();
+    let first = directory.0.join("partial-one");
+    let duplicate = directory.0.join("partial-two");
+    write_package_session(
+        &first,
+        "22222222222222222222222222222222",
+        SourceStatus::Partial,
+    );
+    write_package_session(
+        &duplicate,
+        "22222222222222222222222222222222",
+        SourceStatus::Partial,
+    );
+    let query =
+        br#"{"schema":"sideeffect.package_query","schema_version":1,"filters":{"name":"Alpha"}}"#;
+    let output = package_query(&directory, &[&first], query);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["sessions"][0]["package_source"]["status"], "partial");
+    assert_eq!(
+        result["sessions"][0]["package_source"]["inventory_status"],
+        "partial"
+    );
+    assert_eq!(
+        package_query(&directory, &[&first, &duplicate], query)
+            .status
+            .code(),
+        Some(1)
+    );
 }
 
 fn selected_root_query(

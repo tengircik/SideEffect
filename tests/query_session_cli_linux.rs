@@ -520,6 +520,161 @@ fn write_selected_root_session(
     write_private(path, "root-snapshot.json", artifact_bytes);
 }
 
+fn write_package_session(path: &Path, session_id: &str, status: SourceStatus) {
+    fs::create_dir(path).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    let inventory_status = if status == SourceStatus::Complete {
+        "complete"
+    } else {
+        "partial"
+    };
+    let artifact_bytes = serde_json::to_vec(&json!({
+        "schema":"sideeffect.inventory", "schema_version":2, "platform":"linux",
+        "scope":"synthetic fixture only", "captured_at_unix_ms":1001,
+        "status":inventory_status,
+        "sources":[{"id":"dpkg_query","status":inventory_status,"exit_code":0,"records_seen":1,"diagnostics":[]}],
+        "packages":[{"source_id":"dpkg_query","name":"Alpha","version":"1.2","architecture":"amd64","status_abbrev":"ii ","evidence":{"line":1,"byte_offset":0,"byte_length":15,"record_sha256":hash(b"Alpha\t1.2\tamd64"),"raw_record":"Alpha\t1.2\tamd64"},"diagnostic_code":null}]
+    })).unwrap();
+    let artifact = SessionArtifactRef {
+        kind: ArtifactKind::Packages,
+        path: "packages.json".into(),
+        schema: "sideeffect.inventory".into(),
+        schema_version: 2,
+        byte_length: artifact_bytes.len() as u64,
+        sha256: hash(&artifact_bytes),
+    };
+    let source = AuditSessionSource {
+        role: SourceRole::Packages,
+        collector: Some(collector_identity("linux", SourceRole::Packages)),
+        platform: "linux".into(),
+        scope: "synthetic fixture only".into(),
+        started_at_unix_ms: 1000,
+        ended_at_unix_ms: 1001,
+        status,
+        applied_limits: vec![],
+        requested_settings: vec![],
+        effective_settings: vec![],
+        loss: None,
+        diagnostic_codes: if status == SourceStatus::Complete {
+            vec![]
+        } else {
+            vec!["synthetic_partial".into()]
+        },
+        artifacts: vec![artifact],
+    };
+    let mut manifest = AuditSessionManifest {
+        schema: AUDIT_SESSION_SCHEMA.into(),
+        schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+        session_id: session_id.into(),
+        platform: "linux".into(),
+        architecture: "x86_64".into(),
+        started_at_unix_ms: 1000,
+        ended_at_unix_ms: 1001,
+        interval_semantics: IntervalSemantics::BestEffortNonAtomic,
+        status: if status == SourceStatus::Complete {
+            SessionStatus::Complete
+        } else {
+            SessionStatus::Partial
+        },
+        sources: vec![source],
+        host_context: Some(sideeffect::audit_session::HostContext {
+            os_name: sideeffect::audit_session::ContextFact {
+                status: sideeffect::audit_session::ContextFactStatus::Observed,
+                value: Some("Linux".into()),
+            },
+            os_version: sideeffect::audit_session::ContextFact {
+                status: sideeffect::audit_session::ContextFactStatus::Observed,
+                value: Some("synthetic fixture".into()),
+            },
+            privilege: sideeffect::audit_session::PrivilegeContext::NotElevated,
+        }),
+        coverage_manifest: None,
+    };
+    manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
+    manifest.validate().unwrap();
+    write_private(
+        path,
+        "session.json",
+        &serde_json::to_vec(&manifest).unwrap(),
+    );
+    write_private(path, "packages.json", &artifact_bytes);
+}
+
+fn package_query(directory: &TestDirectory, session: &Path, query_json: &[u8]) -> Output {
+    let query_path = directory.0.join("package-query.json");
+    fs::write(&query_path, query_json).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["query", "--query"])
+        .arg(query_path)
+        .args(["--session"])
+        .arg(session)
+        .args(["--source", "packages"])
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn package_query_filters_linux_rows_exactly_and_retains_verified_evidence() {
+    let directory = TestDirectory::new();
+    let session = directory.0.join("packages");
+    write_package_session(
+        &session,
+        "11111111111111111111111111111111",
+        SourceStatus::Complete,
+    );
+    let query = br#"{"schema":"sideeffect.package_query","schema_version":1,"filters":{"source":"dpkg_query","name":"Alpha","version":"1.2"},"limit":5}"#;
+    let output = package_query(&directory, &session, query);
+    assert_eq!(output.status.code(), Some(0));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["schema"], "sideeffect.package_query_result");
+    assert_eq!(result["matched_count"], 1);
+    assert_eq!(
+        result["sessions"][0]["package_source"]["rows"][0]["row"]["name"],
+        "Alpha"
+    );
+    assert_eq!(
+        result["sessions"][0]["package_source"]["rows"][0]["json_pointer"],
+        "/packages/0"
+    );
+    assert_eq!(
+        result["sessions"][0]["package_source"]["artifact"]["sha256"],
+        hash(&fs::read(session.join("packages.json")).unwrap())
+    );
+
+    let no_case_match =
+        br#"{"schema":"sideeffect.package_query","schema_version":1,"filters":{"name":"alpha"}}"#;
+    let output = package_query(&directory, &session, no_case_match);
+    assert_eq!(output.status.code(), Some(0));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["matched_count"], 0);
+}
+
+#[test]
+fn package_query_preserves_partial_status_and_rejects_unknown_query_fields() {
+    let directory = TestDirectory::new();
+    let session = directory.0.join("partial-packages");
+    write_package_session(
+        &session,
+        "22222222222222222222222222222222",
+        SourceStatus::Partial,
+    );
+    let query =
+        br#"{"schema":"sideeffect.package_query","schema_version":1,"filters":{"name":"Alpha"}}"#;
+    let output = package_query(&directory, &session, query);
+    assert_eq!(output.status.code(), Some(2));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["sessions"][0]["package_source"]["status"], "partial");
+    assert_eq!(
+        result["sessions"][0]["package_source"]["inventory_status"],
+        "partial"
+    );
+    let invalid = br#"{"schema":"sideeffect.package_query","schema_version":1,"filters":{"name":"Alpha","glob":"*"}}"#;
+    assert_eq!(
+        package_query(&directory, &session, invalid).status.code(),
+        Some(1)
+    );
+}
+
 fn selected_root_query(
     directory: &TestDirectory,
     names: &[&str],

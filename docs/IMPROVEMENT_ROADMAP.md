@@ -212,6 +212,8 @@ Milestones are ordered by dependency. Work may be split into independently revie
 
 **Failure gate:** unsafe rendering, uncontrolled network access, report claims without evidence, unreviewable redaction, or unbounded local case storage blocks sharing/export release.
 
+The separate `sideeffect.package_query` v1 exact query now covers Linux package v2 and Windows Uninstall-registration v1 artifacts from 1–16 verified native-platform sessions. Exact source/name/version filters are supported on both platforms, with exact publisher text on Windows. MSIX remains out of scope; zero matches describe only selected snapshots.
+
 ### R8 — Signed provenance manifests and key lifecycle
 
 **Purpose:** improve tamper evidence and chain-of-custody metadata while stating exactly what a signature can and cannot prove.

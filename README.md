@@ -502,3 +502,9 @@ SideEffect is licensed under the [Apache License 2.0](LICENSE).
 ### Startup session queries
 
 Query startup inventory rows with the separate `sideeffect.startup_query` v1 contract and `--source startup`. Filters compare a native artifact row field by exact, case-sensitive string equality; field names and source selectors remain specific to the artifact schema. On Windows, use artifact-provided UTF-16LE hexadecimal fields when exact code-unit matching is needed. Results retain the complete source row, evidence, artifact digest, session/source status, and a JSON pointer. A zero-match result does not establish that startup configuration is absent.
+
+### Package session queries
+
+Package and registry names, versions, publishers, installation paths, and uninstall values may be sensitive.
+
+Query Linux package rows or Windows Uninstall registrations from 1–16 explicitly selected verified sessions with `--source packages` and the separate `sideeffect.package_query` v1 contract. The exact, case-sensitive `source`, `name`, and `version` filters select Linux `source_id`/package fields or Windows registry source ID/`display_name`/`DisplayVersion` text; `publisher` is supported for Windows registrations only. Filters do not normalize names, versions, registry text, or identities. MSIX registrations are not included. Results retain native rows, evidence, JSON pointers, artifact digests, source statuses, and diagnostics. Query and aggregate output are bounded; rows beyond the requested limit cause an error. Missing sources remain not checked and partial or unknown sessions exit with status 2. A zero-match result applies only to the selected snapshot and does not establish that software is absent.
