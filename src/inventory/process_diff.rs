@@ -271,6 +271,19 @@ fn parse_bounded_json(bytes: &[u8]) -> Result<Value, ProcessDiffError> {
     Ok(value)
 }
 
+/// Parse and validate a process snapshot using the same strict historical
+/// schema contracts as the process comparator. Callers may then inspect rows
+/// without creating a second, weaker parser for the same public artifacts.
+pub(crate) fn parse_validated_inventory(bytes: &[u8]) -> Result<Value, ProcessDiffError> {
+    if bytes.len() > MAX_INPUT {
+        return Err(ProcessDiffError::InputTooLarge);
+    }
+    let value = parse_bounded_json(bytes)?;
+    let inventory_kind = kind(&value)?;
+    validate(&value, inventory_kind)?;
+    Ok(value)
+}
+
 fn kind(v: &Value) -> Result<Kind, ProcessDiffError> {
     match v.get("schema").and_then(Value::as_str) {
         Some(LINUX) => Ok(Kind::Linux),
@@ -1973,5 +1986,102 @@ mod tests {
                 .join(",")
         );
         assert!(parse_bounded_json(oversized_array.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn process_query_keeps_exact_row_evidence_and_rejects_name_case_changes() {
+        let document = linux("complete", serde_json::json!([lrow(42, Some(7), "demo")]));
+        let bytes = serde_json::to_vec(&document).unwrap();
+        let artifact = crate::audit_session::SessionArtifactRef {
+            kind: crate::audit_session::ArtifactKind::Processes,
+            path: "processes.json".to_owned(),
+            schema: LINUX.to_owned(),
+            schema_version: 4,
+            byte_length: bytes.len() as u64,
+            sha256: "a".repeat(64),
+        };
+        let query = crate::query::ProcessQuery {
+            schema: crate::query::PROCESS_QUERY_SCHEMA.to_owned(),
+            schema_version: crate::query::PROCESS_QUERY_SCHEMA_VERSION,
+            filters: crate::query::ProcessQueryFilters {
+                process_id: Some(42),
+                image_name: Some("demo".to_owned()),
+            },
+            limit: 5,
+        };
+        let result = crate::query::query_process_artifact(
+            crate::query::ProcessQueryInput {
+                platform: "linux",
+                source_status: crate::audit_session::SourceStatus::Complete,
+                scope: Some("manifest scope".to_owned()),
+                started_at_unix_ms: Some(1),
+                ended_at_unix_ms: Some(2),
+                diagnostic_codes: Vec::new(),
+                artifact: Some(&artifact),
+                bytes: Some(&bytes),
+            },
+            &query,
+        )
+        .unwrap();
+        assert_eq!(result.matched_count, 1);
+        assert_eq!(result.rows[0].json_pointer, "/processes/0");
+        assert_eq!(result.rows[0].row["pid"], 42);
+        assert_eq!(result.rows[0].evidence, result.rows[0].row["evidence"]);
+        assert_eq!(result.started_at_unix_ms, Some(1));
+        assert_eq!(result.inventory_status.as_deref(), Some("complete"));
+
+        let mut case_mismatch = query;
+        case_mismatch.filters.image_name = Some("Demo".to_owned());
+        let result = crate::query::query_process_artifact(
+            crate::query::ProcessQueryInput {
+                platform: "linux",
+                source_status: crate::audit_session::SourceStatus::Complete,
+                scope: None,
+                started_at_unix_ms: None,
+                ended_at_unix_ms: None,
+                diagnostic_codes: Vec::new(),
+                artifact: Some(&artifact),
+                bytes: Some(&bytes),
+            },
+            &case_mismatch,
+        )
+        .unwrap();
+        assert_eq!(result.matched_count, 0);
+
+        let windows_bytes = serde_json::to_vec(&windows()).unwrap();
+        let windows_artifact = crate::audit_session::SessionArtifactRef {
+            kind: crate::audit_session::ArtifactKind::WindowsProcesses,
+            path: "processes.json".to_owned(),
+            schema: WINDOWS.to_owned(),
+            schema_version: 3,
+            byte_length: windows_bytes.len() as u64,
+            sha256: "b".repeat(64),
+        };
+        let windows_query = crate::query::ProcessQuery {
+            schema: crate::query::PROCESS_QUERY_SCHEMA.to_owned(),
+            schema_version: crate::query::PROCESS_QUERY_SCHEMA_VERSION,
+            filters: crate::query::ProcessQueryFilters {
+                process_id: Some(10),
+                image_name: Some("demo.exe".to_owned()),
+            },
+            limit: 5,
+        };
+        let windows_result = crate::query::query_process_artifact(
+            crate::query::ProcessQueryInput {
+                platform: "windows",
+                source_status: crate::audit_session::SourceStatus::Complete,
+                scope: None,
+                started_at_unix_ms: None,
+                ended_at_unix_ms: None,
+                diagnostic_codes: Vec::new(),
+                artifact: Some(&windows_artifact),
+                bytes: Some(&windows_bytes),
+            },
+            &windows_query,
+        )
+        .unwrap();
+        assert_eq!(windows_result.matched_count, 1);
+        assert_eq!(windows_result.rows[0].row["process_id"], 10);
+        assert_eq!(windows_result.rows[0].json_pointer, "/processes/0");
     }
 }

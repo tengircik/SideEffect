@@ -52,6 +52,10 @@ pub const PACKAGE_QUERY_SCHEMA: &str = "sideeffect.package_query";
 pub const PACKAGE_QUERY_SCHEMA_VERSION: u32 = 1;
 pub const PACKAGE_QUERY_RESULT_SCHEMA: &str = "sideeffect.package_query_result";
 pub const PACKAGE_QUERY_RESULT_SCHEMA_VERSION: u32 = 1;
+pub const PROCESS_QUERY_SCHEMA: &str = "sideeffect.process_query";
+pub const PROCESS_QUERY_SCHEMA_VERSION: u32 = 1;
+pub const PROCESS_QUERY_RESULT_SCHEMA: &str = "sideeffect.process_query_result";
+pub const PROCESS_QUERY_RESULT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_STARTUP_QUERY_ROWS: usize = 20_000;
 pub const MAX_STARTUP_QUERY_STRING_BYTES: usize = 16 * 1024;
 pub const MAX_PACKAGE_QUERY_ROWS: usize = 200_000;
@@ -1501,6 +1505,330 @@ pub fn multi_session_package_query_result(
     Ok(MultiSessionPackageQueryResult {
         schema: PACKAGE_QUERY_RESULT_SCHEMA,
         schema_version: PACKAGE_QUERY_RESULT_SCHEMA_VERSION,
+        session_count: sessions.len(),
+        matched_count,
+        complete,
+        filter: query.filters.clone(),
+        limit: query.limit,
+        sessions,
+    })
+}
+
+/// Exact, case-sensitive filters over native process snapshot fields. PID is
+/// snapshot-local and must not be treated as a stable identity across sessions.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessQueryFilters {
+    pub process_id: Option<u32>,
+    pub image_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessQuery {
+    pub schema: String,
+    pub schema_version: u32,
+    #[serde(default)]
+    pub filters: ProcessQueryFilters,
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+}
+
+impl ProcessQuery {
+    pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_QUERY_BYTES {
+            return Err(format!(
+                "process query input exceeds the {MAX_QUERY_BYTES}-byte limit"
+            ));
+        }
+        let query: Self = serde_json::from_slice(bytes)
+            .map_err(|error| format!("invalid process query JSON: {error}"))?;
+        if query.schema != PROCESS_QUERY_SCHEMA
+            || query.schema_version != PROCESS_QUERY_SCHEMA_VERSION
+        {
+            return Err(format!(
+                "process query schema must be {PROCESS_QUERY_SCHEMA} version {PROCESS_QUERY_SCHEMA_VERSION}"
+            ));
+        }
+        if query.limit == 0 || query.limit as usize > MAX_QUERY_RESULTS {
+            return Err(format!(
+                "process query limit must be between 1 and {MAX_QUERY_RESULTS}"
+            ));
+        }
+        if query.filters.process_id.is_none() && query.filters.image_name.is_none() {
+            return Err("process query requires process_id or image_name".to_owned());
+        }
+        if query
+            .filters
+            .image_name
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > MAX_PACKAGE_QUERY_STRING_BYTES)
+        {
+            return Err(format!(
+                "process query image_name must be non-empty and at most {MAX_PACKAGE_QUERY_STRING_BYTES} UTF-8 bytes"
+            ));
+        }
+        Ok(query)
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProcessQueryArtifact {
+    pub path: String,
+    pub schema: String,
+    pub schema_version: u32,
+    pub byte_length: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProcessQueryRow {
+    pub json_pointer: String,
+    pub evidence: serde_json::Value,
+    pub row: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProcessQuerySource {
+    pub role: SourceRole,
+    pub platform: String,
+    pub status: SourceStatus,
+    pub scope: Option<String>,
+    pub started_at_unix_ms: Option<u128>,
+    pub ended_at_unix_ms: Option<u128>,
+    pub inventory_status: Option<String>,
+    pub diagnostic_codes: Vec<String>,
+    pub inventory_diagnostics: Vec<serde_json::Value>,
+    pub source_state: Option<serde_json::Value>,
+    pub artifact: Option<ProcessQueryArtifact>,
+    pub matched_count: usize,
+    pub rows: Vec<ProcessQueryRow>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionProcessQueryResult {
+    pub session: SessionQueryIdentity,
+    pub process_source: ProcessQuerySource,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MultiSessionProcessQueryResult {
+    pub schema: &'static str,
+    pub schema_version: u32,
+    pub session_count: usize,
+    pub matched_count: usize,
+    pub complete: bool,
+    pub filter: ProcessQueryFilters,
+    pub limit: u32,
+    pub sessions: Vec<SessionProcessQueryResult>,
+}
+
+pub struct ProcessQueryInput<'a> {
+    pub platform: &'a str,
+    pub source_status: SourceStatus,
+    pub scope: Option<String>,
+    pub started_at_unix_ms: Option<u128>,
+    pub ended_at_unix_ms: Option<u128>,
+    pub diagnostic_codes: Vec<String>,
+    pub artifact: Option<&'a SessionArtifactRef>,
+    pub bytes: Option<&'a [u8]>,
+}
+
+/// Query verified native process-snapshot bytes. The shared process-diff
+/// validator enforces strict current and historical schemas before matching.
+pub fn query_process_artifact(
+    input: ProcessQueryInput<'_>,
+    query: &ProcessQuery,
+) -> Result<ProcessQuerySource, String> {
+    let ProcessQueryInput {
+        platform,
+        source_status,
+        scope,
+        started_at_unix_ms,
+        ended_at_unix_ms,
+        mut diagnostic_codes,
+        artifact,
+        bytes,
+    } = input;
+    if !matches!(platform, "linux" | "windows") {
+        return Err("process query session platform is unsupported".to_owned());
+    }
+    let Some(artifact) = artifact else {
+        if bytes.is_some() {
+            return Err("process artifact bytes have no manifest reference".to_owned());
+        }
+        return Ok(ProcessQuerySource {
+            role: SourceRole::Processes,
+            platform: platform.to_owned(),
+            status: source_status,
+            scope,
+            started_at_unix_ms,
+            ended_at_unix_ms,
+            inventory_status: None,
+            diagnostic_codes,
+            inventory_diagnostics: Vec::new(),
+            source_state: None,
+            artifact: None,
+            matched_count: 0,
+            rows: Vec::new(),
+        });
+    };
+    let bytes =
+        bytes.ok_or_else(|| "verified process artifact bytes are unavailable".to_owned())?;
+    if bytes.len() as u64 != artifact.byte_length
+        || bytes.len() > crate::audit_session::MAX_SESSION_ARTIFACT_BYTES as usize
+    {
+        return Err("process artifact bytes do not match the verified manifest length".to_owned());
+    }
+    let expected = match platform {
+        "linux" => (
+            ArtifactKind::Processes,
+            "processes.json",
+            "sideeffect.process_inventory",
+            3..=5,
+        ),
+        "windows" => (
+            ArtifactKind::WindowsProcesses,
+            "processes.json",
+            "sideeffect.windows_process_inventory",
+            3..=4,
+        ),
+        _ => unreachable!(),
+    };
+    if artifact.kind != expected.0
+        || artifact.path != expected.1
+        || artifact.schema != expected.2
+        || !expected.3.contains(&artifact.schema_version)
+    {
+        return Err("process artifact contract does not match its session manifest".to_owned());
+    }
+    let document = crate::inventory::process_diff::parse_validated_inventory(bytes)
+        .map_err(|_| "process artifact is malformed or has an unsupported schema".to_owned())?;
+    if document.get("platform").and_then(serde_json::Value::as_str) != Some(platform)
+        || document.get("schema").and_then(serde_json::Value::as_str)
+            != Some(artifact.schema.as_str())
+        || document
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(artifact.schema_version))
+    {
+        return Err(
+            "process artifact header does not match its verified native contract".to_owned(),
+        );
+    }
+    let status = document
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "process artifact status is missing".to_owned())?
+        .to_owned();
+    let source = document
+        .get("source")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "process artifact source is missing".to_owned())?;
+    let diagnostics = source
+        .get("diagnostics")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "process artifact diagnostics are malformed".to_owned())?;
+    diagnostic_codes.extend(diagnostics.iter().filter_map(|item| {
+        item.get("code")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    }));
+    diagnostic_codes.sort();
+    diagnostic_codes.dedup();
+    let processes = document
+        .get("processes")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "process artifact rows are malformed".to_owned())?;
+    let mut rows = Vec::new();
+    for (index, row) in processes.iter().enumerate() {
+        let (pid_key, name_key) = if platform == "linux" {
+            ("pid", "name")
+        } else {
+            ("process_id", "executable_name")
+        };
+        if query.filters.process_id.is_some_and(|expected| {
+            row.get(pid_key).and_then(serde_json::Value::as_u64) != Some(u64::from(expected))
+        }) || query.filters.image_name.as_ref().is_some_and(|expected| {
+            row.get(name_key).and_then(serde_json::Value::as_str) != Some(expected.as_str())
+        }) {
+            continue;
+        }
+        if rows.len() >= query.limit as usize {
+            return Err(format!(
+                "process query matched more than its {}-row limit; narrow the filters",
+                query.limit
+            ));
+        }
+        let evidence = row
+            .get("evidence")
+            .cloned()
+            .ok_or_else(|| "process row evidence is missing".to_owned())?;
+        rows.push(ProcessQueryRow {
+            json_pointer: format!("/processes/{index}"),
+            evidence,
+            row: row.clone(),
+        });
+    }
+    Ok(ProcessQuerySource {
+        role: SourceRole::Processes,
+        platform: platform.to_owned(),
+        status: source_status,
+        scope: Some(
+            document
+                .get("scope")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "process artifact scope is missing".to_owned())?
+                .to_owned(),
+        ),
+        started_at_unix_ms,
+        ended_at_unix_ms,
+        inventory_status: Some(status),
+        diagnostic_codes,
+        inventory_diagnostics: diagnostics.clone(),
+        source_state: Some(serde_json::Value::Object(source.clone())),
+        artifact: Some(ProcessQueryArtifact {
+            path: artifact.path.clone(),
+            schema: artifact.schema.clone(),
+            schema_version: artifact.schema_version,
+            byte_length: artifact.byte_length,
+            sha256: artifact.sha256.clone(),
+        }),
+        matched_count: rows.len(),
+        rows,
+    })
+}
+
+pub fn multi_session_process_query_result(
+    sessions: Vec<SessionProcessQueryResult>,
+    query: &ProcessQuery,
+) -> Result<MultiSessionProcessQueryResult, String> {
+    if !(1..=MAX_QUERY_SESSIONS).contains(&sessions.len()) {
+        return Err(format!(
+            "process query requires 1..={MAX_QUERY_SESSIONS} sessions"
+        ));
+    }
+    let mut ids = HashSet::new();
+    let mut matched_count = 0usize;
+    for session in &sessions {
+        if !ids.insert(session.session.session_id.as_str()) {
+            return Err("process query contains duplicate session IDs".to_owned());
+        }
+        matched_count = matched_count
+            .checked_add(session.process_source.matched_count)
+            .ok_or_else(|| "process query result count overflow".to_owned())?;
+        if matched_count > MAX_MULTI_SESSION_RESULTS {
+            return Err("process query exceeds its 5000-row aggregate limit".to_owned());
+        }
+    }
+    let complete = sessions.iter().all(|item| {
+        item.session.status == SessionStatus::Complete
+            && item.process_source.status == SourceStatus::Complete
+            && item.process_source.inventory_status.as_deref() == Some("complete")
+    });
+    Ok(MultiSessionProcessQueryResult {
+        schema: PROCESS_QUERY_RESULT_SCHEMA,
+        schema_version: PROCESS_QUERY_RESULT_SCHEMA_VERSION,
         session_count: sessions.len(),
         matched_count,
         complete,

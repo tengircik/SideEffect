@@ -18,7 +18,7 @@ mod permission_diff;
 mod permissions;
 #[cfg(windows)]
 mod permissions_windows;
-mod process_diff;
+pub(crate) mod process_diff;
 #[cfg(target_os = "linux")]
 mod processes;
 #[cfg(windows)]
