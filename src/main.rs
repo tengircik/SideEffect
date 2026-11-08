@@ -71,7 +71,7 @@ use sideeffect::limits::MAX_BUNDLE_MANIFEST_BYTES;
 use sideeffect::limits::{MAX_REPORT_BYTES, MAX_TRACE_BYTES, ParseLimits};
 use sideeffect::model::{BundleCaptureContext, ParseCompleteness, TraceDiff, TraceRecordKind};
 use sideeffect::model_manager::{
-    ConfiguredRuntime, EvaluationStatus, ModelRegistry, ModelTask, ResolvedModel,
+    CATALOG, ConfiguredRuntime, EvaluationStatus, ModelRegistry, ModelTask, ResolvedModel,
 };
 #[cfg(target_os = "linux")]
 use sideeffect::record::AnchoredOutput;
@@ -311,6 +311,13 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         [command, operation, id] if command == "model" && operation == "show" => model_show(id),
         [command, operation, id] if command == "model" && operation == "install" => {
             model_install(id, false, None)
+        }
+        [command, operation, interactive_flag]
+            if command == "model"
+                && operation == "setup"
+                && is_interactive_model_setup_flag(interactive_flag) =>
+        {
+            model_setup_interactive()
         }
         [command, operation, id] if command == "model" && operation == "setup" => {
             model_install(id, true, None)
@@ -2103,13 +2110,13 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect attribute --windows-runtime CAPTURE.json\nWrites a separate evidence-linked candidate view over a validated Windows ETW v3 capture. Descendant process links require supported process-start payloads and observed active parent IDs. Network association uses the decoded payload process ID. File and disk header PIDs remain context candidates, not ownership. Capture bytes are unchanged. Missing lifecycle data, ambiguity, unsupported records, or reported/unavailable loss is surfaced as partial or unassigned evidence; no causal or absence claims are made."
         }
         "model" => {
-            "Usage: sideeffect model list\n       sideeffect model show ID\n       sideeffect model install ID\n       sideeffect model setup ID [--runtime EXISTING_FILE]\n       sideeffect model add --name NAME --path FILE --for evidence|explanation|query [--license ID]\n       sideeffect model select evidence|explanation|query ID\n       sideeffect model remove ID\n       sideeffect model runtime set evidence|explanation|query EXISTING_FILE\n       sideeffect model runtime show [evidence|explanation|query]\n       sideeffect model runtime clear evidence|explanation|query\n       sideeffect model doctor --task evidence|explanation|query [--runtime TASK_RUNTIME] [--backend auto|cpu|cuda]\n\nLists pinned catalog candidates and user-provided models. Catalog evaluation status is shown separately from runtime compatibility. Installing a catalog model requires explicit license acceptance; analysis never downloads weights implicitly. The setup command installs and selects the model for its declared task. An optional --runtime path records an existing runtime for that task without executing or downloading it; model doctor checks the task-specific runtime contract. Runtime configuration stores a per-task path without executing the file; runtime revision checks happen only when doctor or analysis is run. Evidence and query runtime checks are supported on Linux x86_64; explanation checks are supported on Linux x86_64 and native Windows. Device enumeration applies only to explanation. Doctor does not run inference, load weights, or assess answer quality. Catalog models still carry their task-specific evaluation warnings, and no model is approved for answer quality. Registering a local model records its size and SHA-256, but does not verify task compatibility, licensing, or quality. Removing a custom registration leaves the model file untouched. Select a model for its task before running a model preview."
+            "Usage: sideeffect model list\n       sideeffect model show ID\n       sideeffect model install ID\n       sideeffect model setup ID [--runtime EXISTING_FILE]\n       sideeffect model setup --interactive\n       sideeffect model add --name NAME --path FILE --for evidence|explanation|query [--license ID]\n       sideeffect model select evidence|explanation|query ID\n       sideeffect model remove ID\n       sideeffect model runtime set evidence|explanation|query EXISTING_FILE\n       sideeffect model runtime show [evidence|explanation|query]\n       sideeffect model runtime clear evidence|explanation|query\n       sideeffect model doctor --task evidence|explanation|query [--runtime TASK_RUNTIME] [--backend auto|cpu|cuda]\n\nLists pinned catalog candidates and user-provided models. Catalog evaluation status is shown separately from runtime compatibility. Installing a catalog model requires explicit license acceptance; analysis never downloads weights implicitly. Interactive setup asks for a task supported on this platform, then lists only compatible pinned models with exact size and evaluation status/note. No model is recommended. It permits cancellation and uses the same license confirmation and pinned download flow as setup ID. Runtime configuration is optional and can be configured later; setup does not download or execute a runtime. The setup command installs and selects the model for its declared task. An optional --runtime path records an existing runtime for that task without executing or downloading it; model doctor checks the task-specific runtime contract. Runtime configuration stores a per-task path without executing the file; runtime revision checks happen only when doctor or analysis is run. Evidence and query runtime checks are supported on Linux x86_64; explanation checks are supported on Linux x86_64 and native Windows. Device enumeration applies only to explanation. Doctor does not run inference, load weights, or assess answer quality. Catalog models still carry their task-specific evaluation warnings, and no model is approved for answer quality. Registering a local model records its size and SHA-256, but does not verify task compatibility, licensing, or quality. Removing a custom registration leaves the model file untouched. Select a model for its task before running a model preview."
         }
         "model doctor" => {
             "Usage: sideeffect model doctor --task evidence|explanation|query [--runtime TASK_RUNTIME] [--backend auto|cpu|cuda]\nUses --runtime when supplied, otherwise the configured runtime for that task. It checks the selected model registration and SHA-256, then runs the task's bounded runtime version check. Evidence requires the llama.cpp b6000 version prefix; query requires the exact pinned 0.7.0-dev build/commit version; explanation checks the pinned commit and may enumerate devices. Evidence and query are supported only on Linux x86_64. --backend applies only to explanation. The JSON schema v2 report states that inference was not run, weights were not loaded, and this doctor did not assess model quality; catalog evaluation metadata is reported separately. A reported CUDA device is not proof of successful GPU inference. Doctor executes the selected runtime as code; trust it separately."
         }
         "model setup" => {
-            "Usage: sideeffect model setup MODEL_ID [--runtime EXISTING_FILE]\nShows the catalog license and model evaluation status, downloads the exact pinned file after explicit typed acceptance, verifies its size and SHA-256, then selects it for its declared task. Optional --runtime records an already obtained runtime path for that task after setup succeeds; it does not download or execute the runtime. Run 'sideeffect model doctor --task TASK' to check the configured task runtime."
+            "Usage: sideeffect model setup MODEL_ID [--runtime EXISTING_FILE]\n       sideeffect model setup --interactive\nInteractive setup asks for a supported task and lists only compatible pinned catalog models with exact size and evaluation status/note; no model is recommended. You can cancel at either selection prompt. Setup then uses the existing explicit license confirmation and pinned download flow. Runtime configuration is optional and can be set later with `model runtime set`; this flow does not download or run a runtime. MODEL_ID setup verifies the exact pinned file after explicit typed license acceptance, then selects it for its declared task. Optional --runtime records an already obtained runtime path for that task after setup succeeds; it does not download or execute the runtime. Run 'sideeffect model doctor --task TASK' to check the configured task runtime."
         }
         "model list" => {
             "Usage: sideeffect model list\nLists pinned catalog candidates, installation status, task, license, exact size, evaluation status, and selected model per task. Every listed model's SHA-256 is rechecked before use."
@@ -8124,6 +8131,187 @@ fn model_show(id: &OsString) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn model_setup_interactive() -> Result<ExitCode, String> {
+    let tasks = [
+        ModelTask::EvidenceSelection,
+        ModelTask::Explanation,
+        ModelTask::QueryPlan,
+    ]
+    .into_iter()
+    .filter(|task| {
+        model_task_supported_here(*task) && CATALOG.iter().any(|model| model.task == *task)
+    })
+    .collect::<Vec<_>>();
+    if tasks.is_empty() {
+        return Err(
+            "interactive model setup has no catalog task supported on this platform".to_owned(),
+        );
+    }
+
+    println!("Interactive local model setup");
+    println!("Choose the task you want to configure (or enter C to cancel):");
+    for (index, task) in tasks.iter().enumerate() {
+        println!("  {}. {}", index + 1, model_task_label(*task));
+    }
+    print!("Task number (or C to cancel): ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("could not display task selection prompt: {error}"))?;
+    let task_choice = read_bounded_model_input("task selection")?;
+    if model_setup_cancelled(&task_choice) {
+        println!("Model setup cancelled.");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let task_index = parse_model_menu_choice(&task_choice, tasks.len(), "task")?;
+    let task = tasks[task_index];
+    let models = CATALOG
+        .iter()
+        .filter(|model| model.task == task && model_task_supported_here(model.task))
+        .collect::<Vec<_>>();
+    if models.is_empty() {
+        return Err("no compatible pinned catalog models are available for this task".to_owned());
+    }
+    let model_directory = sideeffect::model_manager::model_store_directory()?.join("models");
+
+    println!("\nPinned catalog entries for {}:", model_task_label(task));
+    println!("No model is recommended. Evaluation status and notes describe recorded checks only.");
+    for (index, model) in models.iter().enumerate() {
+        println!(
+            "  {}. {} [{}] — {} bytes; {}; evaluation: {}. Note: {}",
+            index + 1,
+            terminal_safe_text(model.name),
+            model.id,
+            model.size_bytes,
+            catalog_install_status(model, &model_directory)?,
+            evaluation_status_label(model.evaluation),
+            terminal_safe_text(model.evaluation_note)
+        );
+    }
+    println!(
+        "Installed entries are selected without downloading; new entries require the existing exact license confirmation before download."
+    );
+    println!(
+        "Runtime configuration is optional. You can configure an existing runtime later with `sideeffect model runtime set`; setup will not download or run one."
+    );
+    print!("Model number (or C to cancel): ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("could not display model selection prompt: {error}"))?;
+    let model_choice = read_bounded_model_input("model selection")?;
+    if model_setup_cancelled(&model_choice) {
+        println!("Model setup cancelled.");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let model_index = parse_model_menu_choice(&model_choice, models.len(), "model")?;
+    let model = models[model_index];
+    match catalog_file_state(model, &model_directory)? {
+        CatalogFileState::Installed => {
+            println!(
+                "{} is already installed. Selecting it for {} without downloading.",
+                model.id,
+                model_task_label(task)
+            );
+            return model_select(
+                &OsString::from(model_task_cli_name(task)),
+                &OsString::from(model.id),
+            );
+        }
+        CatalogFileState::Conflicting => {
+            return Err(format!(
+                "a file already exists for {} but does not match its pinned size/type; refusing to overwrite it",
+                model.id
+            ));
+        }
+        CatalogFileState::Missing => {}
+    }
+    let id = OsString::from(model.id);
+    model_install(&id, true, None)
+}
+
+fn is_interactive_model_setup_flag(flag: &OsStr) -> bool {
+    flag == "--interactive"
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CatalogFileState {
+    Missing,
+    Installed,
+    Conflicting,
+}
+
+fn catalog_file_state(
+    model: &sideeffect::model_manager::CatalogModel,
+    model_directory: &Path,
+) -> Result<CatalogFileState, String> {
+    catalog_file_state_for(model.filename, model.size_bytes, model_directory)
+        .map_err(|error| format!("could not inspect installed model {}: {error}", model.id))
+}
+
+fn catalog_file_state_for(
+    filename: &str,
+    pinned_size: u64,
+    model_directory: &Path,
+) -> io::Result<CatalogFileState> {
+    match fs::symlink_metadata(model_directory.join(filename)) {
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.len() == pinned_size =>
+        {
+            Ok(CatalogFileState::Installed)
+        }
+        Ok(_) => Ok(CatalogFileState::Conflicting),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(CatalogFileState::Missing),
+        Err(error) => Err(error),
+    }
+}
+
+fn catalog_install_status(
+    model: &sideeffect::model_manager::CatalogModel,
+    model_directory: &Path,
+) -> Result<&'static str, String> {
+    Ok(match catalog_file_state(model, model_directory)? {
+        CatalogFileState::Missing => "not installed",
+        CatalogFileState::Installed => "installed (hash checked when selected)",
+        CatalogFileState::Conflicting => {
+            "existing file conflicts with pinned model; will not overwrite"
+        }
+    })
+}
+
+fn read_bounded_model_input(label: &str) -> Result<String, String> {
+    let stdin = io::stdin();
+    let mut bytes = Vec::with_capacity(64);
+    let mut limited = Read::take(stdin.lock(), (MAX_MODEL_CONFIRMATION_BYTES + 1) as u64);
+    limited
+        .read_until(b'\n', &mut bytes)
+        .map_err(|error| format!("could not read {label}: {error}"))?;
+    if bytes.len() > MAX_MODEL_CONFIRMATION_BYTES {
+        return Err(format!(
+            "{label} exceeds the {MAX_MODEL_CONFIRMATION_BYTES}-byte limit"
+        ));
+    }
+    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        bytes.pop();
+    }
+    String::from_utf8(bytes).map_err(|_| format!("{label} must be valid UTF-8"))
+}
+
+fn model_setup_cancelled(input: &str) -> bool {
+    input.trim().eq_ignore_ascii_case("c") || input.trim().eq_ignore_ascii_case("cancel")
+}
+
+fn parse_model_menu_choice(input: &str, option_count: usize, label: &str) -> Result<usize, String> {
+    let choice = input
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| format!("enter a number from 1 to {option_count}, or C to cancel"))?;
+    if choice == 0 || choice > option_count {
+        return Err(format!("{label} choice must be from 1 to {option_count}"));
+    }
+    Ok(choice - 1)
+}
+
 fn model_install(
     id: &OsString,
     select_after_install: bool,
@@ -9444,6 +9632,10 @@ mod tests {
         CappedBuffer, MAX_REPORT_BYTES, read_limited, read_trace_file, write_event_query_text,
         write_startup_query_result,
     };
+    use super::{
+        CatalogFileState, catalog_file_state_for, is_interactive_model_setup_flag,
+        model_setup_cancelled, parse_model_menu_choice,
+    };
     #[cfg(windows)]
     use sha2::{Digest, Sha256};
     #[cfg(target_os = "linux")]
@@ -9454,6 +9646,47 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn interactive_model_menu_supports_selection_and_cancellation() {
+        assert!(is_interactive_model_setup_flag(std::ffi::OsStr::new(
+            "--interactive"
+        )));
+        assert!(!is_interactive_model_setup_flag(std::ffi::OsStr::new(
+            "MODEL_ID"
+        )));
+        assert!(model_setup_cancelled(" C "));
+        assert!(model_setup_cancelled("Cancel"));
+        assert!(!model_setup_cancelled("1"));
+        assert_eq!(parse_model_menu_choice("2", 2, "model").unwrap(), 1);
+        assert!(parse_model_menu_choice("0", 2, "model").is_err());
+        assert!(parse_model_menu_choice("3", 2, "model").is_err());
+        assert!(parse_model_menu_choice("cancel", 2, "model").is_err());
+    }
+
+    #[test]
+    fn catalog_file_state_distinguishes_missing_installed_and_conflicting_files() {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "sideeffect-model-state-test-{}-{id}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        assert_eq!(
+            catalog_file_state_for("model.gguf", 3, &directory).unwrap(),
+            CatalogFileState::Missing
+        );
+        fs::write(directory.join("model.gguf"), b"abc").unwrap();
+        assert_eq!(
+            catalog_file_state_for("model.gguf", 3, &directory).unwrap(),
+            CatalogFileState::Installed
+        );
+        assert_eq!(
+            catalog_file_state_for("model.gguf", 4, &directory).unwrap(),
+            CatalogFileState::Conflicting
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     struct TempTrace(PathBuf);
 
