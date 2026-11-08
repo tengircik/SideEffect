@@ -18,7 +18,7 @@ fn temporary_directory() -> std::path::PathBuf {
 }
 
 #[test]
-fn windows_startup_command_reports_service_and_task_sources() {
+fn windows_startup_command_reports_native_startup_sources() {
     let directory = temporary_directory();
     let output = directory.join("startup.json");
     let run = || {
@@ -33,7 +33,7 @@ fn windows_startup_command_reports_service_and_task_sources() {
     let bytes = fs::read(&output).unwrap();
     let document: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(document["schema"], "sideeffect.windows_startup_inventory");
-    assert_eq!(document["schema_version"], 4);
+    assert_eq!(document["schema_version"], 10);
     assert_eq!(document["platform"], "windows");
     match document["status"].as_str().unwrap() {
         "complete" => assert_eq!(first.status.code(), Some(0)),
@@ -45,7 +45,7 @@ fn windows_startup_command_reports_service_and_task_sources() {
     }
     assert_eq!(
         document["scope"],
-        "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks"
+        "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_load_order_group_and_trigger_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
     );
     let sources = document["sources"].as_array().unwrap();
     for required in [
@@ -59,6 +59,9 @@ fn windows_startup_command_reports_service_and_task_sources() {
         "local_machine_run_once_32",
         "user_startup",
         "common_startup",
+        "service_start_configuration",
+        "scheduled_task_triggers",
+        "wmi_permanent_event_subscriptions",
     ] {
         assert!(sources.iter().any(|source| source["id"] == required));
     }
@@ -70,8 +73,90 @@ fn windows_startup_command_reports_service_and_task_sources() {
         service_source["status"].as_str(),
         Some("complete" | "partial")
     ));
+    assert!(
+        document["service_entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| {
+                matches!(
+                    entry["delayed_auto_start"]["status"].as_str(),
+                    Some("observed" | "unknown")
+                )
+            })
+    );
     assert!(service_source["entries_seen"].as_u64().unwrap() > 0);
     assert!(!document["service_entries"].as_array().unwrap().is_empty());
+    for service in document["service_entries"].as_array().unwrap() {
+        assert!(matches!(
+            service["dependencies"]["status"].as_str(),
+            Some("observed" | "unknown")
+        ));
+        assert!(matches!(
+            service["load_order_group"]["status"].as_str(),
+            Some("observed" | "unknown")
+        ));
+        assert!(matches!(
+            service["triggers"]["status"].as_str(),
+            Some("observed" | "unknown")
+        ));
+        if service["triggers"]["status"] == "observed" {
+            for trigger in service["triggers"]["entries"].as_array().unwrap() {
+                assert!(trigger["trigger_index"].is_number());
+                assert!(trigger["trigger_type_code"].is_number());
+                assert!(trigger["trigger_type"].is_string());
+                assert!(trigger["action_code"].is_number());
+                assert!(trigger["action"].is_string());
+                assert!(trigger["subtype_guid"].is_null() || trigger["subtype_guid"].is_string());
+                for item in trigger["data_items"].as_array().unwrap() {
+                    assert!(item["data_type_code"].is_number());
+                    assert!(item["data_type"].is_string());
+                    assert!(item["data_hex"].is_string());
+                }
+            }
+        }
+        if service["dependencies"]["status"] == "observed" {
+            for dependency in service["dependencies"]["entries"].as_array().unwrap() {
+                assert!(matches!(
+                    dependency["kind"].as_str(),
+                    Some("service" | "load_order_group")
+                ));
+                assert!(
+                    dependency["name"]
+                        .as_str()
+                        .is_some_and(|name| !name.is_empty())
+                );
+            }
+        }
+        let observation = service["service_observation"].as_object().unwrap();
+        let raw = observation["raw_state_code"].as_u64().unwrap();
+        match observation["status"].as_str().unwrap() {
+            "known" => {
+                assert!((1..=7).contains(&raw));
+                assert!(observation["state"].is_string());
+            }
+            "unknown" => {
+                assert!(!(1..=7).contains(&raw));
+                assert!(observation.get("state").is_none());
+            }
+            other => panic!("unexpected service observation status {other:?}"),
+        }
+        assert_ne!(
+            service["service_observation"],
+            service["startup_state"]["observed"]
+        );
+    }
+    let services = document["service_entries"].as_array().unwrap();
+    assert!(
+        services
+            .iter()
+            .any(|service| service["dependencies"]["status"] == "observed")
+    );
+    assert!(
+        services
+            .iter()
+            .any(|service| service["load_order_group"]["status"] == "observed")
+    );
     let scheduled_tasks = sources
         .iter()
         .find(|source| source["id"] == "scheduled_task_triggers")
@@ -84,7 +169,35 @@ fn windows_startup_command_reports_service_and_task_sources() {
         scheduled_tasks["entries_seen"].as_u64().unwrap(),
         document["scheduled_task_entries"].as_array().unwrap().len() as u64
     );
+    let wmi_source = sources
+        .iter()
+        .find(|source| source["id"] == "wmi_permanent_event_subscriptions")
+        .unwrap();
+    assert!(matches!(
+        wmi_source["status"].as_str(),
+        Some("complete" | "partial" | "inaccessible" | "unavailable" | "error")
+    ));
+    assert_eq!(wmi_source["location_path"], "ROOT\\subscription");
+    for field in [
+        "wmi_event_filters",
+        "wmi_event_consumers",
+        "wmi_filter_consumer_bindings",
+    ] {
+        assert!(document[field].is_array());
+    }
+    assert_eq!(
+        wmi_source["entries_seen"].as_u64().unwrap(),
+        document["wmi_event_filters"].as_array().unwrap().len() as u64
+            + document["wmi_event_consumers"].as_array().unwrap().len() as u64
+            + document["wmi_filter_consumer_bindings"]
+                .as_array()
+                .unwrap()
+                .len() as u64
+    );
     for entry in document["service_entries"].as_array().unwrap() {
+        assert_eq!(entry["startup_state"]["configured"], "present");
+        assert_eq!(entry["startup_state"]["effective"]["status"], "unknown");
+        assert_eq!(entry["startup_state"]["observed"]["status"], "unknown");
         assert!(entry["service_name"].is_string());
         assert!(entry["display_name"].is_string());
         assert!(entry["start_type"].is_string());
@@ -93,7 +206,7 @@ fn windows_startup_command_reports_service_and_task_sources() {
         assert!(entry["account"].is_null() || entry["account"].is_string());
         assert_eq!(
             entry["evidence"]["source"],
-            "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW"
+            "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W"
         );
     }
     let task_entries = document["scheduled_task_entries"].as_array().unwrap();
@@ -110,6 +223,9 @@ fn windows_startup_command_reports_service_and_task_sources() {
         assert!(entry["evidence"]["trigger_index"].is_number());
     }
     for action in document["scheduled_task_actions"].as_array().unwrap() {
+        assert_eq!(action["startup_state"]["configured"], "present");
+        assert_eq!(action["startup_state"]["effective"]["status"], "unknown");
+        assert_eq!(action["startup_state"]["observed"]["status"], "unknown");
         assert!(action["task_path"].is_null() || action["task_path"].is_string());
         assert!(action["action_index"].is_number());
         assert!(action["action_type"].is_string());

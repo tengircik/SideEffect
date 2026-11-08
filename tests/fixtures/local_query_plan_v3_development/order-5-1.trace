@@ -1,0 +1,4 @@
+8501 clone(child_stack=NULL, flags=SIGCHLD) = 8511
+8502 fork() = 8512
+8503 vfork() = 8513
+8504 clone3(child_stack=NULL, flags=SIGCHLD) = 8514

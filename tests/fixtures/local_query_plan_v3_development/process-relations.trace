@@ -1,0 +1,15 @@
+12001 fork() = 13001
+12002 vfork() = 13002
+12003 clone(child_stack=NULL, flags=SIGCHLD) = 13003
+12004 clone3(child_stack=NULL, flags=SIGCHLD) = 13004
+12005 fork() = 13005
+12006 fork() = 13006
+12007 vfork() = 13007
+12008 clone(child_stack=NULL, flags=SIGCHLD) = 13008
+12009 clone3(child_stack=NULL, flags=SIGCHLD) = 13009
+12010 fork() = 13010
+12011 fork() = 13011
+12012 vfork() = 13012
+12013 clone(child_stack=NULL, flags=SIGCHLD) = 13013
+12014 clone3(child_stack=NULL, flags=SIGCHLD) = 13014
+12015 fork() = 13015

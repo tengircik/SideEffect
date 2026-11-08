@@ -11,6 +11,16 @@ use std::fmt;
 const MAX_INPUT: usize = 64 * 1024 * 1024;
 const MAX_ROWS: usize = 32_768;
 const MAX_DELTAS: usize = 16_384;
+const SYSTEMD_DEPENDENCY_DIRECTIVES: &[&str] = &[
+    "Requires",
+    "Requisite",
+    "Wants",
+    "BindsTo",
+    "PartOf",
+    "Upholds",
+    "Conflicts",
+];
+const SYSTEMD_ORDERING_DIRECTIVES: &[&str] = &["Before", "After"];
 const MAX_DEPTH: usize = 32;
 const MAX_NODES: usize = 1_000_000;
 const MAX_COLLECTION: usize = 65_536;
@@ -267,6 +277,18 @@ fn keys(v: &Value, allowed: &[&str]) -> Result<(), StartupDiffError> {
         Ok(())
     }
 }
+fn startup_row_keys(
+    value: &Value,
+    fields: &[&str],
+    has_states: bool,
+) -> Result<(), StartupDiffError> {
+    if !has_states {
+        return keys(value, fields);
+    }
+    let mut allowed = fields.to_vec();
+    allowed.push("startup_state");
+    keys(value, &allowed)
+}
 fn arr<'a>(v: &'a Value, k: &str) -> Result<&'a [Value], StartupDiffError> {
     v.get(k)
         .and_then(Value::as_array)
@@ -321,17 +343,45 @@ fn validate_path_diagnostics(items: &[Value], with_raw_path: bool) -> Result<(),
     Ok(())
 }
 fn validate(v: &Value, k: Kind) -> Result<(), StartupDiffError> {
-    let (schema, platform, scope, version) = match k {
-        Kind::Linux => (LINUX, "linux", "curated_xdg_systemd_sysv_cron_sources", 2),
+    let version = num(v, "schema_version")?;
+    let windows_has_wmi = if k == Kind::Windows {
+        windows_has_wmi_contract(v, version)
+    } else {
+        false
+    };
+    let (schema, platform, scope, versions) = match k {
+        Kind::Linux => (
+            LINUX,
+            "linux",
+            "curated_xdg_systemd_sysv_cron_sources",
+            &[2_u64, 3][..],
+        ),
         Kind::Windows => (
             WINDOWS,
             "windows",
-            "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks",
-            4,
+            if windows_has_wmi && version >= 10 {
+                "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_load_order_group_and_trigger_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+            } else if windows_has_wmi && version >= 9 {
+                "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_and_load_order_group_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+            } else if windows_has_wmi && version >= 8 {
+                "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+            } else if windows_has_wmi {
+                "current_user_and_accessible_machine_run_keys_startup_folders_services_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+            } else if version >= 10 {
+                "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_load_order_group_and_trigger_configuration_and_current_token_visible_tasks"
+            } else if version >= 9 {
+                "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_and_load_order_group_configuration_and_current_token_visible_tasks"
+            } else {
+                "current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks"
+            },
+            &[4_u64, 5, 6, 7, 8, 9, 10][..],
         ),
     };
-    if text(v, "schema")? != schema || num(v, "schema_version")? != version {
+    if text(v, "schema")? != schema || !versions.contains(&version) {
         return Err(StartupDiffError::UnsupportedSchema);
+    }
+    if k == Kind::Windows {
+        validate_windows_wmi_presence(v, version, windows_has_wmi)?;
     }
     if text(v, "platform")? != platform {
         return Err(StartupDiffError::PlatformMismatch);
@@ -364,6 +414,9 @@ fn validate(v: &Value, k: Kind) -> Result<(), StartupDiffError> {
                 "service_entries",
                 "scheduled_task_entries",
                 "scheduled_task_actions",
+                "wmi_event_filters",
+                "wmi_event_consumers",
+                "wmi_filter_consumer_bindings",
             ][..],
         ]
         .concat()
@@ -384,9 +437,9 @@ fn validate(v: &Value, k: Kind) -> Result<(), StartupDiffError> {
         return Err(StartupDiffError::MalformedInput);
     }
     if k == Kind::Linux {
-        validate_linux(v)?
+        validate_linux(v, version == 3)?
     } else {
-        validate_windows(v)?
+        validate_windows(v, version)?
     }
     Ok(())
 }
@@ -408,6 +461,9 @@ fn validate_known_fields(v: &Value) -> Result<(), StartupDiffError> {
         "service_entries",
         "scheduled_task_entries",
         "scheduled_task_actions",
+        "wmi_event_filters",
+        "wmi_event_consumers",
+        "wmi_filter_consumer_bindings",
         "directories",
         "entries",
         "records",
@@ -443,8 +499,21 @@ fn validate_known_fields(v: &Value) -> Result<(), StartupDiffError> {
         "raw_line_hex",
         "lines",
         "applicability",
+        "startup_state",
+        "configured",
+        "effective",
+        "observed",
+        "context",
+        "capture_interval",
+        "started_at_unix_ms",
+        "ended_at_unix_ms",
+        "artifact_path",
+        "artifact_schema",
+        "artifact_schema_version",
+        "record_locator",
         "keys",
         "code",
+        "diagnostic_code",
         "message",
         "item_index",
         "win32_error",
@@ -462,16 +531,31 @@ fn validate_known_fields(v: &Value) -> Result<(), StartupDiffError> {
         "command",
         "command_utf16_hex",
         "evidence",
+        "detail_evidence",
         "value_index",
         "registry_type",
         "folder_scope",
         "display_path",
         "service_name",
         "display_name",
+        "dependencies",
+        "load_order_group",
+        "triggers",
+        "trigger_type_code",
+        "action_code",
+        "action",
+        "subtype_guid",
+        "data_items",
+        "data_type_code",
+        "data_type",
+        "data_hex",
+        "delayed_auto_start",
         "start_type",
         "start_type_code",
         "account",
         "binary_path",
+        "service_observation",
+        "raw_state_code",
         "service_index",
         "task_path",
         "task_enabled",
@@ -484,6 +568,24 @@ fn validate_known_fields(v: &Value) -> Result<(), StartupDiffError> {
         "action_type",
         "action_type_code",
         "executable_path",
+        "object_path",
+        "name",
+        "creator_sid",
+        "event_namespace",
+        "query_language",
+        "query",
+        "class_name",
+        "status",
+        "command_line_template",
+        "script_file_name",
+        "script_text",
+        "filter_reference",
+        "consumer_reference",
+        "filter_reference_status",
+        "consumer_reference_status",
+        "delivery_qos",
+        "namespace",
+        "object_index",
         "arguments",
         "working_directory",
         "source",
@@ -511,6 +613,53 @@ fn validate_known_fields(v: &Value) -> Result<(), StartupDiffError> {
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn windows_has_wmi_contract(v: &Value, version: u64) -> bool {
+    if version == 6 {
+        return true;
+    }
+    if version < 7 {
+        return false;
+    }
+    [
+        "wmi_event_filters",
+        "wmi_event_consumers",
+        "wmi_filter_consumer_bindings",
+    ]
+    .iter()
+    .any(|field| v.get(*field).is_some())
+        || v.get("sources")
+            .and_then(Value::as_array)
+            .is_some_and(|sources| {
+                sources
+                    .iter()
+                    .any(|source| source["id"] == "wmi_permanent_event_subscriptions")
+            })
+}
+
+fn validate_windows_wmi_presence(
+    v: &Value,
+    version: u64,
+    has_wmi: bool,
+) -> Result<(), StartupDiffError> {
+    let fields = [
+        "wmi_event_filters",
+        "wmi_event_consumers",
+        "wmi_filter_consumer_bindings",
+    ];
+    let present_count = fields
+        .iter()
+        .filter(|field| v.get(**field).is_some())
+        .count();
+    if version == 6 && present_count != fields.len()
+        || version < 6 && (present_count != 0 || has_wmi)
+        || version >= 7 && (present_count != 0 && present_count != fields.len())
+        || version >= 7 && (present_count == fields.len()) != has_wmi
+    {
+        return Err(StartupDiffError::MalformedInput);
     }
     Ok(())
 }
@@ -560,14 +709,326 @@ fn validate_header(
     }
     Ok(())
 }
-fn validate_linux(v: &Value) -> Result<(), StartupDiffError> {
+fn validate_startup_state(value: &Value) -> Result<(), StartupDiffError> {
+    keys(
+        value,
+        &["schema_version", "configured", "effective", "observed"],
+    )?;
+    if num(value, "schema_version")? != 1 {
+        return Err(StartupDiffError::UnsupportedSchema);
+    }
+    if text(value, "configured")? != "present" {
+        return Err(StartupDiffError::MalformedInput);
+    }
+    let effective = value
+        .get("effective")
+        .ok_or(StartupDiffError::MalformedInput)?;
+    keys(effective, &["status", "context", "evidence"])?;
+    match text(effective, "status")? {
+        "unknown" => {
+            if !effective["context"].is_null() || !effective["evidence"].is_null() {
+                return Err(StartupDiffError::MalformedInput);
+            }
+        }
+        "effective" | "not_effective" => {
+            let context = text(effective, "context")?;
+            if context.is_empty() || context.len() > 512 {
+                return Err(StartupDiffError::LimitExceeded);
+            }
+            validate_state_evidence(&effective["evidence"])?;
+        }
+        _ => return Err(StartupDiffError::MalformedInput),
+    }
+    let observed = value
+        .get("observed")
+        .ok_or(StartupDiffError::MalformedInput)?;
+    keys(observed, &["status", "capture_interval", "evidence"])?;
+    match text(observed, "status")? {
+        "unknown" => {
+            if !observed["capture_interval"].is_null() || !observed["evidence"].is_null() {
+                return Err(StartupDiffError::MalformedInput);
+            }
+        }
+        "observed" => {
+            let interval = observed
+                .get("capture_interval")
+                .ok_or(StartupDiffError::MalformedInput)?;
+            keys(interval, &["started_at_unix_ms", "ended_at_unix_ms"])?;
+            if num(interval, "started_at_unix_ms")? > num(interval, "ended_at_unix_ms")? {
+                return Err(StartupDiffError::MalformedInput);
+            }
+            validate_state_evidence(&observed["evidence"])?;
+        }
+        _ => return Err(StartupDiffError::MalformedInput),
+    }
+    Ok(())
+}
+fn validate_service_observation(value: &Value) -> Result<(), StartupDiffError> {
+    let status = text(value, "status")?;
+    let raw_state_code = num(value, "raw_state_code")?;
+    if raw_state_code > u64::from(u32::MAX) {
+        return Err(StartupDiffError::MalformedInput);
+    }
+    let expected_state = match raw_state_code {
+        1 => Some("stopped"),
+        2 => Some("start_pending"),
+        3 => Some("stop_pending"),
+        4 => Some("running"),
+        5 => Some("continue_pending"),
+        6 => Some("pause_pending"),
+        7 => Some("paused"),
+        _ => None,
+    };
+    match status {
+        "known" => {
+            keys(value, &["status", "state", "raw_state_code"])?;
+            if text(value, "state")? != expected_state.ok_or(StartupDiffError::MalformedInput)? {
+                return Err(StartupDiffError::MalformedInput);
+            }
+        }
+        "unknown" => {
+            keys(value, &["status", "raw_state_code"])?;
+            if expected_state.is_some() {
+                return Err(StartupDiffError::MalformedInput);
+            }
+        }
+        _ => return Err(StartupDiffError::MalformedInput),
+    }
+    Ok(())
+}
+
+fn validate_delayed_auto_start(value: &Value) -> Result<(), StartupDiffError> {
+    match text(value, "status")? {
+        "observed" => {
+            keys(value, &["status", "value"])?;
+            let _ = value
+                .get("value")
+                .and_then(Value::as_bool)
+                .ok_or(StartupDiffError::MalformedInput)?;
+        }
+        "unknown" => {
+            keys(value, &["status", "diagnostic_code"])?;
+            let diagnostic = text(value, "diagnostic_code")?;
+            if !matches!(
+                diagnostic,
+                "service_delayed_auto_start_unsupported"
+                    | "service_delayed_auto_start_access_denied"
+                    | "service_delayed_auto_start_query_failed"
+                    | "service_delayed_auto_start_response_invalid"
+                    | "service_delayed_auto_start_budget_exceeded"
+                    | "service_delayed_auto_start_deadline_exceeded"
+            ) {
+                return Err(StartupDiffError::MalformedInput);
+            }
+        }
+        _ => return Err(StartupDiffError::MalformedInput),
+    }
+    Ok(())
+}
+
+fn validate_service_dependencies(value: &Value) -> Result<(), StartupDiffError> {
+    match text(value, "status")? {
+        "observed" => {
+            keys(value, &["status", "entries"])?;
+            let entries = arr(value, "entries")?;
+            if entries.len() > 4_096 {
+                return Err(StartupDiffError::LimitExceeded);
+            }
+            for entry in entries {
+                keys(entry, &["kind", "name"])?;
+                if !matches!(text(entry, "kind")?, "service" | "load_order_group") {
+                    return Err(StartupDiffError::MalformedInput);
+                }
+                let name = text(entry, "name")?;
+                check_str(entry, "name", 32_768)?;
+                if name.is_empty() || name.starts_with('+') {
+                    return Err(StartupDiffError::MalformedInput);
+                }
+            }
+        }
+        "unknown" => {
+            keys(value, &["status", "diagnostic_code"])?;
+            if text(value, "diagnostic_code")? != "service_dependencies_response_invalid"
+                && text(value, "diagnostic_code")? != "service_dependencies_limit_exceeded"
+                && text(value, "diagnostic_code")? != "service_dependency_budget_exceeded"
+            {
+                return Err(StartupDiffError::MalformedInput);
+            }
+        }
+        _ => return Err(StartupDiffError::MalformedInput),
+    }
+    Ok(())
+}
+
+fn validate_service_load_order_group(value: &Value) -> Result<(), StartupDiffError> {
+    match text(value, "status")? {
+        "observed" => {
+            keys(value, &["status", "value"])?;
+            if !value["value"].is_null() {
+                check_str(value, "value", 32_768)?;
+                if text(value, "value")?.is_empty() {
+                    return Err(StartupDiffError::MalformedInput);
+                }
+            }
+        }
+        "unknown" => {
+            keys(value, &["status", "diagnostic_code"])?;
+            if !matches!(
+                text(value, "diagnostic_code")?,
+                "service_load_order_group_response_invalid"
+                    | "service_load_order_group_limit_exceeded"
+                    | "service_load_order_group_budget_exceeded"
+            ) {
+                return Err(StartupDiffError::MalformedInput);
+            }
+        }
+        _ => return Err(StartupDiffError::MalformedInput),
+    }
+    Ok(())
+}
+
+fn validate_service_triggers(value: &Value) -> Result<(), StartupDiffError> {
+    match text(value, "status")? {
+        "observed" => {
+            keys(value, &["status", "entries"])?;
+            let entries = arr(value, "entries")?;
+            if entries.len() > 256 {
+                return Err(StartupDiffError::LimitExceeded);
+            }
+            for entry in entries {
+                keys(
+                    entry,
+                    &[
+                        "trigger_index",
+                        "trigger_type_code",
+                        "trigger_type",
+                        "action_code",
+                        "action",
+                        "subtype_guid",
+                        "data_items",
+                    ],
+                )?;
+                let _ = num(entry, "trigger_index")?;
+                let _ = num(entry, "trigger_type_code")?;
+                let _ = num(entry, "action_code")?;
+                if !matches!(
+                    text(entry, "trigger_type")?,
+                    "device_interface_arrival"
+                        | "ip_address_availability"
+                        | "domain_join"
+                        | "firewall_port_event"
+                        | "group_policy"
+                        | "network_endpoint"
+                        | "custom"
+                        | "unknown"
+                ) || !matches!(
+                    text(entry, "action")?,
+                    "service_start" | "service_stop" | "unknown"
+                ) {
+                    return Err(StartupDiffError::MalformedInput);
+                }
+                if entry
+                    .get("subtype_guid")
+                    .is_some_and(|guid| !guid.is_null())
+                {
+                    let guid = text(entry, "subtype_guid")?;
+                    check_str(entry, "subtype_guid", 36)?;
+                    if guid.len() != 36
+                        || !guid.bytes().enumerate().all(|(i, byte)| {
+                            if [8, 13, 18, 23].contains(&i) {
+                                byte == b'-'
+                            } else {
+                                byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+                            }
+                        })
+                    {
+                        return Err(StartupDiffError::MalformedInput);
+                    }
+                }
+                let data_items = arr(entry, "data_items")?;
+                if data_items.len() > 64 {
+                    return Err(StartupDiffError::LimitExceeded);
+                }
+                for item in data_items {
+                    keys(item, &["data_type_code", "data_type", "data_hex"])?;
+                    let _ = num(item, "data_type_code")?;
+                    if !matches!(
+                        text(item, "data_type")?,
+                        "binary" | "string" | "level" | "keyword_any" | "keyword_all" | "unknown"
+                    ) {
+                        return Err(StartupDiffError::MalformedInput);
+                    }
+                    let hex = text(item, "data_hex")?;
+                    check_str(item, "data_hex", 2 * 1024)?;
+                    if hex.len() % 2 != 0
+                        || !hex
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                    {
+                        return Err(StartupDiffError::MalformedInput);
+                    }
+                }
+            }
+        }
+        "unknown" => {
+            keys(value, &["status", "diagnostic_code"])?;
+            if !matches!(
+                text(value, "diagnostic_code")?,
+                "service_trigger_unsupported"
+                    | "service_trigger_access_denied"
+                    | "service_trigger_query_failed"
+                    | "service_trigger_response_invalid"
+                    | "service_trigger_budget_exceeded"
+                    | "service_trigger_count_limit_exceeded"
+                    | "service_trigger_deadline_exceeded"
+            ) {
+                return Err(StartupDiffError::MalformedInput);
+            }
+        }
+        _ => return Err(StartupDiffError::MalformedInput),
+    }
+    Ok(())
+}
+
+fn validate_state_evidence(value: &Value) -> Result<(), StartupDiffError> {
+    keys(
+        value,
+        &[
+            "artifact_path",
+            "artifact_schema",
+            "artifact_schema_version",
+            "record_locator",
+        ],
+    )?;
+    let path = text(value, "artifact_path")?;
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(StartupDiffError::MalformedInput);
+    }
+    for field in ["artifact_path", "artifact_schema", "record_locator"] {
+        check_str(value, field, 1024)?;
+        if text(value, field)?.is_empty() {
+            return Err(StartupDiffError::MalformedInput);
+        }
+    }
+    if num(value, "artifact_schema_version")? == 0 {
+        return Err(StartupDiffError::MalformedInput);
+    }
+    Ok(())
+}
+fn validate_linux(v: &Value, has_states: bool) -> Result<(), StartupDiffError> {
     let x = v
         .get("xdg_autostart")
         .ok_or(StartupDiffError::MalformedInput)?;
     validate_header(
         x,
         "sideeffect.xdg_autostart_inventory",
-        1,
+        if has_states { 2 } else { 1 },
         "linux",
         "xdg_autostart_files_only",
         &["complete", "partial"],
@@ -587,7 +1048,21 @@ fn validate_linux(v: &Value) -> Result<(), StartupDiffError> {
         return Err(StartupDiffError::LimitExceeded);
     }
     for e in arr(x, "entries")? {
-        keys(e, &["scope", "source_path", "applicability", "keys"])?;
+        let allowed = if has_states {
+            &[
+                "scope",
+                "source_path",
+                "applicability",
+                "startup_state",
+                "keys",
+            ][..]
+        } else {
+            &["scope", "source_path", "applicability", "keys"][..]
+        };
+        keys(e, allowed)?;
+        if has_states {
+            validate_startup_state(&e["startup_state"])?;
+        }
         for f in ["scope", "source_path", "applicability"] {
             check_str(e, f, 32768)?;
         }
@@ -622,7 +1097,7 @@ fn validate_linux(v: &Value) -> Result<(), StartupDiffError> {
     validate_header(
         u,
         "sideeffect.systemd_unit_inventory",
-        1,
+        if has_states { 2 } else { 1 },
         "linux",
         "systemd_unit_files_and_enablement_symlink_references",
         &["complete", "partial"],
@@ -652,17 +1127,27 @@ fn validate_linux(v: &Value) -> Result<(), StartupDiffError> {
         return Err(StartupDiffError::LimitExceeded);
     }
     for r in arr(u, "records")? {
-        keys(
-            r,
-            &[
-                "scope",
-                "source_path",
-                "source_path_bytes_hex",
-                "record_type",
-                "symlink_target",
-                "directives",
-            ],
-        )?;
+        let allowed = [
+            "scope",
+            "source_path",
+            "source_path_bytes_hex",
+            "record_type",
+            "symlink_target",
+            "directives",
+        ];
+        let allowed_new = [
+            "scope",
+            "source_path",
+            "source_path_bytes_hex",
+            "record_type",
+            "startup_state",
+            "symlink_target",
+            "directives",
+        ];
+        keys(r, if has_states { &allowed_new } else { &allowed })?;
+        if has_states {
+            validate_startup_state(&r["startup_state"])?;
+        }
         for f in [
             "scope",
             "source_path",
@@ -704,7 +1189,7 @@ fn validate_linux(v: &Value) -> Result<(), StartupDiffError> {
     validate_header(
         l,
         "sideeffect.legacy_startup_inventory",
-        1,
+        if has_states { 2 } else { 1 },
         "linux",
         "common_sysv_cron_paths_only",
         &["complete", "partial"],
@@ -744,19 +1229,31 @@ fn validate_linux(v: &Value) -> Result<(), StartupDiffError> {
         return Err(StartupDiffError::LimitExceeded);
     }
     for e in arr(l, "entries")? {
-        keys(
-            e,
-            &[
-                "source_kind",
-                "entry_kind",
-                "path",
-                "path_bytes_hex",
-                "symlink_target",
-                "symlink_target_hex",
-                "symlink_target_sha256",
-                "lines",
-            ],
-        )?;
+        let allowed = [
+            "source_kind",
+            "entry_kind",
+            "path",
+            "path_bytes_hex",
+            "symlink_target",
+            "symlink_target_hex",
+            "symlink_target_sha256",
+            "lines",
+        ];
+        let allowed_new = [
+            "source_kind",
+            "entry_kind",
+            "path",
+            "path_bytes_hex",
+            "startup_state",
+            "symlink_target",
+            "symlink_target_hex",
+            "symlink_target_sha256",
+            "lines",
+        ];
+        keys(e, if has_states { &allowed_new } else { &allowed })?;
+        if has_states {
+            validate_startup_state(&e["startup_state"])?;
+        }
         for f in [
             "source_kind",
             "entry_kind",
@@ -788,8 +1285,14 @@ fn validate_linux(v: &Value) -> Result<(), StartupDiffError> {
     }
     Ok(())
 }
-fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
-    let all = &[
+fn validate_windows(v: &Value, version: u64) -> Result<(), StartupDiffError> {
+    let has_states = version >= 5;
+    let has_wmi = windows_has_wmi_contract(v, version);
+    let has_service_observation = version >= 7;
+    let has_delayed_auto_start = version >= 8;
+    let has_service_dependencies = version >= 9;
+    let has_service_triggers = version >= 10;
+    let mut all = vec![
         ("sources", 8192usize),
         ("registry_entries", 8192),
         ("folder_entries", 8192),
@@ -797,27 +1300,42 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
         ("scheduled_task_entries", 8192),
         ("scheduled_task_actions", 8192),
     ];
+    if has_wmi {
+        all.extend([
+            ("wmi_event_filters", 2048),
+            ("wmi_event_consumers", 2048),
+            ("wmi_filter_consumer_bindings", 2048),
+        ]);
+    }
     for (key, cap) in all {
-        if arr(v, key)?.len() > *cap {
+        if arr(v, key)?.len() > cap {
             return Err(StartupDiffError::LimitExceeded);
         }
     }
-    let row_total = [
+    let mut row_fields = vec![
         "registry_entries",
         "folder_entries",
         "service_entries",
         "scheduled_task_entries",
         "scheduled_task_actions",
-    ]
-    .into_iter()
-    .map(|key| arr(v, key).map(<[Value]>::len))
-    .collect::<Result<Vec<_>, _>>()?
-    .into_iter()
-    .sum::<usize>();
+    ];
+    if has_wmi {
+        row_fields.extend([
+            "wmi_event_filters",
+            "wmi_event_consumers",
+            "wmi_filter_consumer_bindings",
+        ]);
+    }
+    let row_total = row_fields
+        .into_iter()
+        .map(|key| arr(v, key).map(<[Value]>::len))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .sum::<usize>();
     if row_total > MAX_ROWS {
         return Err(StartupDiffError::LimitExceeded);
     }
-    let expected_sources: BTreeSet<&str> = [
+    let mut expected_sources: BTreeSet<&str> = [
         "current_user_run_native",
         "current_user_run_once_native",
         "current_user_run_32",
@@ -833,6 +1351,9 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
     ]
     .into_iter()
     .collect();
+    if has_wmi {
+        expected_sources.insert("wmi_permanent_event_subscriptions");
+    }
     let mut seen_sources = BTreeSet::new();
     for s in arr(v, "sources")? {
         keys(
@@ -889,7 +1410,7 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
         return Err(StartupDiffError::MalformedInput);
     }
     for e in arr(v, "registry_entries")? {
-        keys(
+        startup_row_keys(
             e,
             &[
                 "registry_key",
@@ -902,7 +1423,11 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
                 "command_utf16_hex",
                 "evidence",
             ],
+            has_states,
         )?;
+        if has_states {
+            validate_startup_state(&e["startup_state"])?;
+        }
         for f in [
             "registry_key",
             "hive",
@@ -949,7 +1474,7 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
         let _ = num(ev, "registry_type")?;
     }
     for e in arr(v, "folder_entries")? {
-        keys(
+        startup_row_keys(
             e,
             &[
                 "folder_scope",
@@ -959,7 +1484,11 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
                 "kind",
                 "evidence",
             ],
+            has_states,
         )?;
+        if has_states {
+            validate_startup_state(&e["startup_state"])?;
+        }
         for f in [
             "folder_scope",
             "trigger",
@@ -984,18 +1513,44 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
         }
     }
     for e in arr(v, "service_entries")? {
-        keys(
-            e,
-            &[
-                "service_name",
-                "display_name",
-                "start_type",
-                "start_type_code",
-                "account",
-                "binary_path",
-                "evidence",
-            ],
-        )?;
+        let mut fields = vec![
+            "service_name",
+            "display_name",
+            "start_type",
+            "start_type_code",
+            "account",
+            "binary_path",
+            "evidence",
+        ];
+        if has_service_observation {
+            fields.push("service_observation");
+        }
+        if has_delayed_auto_start {
+            fields.push("delayed_auto_start");
+        }
+        if has_service_dependencies {
+            fields.extend(["dependencies", "load_order_group"]);
+        }
+        if has_service_triggers {
+            fields.push("triggers");
+        }
+        startup_row_keys(e, &fields, has_states)?;
+        if has_states {
+            validate_startup_state(&e["startup_state"])?;
+        }
+        if has_service_observation {
+            validate_service_observation(&e["service_observation"])?;
+        }
+        if has_delayed_auto_start {
+            validate_delayed_auto_start(&e["delayed_auto_start"])?;
+        }
+        if has_service_dependencies {
+            validate_service_dependencies(&e["dependencies"])?;
+            validate_service_load_order_group(&e["load_order_group"])?;
+        }
+        if has_service_triggers {
+            validate_service_triggers(&e["triggers"])?;
+        }
         for f in [
             "service_name",
             "display_name",
@@ -1008,13 +1563,18 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
         let ev = e.get("evidence").ok_or(StartupDiffError::MalformedInput)?;
         keys(ev, &["source", "service_index"])?;
         check_str(ev, "source", 256)?;
-        if text(ev, "source")? != "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW" {
+        let expected_source = if has_delayed_auto_start {
+            "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W"
+        } else {
+            "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW"
+        };
+        if text(ev, "source")? != expected_source {
             return Err(StartupDiffError::MalformedInput);
         }
         let _ = num(ev, "service_index")?;
     }
     for e in arr(v, "scheduled_task_entries")? {
-        keys(
+        startup_row_keys(
             e,
             &[
                 "task_path",
@@ -1024,7 +1584,11 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
                 "logon_user",
                 "evidence",
             ],
+            has_states,
         )?;
+        if has_states {
+            validate_startup_state(&e["startup_state"])?;
+        }
         for f in ["task_path", "trigger_type", "logon_user"] {
             check_str(e, f, 131072)?;
         }
@@ -1037,7 +1601,7 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
         let _ = num(ev, "trigger_index")?;
     }
     for e in arr(v, "scheduled_task_actions")? {
-        keys(
+        startup_row_keys(
             e,
             &[
                 "task_path",
@@ -1050,7 +1614,11 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
                 "working_directory",
                 "evidence",
             ],
+            has_states,
         )?;
+        if has_states {
+            validate_startup_state(&e["startup_state"])?;
+        }
         for f in [
             "task_path",
             "action_type",
@@ -1072,6 +1640,112 @@ fn validate_windows(v: &Value) -> Result<(), StartupDiffError> {
             return Err(StartupDiffError::MalformedInput);
         }
         let _ = num(ev, "task_index")?;
+    }
+    if has_wmi {
+        for (field, expected_class) in [
+            ("wmi_event_filters", "__EventFilter"),
+            ("wmi_event_consumers", "__EventConsumer"),
+            ("wmi_filter_consumer_bindings", "__FilterToConsumerBinding"),
+        ] {
+            for (index, row) in arr(v, field)?.iter().enumerate() {
+                let fields: &[&str] = match field {
+                    "wmi_event_filters" => &[
+                        "object_path",
+                        "name",
+                        "creator_sid",
+                        "event_namespace",
+                        "query_language",
+                        "query",
+                        "evidence",
+                    ],
+                    "wmi_event_consumers" => &[
+                        "object_path",
+                        "class_name",
+                        "name",
+                        "creator_sid",
+                        "status",
+                        "executable_path",
+                        "command_line_template",
+                        "script_file_name",
+                        "script_text",
+                        "evidence",
+                        "detail_evidence",
+                    ],
+                    _ => &[
+                        "object_path",
+                        "filter_reference",
+                        "consumer_reference",
+                        "filter_reference_status",
+                        "consumer_reference_status",
+                        "creator_sid",
+                        "delivery_qos",
+                        "evidence",
+                    ],
+                };
+                keys(row, fields)?;
+                for name in fields
+                    .iter()
+                    .filter(|name| **name != "evidence" && **name != "detail_evidence")
+                {
+                    check_str(row, name, 32768)?;
+                }
+                let evidence = row
+                    .get("evidence")
+                    .ok_or(StartupDiffError::MalformedInput)?;
+                keys(
+                    evidence,
+                    &["source", "namespace", "class_name", "object_index"],
+                )?;
+                if text(evidence, "class_name")? != expected_class
+                    || text(evidence, "namespace")? != "ROOT\\subscription"
+                {
+                    return Err(StartupDiffError::MalformedInput);
+                }
+                if text(evidence, "source")? != "IWbemLocator/IWbemServices/IEnumWbemClassObject" {
+                    return Err(StartupDiffError::MalformedInput);
+                }
+                let _ = num(evidence, "object_index")?;
+                if field == "wmi_event_consumers"
+                    && !matches!(
+                        text(row, "status")?,
+                        "observed" | "unsupported_class" | "partial"
+                    )
+                {
+                    return Err(StartupDiffError::MalformedInput);
+                }
+                if field == "wmi_event_consumers" {
+                    if let Some(detail) = row.get("detail_evidence") {
+                        keys(
+                            detail,
+                            &["source", "namespace", "class_name", "object_index"],
+                        )?;
+                        if text(detail, "source")?
+                            != "IWbemLocator/IWbemServices/IEnumWbemClassObject"
+                            || text(detail, "namespace")? != "ROOT\\subscription"
+                            || !matches!(
+                                text(detail, "class_name")?,
+                                "CommandLineEventConsumer" | "ActiveScriptEventConsumer"
+                            )
+                        {
+                            return Err(StartupDiffError::MalformedInput);
+                        }
+                        let _ = num(detail, "object_index")?;
+                    }
+                }
+                if field == "wmi_filter_consumer_bindings"
+                    && (!matches!(
+                        text(row, "filter_reference_status")?,
+                        "resolved" | "unresolved"
+                    ) || !matches!(
+                        text(row, "consumer_reference_status")?,
+                        "resolved" | "unresolved"
+                    ))
+                {
+                    return Err(StartupDiffError::MalformedInput);
+                }
+                let _ = index;
+            }
+        }
     }
     Ok(())
 }
@@ -1097,10 +1771,41 @@ fn ptr(prefix: &str, i: usize) -> String {
 fn value(v: &Value) -> String {
     serde_json::to_string(v).unwrap_or_default()
 }
+fn startup_state_fact(row: &Value) -> String {
+    let Some(state) = row.get("startup_state") else {
+        // Legacy startup rows imply only that the source row was configured.
+        // They provide no evidence about effectiveness or runtime observation.
+        return digest(&value(&serde_json::json!({
+            "configured": "present",
+            "effective": {"status": "unknown", "context": null},
+            "observed": {"status": "unknown"}
+        })));
+    };
+    // These fields express the compared state. Evidence locations and capture
+    // intervals stay available in the inputs but may vary between snapshots
+    // without changing the state itself.
+    digest(&value(&serde_json::json!({
+        "configured": state["configured"],
+        "effective": {
+            "status": state["effective"]["status"],
+            "context": state["effective"]["context"]
+        },
+        "observed": {"status": state["observed"]["status"]}
+    })))
+}
 fn objfact(v: &Value, fields: &[(&'static str, &str)]) -> Vec<(&'static str, String)> {
     fields
         .iter()
-        .map(|(n, k)| (*n, v.get(*k).map(value).unwrap_or_else(|| "null".into())))
+        .map(|(n, k)| {
+            (
+                *n,
+                if *k == "startup_state" {
+                    startup_state_fact(v)
+                } else {
+                    v.get(*k).map(value).unwrap_or_else(|| "null".into())
+                },
+            )
+        })
         .collect()
 }
 fn side(r: &Row) -> StartupEvidenceSide {
@@ -1109,6 +1814,75 @@ fn side(r: &Row) -> StartupEvidenceSide {
     }
 }
 fn compare(l: &Value, r: &Value, k: Kind) -> Result<StartupInventoryDiff, StartupDiffError> {
+    let service_state_incomparable = if k == Kind::Windows {
+        let before_version = num(l, "schema_version")?;
+        let after_version = num(r, "schema_version")?;
+        let has_services =
+            !arr(l, "service_entries")?.is_empty() || !arr(r, "service_entries")?.is_empty();
+        has_services && (before_version >= 7) != (after_version >= 7)
+    } else {
+        false
+    };
+    let delayed_auto_start_incomparable = if k == Kind::Windows {
+        let before_version = num(l, "schema_version")?;
+        let after_version = num(r, "schema_version")?;
+        let has_services =
+            !arr(l, "service_entries")?.is_empty() || !arr(r, "service_entries")?.is_empty();
+        has_services && (before_version >= 8) != (after_version >= 8)
+    } else {
+        false
+    };
+    let service_dependencies_incomparable = if k == Kind::Windows {
+        let before_version = num(l, "schema_version")?;
+        let after_version = num(r, "schema_version")?;
+        let has_services =
+            !arr(l, "service_entries")?.is_empty() || !arr(r, "service_entries")?.is_empty();
+        has_services && (before_version >= 9) != (after_version >= 9)
+    } else {
+        false
+    };
+    let service_triggers_incomparable = if k == Kind::Windows {
+        let before_version = num(l, "schema_version")?;
+        let after_version = num(r, "schema_version")?;
+        let has_services =
+            !arr(l, "service_entries")?.is_empty() || !arr(r, "service_entries")?.is_empty();
+        has_services && (before_version >= 10) != (after_version >= 10)
+    } else {
+        false
+    };
+    let service_dependencies_unknown = k == Kind::Windows
+        && [l, r].into_iter().any(|doc| {
+            num(doc, "schema_version").is_ok_and(|version| version >= 9)
+                && arr(doc, "service_entries").is_ok_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry["dependencies"]["status"] != "observed"
+                            || entry["load_order_group"]["status"] != "observed"
+                    })
+                })
+        });
+    let compare_service_dependencies = !service_dependencies_incomparable
+        && !service_dependencies_unknown
+        && k == Kind::Windows
+        && num(l, "schema_version")? >= 9
+        && num(r, "schema_version")? >= 9;
+    let service_dependency_presence_comparable =
+        !service_dependencies_incomparable && !service_dependencies_unknown;
+    let service_triggers_unknown = k == Kind::Windows
+        && [l, r].into_iter().any(|doc| {
+            num(doc, "schema_version").is_ok_and(|version| version >= 10)
+                && arr(doc, "service_entries").is_ok_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| entry["triggers"]["status"] != "observed")
+                })
+        });
+    let compare_service_triggers = !service_triggers_incomparable
+        && !service_triggers_unknown
+        && k == Kind::Windows
+        && num(l, "schema_version")? >= 10
+        && num(r, "schema_version")? >= 10;
+    let service_trigger_presence_comparable =
+        !service_triggers_incomparable && !service_triggers_unknown;
     let (mut a, mut b, mut complete, mut lossy) = if k == Kind::Linux {
         (
             linux_rows(l)?,
@@ -1118,12 +1892,37 @@ fn compare(l: &Value, r: &Value, k: Kind) -> Result<StartupInventoryDiff, Startu
         )
     } else {
         (
-            windows_rows(l)?,
-            windows_rows(r)?,
+            windows_rows(
+                l,
+                !service_state_incomparable,
+                !delayed_auto_start_incomparable,
+                compare_service_dependencies,
+                service_dependency_presence_comparable,
+                compare_service_triggers,
+                service_trigger_presence_comparable,
+            )?,
+            windows_rows(
+                r,
+                !service_state_incomparable,
+                !delayed_auto_start_incomparable,
+                compare_service_dependencies,
+                service_dependency_presence_comparable,
+                compare_service_triggers,
+                service_trigger_presence_comparable,
+            )?,
             windows_complete(l) && windows_complete(r),
             0usize,
         )
     };
+    if service_state_incomparable
+        || delayed_auto_start_incomparable
+        || service_dependencies_incomparable
+        || service_dependencies_unknown
+        || service_triggers_incomparable
+        || service_triggers_unknown
+    {
+        complete = false;
+    }
     if k == Kind::Linux {
         lossy = a
             .iter()
@@ -1153,6 +1952,18 @@ fn compare(l: &Value, r: &Value, k: Kind) -> Result<StartupInventoryDiff, Startu
     };
     let mut diagnostics = BTreeSet::new();
     if k == Kind::Windows {
+        if service_state_incomparable {
+            diagnostics.insert("service-state observations are not present on both snapshots");
+        }
+        if delayed_auto_start_incomparable {
+            diagnostics.insert("delayed-auto-start configuration is not present on both snapshots");
+        }
+        if service_dependencies_incomparable {
+            diagnostics.insert("service dependency configuration is not present on both snapshots");
+        }
+        if service_dependencies_unknown {
+            diagnostics.insert("service dependency or load-order group configuration is unknown");
+        }
         let unkeyed = [l, r]
             .into_iter()
             .flat_map(|doc| {
@@ -1323,7 +2134,10 @@ fn linux_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
         rows.push(Row {
             category: "xdg_autostart",
             key,
-            facts: vec![("selected_keys", digest(&fields))],
+            facts: vec![
+                ("selected_keys", digest(&fields)),
+                ("startup_state", startup_state_fact(e)),
+            ],
             refs: vec![ptr("/xdg_autostart/entries", i)],
             complete: linux_component_complete(&v["xdg_autostart"]),
             lossy_identity,
@@ -1337,7 +2151,16 @@ fn linux_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
         ]);
         let facts = vec![
             ("directives", digest(&value(&e["directives"]))),
+            (
+                "dependency_directives",
+                systemd_directive_group_digest(e, SYSTEMD_DEPENDENCY_DIRECTIVES),
+            ),
+            (
+                "ordering_directives",
+                systemd_directive_group_digest(e, SYSTEMD_ORDERING_DIRECTIVES),
+            ),
             ("symlink_target", digest(&value(&e["symlink_target"]))),
+            ("startup_state", startup_state_fact(e)),
         ];
         rows.push(Row {
             category: "systemd_units",
@@ -1357,6 +2180,7 @@ fn linux_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
         let facts = vec![
             ("symlink_target", digest(&value(&e["symlink_target_hex"]))),
             ("line_evidence", digest(&value(&e["lines"]))),
+            ("startup_state", startup_state_fact(e)),
         ];
         rows.push(Row {
             category: "legacy_sources",
@@ -1369,13 +2193,47 @@ fn linux_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
     }
     Ok(rows)
 }
+
+/// Hash only the selected systemd directive group, retaining occurrence order
+/// and duplicates so repeated or empty reset assignments remain distinguishable.
+/// The comparison result exposes only the static group label, never these values.
+fn systemd_directive_group_digest(record: &Value, keys: &[&str]) -> String {
+    let selected = record
+        .get("directives")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|directive| {
+            directive.get("section").and_then(Value::as_str) == Some("Unit")
+                && directive
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .is_some_and(|key| keys.contains(&key))
+        })
+        .map(|directive| {
+            serde_json::json!({
+                "section": directive.get("section"),
+                "key": directive.get("key"),
+                "value": directive.get("value"),
+                "value_hex": directive.get("value_hex"),
+            })
+        })
+        .collect::<Vec<_>>();
+    digest(&value(&serde_json::Value::Array(selected)))
+}
+
 fn linux_component_complete(v: &Value) -> bool {
     v["status"] == "complete"
 }
 fn windows_complete(v: &Value) -> bool {
     v["status"] == "complete"
         && v["sources"].as_array().is_some_and(|a| {
-            a.len() == 12
+            a.len()
+                == if windows_has_wmi_contract(v, num(v, "schema_version").unwrap_or(5)) {
+                    13
+                } else {
+                    12
+                }
                 && a.iter()
                     .all(|s| matches!(s["status"].as_str(), Some("complete" | "not_present")))
         })
@@ -1397,7 +2255,15 @@ fn registry_source_complete(v: &Value, entry: &Value) -> bool {
         })
     })
 }
-fn windows_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
+fn windows_rows(
+    v: &Value,
+    compare_service_observation: bool,
+    compare_delayed_auto_start: bool,
+    compare_service_dependencies: bool,
+    service_dependency_presence_comparable: bool,
+    compare_service_triggers: bool,
+    service_trigger_presence_comparable: bool,
+) -> Result<Vec<Row>, StartupDiffError> {
     let mut rows = Vec::new();
     for (i, e) in arr(v, "registry_entries")?.iter().enumerate() {
         let ev = &e["evidence"];
@@ -1417,6 +2283,7 @@ fn windows_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
                     ("value_type", "value_type"),
                     ("command", "command"),
                     ("command_encoding", "command_utf16_hex"),
+                    ("startup_state", "startup_state"),
                 ],
             ),
             refs: vec![ptr("/registry_entries", i)],
@@ -1434,7 +2301,7 @@ fn windows_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
         rows.push(Row {
             category: "startup_folder_entry",
             key,
-            facts: objfact(e, &[("kind", "kind")]),
+            facts: objfact(e, &[("kind", "kind"), ("startup_state", "startup_state")]),
             refs: vec![ptr("/folder_entries", i)],
             complete: source_complete(v, id),
             lossy_identity: false,
@@ -1443,21 +2310,51 @@ fn windows_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
     for (i, e) in arr(v, "service_entries")?.iter().enumerate() {
         let key = text(e, "service_name")?.to_owned();
         let id = "service_start_configuration";
+        let mut facts = objfact(
+            e,
+            &[
+                ("display_name", "display_name"),
+                ("start_type", "start_type"),
+                ("start_type_code", "start_type_code"),
+                ("account", "account"),
+                ("binary_path", "binary_path"),
+                ("startup_state", "startup_state"),
+            ],
+        );
+        if compare_service_observation && num(v, "schema_version")? >= 7 {
+            facts.push(("service_observation", value(&e["service_observation"])));
+        }
+        if compare_delayed_auto_start
+            && num(v, "schema_version")? >= 8
+            && e["delayed_auto_start"]["status"] == "observed"
+        {
+            facts.push((
+                "delayed_auto_start",
+                value(&e["delayed_auto_start"]["value"]),
+            ));
+        }
+        if compare_service_dependencies
+            && num(v, "schema_version")? >= 9
+            && e["dependencies"]["status"] == "observed"
+            && e["load_order_group"]["status"] == "observed"
+        {
+            facts.push(("dependencies", value(&e["dependencies"]["entries"])));
+            facts.push(("load_order_group", value(&e["load_order_group"]["value"])));
+        }
+        if compare_service_triggers
+            && num(v, "schema_version")? >= 10
+            && e["triggers"]["status"] == "observed"
+        {
+            facts.push(("triggers", value(&e["triggers"]["entries"])));
+        }
         rows.push(Row {
             category: "service_configuration",
             key,
-            facts: objfact(
-                e,
-                &[
-                    ("display_name", "display_name"),
-                    ("start_type", "start_type"),
-                    ("start_type_code", "start_type_code"),
-                    ("account", "account"),
-                    ("binary_path", "binary_path"),
-                ],
-            ),
+            facts,
             refs: vec![ptr("/service_entries", i)],
-            complete: source_complete(v, id),
+            complete: source_complete(v, id)
+                && service_dependency_presence_comparable
+                && service_trigger_presence_comparable,
             lossy_identity: false,
         });
     }
@@ -1473,12 +2370,79 @@ fn windows_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
                     ("task_enabled", "task_enabled"),
                     ("trigger_enabled", "trigger_enabled"),
                     ("logon_user", "logon_user"),
+                    ("startup_state", "startup_state"),
                 ],
             ),
             refs: vec![ptr("/scheduled_task_entries", i)],
             complete: source_complete(v, id),
             lossy_identity: false,
         });
+    }
+    if windows_has_wmi_contract(v, num(v, "schema_version").unwrap_or(5)) {
+        for (i, e) in arr(v, "wmi_event_filters")?.iter().enumerate() {
+            rows.push(Row {
+                category: "wmi_event_filter",
+                key: text(e, "object_path")?.to_owned(),
+                facts: objfact(
+                    e,
+                    &[
+                        ("name", "name"),
+                        ("creator_sid", "creator_sid"),
+                        ("event_namespace", "event_namespace"),
+                        ("query_language", "query_language"),
+                        ("query", "query"),
+                    ],
+                ),
+                refs: vec![ptr("/wmi_event_filters", i)],
+                complete: source_complete(v, "wmi_permanent_event_subscriptions"),
+                lossy_identity: false,
+            });
+        }
+        for (i, e) in arr(v, "wmi_event_consumers")?.iter().enumerate() {
+            rows.push(Row {
+                category: "wmi_event_consumer",
+                key: text(e, "object_path")?.to_owned(),
+                facts: objfact(
+                    e,
+                    &[
+                        ("class_name", "class_name"),
+                        ("name", "name"),
+                        ("creator_sid", "creator_sid"),
+                        ("status", "status"),
+                        ("executable_path", "executable_path"),
+                        ("command_line_template", "command_line_template"),
+                        ("script_file_name", "script_file_name"),
+                        ("script_text", "script_text"),
+                    ],
+                ),
+                refs: vec![ptr("/wmi_event_consumers", i)],
+                complete: source_complete(v, "wmi_permanent_event_subscriptions")
+                    && e["status"] == "observed",
+                lossy_identity: false,
+            });
+        }
+        for (i, e) in arr(v, "wmi_filter_consumer_bindings")?.iter().enumerate() {
+            rows.push(Row {
+                category: "wmi_filter_consumer_binding",
+                key: text(e, "object_path")?.to_owned(),
+                facts: objfact(
+                    e,
+                    &[
+                        ("filter_reference", "filter_reference"),
+                        ("consumer_reference", "consumer_reference"),
+                        ("filter_reference_status", "filter_reference_status"),
+                        ("consumer_reference_status", "consumer_reference_status"),
+                        ("creator_sid", "creator_sid"),
+                        ("delivery_qos", "delivery_qos"),
+                    ],
+                ),
+                refs: vec![ptr("/wmi_filter_consumer_bindings", i)],
+                complete: source_complete(v, "wmi_permanent_event_subscriptions")
+                    && e["filter_reference_status"] == "resolved"
+                    && e["consumer_reference_status"] == "resolved",
+                lossy_identity: false,
+            });
+        }
     }
     let mut groups = BTreeMap::<String, Vec<(usize, &Value)>>::new();
     for (i, e) in arr(v, "scheduled_task_actions")?.iter().enumerate() {
@@ -1500,9 +2464,16 @@ fn windows_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
                         "executable_path",
                         "arguments",
                         "working_directory",
+                        "startup_state",
                     ]
                     .iter()
-                    .map(|k| e[*k].clone())
+                    .map(|k| {
+                        if *k == "startup_state" {
+                            Value::String(startup_state_fact(e))
+                        } else {
+                            e[*k].clone()
+                        }
+                    })
                     .collect(),
                 ))
             })
@@ -1528,6 +2499,15 @@ fn windows_rows(v: &Value) -> Result<Vec<Row>, StartupDiffError> {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    fn startup_state() -> Value {
+        json!({
+            "schema_version": 1,
+            "configured": "present",
+            "effective": {"status":"unknown", "context":null, "evidence":null},
+            "observed": {"status":"unknown", "capture_interval":null, "evidence":null}
+        })
+    }
 
     fn linux() -> Value {
         json!({
@@ -1556,6 +2536,821 @@ mod tests {
         ];
         json!({"schema":WINDOWS,"schema_version":4,"platform":"windows","scope":"current_user_and_accessible_machine_run_keys_startup_folders_services_and_current_token_visible_tasks","capture_started_at_unix_ms":1,"capture_ended_at_unix_ms":2,"status":"complete","sources":ids.into_iter().map(|id|json!({"id":id,"status":"complete","entries_seen":0,"diagnostics":[]})).collect::<Vec<_>>(),"registry_entries":[],"folder_entries":[],"service_entries":[],"scheduled_task_entries":[],"scheduled_task_actions":[]})
     }
+
+    fn linux_v3() -> Value {
+        let mut value = linux();
+        value["schema_version"] = json!(3);
+        value["xdg_autostart"]["schema_version"] = json!(2);
+        value["systemd_units"]["schema_version"] = json!(2);
+        value["legacy_sources"]["schema_version"] = json!(2);
+        value
+    }
+
+    fn systemd_directive(key: &str, value: &str, line: usize) -> Value {
+        json!({
+            "section":"Unit",
+            "key":key,
+            "value":value,
+            "value_hex":null,
+            "line":line,
+            "byte_offset":line * 8,
+            "byte_length":value.len(),
+            "line_sha256":format!("line-{line}")
+        })
+    }
+
+    fn systemd_record(directives: Vec<Value>, has_state: bool) -> Value {
+        let mut record = json!({
+            "scope":"system",
+            "source_path":"/etc/systemd/system/example.service",
+            "source_path_bytes_hex":"2f6574632f73797374656d642f73797374656d2f6578616d706c652e73657276696365",
+            "record_type":"unit_file",
+            "symlink_target":null,
+            "directives":directives
+        });
+        if has_state {
+            record["startup_state"] = startup_state();
+        }
+        record
+    }
+
+    fn compare_systemd_records(
+        before_record: Value,
+        after_record: Value,
+        before_partial: bool,
+        after_v3: bool,
+    ) -> StartupInventoryDiff {
+        let mut before = linux();
+        before["systemd_units"]["records"] = json!([before_record]);
+        if before_partial {
+            before["status"] = json!("partial");
+            before["systemd_units"]["status"] = json!("partial");
+        }
+        let mut after = if after_v3 { linux_v3() } else { linux() };
+        after["systemd_units"]["records"] = json!([after_record]);
+        compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap()
+    }
+
+    #[test]
+    fn systemd_requirement_directive_changes_use_static_dependency_label_only() {
+        let diff = compare_systemd_records(
+            systemd_record(
+                vec![systemd_directive("Requires", "alpha.service", 1)],
+                false,
+            ),
+            systemd_record(
+                vec![systemd_directive("Requires", "beta.service", 1)],
+                false,
+            ),
+            false,
+            false,
+        );
+        assert_eq!(diff.deltas.len(), 1);
+        assert_eq!(
+            diff.deltas[0].changed_fields,
+            ["directives", "dependency_directives"]
+        );
+        let output = serde_json::to_string(&diff).unwrap();
+        assert!(!output.contains("alpha.service"));
+        assert!(!output.contains("beta.service"));
+    }
+
+    #[test]
+    fn systemd_ordering_changes_are_separate_from_requirement_changes() {
+        let diff = compare_systemd_records(
+            systemd_record(vec![systemd_directive("After", "alpha.service", 1)], false),
+            systemd_record(vec![systemd_directive("Before", "alpha.service", 1)], false),
+            false,
+            false,
+        );
+        assert_eq!(diff.deltas.len(), 1);
+        assert_eq!(
+            diff.deltas[0].changed_fields,
+            ["directives", "ordering_directives"]
+        );
+        assert!(
+            !diff.deltas[0]
+                .changed_fields
+                .contains(&"dependency_directives")
+        );
+    }
+
+    #[test]
+    fn unrelated_or_non_unit_directives_keep_only_the_general_label() {
+        let diff = compare_systemd_records(
+            systemd_record(vec![systemd_directive("Description", "first", 1)], false),
+            systemd_record(vec![systemd_directive("Description", "second", 1)], false),
+            false,
+            false,
+        );
+        assert_eq!(diff.deltas.len(), 1);
+        assert_eq!(diff.deltas[0].changed_fields, ["directives"]);
+
+        let mut invalid_section = systemd_directive("After", "alpha.service", 1);
+        invalid_section["section"] = json!("Service");
+        let mut other_invalid_section = invalid_section.clone();
+        other_invalid_section["value"] = json!("beta.service");
+        let diff = compare_systemd_records(
+            systemd_record(vec![invalid_section], false),
+            systemd_record(vec![other_invalid_section], false),
+            false,
+            false,
+        );
+        assert_eq!(diff.deltas.len(), 1);
+        assert_eq!(diff.deltas[0].changed_fields, ["directives"]);
+    }
+
+    #[test]
+    fn systemd_duplicate_and_empty_reset_lines_are_compared_as_source_facts() {
+        let before = systemd_record(
+            vec![
+                systemd_directive("Requires", "alpha.service", 1),
+                systemd_directive("Requires", "beta.service", 2),
+            ],
+            false,
+        );
+        let same = compare_systemd_records(before.clone(), before.clone(), false, false);
+        assert_eq!(same.counts.changed, 0);
+
+        let reset = compare_systemd_records(
+            before,
+            systemd_record(
+                vec![
+                    systemd_directive("Requires", "alpha.service", 1),
+                    systemd_directive("Requires", "", 2),
+                ],
+                false,
+            ),
+            false,
+            false,
+        );
+        assert_eq!(reset.deltas.len(), 1);
+        assert!(
+            reset.deltas[0]
+                .changed_fields
+                .contains(&"dependency_directives")
+        );
+        let output = serde_json::to_string(&reset).unwrap();
+        assert!(!output.contains("alpha.service"));
+        assert!(!output.contains("beta.service"));
+    }
+
+    #[test]
+    fn systemd_relationship_change_remains_partial_or_compatible_across_versions() {
+        let before = systemd_record(vec![systemd_directive("Wants", "alpha.service", 1)], false);
+        let after = systemd_record(vec![systemd_directive("Wants", "beta.service", 1)], true);
+
+        let partial = compare_systemd_records(before.clone(), after.clone(), true, true);
+        assert_eq!(partial.status, StartupDiffStatus::Partial);
+        assert!(
+            partial.deltas[0]
+                .changed_fields
+                .contains(&"dependency_directives")
+        );
+
+        let mixed_versions = compare_systemd_records(before, after, false, true);
+        assert_eq!(mixed_versions.status, StartupDiffStatus::Complete);
+        assert!(
+            mixed_versions.deltas[0]
+                .changed_fields
+                .contains(&"dependency_directives")
+        );
+    }
+
+    fn windows_v5() -> Value {
+        let mut value = windows();
+        value["schema_version"] = json!(5);
+        value
+    }
+
+    fn windows_v6() -> Value {
+        let mut value = windows_v5();
+        value["schema_version"] = json!(6);
+        value["scope"] = json!(
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+        );
+        value["sources"].as_array_mut().unwrap().push(json!({"id":"wmi_permanent_event_subscriptions","status":"complete","entries_seen":0,"location_path":"ROOT\\subscription","diagnostics":[]}));
+        value["wmi_event_filters"] = json!([]);
+        value["wmi_event_consumers"] = json!([]);
+        value["wmi_filter_consumer_bindings"] = json!([]);
+        value
+    }
+
+    fn windows_v7() -> Value {
+        let mut value = windows_v5();
+        value["schema_version"] = json!(7);
+        for service in value["service_entries"].as_array_mut().unwrap() {
+            service["service_observation"] = json!({
+                "status":"known", "state":"running", "raw_state_code":4
+            });
+        }
+        value
+    }
+
+    fn windows_v8() -> Value {
+        let mut value = windows_v7();
+        value["schema_version"] = json!(8);
+        value["scope"] = json!(
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+        );
+        value["sources"].as_array_mut().unwrap().push(json!({"id":"wmi_permanent_event_subscriptions","status":"complete","entries_seen":0,"location_path":"ROOT\\subscription","diagnostics":[]}));
+        value["wmi_event_filters"] = json!([]);
+        value["wmi_event_consumers"] = json!([]);
+        value["wmi_filter_consumer_bindings"] = json!([]);
+        value
+    }
+
+    fn windows_v9() -> Value {
+        let mut value = windows_v8();
+        value["schema_version"] = json!(9);
+        value["scope"] = json!(
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_and_load_order_group_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+        );
+        value
+    }
+
+    fn windows_v10() -> Value {
+        let mut value = windows_v9();
+        value["schema_version"] = json!(10);
+        value["scope"] = json!(
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_load_order_group_and_trigger_configuration_and_current_token_visible_tasks_and_local_root_subscription_wmi_objects"
+        );
+        for service in value["service_entries"].as_array_mut().unwrap() {
+            service["triggers"] = json!({"status":"observed","entries":[]});
+        }
+        value
+    }
+
+    #[test]
+    fn windows_v10_compares_observed_service_triggers_and_suppresses_unknowns() {
+        let mut before = windows_v10();
+        let mut after = windows_v10();
+        let trigger = json!({
+            "trigger_index":0,
+            "trigger_type_code":1,
+            "trigger_type":"device_interface_arrival",
+            "action_code":1,
+            "action":"service_start",
+            "subtype_guid":"1234abcd-5678-9abc-def0-123456789abc",
+            "data_items":[{"data_type_code":2,"data_type":"string","data_hex":"414200"}]
+        });
+        before["service_entries"] = json!([{
+            "service_name":"EditorService","display_name":"Editor Service","start_type":"automatic","start_type_code":2,
+            "account":null,"binary_path":"C:\\Apps\\editor.exe","startup_state":startup_state(),
+            "service_observation":{"status":"known","state":"running","raw_state_code":4},
+            "delayed_auto_start":{"status":"observed","value":false},
+            "dependencies":{"status":"observed","entries":[]},
+            "load_order_group":{"status":"observed","value":null},
+            "triggers":{"status":"observed","entries":[]},
+            "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W","service_index":0}
+        }]);
+        after["service_entries"] = before["service_entries"].clone();
+        after["service_entries"][0]["triggers"]["entries"] = json!([trigger]);
+        let report = compare_startup_inventory_json(
+            &serde_json::to_vec(&before).unwrap(),
+            &serde_json::to_vec(&after).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report.status, StartupDiffStatus::Complete);
+        assert_eq!(report.deltas.len(), 1);
+        assert!(report.deltas[0].changed_fields.contains(&"triggers"));
+        assert_eq!(
+            report.deltas[0].before.as_ref().unwrap().references,
+            ["/service_entries/0"]
+        );
+
+        after["service_entries"][0]["triggers"] = json!({
+            "status":"unknown","diagnostic_code":"service_trigger_access_denied"
+        });
+        let unknown = compare_startup_inventory_json(
+            &serde_json::to_vec(&before).unwrap(),
+            &serde_json::to_vec(&after).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unknown.status, StartupDiffStatus::Partial);
+        assert!(unknown.deltas.is_empty());
+    }
+
+    #[test]
+    fn startup_state_contract_requires_direct_evidence_for_known_dimensions() {
+        let state = startup_state();
+        validate_startup_state(&state).unwrap();
+
+        let mut effective_without_context = state.clone();
+        effective_without_context["effective"]["status"] = json!("effective");
+        assert!(validate_startup_state(&effective_without_context).is_err());
+
+        let mut observed_without_interval = state;
+        observed_without_interval["observed"]["status"] = json!("observed");
+        assert!(validate_startup_state(&observed_without_interval).is_err());
+    }
+
+    #[test]
+    fn legacy_and_stateful_startup_versions_compare_without_rewriting_inputs() {
+        let linux_old = serde_json::to_vec(&linux()).unwrap();
+        let linux_new = serde_json::to_vec(&linux_v3()).unwrap();
+        assert_eq!(
+            compare_startup_inventory_json(&linux_old, &linux_new)
+                .unwrap()
+                .status,
+            StartupDiffStatus::Complete
+        );
+
+        let windows_old = serde_json::to_vec(&windows()).unwrap();
+        let windows_new = serde_json::to_vec(&windows_v5()).unwrap();
+        assert_eq!(
+            compare_startup_inventory_json(&windows_old, &windows_new)
+                .unwrap()
+                .status,
+            StartupDiffStatus::Complete
+        );
+    }
+
+    #[test]
+    fn windows_v6_accepts_wmi_scope_and_keeps_legacy_readers() {
+        let old = serde_json::to_vec(&windows_v5()).unwrap();
+        let current = windows_v6();
+        let encoded = serde_json::to_vec(&current).unwrap();
+        validate(&parse(&encoded).unwrap(), Kind::Windows).unwrap();
+        let report = compare_startup_inventory_json(&old, &encoded).unwrap();
+        assert_eq!(report.platform, "windows");
+
+        let filter = json!({
+            "object_path":"__EventFilter.Name=\"f\"",
+            "name":"f",
+            "creator_sid":null,
+            "event_namespace":null,
+            "query_language":"WQL",
+            "query":"SELECT * FROM __InstanceCreationEvent",
+            "evidence":{"source":"IWbemLocator/IWbemServices/IEnumWbemClassObject","namespace":"ROOT\\subscription","class_name":"__EventFilter","object_index":0}
+        });
+        current_filter_smoke(filter);
+    }
+
+    #[test]
+    fn windows_v7_compares_only_service_state_snapshot_changes() {
+        let mut before = windows_v7();
+        let mut after = windows_v7();
+        let service = |observation: Value| {
+            json!({
+                "service_name":"EditorService",
+                "display_name":"Editor Service",
+                "start_type":"SERVICE_AUTO_START",
+                "start_type_code":2,
+                "account":"LocalSystem",
+                "binary_path":"C:\\Tools\\editor.exe --service",
+            "startup_state":startup_state(),
+                "service_observation":observation,
+                "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW","service_index":0}
+            })
+        };
+        before["service_entries"] = json!([service(json!({
+            "status":"known", "state":"stopped", "raw_state_code":1
+        }))]);
+        after["service_entries"] = json!([service(json!({
+            "status":"known", "state":"running", "raw_state_code":4
+        }))]);
+
+        let report = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
+        assert_eq!(report.status, StartupDiffStatus::Complete);
+        assert_eq!(report.counts.changed, 1);
+        assert_eq!(report.deltas[0].changed_fields, ["service_observation"]);
+    }
+
+    #[test]
+    fn windows_v7_preserves_unknown_service_state_codes_and_rejects_guesses() {
+        let mut snapshot = windows_v7();
+        snapshot["service_entries"] = json!([{
+            "service_name":"EditorService",
+            "display_name":"Editor Service",
+            "start_type":"SERVICE_AUTO_START",
+            "start_type_code":2,
+            "account":"LocalSystem",
+            "binary_path":"C:\\Tools\\editor.exe --service",
+            "startup_state":startup_state(),
+            "service_observation":{"status":"unknown","raw_state_code":4294967295_u64},
+            "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW","service_index":0}
+        }]);
+        validate(&snapshot, Kind::Windows).unwrap();
+        snapshot["service_entries"][0]["service_observation"] = json!({
+            "status":"known", "state":"running", "raw_state_code":0
+        });
+        assert!(validate(&snapshot, Kind::Windows).is_err());
+    }
+
+    #[test]
+    fn windows_v8_compares_observed_delayed_auto_start_and_ignores_unknown_values() {
+        let mut before = windows_v8();
+        let mut after = windows_v8();
+        let service = |delayed_auto_start: Value| {
+            json!({
+                "service_name":"EditorService",
+                "display_name":"Editor Service",
+                "start_type":"SERVICE_AUTO_START",
+                "start_type_code":2,
+                "account":"LocalSystem",
+                "binary_path":"C:\\Tools\\editor.exe --service",
+                "startup_state":startup_state(),
+                "service_observation":{"status":"known","state":"running","raw_state_code":4},
+                "delayed_auto_start":delayed_auto_start,
+                "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W","service_index":0}
+            })
+        };
+        before["service_entries"] = json!([service(json!({"status":"observed","value":false}))]);
+        after["service_entries"] = json!([service(json!({"status":"observed","value":true}))]);
+        validate(&before, Kind::Windows).unwrap();
+        validate(&after, Kind::Windows).unwrap();
+        let report = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
+        assert_eq!(report.counts.changed, 1);
+        assert_eq!(report.deltas[0].changed_fields, ["delayed_auto_start"]);
+
+        after["service_entries"][0]["delayed_auto_start"] = json!({
+            "status":"unknown","diagnostic_code":"service_delayed_auto_start_access_denied"
+        });
+        after["service_entries"][0]["service_observation"] =
+            before["service_entries"][0]["service_observation"].clone();
+        after["sources"][10]["status"] = json!("partial");
+        after["sources"][10]["diagnostics"] =
+            json!([{"code":"service_delayed_auto_start_access_denied"}]);
+        after["status"] = json!("partial");
+        let report = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
+        assert_eq!(report.status, StartupDiffStatus::Partial);
+        assert!(report.deltas.is_empty());
+    }
+
+    #[test]
+    fn mixed_windows_v7_v8_service_snapshots_do_not_compare_delayed_auto_start() {
+        let mut before = windows_v7();
+        let mut after = windows_v8();
+        let mut service = json!({
+            "service_name":"EditorService",
+            "display_name":"Editor Service",
+            "start_type":"SERVICE_AUTO_START",
+            "start_type_code":2,
+            "account":"LocalSystem",
+            "binary_path":"C:\\Tools\\editor.exe --service",
+            "startup_state":startup_state(),
+            "service_observation":{"status":"known","state":"running","raw_state_code":4},
+            "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW","service_index":0}
+        });
+        before["service_entries"] = json!([service.clone()]);
+        service["delayed_auto_start"] = json!({"status":"observed","value":true});
+        service["evidence"]["source"] =
+            json!("EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W");
+        after["service_entries"] = json!([service]);
+        validate(&before, Kind::Windows).unwrap();
+        validate(&after, Kind::Windows).unwrap();
+        let report = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
+        assert_eq!(report.status, StartupDiffStatus::Partial);
+        assert!(report.deltas.is_empty());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            *diagnostic == "delayed-auto-start configuration is not present on both snapshots"
+        }));
+    }
+
+    #[test]
+    fn windows_v9_compares_only_observed_dependency_and_load_order_group_configuration() {
+        let service = |dependencies: Value, group: Value| {
+            json!({
+                "service_name":"ExampleSvc",
+                "display_name":"Example service",
+                "start_type":"automatic",
+                "start_type_code":2,
+                "account":"LocalSystem",
+                "binary_path":"C:\\Example\\svc.exe",
+                "startup_state":startup_state(),
+                "service_observation":{"status":"known","state":"stopped","raw_state_code":1},
+                "delayed_auto_start":{"status":"observed","value":false},
+                "dependencies":dependencies,
+                "load_order_group":group,
+                "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W","service_index":0}
+            })
+        };
+        let mut before = windows_v9();
+        let mut after = windows_v9();
+        before["service_entries"] = json!([service(
+            json!({"status":"observed","entries":[{"kind":"service","name":"BaseSvc"}]}),
+            json!({"status":"observed","value":null})
+        )]);
+        after["service_entries"] = json!([service(
+            json!({"status":"observed","entries":[{"kind":"load_order_group","name":"CoreGroup"}]}),
+            json!({"status":"observed","value":"NetworkGroup"})
+        )]);
+        validate_service_dependencies(&before["service_entries"][0]["dependencies"]).unwrap();
+        validate_service_load_order_group(&before["service_entries"][0]["load_order_group"])
+            .unwrap();
+        validate_service_observation(&before["service_entries"][0]["service_observation"]).unwrap();
+        validate_delayed_auto_start(&before["service_entries"][0]["delayed_auto_start"]).unwrap();
+        validate_startup_state(&before["service_entries"][0]["startup_state"]).unwrap();
+        for field in [
+            "service_name",
+            "display_name",
+            "start_type",
+            "account",
+            "binary_path",
+        ] {
+            check_str(&before["service_entries"][0], field, 131072).unwrap();
+        }
+        startup_row_keys(
+            &before["service_entries"][0],
+            &[
+                "service_name",
+                "display_name",
+                "start_type",
+                "start_type_code",
+                "account",
+                "binary_path",
+                "evidence",
+                "service_observation",
+                "delayed_auto_start",
+                "dependencies",
+                "load_order_group",
+            ],
+            true,
+        )
+        .unwrap();
+        let service_evidence = &before["service_entries"][0]["evidence"];
+        keys(service_evidence, &["source", "service_index"]).unwrap();
+        check_str(service_evidence, "source", 256).unwrap();
+        assert_eq!(
+            text(service_evidence, "source").unwrap(),
+            "EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W"
+        );
+        assert_eq!(num(service_evidence, "service_index").unwrap(), 0);
+        let mut no_services = before.clone();
+        no_services["service_entries"] = json!([]);
+        validate(&parse(&bytes(&no_services)).unwrap(), Kind::Windows).unwrap();
+        validate(&parse(&bytes(&before)).unwrap(), Kind::Windows).unwrap();
+        validate(&parse(&bytes(&after)).unwrap(), Kind::Windows).unwrap();
+        let report = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
+        assert_eq!(report.status, StartupDiffStatus::Complete);
+        assert_eq!(report.deltas.len(), 1);
+        assert!(report.deltas[0].changed_fields.contains(&"dependencies"));
+        assert!(
+            report.deltas[0]
+                .changed_fields
+                .contains(&"load_order_group")
+        );
+    }
+
+    #[test]
+    fn windows_v9_unknown_and_mixed_schema_facts_suppress_service_presence_claims() {
+        let service = |dependency_status: Value| {
+            json!({
+                "service_name":"ExampleSvc",
+                "display_name":"Example service",
+                "start_type":"automatic",
+                "start_type_code":2,
+                "account":"LocalSystem",
+                "binary_path":"C:\\Example\\svc.exe",
+                "startup_state":startup_state(),
+                "service_observation":{"status":"known","state":"stopped","raw_state_code":1},
+                "delayed_auto_start":{"status":"observed","value":false},
+                "dependencies":dependency_status,
+                "load_order_group":{"status":"observed","value":null},
+                "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W","service_index":0}
+            })
+        };
+        let mut unknown_before = windows_v9();
+        let mut unknown_after = windows_v9();
+        unknown_before["service_entries"] = json!([service(json!({
+            "status":"unknown","diagnostic_code":"service_dependencies_response_invalid"
+        }))]);
+        unknown_after["service_entries"] = json!([]);
+        validate(&parse(&bytes(&unknown_before)).unwrap(), Kind::Windows).unwrap();
+        validate(&parse(&bytes(&unknown_after)).unwrap(), Kind::Windows).unwrap();
+        let unknown =
+            compare_startup_inventory_json(&bytes(&unknown_before), &bytes(&unknown_after))
+                .unwrap();
+        assert_eq!(unknown.status, StartupDiffStatus::Partial);
+        assert!(unknown.deltas.is_empty());
+        assert_eq!(
+            unknown
+                .counts
+                .unmatched_rows_suppressed_for_incomplete_source,
+            1
+        );
+
+        let mut v8 = windows_v8();
+        v8["service_entries"] = json!([{
+            "service_name":"ExampleSvc",
+            "display_name":"Example service",
+            "start_type":"automatic",
+            "start_type_code":2,
+            "account":"LocalSystem",
+            "binary_path":"C:\\Example\\svc.exe",
+            "startup_state":startup_state(),
+            "service_observation":{"status":"known","state":"stopped","raw_state_code":1},
+            "delayed_auto_start":{"status":"observed","value":false},
+            "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W","service_index":0}
+        }]);
+        let mixed = compare_startup_inventory_json(&bytes(&v8), &bytes(&unknown_after)).unwrap();
+        assert_eq!(mixed.status, StartupDiffStatus::Partial);
+        assert!(mixed.deltas.is_empty());
+        assert_eq!(
+            mixed.counts.unmatched_rows_suppressed_for_incomplete_source,
+            1
+        );
+    }
+
+    #[test]
+    fn windows_v9_rejects_invalid_dependency_kind_and_untrusted_group_marker() {
+        let mut invalid = windows_v9();
+        invalid["service_entries"] = json!([{
+            "service_name":"ExampleSvc",
+            "display_name":"Example service",
+            "start_type":"automatic",
+            "start_type_code":2,
+            "account":null,
+            "binary_path":null,
+            "startup_state":startup_state(),
+            "service_observation":{"status":"known","state":"stopped","raw_state_code":1},
+            "delayed_auto_start":{"status":"observed","value":false},
+            "dependencies":{"status":"observed","entries":[{"kind":"command","name":"<script>"}]},
+            "load_order_group":{"status":"observed","value":null},
+            "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W","service_index":0}
+        }]);
+        assert_eq!(
+            validate(&parse(&bytes(&invalid)).unwrap(), Kind::Windows),
+            Err(StartupDiffError::MalformedInput)
+        );
+        invalid["service_entries"][0]["dependencies"]["entries"][0]["kind"] = json!("service");
+        invalid["service_entries"][0]["dependencies"]["entries"][0]["name"] = json!("+Group");
+        assert_eq!(
+            validate(&parse(&bytes(&invalid)).unwrap(), Kind::Windows),
+            Err(StartupDiffError::MalformedInput)
+        );
+    }
+
+    #[test]
+    fn windows_v9_allows_historical_optional_wmi_absence_with_its_exact_scope() {
+        let mut value = windows_v9();
+        value["scope"] = json!(
+            "current_user_and_accessible_machine_run_keys_startup_folders_services_with_delayed_auto_start_dependencies_and_load_order_group_configuration_and_current_token_visible_tasks"
+        );
+        for field in [
+            "wmi_event_filters",
+            "wmi_event_consumers",
+            "wmi_filter_consumer_bindings",
+        ] {
+            value.as_object_mut().unwrap().remove(field);
+        }
+        value["sources"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|source| source["id"] != "wmi_permanent_event_subscriptions");
+        validate(&parse(&bytes(&value)).unwrap(), Kind::Windows).unwrap();
+    }
+
+    #[test]
+    fn mixed_v6_v7_service_snapshots_do_not_compare_missing_service_state() {
+        let mut before = windows_v6();
+        let mut after = windows_v7();
+        let common = json!({
+            "service_name":"EditorService",
+            "display_name":"Editor Service",
+            "start_type":"SERVICE_AUTO_START",
+            "start_type_code":2,
+            "account":"LocalSystem",
+            "binary_path":"C:\\Tools\\editor.exe --service",
+            "startup_state":startup_state(),
+            "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW","service_index":0}
+        });
+        before["service_entries"] = json!([common.clone()]);
+        let mut service = common;
+        service["service_observation"] = json!({
+            "status":"known", "state":"running", "raw_state_code":4
+        });
+        after["service_entries"] = json!([service]);
+        let report = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
+        assert_eq!(report.status, StartupDiffStatus::Partial);
+        assert!(report.deltas.is_empty());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            *diagnostic == "service-state observations are not present on both snapshots"
+        }));
+    }
+
+    fn current_filter_smoke(filter: Value) {
+        let mut value = windows_v6();
+        value["wmi_event_filters"] = json!([filter]);
+        value["sources"][12]["entries_seen"] = json!(1);
+        let encoded = serde_json::to_vec(&value).unwrap();
+        validate(&parse(&encoded).unwrap(), Kind::Windows).unwrap();
+        let report = compare_startup_inventory_json(&encoded, &encoded).unwrap();
+        assert!(report.deltas.is_empty());
+    }
+
+    #[test]
+    fn linux_v2_v3_mixed_rows_ignore_default_state_but_compare_source_facts() {
+        let mut old = linux();
+        let mut current = linux_v3();
+        let entry = |command: &str| {
+            json!({
+                "scope":"user",
+                "source_path":"/home/u/.config/autostart/editor.desktop",
+                "applicability":"not_evaluated",
+                "keys":[{"key":"Exec","value":command,"value_hex":null,"line":3,"byte_offset":24,"byte_length":command.len(),"line_sha256":"fixture-line-hash"}]
+            })
+        };
+        old["xdg_autostart"]["entries"] = json!([entry("editor --open")]);
+        let mut current_entry = entry("editor --open");
+        current_entry["startup_state"] = startup_state();
+        current["xdg_autostart"]["entries"] = json!([current_entry]);
+
+        let unchanged = compare_startup_inventory_json(&bytes(&old), &bytes(&current)).unwrap();
+        assert_eq!(unchanged.counts.changed, 0);
+        assert!(unchanged.deltas.is_empty());
+
+        current["xdg_autostart"]["entries"][0]["keys"][0]["value"] = json!("editor --safe-mode");
+        let changed = compare_startup_inventory_json(&bytes(&old), &bytes(&current)).unwrap();
+        assert_eq!(changed.counts.changed, 1);
+        assert_eq!(changed.deltas[0].changed_fields, ["selected_keys"]);
+    }
+
+    #[test]
+    fn windows_v4_v5_mixed_rows_ignore_default_state_but_compare_source_facts() {
+        let mut old = windows();
+        let mut current = windows_v5();
+        let service = |binary_path: &str| {
+            json!({
+                "service_name":"EditorService",
+                "display_name":"Editor Service",
+                "start_type":"SERVICE_AUTO_START",
+                "start_type_code":2,
+                "account":"LocalSystem",
+                "binary_path":binary_path,
+                "evidence":{"source":"EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW","service_index":0}
+            })
+        };
+        old["service_entries"] = json!([service("C:\\Tools\\editor.exe --service")]);
+        let mut current_service = service("C:\\Tools\\editor.exe --service");
+        current_service["startup_state"] = startup_state();
+        current["service_entries"] = json!([current_service]);
+
+        let unchanged = compare_startup_inventory_json(&bytes(&old), &bytes(&current)).unwrap();
+        assert_eq!(unchanged.counts.changed, 0);
+        assert!(unchanged.deltas.is_empty());
+
+        current["service_entries"][0]["binary_path"] = json!("C:\\Tools\\editor.exe --safe-mode");
+        let changed = compare_startup_inventory_json(&bytes(&old), &bytes(&current)).unwrap();
+        assert_eq!(changed.counts.changed, 1);
+        assert_eq!(changed.deltas[0].changed_fields, ["binary_path"]);
+    }
+
+    #[test]
+    fn startup_state_compares_meaning_while_retaining_evidence_metadata() {
+        let mut before = linux_v3();
+        let mut after = linux_v3();
+        let entry = json!({
+            "scope":"user",
+            "source_path":"/home/u/.config/autostart/editor.desktop",
+            "applicability":"not_evaluated",
+            "keys":[{"key":"Exec","value":"editor","value_hex":null,"line":3,"byte_offset":24,"byte_length":6,"line_sha256":"fixture-line-hash"}],
+            "startup_state": {
+                "schema_version":1,
+                "configured":"present",
+                "effective":{
+                    "status":"effective",
+                    "context":"user-session",
+                    "evidence":{"artifact_path":"context.json","artifact_schema":"sideeffect.context","artifact_schema_version":1,"record_locator":"/context/0"}
+                },
+                "observed":{
+                    "status":"observed",
+                    "capture_interval":{"started_at_unix_ms":10,"ended_at_unix_ms":20},
+                    "evidence":{"artifact_path":"runtime.json","artifact_schema":"sideeffect.runtime","artifact_schema_version":1,"record_locator":"/events/0"}
+                }
+            }
+        });
+        before["xdg_autostart"]["entries"] = json!([entry]);
+        after["xdg_autostart"]["entries"] = json!([entry]);
+        after["xdg_autostart"]["entries"][0]["startup_state"]["effective"]["evidence"]["artifact_path"] =
+            json!("context-after.json");
+        after["xdg_autostart"]["entries"][0]["startup_state"]["effective"]["evidence"]["record_locator"] =
+            json!("/context/1");
+        after["xdg_autostart"]["entries"][0]["startup_state"]["observed"]["capture_interval"] =
+            json!({"started_at_unix_ms":30,"ended_at_unix_ms":40});
+        after["xdg_autostart"]["entries"][0]["startup_state"]["observed"]["evidence"]["record_locator"] =
+            json!("/events/7");
+
+        let unchanged = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
+        assert_eq!(unchanged.counts.changed, 0);
+        assert!(unchanged.deltas.is_empty());
+
+        after["xdg_autostart"]["entries"][0]["startup_state"]["effective"]["status"] =
+            json!("not_effective");
+        let changed = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
+        assert_eq!(changed.counts.changed, 1);
+        assert_eq!(changed.deltas[0].changed_fields, ["startup_state"]);
+
+        after["xdg_autostart"]["entries"][0]["startup_state"]["effective"]["status"] =
+            json!("effective");
+        after["xdg_autostart"]["entries"][0]["startup_state"]["effective"]["context"] =
+            json!("system-session");
+        let changed = compare_startup_inventory_json(&bytes(&before), &bytes(&after)).unwrap();
+        assert_eq!(changed.counts.changed, 1);
+        assert_eq!(changed.deltas[0].changed_fields, ["startup_state"]);
+    }
+
     fn bytes(v: &Value) -> Vec<u8> {
         serde_json::to_vec(v).unwrap()
     }

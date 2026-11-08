@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Validate the development-only corpus and pre-recorded local-model responses.
+"""Validate the frozen development corpus and pre-recorded model outputs.
 
-This tool performs structural, digest, citation-ID, status, and explicitly
-human-supplied label checks. It does not judge whether model-authored claims
-are true or supported by cited evidence, and it never launches a model.
+Results v1 validates historical prose-response structure; results v2 validates
+the selector contract; results v3 adds blinded human-review annotations to
+selector runs. Structural checks never establish semantic correctness, and this
+tool never launches a model.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 import stat
 import sys
@@ -28,16 +30,25 @@ MAX_CORPUS_BYTES = 128 * 1024
 MAX_FIXTURE_BYTES = 64 * 1024
 MAX_CASES = 128
 MAX_RESULTS_BYTES = 16 * 1024 * 1024
+MAX_REVIEW_PACKET_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_CASE_ID_BYTES = 96
 MAX_QUESTION_BYTES = 2048
 MAX_STATEMENT_BYTES = 512
 MAX_STATEMENTS = 5
 MAX_EVIDENCE_IDS_PER_STATEMENT = 4
+MAX_SELECTED_EVIDENCE_IDS = 5
+MAX_RUN_MODEL_ID_BYTES = 128
+MAX_REVIEWERS_PER_CASE = 8
+MAX_REVIEWER_ID_BYTES = 64
+MAX_REVIEW_LABELS = 32
 STATUS_VALUES = {"answered", "partial", "abstained"}
+SELECTION_STATUS_VALUES = {"selected", "partial_selection", "abstained"}
 ABSTAIN_REASONS = {"ambiguous", "unsupported_scope", "insufficient_evidence"}
 STATEMENT_KINDS = {"observation", "interpretation", "uncertainty"}
 LABEL_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,95}$")
 EVIDENCE_ID_PATTERN = re.compile(r"^E[0-9]{3}$")
+REVIEWER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+ANSWERABILITY_VALUES = {"answerable", "unanswerable", "uncertain"}
 
 
 class ContractError(ValueError):
@@ -54,8 +65,10 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _decode_json(raw: bytes, label: str) -> Any:
+    def reject_constant(value: str) -> None:
+        raise ContractError(f"{label} contains invalid JSON constant {value}")
     try:
-        return json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object, parse_constant=reject_constant)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ContractError(f"{label} is not strict UTF-8 JSON: {error}") from error
 
@@ -65,10 +78,11 @@ def _require(condition: bool, message: str) -> None:
         raise ContractError(message)
 
 
-def _exact_keys(value: Any, required: set[str], label: str) -> dict[str, Any]:
+def _exact_keys(value: Any, required: set[str], label: str, optional_keys: set[str] | None = None) -> dict[str, Any]:
     _require(isinstance(value, dict), f"{label} must be an object")
     actual = set(value)
-    _require(actual == required, f"{label} keys must be exactly {sorted(required)}")
+    optional = optional_keys or set()
+    _require(required.issubset(actual) and actual.issubset(required | optional), f"{label} keys must contain {sorted(required)} and no unknown keys")
     return value
 
 
@@ -84,6 +98,131 @@ def _labels(value: Any, label: str) -> list[str]:
     _require(all(isinstance(item, str) and LABEL_PATTERN.fullmatch(item) for item in value), f"{label} contains an invalid label")
     _require(len(value) == len(set(value)), f"{label} contains duplicate labels")
     return value
+
+
+def _review_target_sha256(row: dict[str, Any], question: str, corpus_digest: str) -> str:
+    """Hash the exact bounded case context reviewers are asked to assess."""
+    target = {
+        "schema": "sideeffect.local_model_explain_review_target",
+        "schema_version": 1,
+        "corpus_sha256": corpus_digest,
+        "case_id": row["case_id"],
+        "question": question,
+        "preview_request_sha256": row["preview_request_sha256"],
+        "selector_response": row["response"],
+        "source_parse_status": row["source_parse_status"],
+        "available_evidence": row["available_evidence"],
+    }
+    canonical = json.dumps(
+        target,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _canonical_sha256(value: Any) -> str:
+    canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+_REVIEW_ONLY_RESULT_FIELDS = {
+    "human_reviews", "preview_request_sha256", "review_target_sha256",
+    "review_packet_sha256", "run_case_input_sha256",
+}
+_REVIEW_INPUT_PACKET_FIELDS = (
+    "schema", "schema_version", "corpus_sha256", "case_id", "question",
+    "preview_schema", "preview_schema_version", "deterministic_abstain_reason",
+    "system_prompt", "prompt", "output_schema", "evidence_summary", "response",
+)
+
+
+def _review_input_binding_sha256(run: dict[str, Any], row: dict[str, Any], packet: dict[str, Any]) -> str:
+    """Bind current identity-bearing results to the exact allowlisted review content."""
+    packet_content = {key: packet[key] for key in _REVIEW_INPUT_PACKET_FIELDS}
+    result_row = {key: value for key, value in row.items() if key not in _REVIEW_ONLY_RESULT_FIELDS}
+    return _canonical_sha256({
+        "schema": "sideeffect.local_model_explain_review_input_binding",
+        "schema_version": 2,
+        "run": run,
+        "case_id": row["case_id"],
+        "corpus_sha256": packet["corpus_sha256"],
+        "review_digests": {
+            "preview_request_sha256": row["preview_request_sha256"],
+            "review_target_sha256": row["review_target_sha256"],
+        },
+        "result_row": result_row,
+        "packet_content": packet_content,
+    })
+
+
+def _bounded_packet_paths(directory: Path) -> list[Path]:
+    try:
+        metadata = directory.lstat()
+    except OSError as error:
+        raise ContractError(f"cannot inspect review packet directory: {error}") from error
+    _require(stat.S_ISDIR(metadata.st_mode), "review packet path must be a directory, not a symlink")
+    paths: list[Path] = []
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                _require(len(paths) < MAX_CASES, "review packet directory exceeds the case limit")
+                _require(entry.name.endswith(".json") and entry.is_file(follow_symlinks=False),
+                         "review packet directory may contain only regular .json packet files")
+                paths.append(Path(entry.path))
+    except OSError as error:
+        raise ContractError(f"cannot read review packet directory: {error}") from error
+    return sorted(paths, key=lambda path: path.name)
+
+
+def _verify_review_packets(directory: Path, rows: list[dict[str, Any]], corpus: dict[str, Any], corpus_digest: str, run: dict[str, Any]) -> None:
+    reviewed = {row["case_id"]: row for row in rows if row["human_reviews"]}
+    packet_paths = _bounded_packet_paths(directory)
+    packets: dict[str, dict[str, Any]] = {}
+    total_packet_bytes = 0
+    for path in packet_paths:
+        raw = _read_regular_file(path, MAX_RESULTS_BYTES, "review packet")
+        total_packet_bytes += len(raw)
+        _require(total_packet_bytes <= MAX_REVIEW_PACKET_TOTAL_BYTES, "review packet directory exceeds the aggregate byte limit")
+        packet = _decode_json(raw, "review packet")
+        _require(isinstance(packet, dict), "review packet must be an object")
+        case_id = packet.get("case_id")
+        _require(isinstance(case_id, str), "review packet has no case_id")
+        _require(case_id not in packets, f"duplicate review packet for case {case_id}")
+        _require(case_id in reviewed, f"unknown or unreviewed case packet: {case_id}")
+        packets[case_id] = packet
+    _require(set(packets) == set(reviewed), "review packet directory is incomplete or contains unknown packets")
+    corpus_by_id = {case["id"]: case for case in corpus["cases"]}
+    packet_keys = {
+        "schema", "schema_version", "corpus_sha256", "case_id", "question", "preview_schema",
+        "preview_schema_version", "deterministic_abstain_reason", "system_prompt", "prompt",
+        "output_schema", "evidence_summary", "response", "preview_request_sha256",
+        "review_target_sha256", "run_case_input_sha256", "packet_sha256",
+    }
+    for case_id, row in reviewed.items():
+        packet = packets[case_id]
+        _require(set(packet) == packet_keys, f"review packet keys are incomplete or unknown for case {case_id}")
+        _require(packet["schema"] == "sideeffect.local_model_explain_blind_review_packet" and packet["schema_version"] == 2,
+                 f"unsupported review packet contract for case {case_id}")
+        claimed_packet_hash = packet["packet_sha256"]
+        unhashed_packet = dict(packet)
+        del unhashed_packet["packet_sha256"]
+        _require(isinstance(claimed_packet_hash, str) and re.fullmatch(r"[0-9a-f]{64}", claimed_packet_hash) is not None,
+                 f"invalid packet hash for case {case_id}")
+        _require(claimed_packet_hash == _canonical_sha256(unhashed_packet), f"review packet tampering detected for case {case_id}")
+        _require(packet["corpus_sha256"] == corpus_digest and packet["question"] == corpus_by_id[case_id]["question"],
+                 f"review packet corpus or question mismatch for case {case_id}")
+        _require(packet["preview_request_sha256"] == row["preview_request_sha256"], f"review packet preview mismatch for case {case_id}")
+        _require(packet["review_target_sha256"] == row["review_target_sha256"], f"review packet target mismatch for case {case_id}")
+        _require(packet["response"] == {"selection_status": row["response"]["selection_status"], "evidence_ids": row["response"]["evidence_ids"], "abstain_reason": packet["response"].get("abstain_reason")},
+                 f"review packet selector response mismatch for case {case_id}")
+        _require(packet["packet_sha256"] == row.get("review_packet_sha256") and packet["run_case_input_sha256"] == row.get("run_case_input_sha256"),
+                 f"review packet row binding mismatch for case {case_id}")
+        _require(packet["run_case_input_sha256"] == _review_input_binding_sha256(
+            run, row, packet
+        ), f"review packet input binding mismatch for case {case_id}")
 
 
 def _read_regular_file(path: Path, limit: int, label: str) -> bytes:
@@ -252,10 +391,9 @@ def validate_response(response: Any, allowed_ids: set[str], case_id: str) -> tup
     return response, cited
 
 
-def _validate_results(results_path: Path, corpus: dict[str, Any], corpus_digest: str) -> dict[str, Any]:
-    raw = _read_regular_file(results_path, MAX_RESULTS_BYTES, "pre-recorded results")
-    results = _decode_json(raw, "pre-recorded results")
-    _require(isinstance(results, dict), "results must be an object")
+def _validate_results_v1(
+    results: dict[str, Any], corpus: dict[str, Any], corpus_digest: str
+) -> dict[str, Any]:
     result_keys = set(results)
     _require(result_keys in (
         {"schema", "schema_version", "corpus_sha256", "cases"},
@@ -389,17 +527,540 @@ def _validate_results(results_path: Path, corpus: dict[str, Any], corpus_digest:
     }
 
 
+def _validate_results_v2(
+    results: dict[str, Any], corpus: dict[str, Any], corpus_digest: str
+) -> dict[str, Any]:
+    result_keys = set(results)
+    _require(result_keys in (
+        {"schema", "schema_version", "corpus_sha256", "run", "cases"},
+        {"schema", "schema_version", "corpus_sha256", "run", "cases", "errors"},
+    ), "results contain missing or unexpected keys")
+    _require(results["schema"] == "sideeffect.local_model_explain_development_results", "unsupported results schema")
+    _require(results["schema_version"] == 2, "unsupported results version")
+    _require(results["corpus_sha256"] == corpus_digest, "results corpus digest does not match the pinned development corpus")
+    run = _exact_keys(
+        results["run"],
+        {"model_id", "model_sha256", "runtime_source_revision", "backend_preference"},
+        "results.run",
+    )
+    run["model_id"] = _bounded_string(run["model_id"], "results.run.model_id", MAX_RUN_MODEL_ID_BYTES)
+    _require(
+        run["model_id"] not in {".", ".."} and not any(separator in run["model_id"] for separator in ("/", "\\", ":")),
+        "results.run.model_id must not contain a filesystem path",
+    )
+    _require(
+        isinstance(run["model_sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", run["model_sha256"]) is not None,
+        "results.run.model_sha256 must be 64 lowercase hexadecimal characters",
+    )
+    _require(
+        isinstance(run["runtime_source_revision"], str)
+        and re.fullmatch(r"[0-9a-f]{40}", run["runtime_source_revision"]) is not None,
+        "results.run.runtime_source_revision must be 40 lowercase hexadecimal characters",
+    )
+    _require(
+        isinstance(run["backend_preference"], str)
+        and run["backend_preference"] in {"auto", "cpu", "cuda"},
+        "results.run.backend_preference must be auto, cpu, or cuda",
+    )
+    rows = results["cases"]
+    errors = results.get("errors", [])
+    _require(isinstance(rows, list) and len(rows) <= len(corpus["cases"]), "results cases must be a bounded array")
+    _require(isinstance(errors, list) and len(errors) <= len(corpus["cases"]), "results errors must be a bounded array")
+
+    expected_cases = {case["id"]: case for case in corpus["cases"]}
+    seen: set[str] = set()
+    execution_errors: list[dict[str, str]] = []
+    report_rows: list[dict[str, Any]] = []
+    case_signatures: dict[str, tuple[str, str, list[str]]] = {}
+    latencies: list[int] = []
+    valid_count = 0
+    consistent_count = 0
+    selected_required_label_hits = 0
+    selectable_required_label_count = 0
+    unavailable_required_label_count = 0
+
+    for index, row in enumerate(errors):
+        row = _exact_keys(row, {"case_id", "phase", "error"}, f"results.errors[{index}]")
+        case_id = row["case_id"]
+        _require(isinstance(case_id, str) and case_id in expected_cases and case_id not in seen, f"unknown or duplicate error case ID: {case_id}")
+        _require(isinstance(row["phase"], str) and row["phase"] in {"preview", "analysis"}, f"invalid error phase in case {case_id}")
+        message = _bounded_string(row["error"], f"error for {case_id}", 1024)
+        seen.add(case_id)
+        execution_errors.append({"case_id": case_id, "phase": row["phase"], "error": message})
+
+    for index, row in enumerate(rows):
+        row = _exact_keys(
+            row,
+            {"case_id", "response", "source_parse_status", "backend_used", "available_evidence", "latency_ms"},
+            f"results.cases[{index}]",
+        )
+        case_id = row["case_id"]
+        _require(isinstance(case_id, str) and case_id in expected_cases and case_id not in seen, f"unknown or duplicate result case ID: {case_id}")
+        seen.add(case_id)
+        case = expected_cases[case_id]
+
+        source_parse_status = row["source_parse_status"]
+        _require(
+            isinstance(source_parse_status, str) and source_parse_status in {"complete", "partial"},
+            f"invalid source_parse_status in case {case_id}",
+        )
+        backend_used = row["backend_used"]
+        _require(
+            isinstance(backend_used, str) and backend_used in {"not_run", "cpu", "cuda"},
+            f"invalid backend_used in case {case_id}",
+        )
+        backend_preference = results["run"]["backend_preference"]
+        _require(
+            backend_preference == "auto"
+            or backend_used == "not_run"
+            or backend_preference == backend_used,
+            f"backend_used is inconsistent with run.backend_preference in case {case_id}",
+        )
+        response = _exact_keys(
+            row["response"],
+            {"selection_status", "evidence_ids"},
+            f"selector response for {case_id}",
+        )
+        selection_status = response["selection_status"]
+        _require(
+            isinstance(selection_status, str) and selection_status in SELECTION_STATUS_VALUES,
+            f"invalid selection_status in case {case_id}",
+        )
+        evidence_ids = response["evidence_ids"]
+        _require(
+            isinstance(evidence_ids, list) and len(evidence_ids) <= MAX_SELECTED_EVIDENCE_IDS,
+            f"invalid or oversized selected evidence ID array in case {case_id}",
+        )
+        _require(
+            all(isinstance(item, str) and EVIDENCE_ID_PATTERN.fullmatch(item) for item in evidence_ids),
+            f"invalid selected evidence ID in case {case_id}",
+        )
+        _require(len(evidence_ids) == len(set(evidence_ids)), f"duplicate selected evidence ID in case {case_id}")
+
+        evidence_rows = row["available_evidence"]
+        _require(isinstance(evidence_rows, list) and len(evidence_rows) <= 64, f"available evidence must remain bounded in case {case_id}")
+        evidence_labels: dict[str, list[str]] = {}
+        for evidence_index, evidence_row in enumerate(evidence_rows):
+            evidence_row = _exact_keys(evidence_row, {"evidence_id", "semantic_labels"}, f"available_evidence[{evidence_index}] in case {case_id}")
+            evidence_id = evidence_row["evidence_id"]
+            _require(isinstance(evidence_id, str) and EVIDENCE_ID_PATTERN.fullmatch(evidence_id), f"invalid available evidence ID in case {case_id}")
+            _require(evidence_id not in evidence_labels, f"duplicate available evidence ID in case {case_id}")
+            evidence_labels[evidence_id] = _labels(evidence_row["semantic_labels"], f"available evidence labels in case {case_id}")
+        _require(all(item in evidence_labels for item in evidence_ids), f"selection contains an evidence ID outside its syscall-result preview in case {case_id}")
+
+        expected_state = (
+            "abstained" if not evidence_ids else
+            "selected" if source_parse_status == "complete" else
+            "partial_selection"
+        )
+        state_consistent = selection_status == expected_state
+        _require(state_consistent, f"selection_status, evidence_ids, and source_parse_status disagree in case {case_id}")
+        _require(
+            backend_used != "not_run" or selection_status == "abstained",
+            f"not_run backend requires an empty abstention in case {case_id}",
+        )
+        valid_count += 1
+        consistent_count += int(state_consistent)
+
+        latency = row["latency_ms"]
+        _require(type(latency) is int and 0 <= latency <= 120_000, f"invalid latency in case {case_id}")
+        latencies.append(latency)
+        selected_labels = sorted({label for evidence_id in evidence_ids for label in evidence_labels[evidence_id]})
+        available_labels = {label for labels in evidence_labels.values() for label in labels}
+        required_labels = set(case["required_evidence_labels"])
+        selectable_required = required_labels & available_labels
+        unavailable_required = required_labels - available_labels
+        selected_required_hits = selectable_required & set(selected_labels)
+        selected_required_label_hits += len(selected_required_hits)
+        selectable_required_label_count += len(selectable_required)
+        unavailable_required_label_count += len(unavailable_required)
+        case_signatures[case_id] = (source_parse_status, selection_status, selected_labels)
+        report_rows.append({
+            "case_id": case_id,
+            "selection_output_contract_valid": True,
+            "selection_state_consistent_with_source_parse": state_consistent,
+            "selection_status": selection_status,
+            "backend_used": backend_used,
+            "selected_evidence_ids": evidence_ids,
+            "selected_evidence_labels": selected_labels,
+            "required_evidence_labels_available_to_selector": sorted(selectable_required),
+            "required_evidence_labels_unavailable_to_selector": sorted(unavailable_required),
+            "selected_required_evidence_label_recall_over_available_labels": (
+                len(selected_required_hits) / len(selectable_required) if selectable_required else None
+            ),
+            "latency_ms": latency,
+        })
+
+    _require(seen == set(expected_cases), "results omit one or more corpus cases")
+    sorted_latencies = sorted(latencies)
+    p95 = sorted_latencies[math.ceil(0.95 * len(sorted_latencies)) - 1] if sorted_latencies else None
+    permutation_rows = []
+    for group in corpus["permutation_groups"]:
+        signatures = [case_signatures.get(case_id) for case_id in group["case_ids"]]
+        consistent = all(signature is not None for signature in signatures) and len(set(map(repr, signatures))) == 1
+        permutation_rows.append({"group_id": group["id"], "selection_consistent": consistent})
+    return {
+        "schema": "sideeffect.local_model_explain_selector_diagnostic_report",
+        "schema_version": 2,
+        "evaluation_status": "development_only_not_a_release_gate",
+        "corpus_sha256": corpus_digest,
+        "run": run,
+        "cases": len(corpus["cases"]),
+        "selection_output_contract_valid_count": valid_count,
+        "execution_error_count": len(execution_errors),
+        "execution_errors": execution_errors,
+        "selection_state_consistency_count": consistent_count,
+        "selected_required_evidence_label_recall_over_available_labels": (
+            selected_required_label_hits / selectable_required_label_count
+            if selectable_required_label_count else None
+        ),
+        "selectable_required_evidence_label_count": selectable_required_label_count,
+        "required_evidence_label_unavailable_to_selector_count": unavailable_required_label_count,
+        "p95_supplied_case_latency_ms": p95,
+        "supplied_case_latency_count": len(latencies),
+        "p95_supplied_case_latency_scope": "cases_with_valid_selector_results_only",
+        "latency_ms_source": "supplied_in_results_not_independently_measured_by_validator",
+        "backend_used_source": "supplied_product_output_not_independently_verified_by_validator",
+        "cuda_offload_evidence_verified_automatically": False,
+        "permutation_group_count": len(permutation_rows),
+        "selection_consistent_permutation_group_count": sum(row["selection_consistent"] for row in permutation_rows),
+        "permutation_groups": permutation_rows,
+        "available_evidence_labels_verified_automatically": False,
+        "evidence_label_recall_is_diagnostic": True,
+        "selection_quality_verified_automatically": False,
+        "semantic_correctness_verified_automatically": False,
+        "report_rows": report_rows,
+    }
+
+
+def _validate_results_v3(
+    results: dict[str, Any], corpus: dict[str, Any], corpus_digest: str, review_packet_directory: Path | None = None
+) -> dict[str, Any]:
+    result_keys = set(results)
+    _require(result_keys in (
+        {"schema", "schema_version", "corpus_sha256", "run", "cases"},
+        {"schema", "schema_version", "corpus_sha256", "run", "cases", "errors"},
+    ), "results contain missing or unexpected keys")
+    _require(results["schema"] == "sideeffect.local_model_explain_development_results", "unsupported results schema")
+    _require(results["schema_version"] == 3, "unsupported results version")
+    _require(results["corpus_sha256"] == corpus_digest, "results corpus digest does not match the pinned development corpus")
+    rows = results["cases"]
+    _require(isinstance(rows, list) and len(rows) <= len(corpus["cases"]), "results cases must be a bounded array")
+    # Reuse the unchanged v2 selector validator. V3 adds annotations only; it
+    # must not alter the frozen corpus, selector criteria, or v2 report.
+    selector_results = dict(results)
+    selector_results["schema_version"] = 2
+    selector_results["cases"] = []
+    case_reviews: dict[str, dict[str, dict[str, Any]]] = {}
+    for index, row in enumerate(rows):
+        row = _exact_keys(
+            row,
+            {
+                "case_id", "review_target_sha256", "preview_request_sha256", "response",
+                "source_parse_status", "backend_used", "available_evidence", "latency_ms", "human_reviews",
+            },
+            f"results.cases[{index}]",
+            optional_keys={"review_packet_sha256", "run_case_input_sha256"},
+        )
+        _require(("review_packet_sha256" in row) == ("run_case_input_sha256" in row), "review packet bindings must be supplied together")
+        selector_results["cases"].append({
+            key: value for key, value in row.items()
+            if key not in {"human_reviews", "review_target_sha256", "preview_request_sha256", "review_packet_sha256", "run_case_input_sha256"}
+        })
+
+    # Validate all model-controlled selector fields before using their values
+    # in human-review validation or set operations.
+    report = _validate_results_v2(selector_results, corpus, corpus_digest)
+    if any(row["human_reviews"] for row in rows):
+        _require(review_packet_directory is not None, "reviewed results require --review-packets with the exact packet directory")
+        _verify_review_packets(review_packet_directory, rows, corpus, corpus_digest, results["run"])
+    elif review_packet_directory is not None:
+        _require(not _bounded_packet_paths(review_packet_directory), "review packet directory contains packets without annotations")
+    review_target_digests = {row["case_id"]: row["review_target_sha256"] for row in rows}
+    preview_request_digests = {row["case_id"]: row["preview_request_sha256"] for row in rows}
+    corpus_by_id = {case["id"]: case for case in corpus["cases"]}
+    for row in rows:
+        case_id = row["case_id"]
+        target_digest = row["review_target_sha256"]
+        _require(
+            isinstance(target_digest, str) and re.fullmatch(r"[0-9a-f]{64}", target_digest) is not None,
+            f"review_target_sha256 must be 64 lowercase hexadecimal characters in case {case_id}",
+        )
+        preview_digest = row["preview_request_sha256"]
+        _require(
+            isinstance(preview_digest, str) and re.fullmatch(r"[0-9a-f]{64}", preview_digest) is not None,
+            f"preview_request_sha256 must be 64 lowercase hexadecimal characters in case {case_id}",
+        )
+        expected_target_digest = _review_target_sha256(row, corpus_by_id[case_id]["question"], corpus_digest)
+        _require(target_digest == expected_target_digest, f"review target digest mismatch in case {case_id}")
+        reviews = row["human_reviews"]
+        _require(
+            isinstance(reviews, list) and len(reviews) <= MAX_REVIEWERS_PER_CASE,
+            f"human_reviews must be a bounded array in case {case_id}",
+        )
+        by_reviewer: dict[str, dict[str, Any]] = {}
+        if reviews:
+            _require("review_packet_sha256" in row, f"review annotations lack an immutable packet binding in case {case_id}")
+            for binding_name in ("review_packet_sha256", "run_case_input_sha256"):
+                binding = row[binding_name]
+                _require(isinstance(binding, str) and re.fullmatch(r"[0-9a-f]{64}", binding) is not None,
+                         f"{binding_name} must be 64 lowercase hexadecimal characters in case {case_id}")
+        selected_ids = row["response"].get("evidence_ids") if isinstance(row["response"], dict) else None
+        _require(isinstance(selected_ids, list), f"selector response is malformed in case {case_id}")
+        selected_set = set(selected_ids)
+        for review_index, review in enumerate(reviews):
+            label = f"human_reviews[{review_index}] in case {case_id}"
+            review = _exact_keys(
+                review,
+                {
+                    "reviewer_id", "review_target_sha256", "preview_request_sha256",
+                    "review_packet_sha256", "run_case_input_sha256",
+                    "blind_to_model_identity", "independence_attested",
+                    "answerability", "required_evidence_labels", "selected_evidence_judgments",
+                },
+                label,
+            )
+            reviewer_target_digest = review["review_target_sha256"]
+            _require(
+                isinstance(reviewer_target_digest, str)
+                and re.fullmatch(r"[0-9a-f]{64}", reviewer_target_digest) is not None,
+                f"review_target_sha256 must be 64 lowercase hexadecimal characters for reviewer in case {case_id}",
+            )
+            _require(
+                reviewer_target_digest == target_digest,
+                f"reviewer target digest mismatch in case {case_id}",
+            )
+            reviewer_preview_digest = review["preview_request_sha256"]
+            _require(
+                isinstance(reviewer_preview_digest, str)
+                and re.fullmatch(r"[0-9a-f]{64}", reviewer_preview_digest) is not None,
+                f"preview_request_sha256 must be 64 lowercase hexadecimal characters for reviewer in case {case_id}",
+            )
+            _require(
+                reviewer_preview_digest == preview_digest,
+                f"reviewer preview digest mismatch in case {case_id}",
+            )
+            for binding_name in ("review_packet_sha256", "run_case_input_sha256"):
+                _require(review[binding_name] == row[binding_name], f"reviewer {binding_name} mismatch in case {case_id}")
+            reviewer_id = _bounded_string(review["reviewer_id"], f"reviewer_id in case {case_id}", MAX_REVIEWER_ID_BYTES)
+            _require(REVIEWER_ID_PATTERN.fullmatch(reviewer_id) is not None, f"reviewer_id has an invalid format in case {case_id}")
+            _require(reviewer_id not in by_reviewer, f"duplicate reviewer_id in case {case_id}")
+            _require(type(review["blind_to_model_identity"]) is bool, f"blind_to_model_identity must be boolean in case {case_id}")
+            _require(type(review["independence_attested"]) is bool, f"independence_attested must be boolean in case {case_id}")
+            answerability = review["answerability"]
+            _require(
+                isinstance(answerability, str) and answerability in ANSWERABILITY_VALUES,
+                f"invalid human answerability in case {case_id}",
+            )
+            required_labels = _labels(review["required_evidence_labels"], f"human required labels in case {case_id}")
+            _require(len(required_labels) <= MAX_REVIEW_LABELS, f"too many human required labels in case {case_id}")
+            judgments = review["selected_evidence_judgments"]
+            _require(
+                isinstance(judgments, list) and len(judgments) <= MAX_SELECTED_EVIDENCE_IDS,
+                f"selected_evidence_judgments must be a bounded array in case {case_id}",
+            )
+            judged_ids: set[str] = set()
+            supported_labels: set[str] = set()
+            unsupported_inference_count = 0
+            for judgment_index, judgment in enumerate(judgments):
+                judgment = _exact_keys(
+                    judgment,
+                    {"evidence_id", "supported_required_evidence_labels", "unsupported_inference"},
+                    f"evidence judgment {judgment_index} in case {case_id}",
+                )
+                evidence_id = judgment["evidence_id"]
+                _require(
+                    isinstance(evidence_id, str) and EVIDENCE_ID_PATTERN.fullmatch(evidence_id) is not None,
+                    f"invalid reviewed evidence ID in case {case_id}",
+                )
+                _require(evidence_id in selected_set, f"human review references an unselected evidence ID in case {case_id}")
+                _require(evidence_id not in judged_ids, f"duplicate reviewed evidence ID in case {case_id}")
+                judged_ids.add(evidence_id)
+                supported = _labels(
+                    judgment["supported_required_evidence_labels"],
+                    f"reviewed supported labels in case {case_id}",
+                )
+                _require(
+                    set(supported).issubset(required_labels),
+                    f"reviewed supported labels must be required labels in case {case_id}",
+                )
+                supported_labels.update(supported)
+                _require(type(judgment["unsupported_inference"]) is bool, f"unsupported_inference must be boolean in case {case_id}")
+                unsupported_inference_count += int(judgment["unsupported_inference"])
+            _require(judged_ids == selected_set, f"human review must assess every selected evidence ID in case {case_id}")
+            by_reviewer[reviewer_id] = {
+                "reviewer_id": reviewer_id,
+                "blind_to_model_identity": review["blind_to_model_identity"],
+                "independence_attested": review["independence_attested"],
+                "answerability": answerability,
+                "selection_status": row["response"]["selection_status"],
+                "required_labels": set(required_labels),
+                "covered_labels": supported_labels,
+                "unsupported_inference_count": unsupported_inference_count,
+                "review_target_sha256": target_digest,
+                "preview_request_sha256": preview_digest,
+            }
+        case_reviews[case_id] = by_reviewer
+
+    reviewer_ids = sorted({reviewer_id for reviews in case_reviews.values() for reviewer_id in reviews})
+    reviewer_reports: list[dict[str, Any]] = []
+    complete_reviewers: list[str] = []
+    for reviewer_id in reviewer_ids:
+        review_rows = [reviews[reviewer_id] for reviews in case_reviews.values() if reviewer_id in reviews]
+        full_completion = (
+            len(review_rows) == len(corpus["cases"])
+            and all(review["blind_to_model_identity"] and review["independence_attested"] for review in review_rows)
+            and not report["execution_error_count"]
+        )
+        if full_completion:
+            complete_reviewers.append(reviewer_id)
+        required_count = sum(len(review["required_labels"]) for review in review_rows)
+        covered_count = sum(len(review["covered_labels"] & review["required_labels"]) for review in review_rows)
+        answerability_denominator = 0
+        answerability_agreement_count = 0
+        answerability_false_positive_count = 0
+        answerability_false_negative_count = 0
+        answerability_uncertain_count = 0
+        for review in review_rows:
+            if review["answerability"] == "uncertain":
+                answerability_uncertain_count += 1
+                continue
+            answerability_denominator += 1
+            selector_selected = review["selection_status"] != "abstained"
+            reviewer_answerable = review["answerability"] == "answerable"
+            answerability_agreement_count += int(selector_selected == reviewer_answerable)
+            answerability_false_positive_count += int(not reviewer_answerable and selector_selected)
+            answerability_false_negative_count += int(reviewer_answerable and not selector_selected)
+        pair_count = 0
+        exact_coverage = 0
+        jaccard_total = 0.0
+        answerability_agreement = 0
+        for reviews in case_reviews.values():
+            own = reviews.get(reviewer_id)
+            if own is None:
+                continue
+            for other_id, other in reviews.items():
+                if other_id == reviewer_id:
+                    continue
+                pair_count += 1
+                own_labels = own["required_labels"]
+                other_labels = other["required_labels"]
+                exact_coverage += int(own_labels == other_labels)
+                union = own_labels | other_labels
+                jaccard_total += (len(own_labels & other_labels) / len(union)) if union else 1.0
+                answerability_agreement += int(own["answerability"] == other["answerability"])
+        reviewer_reports.append({
+            "reviewer_id": reviewer_id,
+            "reviewed_case_count": len(review_rows),
+            "review_completion_status": (
+                "self_attested_full_completion_not_independently_verified"
+                if full_completion else
+                "self_attested_review_incomplete_or_unverified"
+            ),
+            "review_blinding_or_independence_verified_automatically": False,
+            "fully_completed_blinded_independent_review": full_completion,
+            "required_evidence_label_coverage": (covered_count / required_count) if required_count else None,
+            "covered_required_evidence_label_count": covered_count,
+            "required_evidence_label_count": required_count,
+            "selector_answerability_agreement_count": answerability_agreement_count,
+            "selector_answerability_denominator": answerability_denominator,
+            "selector_answerability_agreement_rate": (
+                answerability_agreement_count / answerability_denominator
+                if answerability_denominator else None
+            ),
+            "selector_answerability_false_positive_count": answerability_false_positive_count,
+            "selector_answerability_false_negative_count": answerability_false_negative_count,
+            "selector_answerability_uncertain_excluded_count": answerability_uncertain_count,
+            "peer_case_comparison_count": pair_count,
+            "peer_required_label_exact_agreement_rate": (exact_coverage / pair_count) if pair_count else None,
+            "peer_required_label_jaccard_mean": (jaccard_total / pair_count) if pair_count else None,
+            "peer_answerability_agreement_rate": (answerability_agreement / pair_count) if pair_count else None,
+            "unsupported_inference_count": sum(review["unsupported_inference_count"] for review in review_rows),
+        })
+
+    case_review_reports = []
+    for case in corpus["cases"]:
+        case_id = case["id"]
+        reviews = case_reviews.get(case_id, {})
+        pairs = [
+            (left, right)
+            for index, left_id in enumerate(sorted(reviews))
+            for right_id in sorted(reviews)[index + 1:]
+            for left, right in [(reviews[left_id], reviews[right_id])]
+        ]
+        case_review_reports.append({
+            "case_id": case_id,
+            "review_target_sha256": review_target_digests.get(case_id),
+            "preview_request_sha256": preview_request_digests.get(case_id),
+            "review_packet_sha256": next((row.get("review_packet_sha256") for row in rows if row.get("case_id") == case_id), None),
+            "run_case_input_sha256": next((row.get("run_case_input_sha256") for row in rows if row.get("case_id") == case_id), None),
+            "reviewer_count": len(reviews),
+            "answerability_agreement_rate": (
+                sum(left["answerability"] == right["answerability"] for left, right in pairs) / len(pairs)
+                if pairs else None
+            ),
+            "required_label_exact_agreement_rate": (
+                sum(left["required_labels"] == right["required_labels"] for left, right in pairs) / len(pairs)
+                if pairs else None
+            ),
+            "unsupported_inference_count": sum(review["unsupported_inference_count"] for review in reviews.values()),
+        })
+
+    report["schema"] = "sideeffect.local_model_explain_selector_human_review_report"
+    report["schema_version"] = 3
+    report["human_review_gate_status"] = (
+        "reviewer_threshold_met_self_attested"
+        if len(complete_reviewers) >= 2
+        else "not_independently_reviewed"
+    )
+    report["human_review_gate_status_scope"] = "reviewer_completion_only_not_independent_verification_or_model_quality"
+    report["human_review_status_is_self_attested_diagnostic_only"] = True
+    report["human_review_gate_reviewer_id_count"] = len(complete_reviewers)
+    report["self_attested_full_review_completion_reviewer_id_count"] = len(complete_reviewers)
+    report["human_review_identity_or_independence_verified_automatically"] = False
+    report["reviewer_identity_status"] = "UNVERIFIED"
+    report["reviewer_independence_status"] = "UNVERIFIED"
+    report["reviewer_blinding_status"] = "UNVERIFIED"
+    report["review_input_origin_status"] = "UNVERIFIED"
+    packet_validation_ran = any(row["human_reviews"] for row in rows)
+    report["packet_binding_consistency_verified_automatically"] = packet_validation_ran
+    report["packet_binding_validation_status"] = "VERIFIED_AGAINST_SUPPLIED_FILES" if packet_validation_ran else "UNVERIFIED_NO_REVIEW_PACKETS"
+    report["packet_hash_authenticates_origin"] = False
+    report["human_review_is_model_quality_gate"] = False
+    report["selector_answerability_agreement_is_diagnostic"] = True
+    report["selector_answerability_agreement_has_pass_threshold"] = False
+    report["human_reviewers"] = reviewer_reports
+    report["human_review_cases"] = case_review_reports
+    report["semantic_truth_inferred_from_selector_structure"] = False
+    return report
+
+
+def _validate_results(results_path: Path, corpus: dict[str, Any], corpus_digest: str, review_packet_directory: Path | None = None) -> dict[str, Any]:
+    raw = _read_regular_file(results_path, MAX_RESULTS_BYTES, "pre-recorded results")
+    results = _decode_json(raw, "pre-recorded results")
+    _require(isinstance(results, dict), "results must be an object")
+    version = results.get("schema_version")
+    if version == 1:
+        return _validate_results_v1(results, corpus, corpus_digest)
+    if version == 2:
+        return _validate_results_v2(results, corpus, corpus_digest)
+    if version == 3:
+        return _validate_results_v3(results, corpus, corpus_digest, review_packet_directory)
+    raise ContractError("unsupported results version")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check-corpus", action="store_true", help="validate corpus schema, limits, permutation fixtures, and pinned digests")
     parser.add_argument("--results", type=Path, help="structurally inspect a pre-recorded response set; never runs inference")
+    parser.add_argument("--review-packets", type=Path, help="directory containing the exact allowlisted packet JSON files for every annotated v3 case")
     args = parser.parse_args()
     if not args.check_corpus and args.results is None:
         parser.error("select --check-corpus and/or provide --results")
     try:
         corpus, digest = load_corpus()
         if args.results is not None:
-            report = _validate_results(args.results, corpus, digest)
+            report = _validate_results(args.results, corpus, digest, args.review_packets)
             print(json.dumps(report, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
         else:
             print(json.dumps({

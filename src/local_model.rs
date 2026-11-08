@@ -870,6 +870,18 @@ pub(crate) fn copy_verified_model(
 ) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
 
+    if limit == 0 || expected_sha256.len() != 64 {
+        return Err(
+            "verified model copy requires a positive limit and a SHA-256 digest".to_owned(),
+        );
+    }
+    if !expected_sha256
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("verified model copy requires a lowercase SHA-256 digest".to_owned());
+    }
+
     let file = std::fs::File::open(source)
         .map_err(|error| format!("could not open selected model file: {error}"))?;
     if file
@@ -889,39 +901,49 @@ pub(crate) fn copy_verified_model(
         .mode(0o600)
         .open(destination)
         .map_err(|error| format!("could not stage verified local model: {error}"))?;
-    let mut hasher = Sha256::new();
-    let mut copied = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|error| format!("could not hash selected model file: {error}"))?;
-        if read == 0 {
-            break;
+    let result = (|| {
+        let mut hasher = Sha256::new();
+        let mut copied = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .map_err(|error| format!("could not hash selected model file: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            copied = copied.saturating_add(read as u64);
+            if copied > limit {
+                return Err(format!(
+                    "selected model file exceeds the {limit} byte limit"
+                ));
+            }
+            hasher.update(&buffer[..read]);
+            output
+                .write_all(&buffer[..read])
+                .map_err(|error| format!("could not stage verified local model: {error}"))?;
         }
-        copied = copied.saturating_add(read as u64);
-        if copied > limit {
+        let digest = hasher.finalize();
+        let mut text = String::with_capacity(64);
+        for byte in digest {
+            use std::fmt::Write as _;
+            let _ = write!(text, "{byte:02x}");
+        }
+        if text != expected_sha256 {
             return Err(format!(
-                "selected model file exceeds the {limit} byte limit"
+                "the selected model hash does not match the reviewed model ({expected_sha256})"
             ));
         }
-        hasher.update(&buffer[..read]);
         output
-            .write_all(&buffer[..read])
-            .map_err(|error| format!("could not stage verified local model: {error}"))?;
+            .sync_all()
+            .map_err(|error| format!("could not flush verified local model: {error}"))?;
+        Ok(())
+    })();
+    drop(output);
+    if result.is_err() {
+        let _ = std::fs::remove_file(destination);
     }
-    let digest = hasher.finalize();
-    let mut text = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(text, "{byte:02x}");
-    }
-    if text != expected_sha256 {
-        return Err(format!(
-            "the selected model hash does not match the reviewed model ({expected_sha256})"
-        ));
-    }
-    Ok(())
+    result
 }
 
 #[cfg(test)]
@@ -1156,5 +1178,20 @@ mod tests {
             std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_model_copy_rejects_changed_bytes_and_removes_partial_stage() {
+        use crate::local_model_runtime::{TempDirectory, create_private_temp_dir};
+
+        let directory = create_private_temp_dir().unwrap();
+        let _guard = TempDirectory(directory.clone());
+        let source = directory.join("source.gguf");
+        let staged = directory.join("staged.gguf");
+        std::fs::write(&source, b"changed model bytes").unwrap();
+
+        assert!(copy_verified_model(&source, &staged, &"0".repeat(64), 1024).is_err());
+        assert!(!staged.exists());
     }
 }

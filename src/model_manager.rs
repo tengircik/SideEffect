@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const REGISTRY_SCHEMA: &str = "sideeffect.local_model_registry";
-pub const REGISTRY_SCHEMA_VERSION: u32 = 1;
+pub const REGISTRY_SCHEMA_VERSION: u32 = 2;
 pub const MAX_REGISTRY_BYTES: usize = 64 * 1024;
 pub const MAX_REGISTERED_MODELS: usize = 32;
 pub const MAX_MODEL_NAME_BYTES: usize = 128;
@@ -22,6 +22,8 @@ pub const MAX_MODEL_PATH_BYTES: usize = 32 * 1024;
 /// The largest model file currently supported by any one local analysis path.
 /// Task-specific limits are enforced below before registration and use.
 pub const MAX_MODEL_FILE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+/// Bound work spent verifying a user-selected executable before an analysis.
+pub const MAX_RUNTIME_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 
 pub fn model_file_size_limit(task: ModelTask) -> u64 {
     max_bytes_for_task(task)
@@ -64,8 +66,8 @@ pub struct CatalogModel {
     pub evaluation_document: &'static str,
 }
 
-/// Pinned local candidates documented in the repository. Every current entry
-/// failed a task-specific quality check and is never marked recommended.
+/// Pinned local candidates documented in the repository. Catalog provenance
+/// is separate from quality; no candidate is recommended or approved.
 pub const CATALOG: &[CatalogModel] = &[
     CatalogModel {
         id: "evidence-qwen2.5-0.5b-q4-0",
@@ -81,6 +83,21 @@ pub const CATALOG: &[CatalogModel] = &[
         evaluation: EvaluationStatus::FailedFrozenGate,
         evaluation_note: "Scored 9/39 answerable selections and false-selected all 12 unanswerable cases; not recommended.",
         evaluation_document: "docs/LOCAL_MODEL_EVALUATION.md",
+    },
+    CatalogModel {
+        id: "explanation-qwen3.5-0.8b-q4-0",
+        name: "Qwen3.5 0.8B Q4_0 (experimental; not evaluated)",
+        task: ModelTask::Explanation,
+        repository: "ggml-org/Qwen3.5-0.8B-GGUF",
+        revision: "9447f74101aeb4e93621884dfa36ee8effb8831b",
+        filename: "Qwen3.5-0.8B-Q4_0.gguf",
+        size_bytes: 563_036_064,
+        sha256: "57d1997790d1744fba5b40a7317df71ea5e2acee28c47e78f0cce39c0703f8cf",
+        license_id: "Apache-2.0",
+        license_url: "https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/95ab6d408b035a1ca532ca6ec09f21071fbf4b22/LICENSE",
+        evaluation: EvaluationStatus::NotAssessed,
+        evaluation_note: "Not evaluated; experimental and unqualified. No recommendation or approval.",
+        evaluation_document: "docs/LOCAL_MODEL_EXPLANATION_EVALUATION.md",
     },
     CatalogModel {
         id: "explanation-qwen3.5-4b-q4-k-m",
@@ -161,6 +178,14 @@ pub struct RegisteredModel {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ConfiguredRuntime {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelRegistry {
     pub schema: String,
     pub schema_version: u32,
@@ -168,6 +193,20 @@ pub struct ModelRegistry {
     pub accepted_licenses: Vec<AcceptedModelLicense>,
     pub custom_models: Vec<RegisteredModel>,
     pub selected_by_task: BTreeMap<ModelTask, String>,
+    /// User-selected existing local llama.cpp executable paths. These paths
+    /// are configuration only; setting or displaying them never executes a runtime.
+    pub runtime_by_task: BTreeMap<ModelTask, ConfiguredRuntime>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelRegistryV1 {
+    schema: String,
+    schema_version: u32,
+    #[serde(default)]
+    accepted_licenses: Vec<AcceptedModelLicense>,
+    custom_models: Vec<RegisteredModel>,
+    selected_by_task: BTreeMap<ModelTask, String>,
 }
 
 /// Holds the cross-process exclusive lock for one registry read-modify-write
@@ -233,6 +272,7 @@ impl Default for ModelRegistry {
             accepted_licenses: Vec::new(),
             custom_models: Vec::new(),
             selected_by_task: BTreeMap::new(),
+            runtime_by_task: BTreeMap::new(),
         }
     }
 }
@@ -266,8 +306,40 @@ impl ModelRegistry {
         if bytes.len() > MAX_REGISTRY_BYTES {
             return Err(format!("model registry exceeds {MAX_REGISTRY_BYTES} bytes"));
         }
-        let registry: Self = serde_json::from_slice(bytes)
+        let header: serde_json::Value = serde_json::from_slice(bytes)
             .map_err(|error| format!("could not parse model registry: {error}"))?;
+        let schema = header
+            .get("schema")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "model registry schema is missing or invalid".to_owned())?;
+        if schema != REGISTRY_SCHEMA {
+            return Err("model registry schema or version is unsupported".to_owned());
+        }
+        let version = header
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| "model registry schema version is missing or invalid".to_owned())?;
+        let registry = match version {
+            1 => {
+                let old: ModelRegistryV1 = serde_json::from_slice(bytes)
+                    .map_err(|error| format!("could not parse model registry v1: {error}"))?;
+                if old.schema != REGISTRY_SCHEMA || old.schema_version != 1 {
+                    return Err("model registry schema or version is unsupported".to_owned());
+                }
+                Self {
+                    schema: old.schema,
+                    schema_version: REGISTRY_SCHEMA_VERSION,
+                    accepted_licenses: old.accepted_licenses,
+                    custom_models: old.custom_models,
+                    selected_by_task: old.selected_by_task,
+                    runtime_by_task: BTreeMap::new(),
+                }
+            }
+            REGISTRY_SCHEMA_VERSION => serde_json::from_slice(bytes)
+                .map_err(|error| format!("could not parse model registry v2: {error}"))?,
+            _ => return Err("model registry schema or version is unsupported".to_owned()),
+        };
         registry.validate()?;
         Ok(registry)
     }
@@ -317,8 +389,33 @@ impl ModelRegistry {
             }
         }
         for (task, id) in &self.selected_by_task {
-            if id.len() > 96 || !is_safe_id(id) || !model_supports(task, id, &self.custom_models) {
+            // Custom IDs use the generated `custom-<hex>` grammar. Catalog
+            // IDs are compile-time allowlisted strings and may have a model
+            // version dot; they are compared exactly and never treated as paths.
+            let is_catalog_id = catalog_model(id).is_some();
+            if id.len() > 96
+                || (!is_safe_id(id) && !is_catalog_id)
+                || !model_supports(task, id, &self.custom_models)
+            {
                 return Err("selected model ID is invalid or unsupported for its task".to_owned());
+            }
+        }
+        if self.runtime_by_task.len() > 3 {
+            return Err("model registry contains too many runtime paths".to_owned());
+        }
+        for runtime in self.runtime_by_task.values() {
+            if !runtime.path.is_absolute()
+                || runtime.path.as_os_str().is_empty()
+                || runtime.path.to_string_lossy().len() > MAX_MODEL_PATH_BYTES
+                || runtime.size_bytes == 0
+                || runtime.size_bytes > MAX_RUNTIME_FILE_BYTES
+                || runtime.sha256.len() != 64
+                || !runtime.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(
+                    "configured runtime metadata is invalid or exceeds a configured limit"
+                        .to_owned(),
+                );
             }
         }
         Ok(())
@@ -436,6 +533,45 @@ impl ModelRegistry {
         self.resolve(id, task)
     }
 
+    /// Resolve the registered identity for a preview or analysis request
+    /// without rereading a potentially multi-gigabyte model. Runtime callers
+    /// must still verify the staged bytes against this recorded digest before
+    /// executing the model. `selected` remains available for diagnostics that
+    /// need to verify the source file immediately.
+    pub fn selected_identity(&self, task: ModelTask) -> Result<ResolvedModel, String> {
+        let id = self
+            .selected_by_task
+            .get(&task)
+            .ok_or_else(|| "no model is selected for this task".to_owned())?;
+        self.resolve_identity(id, task)
+    }
+
+    pub fn set_runtime(
+        &mut self,
+        task: ModelTask,
+        path: &Path,
+    ) -> Result<ConfiguredRuntime, String> {
+        if path.as_os_str().is_empty() || path.to_string_lossy().len() > MAX_MODEL_PATH_BYTES {
+            return Err("runtime path is empty or exceeds the path length limit".to_owned());
+        }
+        let resolved = path
+            .canonicalize()
+            .map_err(|_| "runtime path does not identify an existing local file".to_owned())?;
+        if resolved.to_str().is_none() {
+            return Err(
+                "runtime path must be representable as UTF-8 in the model registry".to_owned(),
+            );
+        }
+        let runtime = inspect_runtime_file(&resolved)?;
+        self.runtime_by_task.insert(task, runtime.clone());
+        self.validate()?;
+        Ok(runtime)
+    }
+
+    pub fn clear_runtime(&mut self, task: ModelTask) -> Result<bool, String> {
+        Ok(self.runtime_by_task.remove(&task).is_some())
+    }
+
     pub fn resolve(&self, id: &str, task: ModelTask) -> Result<ResolvedModel, String> {
         if let Some(catalog) = catalog_model(id) {
             if catalog.task != task {
@@ -486,6 +622,146 @@ impl ModelRegistry {
             recommended: false,
         })
     }
+
+    fn resolve_identity(&self, id: &str, task: ModelTask) -> Result<ResolvedModel, String> {
+        if let Some(catalog) = catalog_model(id) {
+            if catalog.task != task {
+                return Err("catalog model is not registered for this task".to_owned());
+            }
+            let path = model_store_directory()?
+                .join("models")
+                .join(catalog.filename);
+            return Ok(ResolvedModel {
+                id: catalog.id.to_owned(),
+                name: catalog.name.to_owned(),
+                path,
+                size_bytes: catalog.size_bytes,
+                sha256: catalog.sha256.to_owned(),
+                source: ModelSource::Catalog {
+                    repository: catalog.repository.to_owned(),
+                    revision: catalog.revision.to_owned(),
+                    filename: catalog.filename.to_owned(),
+                },
+                license_id: Some(catalog.license_id.to_owned()),
+                evaluation: catalog.evaluation,
+                recommended: false,
+            });
+        }
+
+        let model = self
+            .custom_models
+            .iter()
+            .find(|model| model.id == id)
+            .ok_or_else(|| "model ID is not known".to_owned())?;
+        if !model.tasks.contains(&task) {
+            return Err("custom model is not registered for this task".to_owned());
+        }
+        Ok(ResolvedModel {
+            id: model.id.clone(),
+            name: model.name.clone(),
+            path: model.path.clone(),
+            size_bytes: model.size_bytes,
+            sha256: model.sha256.clone(),
+            source: ModelSource::UserProvided,
+            license_id: model.license_id.clone(),
+            evaluation: EvaluationStatus::NotAssessed,
+            recommended: false,
+        })
+    }
+}
+
+/// Re-hash a configured runtime without executing it. This detects replacement
+/// or modification since configuration; callers still must treat the runtime
+/// and its dependencies as executable code.
+pub fn verify_configured_runtime(runtime: &ConfiguredRuntime) -> Result<(), String> {
+    let current = inspect_runtime_file(&runtime.path)?;
+    if current != *runtime {
+        return Err(
+            "configured runtime file changed since it was saved; configure it again".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn inspect_runtime_file(path: &Path) -> Result<ConfiguredRuntime, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| "runtime path does not identify an existing local file".to_owned())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("runtime path must identify a plain regular file".to_owned());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("runtime path must not be a Windows reparse point".to_owned());
+        }
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_RUNTIME_FILE_BYTES {
+        return Err("runtime file is empty or exceeds the configured size limit".to_owned());
+    }
+    let canonical = fs::canonicalize(path)
+        .map_err(|_| "runtime path does not identify an existing local file".to_owned())?;
+    if canonical.as_os_str().to_string_lossy().len() > MAX_MODEL_PATH_BYTES {
+        return Err("runtime path exceeds its maximum length".to_owned());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options
+        .open(&canonical)
+        .map_err(|_| "could not open runtime file for verification".to_owned())?;
+    let opened = file
+        .metadata()
+        .map_err(|_| "could not inspect runtime file for verification".to_owned())?;
+    if !opened.is_file() || opened.len() != metadata.len() || opened.len() > MAX_RUNTIME_FILE_BYTES
+    {
+        return Err(
+            "runtime file changed or exceeded its size limit during verification".to_owned(),
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("runtime path resolves to a reparse point".to_owned());
+        }
+    }
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| "could not read runtime file for verification".to_owned())?;
+        if count == 0 {
+            break;
+        }
+        total = total
+            .checked_add(count as u64)
+            .filter(|size| *size <= MAX_RUNTIME_FILE_BYTES)
+            .ok_or_else(|| "runtime file exceeded its size limit during verification".to_owned())?;
+        hasher.update(&buffer[..count]);
+    }
+    if total != opened.len() {
+        return Err("runtime file changed while it was being verified".to_owned());
+    }
+    Ok(ConfiguredRuntime {
+        path: canonical,
+        size_bytes: total,
+        sha256: format!("{:x}", hasher.finalize()),
+    })
 }
 
 pub fn catalog_model(id: &str) -> Option<&'static CatalogModel> {
@@ -1388,6 +1664,92 @@ fn publish_registry(staged: &Path, destination: &Path) -> std::io::Result<()> {
         Err(std::io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod selected_model_identity_tests {
+    use super::{ModelRegistry, ModelTask};
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDirectory(PathBuf);
+
+    impl TempDirectory {
+        fn new() -> Self {
+            loop {
+                let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "sideeffect-model-identity-{}-{id}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("could not create temporary model directory: {error}"),
+                }
+            }
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn selected_identity_uses_recorded_digest_but_verified_selection_detects_changes() {
+        let directory = TempDirectory::new();
+        let model_path = directory.0.join("fixture.gguf");
+        let original = b"GGUF\x03\0\0\0fixture-original";
+        let changed = b"GGUF\x03\0\0\0fixture-modified";
+        assert_eq!(original.len(), changed.len());
+        fs::write(&model_path, original).unwrap();
+
+        let mut registry = ModelRegistry::default();
+        let id = registry
+            .register_custom(
+                "Synthetic fixture",
+                &model_path,
+                None,
+                vec![ModelTask::Explanation],
+            )
+            .unwrap();
+        registry.select(ModelTask::Explanation, &id).unwrap();
+        fs::write(&model_path, changed).unwrap();
+
+        let identity = registry.selected_identity(ModelTask::Explanation).unwrap();
+        assert_eq!(identity.sha256, format!("{:x}", Sha256::digest(original)));
+        assert_eq!(identity.size_bytes, original.len() as u64);
+        assert!(
+            registry
+                .selected(ModelTask::Explanation)
+                .unwrap_err()
+                .contains("changed since it was added")
+        );
+    }
+
+    #[test]
+    fn dotted_catalog_id_can_be_selected_and_round_tripped_for_its_declared_task() {
+        let id = "explanation-qwen3.5-0.8b-q4-0";
+        let mut registry = ModelRegistry::default();
+        registry.select(ModelTask::Explanation, id).unwrap();
+
+        let encoded = registry.to_json().unwrap();
+        let restored = ModelRegistry::from_json(&encoded).unwrap();
+        assert_eq!(
+            restored
+                .selected_by_task
+                .get(&ModelTask::Explanation)
+                .map(String::as_str),
+            Some(id)
+        );
+        assert!(registry.select(ModelTask::QueryPlan, id).is_err());
     }
 }
 

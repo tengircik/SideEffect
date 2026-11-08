@@ -145,7 +145,7 @@ fn audit_cli_publishes_private_session_with_verified_source_intervals_and_hashes
         if format == "json" {
             let review: serde_json::Value = serde_json::from_slice(&reviewed.stdout).unwrap();
             assert_eq!(review["schema"], "sideeffect.audit_session_review");
-            assert_eq!(review["schema_version"], 6);
+            assert_eq!(review["schema_version"], 7);
             assert!(review["sources"][0]["collector"]["id"].is_string());
             assert_eq!(review["host_context"]["os_name"]["status"], "observed");
             assert!(review["host_context"]["privilege"].is_string());
@@ -189,6 +189,372 @@ fn audit_cli_publishes_private_session_with_verified_source_intervals_and_hashes
     assert!(
         String::from_utf8_lossy(&rejected.stderr).contains("audit session verification failed")
     );
+}
+
+#[test]
+fn audit_sessions_capture_and_compare_one_selected_root_with_verified_evidence() {
+    let directory = TestDirectory::new();
+    let selected_root = directory.0.join("selected-root");
+    fs::create_dir(&selected_root).unwrap();
+    fs::write(selected_root.join("before.txt"), b"fixture").unwrap();
+    let before = directory.0.join("before.session");
+    let first = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["audit", "--output"])
+        .arg(&before)
+        .arg("--root")
+        .arg(&selected_root)
+        .output()
+        .unwrap();
+    assert!(
+        matches!(first.status.code(), Some(0 | 2)),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let before_manifest = parse_manifest(&fs::read(before.join("session.json")).unwrap()).unwrap();
+    assert_eq!(before_manifest.schema_version, 9);
+    let root_source = before_manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::SelectedRoot)
+        .unwrap();
+    assert_eq!(root_source.artifacts[0].path, "root-snapshot.json");
+    let before_snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(before.join("root-snapshot.json")).unwrap()).unwrap();
+    assert_eq!(before_snapshot["schema_version"], 1);
+    assert!(before_snapshot["content_hashing"].is_null());
+    assert_eq!(before_snapshot["entries"].as_array().unwrap().len(), 1);
+    assert!(
+        before_snapshot["root"]["display_path"]
+            .as_str()
+            .unwrap()
+            .contains("selected-root")
+    );
+    let review = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("inspect")
+        .arg("--format")
+        .arg("json")
+        .arg("--session")
+        .arg(&before)
+        .output()
+        .unwrap();
+    assert!(matches!(review.status.code(), Some(0 | 2)));
+    let review: serde_json::Value = serde_json::from_slice(&review.stdout).unwrap();
+    assert_eq!(review["schema"], "sideeffect.audit_session_review");
+    assert_eq!(review["schema_version"], 7);
+    assert!(
+        review["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["role"] == "selected_root")
+    );
+
+    fs::write(selected_root.join("after.txt"), b"second fixture").unwrap();
+    let after = directory.0.join("after.session");
+    let second = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["audit", "--output"])
+        .arg(&after)
+        .arg("--root")
+        .arg(&selected_root)
+        .output()
+        .unwrap();
+    assert!(
+        matches!(second.status.code(), Some(0 | 2)),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let comparison = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("compare-sessions")
+        .arg(&before)
+        .arg(&after)
+        .output()
+        .unwrap();
+    assert!(
+        comparison.status.success(),
+        "{}",
+        String::from_utf8_lossy(&comparison.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&comparison.stdout).unwrap();
+    assert_eq!(
+        report["scope"],
+        "metadata_and_item_level_inventory_runtime_and_selected_root_metadata"
+    );
+    let root_diff = report["source_diffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["role"] == "selected_root")
+        .unwrap();
+    let after_snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(after.join("root-snapshot.json")).unwrap()).unwrap();
+    let after_ordinal = after_snapshot["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["display_name"] == "after.txt")
+        .unwrap()["ordinal"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(root_diff["status"], "compared");
+    assert_eq!(root_diff["comparison"]["counts"]["additions"], 1);
+    assert_eq!(
+        root_diff["comparison"]["deltas"][0]["after"]["entry_ordinal"],
+        after_ordinal
+    );
+
+    let duplicate = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["audit", "--output"])
+        .arg(directory.0.join("duplicate.session"))
+        .arg("--root")
+        .arg(&selected_root)
+        .arg("--root")
+        .arg(&selected_root)
+        .output()
+        .unwrap();
+    assert_eq!(duplicate.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("exactly one --root"));
+}
+
+#[test]
+fn audit_sessions_opt_in_to_root_hashes_and_compare_content_with_verified_evidence() {
+    let directory = TestDirectory::new();
+    let selected_root = directory.0.join("selected-root-hashes");
+    fs::create_dir(&selected_root).unwrap();
+    let file = selected_root.join("payload.bin");
+    fs::write(&file, b"before").unwrap();
+    let before = directory.0.join("before-hashed.session");
+    let first = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["audit", "--output"])
+        .arg(&before)
+        .arg("--root")
+        .arg(&selected_root)
+        .arg("--hash-regular-files")
+        .output()
+        .unwrap();
+    assert!(
+        matches!(first.status.code(), Some(0 | 2)),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let before_manifest = parse_manifest(&fs::read(before.join("session.json")).unwrap()).unwrap();
+    assert_eq!(before_manifest.schema_version, 9);
+    let before_root = before_manifest
+        .sources
+        .iter()
+        .find(|s| s.role == SourceRole::SelectedRoot)
+        .unwrap();
+    assert_eq!(before_root.requested_settings[0].code, "hash_regular_files");
+    let before_snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(before.join("root-snapshot.json")).unwrap()).unwrap();
+    assert_eq!(before_snapshot["schema_version"], 2);
+    assert!(
+        before_snapshot["entries"][0]["content_sha256"]
+            .as_str()
+            .is_some()
+    );
+
+    fs::write(&file, b"after!").unwrap();
+    let after = directory.0.join("after-hashed.session");
+    let second = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["audit", "--output"])
+        .arg(&after)
+        .arg("--root")
+        .arg(&selected_root)
+        .arg("--hash-regular-files")
+        .output()
+        .unwrap();
+    assert!(
+        matches!(second.status.code(), Some(0 | 2)),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let comparison = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("compare-sessions")
+        .arg(&before)
+        .arg(&after)
+        .output()
+        .unwrap();
+    assert!(
+        comparison.status.success(),
+        "{}",
+        String::from_utf8_lossy(&comparison.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&comparison.stdout).unwrap();
+    let root_diff = report["source_diffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "selected_root")
+        .unwrap();
+    assert_eq!(root_diff["status"], "compared");
+    assert_eq!(root_diff["comparison"]["counts"]["changes"], 1);
+    assert!(
+        root_diff["comparison"]["deltas"][0]["changed_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "content_sha256")
+    );
+    assert_eq!(
+        root_diff["comparison"]["deltas"][0]["before"]["entry_ordinal"],
+        0
+    );
+    assert_eq!(
+        root_diff["comparison"]["deltas"][0]["after"]["evidence_source"],
+        "selected_root_directory_entry"
+    );
+
+    let default_session = directory.0.join("default.session");
+    let metadata_only = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["audit", "--output"])
+        .arg(&default_session)
+        .arg("--root")
+        .arg(&selected_root)
+        .output()
+        .unwrap();
+    assert!(matches!(metadata_only.status.code(), Some(0 | 2)));
+    let default_manifest =
+        parse_manifest(&fs::read(default_session.join("session.json")).unwrap()).unwrap();
+    let default_ref = &default_manifest
+        .sources
+        .iter()
+        .find(|s| s.role == SourceRole::SelectedRoot)
+        .unwrap()
+        .artifacts[0];
+    assert_eq!(default_ref.schema_version, 1);
+
+    let legacy_v7_session = directory.0.join("legacy-v7.session");
+    fs::create_dir(&legacy_v7_session).unwrap();
+    fs::set_permissions(&legacy_v7_session, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::copy(
+        default_session.join("root-snapshot.json"),
+        legacy_v7_session.join("root-snapshot.json"),
+    )
+    .unwrap();
+    let mut legacy_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(default_session.join("session.json")).unwrap()).unwrap();
+    legacy_manifest["schema_version"] = serde_json::json!(7);
+    let selected_root_source = legacy_manifest["sources"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|source| source["role"] == "selected_root")
+        .unwrap();
+    selected_root_source["scope"] =
+        serde_json::json!("one explicitly selected directory and direct-child metadata only");
+    let legacy_manifest_path = legacy_v7_session.join("session.json");
+    fs::write(
+        &legacy_manifest_path,
+        serde_json::to_vec(&legacy_manifest).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&legacy_manifest_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let v7_v8_metadata = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("compare-sessions")
+        .arg(&legacy_v7_session)
+        .arg(&default_session)
+        .output()
+        .unwrap();
+    assert!(
+        matches!(v7_v8_metadata.status.code(), Some(0 | 2)),
+        "{}",
+        String::from_utf8_lossy(&v7_v8_metadata.stderr)
+    );
+    let v7_v8_metadata: serde_json::Value = serde_json::from_slice(&v7_v8_metadata.stdout).unwrap();
+    assert_eq!(v7_v8_metadata["comparable"], true);
+    let legacy_root_diff = v7_v8_metadata["source_diffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["role"] == "selected_root")
+        .unwrap();
+    assert_eq!(legacy_root_diff["status"], "compared");
+
+    let v7_hashed = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("compare-sessions")
+        .arg(&legacy_v7_session)
+        .arg(&after)
+        .output()
+        .unwrap();
+    assert!(
+        matches!(v7_hashed.status.code(), Some(0 | 2)),
+        "{}",
+        String::from_utf8_lossy(&v7_hashed.stderr)
+    );
+    let v7_hashed: serde_json::Value = serde_json::from_slice(&v7_hashed.stdout).unwrap();
+    let legacy_hashed_root = v7_hashed["source_diffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["role"] == "selected_root")
+        .unwrap();
+    assert_eq!(legacy_hashed_root["status"], "partial");
+    assert_eq!(
+        legacy_hashed_root["comparison"]["deltas"][0]["unknown_fields"][0],
+        "content_sha256"
+    );
+
+    let mixed = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("compare-sessions")
+        .arg(&default_session)
+        .arg(&after)
+        .output()
+        .unwrap();
+    assert!(
+        matches!(mixed.status.code(), Some(0 | 2)),
+        "{}",
+        String::from_utf8_lossy(&mixed.stderr)
+    );
+    let mixed_report: serde_json::Value = serde_json::from_slice(&mixed.stdout).unwrap();
+    let mixed_root = mixed_report["source_diffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "selected_root")
+        .unwrap();
+    assert_eq!(mixed_root["status"], "partial");
+    assert_eq!(
+        mixed_root["comparison"]["deltas"][0]["unknown_fields"][0],
+        "content_sha256"
+    );
+}
+
+#[test]
+fn root_snapshot_does_not_capture_its_session_staging_or_final_directory() {
+    let directory = TestDirectory::new();
+    let selected_root = directory.0.join("selected-root");
+    fs::create_dir(&selected_root).unwrap();
+    fs::write(selected_root.join("input.txt"), b"synthetic fixture").unwrap();
+    let output_path = selected_root.join("audit-session");
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["audit", "--output"])
+        .arg(&output_path)
+        .arg("--root")
+        .arg(&selected_root)
+        .output()
+        .unwrap();
+    assert!(
+        matches!(output.status.code(), Some(0 | 2)),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(output_path.join("root-snapshot.json")).unwrap()).unwrap();
+    let names = snapshot["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["display_name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["input.txt"]);
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.starts_with(".sideeffect-capture-"))
+    );
+    assert!(!names.contains(&"audit-session"));
 }
 
 #[test]

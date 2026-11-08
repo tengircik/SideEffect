@@ -284,18 +284,21 @@ pub fn explain_trace(document: &TraceDocument) -> TraceExplanation {
 /// conservative diff engine. Raw arguments, result values, and syscall names
 /// are deliberately omitted.
 pub fn explain_diff(diff: &TraceDiff<'_>) -> DiffExplanation {
-    let scan_count = diff.changes.len().min(MAX_EXPLANATION_INPUT_ROWS);
+    let scan_count = diff
+        .normalized_changes
+        .len()
+        .min(MAX_EXPLANATION_INPUT_ROWS);
     let kept_change_count = scan_count.min(MAX_EXPLANATION_CHANGES);
     let mut counts = Vec::new();
     let mut changes = Vec::new();
     let mut used_references = 0_usize;
     let mut omitted_reference_count = 0_usize;
 
-    for delta in &diff.changes[..scan_count] {
+    for delta in &diff.normalized_changes[..scan_count] {
         increment_delta_count(&mut counts, delta.category, delta.kind);
     }
 
-    for delta in &diff.changes[..kept_change_count] {
+    for delta in &diff.normalized_changes[..kept_change_count] {
         let before_capacity = delta
             .before
             .len()
@@ -312,10 +315,13 @@ pub fn explain_diff(diff: &TraceDiff<'_>) -> DiffExplanation {
         changes.push(diff_change_fact(delta, before_capacity, after_capacity));
     }
 
-    let omitted_change_count = diff.changes.len().saturating_sub(kept_change_count);
+    let omitted_change_count = diff
+        .normalized_changes
+        .len()
+        .saturating_sub(kept_change_count);
     let mut known_unknowns = vec![KnownUnknown::CaptureCompletenessUnknown];
     if omitted_change_count > 0 {
-        known_unknowns.push(if diff.changes.len() > scan_count {
+        known_unknowns.push(if diff.normalized_changes.len() > scan_count {
             KnownUnknown::DiffInputRowsOmittedByLimit
         } else {
             KnownUnknown::DiffChangesOmittedByLimit

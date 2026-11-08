@@ -1,15 +1,17 @@
 //! Bounded native Windows audit-session collection and private publication.
 
 use crate::audit_session::{
-    AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, ArtifactKind, AuditSessionManifest,
-    AuditSessionSource, ContextFact, ContextFactStatus, CoverageManifest, HostContext,
-    IntervalSemantics, PrivilegeContext, RuntimeCoverageDetail, SessionArtifactRef, SessionStatus,
-    SourceRole, SourceStatus, UnsupportedRuntimeCategoryCode,
+    AUDIT_SESSION_SCHEMA, ArtifactKind, AuditSessionManifest, AuditSessionSource, ContextFact,
+    ContextFactStatus, CoverageManifest, HostContext, IntervalSemantics, PrivilegeContext,
+    RuntimeCoverageDetail, SessionArtifactRef, SessionStatus, SourceRole, SourceStatus,
+    UnsupportedRuntimeCategoryCode,
 };
 use crate::fingerprint::sha256_hex;
 use crate::inventory::{
-    collect_path_executables, collect_windows_permissions, collect_windows_processes,
-    collect_windows_software, collect_windows_startup,
+    collect_path_executables, collect_windows_app_paths, collect_windows_msix,
+    collect_windows_permissions, collect_windows_processes, collect_windows_software,
+    collect_windows_startup_v5, collect_windows_startup_v6, collect_windows_startup_v7,
+    collect_windows_startup_v8, collect_windows_startup_v9,
 };
 use crate::record::publish_private_windows_directory;
 use serde::Serialize;
@@ -24,9 +26,13 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug, Default)]
 pub struct WindowsAuditOptions {
     pub software: bool,
+    pub msix: bool,
+    pub app_paths: bool,
     pub processes: bool,
     pub startup: bool,
     pub path_executables: bool,
+    pub root_path: Option<PathBuf>,
+    pub hash_root_regular_files: bool,
     pub permission_paths: Vec<PathBuf>,
     pub include_runtime: bool,
     pub runtime_duration: Option<Duration>,
@@ -53,13 +59,20 @@ pub fn collect_and_publish(
     options: &WindowsAuditOptions,
 ) -> Result<PublishedWindowsAuditSession, String> {
     if !options.software
+        && !options.msix
+        && !options.app_paths
         && !options.processes
         && !options.startup
         && !options.path_executables
+        && options.root_path.is_none()
+        && !options.hash_root_regular_files
         && options.permission_paths.is_empty()
         && !options.include_runtime
     {
         return Err("select at least one source for the audit session".to_owned());
+    }
+    if options.hash_root_regular_files && options.root_path.is_none() {
+        return Err("audit --hash-regular-files requires --root DIRECTORY".to_owned());
     }
     if options.permission_paths.len() > 256 {
         return Err("permission path count exceeds the 256 path limit".to_owned());
@@ -118,6 +131,63 @@ pub fn collect_and_publish(
             value,
         ));
     }
+    if options.msix {
+        let doc = collect_windows_msix();
+        let (status, diagnostics) = status_from_serialized(&doc, "status");
+        let value = serde_json::to_vec(&doc)
+            .map_err(|e| format!("could not serialize MSIX inventory: {e}"))?;
+        sources.push(source(
+            SourceRole::Msix,
+            "bounded current-user MSIX package registrations",
+            doc.capture_started_at_unix_ms,
+            doc.capture_ended_at_unix_ms,
+            status,
+            diagnostics,
+            vec![
+                ("max_packages", 4096),
+                ("max_string_utf16_units", 32768),
+                ("max_aggregate_string_utf16_units", 1_048_576),
+                ("max_diagnostics", 512),
+                ("scan_deadline_ms", 10000),
+            ],
+        ));
+        artifacts.push(artifact(
+            ArtifactKind::WindowsMsix,
+            "msix.windows.json",
+            "sideeffect.windows_msix_inventory",
+            1,
+            value,
+        ));
+    }
+    if options.app_paths {
+        let doc = collect_windows_app_paths();
+        let (status, diagnostics) = status_from_serialized(&doc, "status");
+        let value = serde_json::to_vec(&doc)
+            .map_err(|e| format!("could not serialize App Paths inventory: {e}"))?;
+        sources.push(source(
+            SourceRole::AppPaths,
+            "selected current-user native and accessible machine 32-bit and 64-bit App Paths registry entries",
+            doc.capture_started_at_unix_ms,
+            doc.capture_ended_at_unix_ms,
+            status,
+            diagnostics,
+            vec![
+                ("max_entries", crate::inventory::APP_PATHS_MAX_ENTRIES as u64),
+                ("max_name_utf16_units", crate::inventory::APP_PATHS_MAX_NAME_UNITS as u64),
+                ("max_aggregate_name_utf16_units", crate::inventory::APP_PATHS_MAX_AGGREGATE_NAME_UNITS as u64),
+                ("max_value_bytes", crate::inventory::APP_PATHS_MAX_VALUE_BYTES as u64),
+                ("max_aggregate_value_bytes", crate::inventory::APP_PATHS_MAX_AGGREGATE_VALUE_BYTES as u64),
+                ("scan_deadline_ms", crate::inventory::APP_PATHS_MAX_SCAN_DURATION_MS as u64),
+            ],
+        ));
+        artifacts.push(artifact(
+            ArtifactKind::WindowsAppPaths,
+            "app-paths.windows.json",
+            "sideeffect.windows_app_path_inventory",
+            1,
+            value,
+        ));
+    }
     if options.processes {
         let doc = collect_windows_processes();
         let status = if doc.status == crate::inventory::WindowsProcessInventoryStatus::Complete {
@@ -149,7 +219,7 @@ pub fn collect_and_publish(
             ArtifactKind::WindowsProcesses,
             "processes.windows.json",
             "sideeffect.windows_process_inventory",
-            3,
+            4,
             value,
         ));
     }
@@ -179,16 +249,18 @@ pub fn collect_and_publish(
         ));
     }
     if options.startup {
-        let doc = collect_windows_startup();
+        let doc = collect_windows_startup_for_session(
+            crate::audit_session::AUDIT_SESSION_SCHEMA_VERSION,
+        )?;
         let (status, diagnostics) = status_from_serialized(&doc, "status");
         let value = serde_json::to_vec(&doc)
             .map_err(|e| format!("could not serialize startup inventory: {e}"))?;
-        sources.push(source(SourceRole::Startup, "selected Run/RunOnce, Startup folders, services, and visible boot/logon scheduled tasks", doc.capture_started_at_unix_ms, doc.capture_ended_at_unix_ms, status, diagnostics, vec![("max_startup_entries", 8192), ("deadline_ms_between_calls", 10000)]));
+        sources.push(source(SourceRole::Startup, "selected Run/RunOnce, Startup folders, services including read-only delayed-auto-start, dependency, load-order group, and service trigger configuration, visible boot/logon scheduled tasks, and local ROOT\\subscription WMI permanent event subscriptions", doc.capture_started_at_unix_ms, doc.capture_ended_at_unix_ms, status, diagnostics, vec![("max_startup_entries", 8192), ("max_service_trigger_entries", 8192), ("max_service_trigger_data_bytes", 1048576), ("deadline_ms_between_calls", 10000)]));
         artifacts.push(artifact(
             ArtifactKind::WindowsStartup,
             "startup.windows.json",
             "sideeffect.windows_startup_inventory",
-            4,
+            doc.schema_version,
             value,
         ));
     }
@@ -232,6 +304,83 @@ pub fn collect_and_publish(
             1,
             value,
         ));
+    }
+    if let Some(root_path) = &options.root_path {
+        let doc = crate::inventory::collect_root_snapshot_with_hash(
+            root_path,
+            options.hash_root_regular_files,
+        );
+        let status = match doc.status {
+            "complete" => SourceStatus::Complete,
+            "partial" => SourceStatus::Partial,
+            _ => SourceStatus::Unknown,
+        };
+        let diagnostics = doc.diagnostics.iter().map(|item| item.code).collect();
+        let mut root_limits = vec![
+            ("max_entries", doc.limits.max_entries as u64),
+            (
+                "max_root_path_bytes_or_utf16_units",
+                doc.limits.max_root_path_bytes_or_utf16_units as u64,
+            ),
+            (
+                "max_name_bytes_or_utf16_units",
+                doc.limits.max_name_bytes_or_utf16_units as u64,
+            ),
+            (
+                "max_aggregate_name_bytes",
+                doc.limits.max_aggregate_name_bytes as u64,
+            ),
+            ("deadline_seconds", doc.limits.deadline_seconds),
+        ];
+        if options.hash_root_regular_files {
+            root_limits.extend([
+                (
+                    "max_file_hash_bytes",
+                    crate::inventory::MAX_ROOT_FILE_HASH_BYTES,
+                ),
+                (
+                    "max_aggregate_hash_bytes",
+                    crate::inventory::MAX_ROOT_AGGREGATE_HASH_BYTES,
+                ),
+                (
+                    "hash_deadline_seconds",
+                    crate::inventory::ROOT_HASH_DEADLINE.as_secs(),
+                ),
+            ]);
+        }
+        sources.push(source(
+            SourceRole::SelectedRoot,
+            if options.hash_root_regular_files {
+                "one explicitly selected directory and direct-child metadata; optional regular-file content fingerprints"
+            } else {
+                "one explicitly selected directory and direct-child metadata only"
+            },
+            doc.captured_started_at_unix_ms,
+            doc.captured_ended_at_unix_ms,
+            status,
+            diagnostics,
+            root_limits,
+        ));
+        let value = serde_json::to_vec(&doc)
+            .map_err(|error| format!("could not serialize selected-root inventory: {error}"))?;
+        let root_artifact = artifact(
+            ArtifactKind::SelectedRoot,
+            "root-snapshot.json",
+            "sideeffect.selected_root_inventory",
+            doc.schema_version,
+            value,
+        );
+        if options.hash_root_regular_files {
+            if let Some(root_source) = sources.last_mut() {
+                root_source
+                    .requested_settings
+                    .push(crate::audit_session::Setting {
+                        code: "hash_regular_files".to_owned(),
+                        value: 1,
+                    });
+            }
+        }
+        artifacts.push(root_artifact);
     }
     if options.include_runtime {
         let duration = options.runtime_duration.ok_or_else(|| {
@@ -377,6 +526,7 @@ pub fn collect_and_publish(
         sources,
         &artifacts,
         runtime_coverage_detail,
+        session_schema_version(options),
     )?;
     let manifest_bytes = serde_json::to_vec(&manifest)
         .map_err(|e| format!("could not serialize audit manifest: {e}"))?;
@@ -479,6 +629,7 @@ fn build_manifest(
     mut sources: Vec<AuditSessionSource>,
     artifacts: &[Artifact],
     runtime_coverage_detail: Option<RuntimeCoverageDetail>,
+    schema_version: u32,
 ) -> Result<AuditSessionManifest, String> {
     for source in &mut sources {
         source.artifacts = artifacts
@@ -501,7 +652,7 @@ fn build_manifest(
     ));
     let manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
-        schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+        schema_version,
         session_id: format!(
             "{:016x}{:016x}",
             started as u64,
@@ -681,11 +832,41 @@ fn windows_privilege() -> PrivilegeContext {
 fn role_kind(role: SourceRole) -> Option<ArtifactKind> {
     match role {
         SourceRole::Packages => Some(ArtifactKind::WindowsSoftware),
+        SourceRole::Msix => Some(ArtifactKind::WindowsMsix),
+        SourceRole::AppPaths => Some(ArtifactKind::WindowsAppPaths),
         SourceRole::Processes => Some(ArtifactKind::WindowsProcesses),
         SourceRole::Permissions => Some(ArtifactKind::WindowsPermissions),
         SourceRole::Startup => Some(ArtifactKind::WindowsStartup),
         SourceRole::PathExecutables => Some(ArtifactKind::PathExecutables),
+        SourceRole::SelectedRoot => Some(ArtifactKind::SelectedRoot),
         SourceRole::Runtime => Some(ArtifactKind::WindowsRuntimeCapture),
+    }
+}
+
+fn collect_windows_startup_for_session(
+    schema_version: u32,
+) -> Result<crate::inventory::WindowsStartupInventoryDocument, String> {
+    match schema_version {
+        crate::audit_session::AUDIT_SESSION_V9_SCHEMA_VERSION => Ok(collect_windows_startup_v5()),
+        crate::audit_session::AUDIT_SESSION_V10_SCHEMA_VERSION => Ok(collect_windows_startup_v6()),
+        crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION => Ok(collect_windows_startup_v6()),
+        crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION => Ok(collect_windows_startup_v7()),
+        crate::audit_session::AUDIT_SESSION_V13_SCHEMA_VERSION => Ok(collect_windows_startup_v8()),
+        crate::audit_session::AUDIT_SESSION_V14_SCHEMA_VERSION => Ok(collect_windows_startup_v9()),
+        crate::audit_session::AUDIT_SESSION_V15_SCHEMA_VERSION => {
+            Ok(crate::inventory::collect_windows_startup())
+        }
+        _ => Err("unsupported Windows audit-session schema version".to_owned()),
+    }
+}
+
+fn session_schema_version(options: &WindowsAuditOptions) -> u32 {
+    if options.startup {
+        crate::audit_session::AUDIT_SESSION_SCHEMA_VERSION
+    } else if options.app_paths {
+        crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION
+    } else {
+        crate::audit_session::AUDIT_SESSION_V9_SCHEMA_VERSION
     }
 }
 
@@ -698,11 +879,33 @@ fn now_ms() -> Result<u128, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{artifact, build_manifest, source};
+    use super::{WindowsAuditOptions, artifact, build_manifest, session_schema_version, source};
     use crate::audit_session::{
         ArtifactKind, ContextFact, ContextFactStatus, HostContext, PrivilegeContext, SessionStatus,
         SourceRole, SourceStatus,
     };
+
+    #[test]
+    fn producer_selects_v15_for_startup_and_v11_for_app_paths_only() {
+        let startup_and_app_paths = WindowsAuditOptions {
+            startup: true,
+            app_paths: true,
+            ..WindowsAuditOptions::default()
+        };
+        assert_eq!(
+            session_schema_version(&startup_and_app_paths),
+            crate::audit_session::AUDIT_SESSION_V15_SCHEMA_VERSION
+        );
+
+        let app_paths_only = WindowsAuditOptions {
+            app_paths: true,
+            ..WindowsAuditOptions::default()
+        };
+        assert_eq!(
+            session_schema_version(&app_paths_only),
+            crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION
+        );
+    }
 
     #[test]
     fn windows_runtime_coverage_counts_only_fixed_decoder_diagnostic_categories() {
@@ -783,6 +986,7 @@ mod tests {
             vec![runtime_source],
             &artifacts,
             None,
+            crate::audit_session::AUDIT_SESSION_V10_SCHEMA_VERSION,
         )
         .unwrap();
         assert_eq!(manifest.status, SessionStatus::Partial);

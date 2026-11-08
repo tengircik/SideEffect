@@ -1,0 +1,15 @@
+9001 openat(AT_FDCWD, "/tmp/se-v3/syscall/item-01.dat", O_RDONLY) = 3
+9002 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
+9003 execve("/tmp/se-v3/syscall/item-03.dat", ["se-v3-tool"], 0x0) = 0
+9004 openat2(AT_FDCWD, "/tmp/se-v3/syscall/item-04.dat", O_RDONLY) = -1 ENOENT (synthetic failure)
+9005 execveat("/tmp/se-v3/syscall/item-05.dat", ["se-v3-tool"], 0x0) = 0
+9006 openat(AT_FDCWD, "/tmp/se-v3/syscall/item-06.dat", O_RDONLY) = 3
+9007 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.10")}, 16) = 0
+9008 execve("/tmp/se-v3/syscall/item-08.dat", ["se-v3-tool"], 0x0) = -1 ENOENT (synthetic failure)
+9009 openat2(AT_FDCWD, "/tmp/se-v3/syscall/item-09.dat", O_RDONLY) = 3
+9010 execveat("/tmp/se-v3/syscall/item-10.dat", ["se-v3-tool"], 0x0) = 0
+9011 openat(AT_FDCWD, "/tmp/se-v3/syscall/item-11.dat", O_RDONLY) = 3
+9012 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.10")}, 16) = -1 ENOENT (synthetic failure)
+9013 execve("/tmp/se-v3/syscall/item-13.dat", ["se-v3-tool"], 0x0) = 0
+9014 openat2(AT_FDCWD, "/tmp/se-v3/syscall/item-14.dat", O_RDONLY) = 3
+9015 execveat("/tmp/se-v3/syscall/item-15.dat", ["se-v3-tool"], 0x0) = 0

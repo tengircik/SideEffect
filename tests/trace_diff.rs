@@ -59,10 +59,10 @@ fn synthetic_pair_reports_observed_file_network_and_process_deltas_with_evidence
     );
     assert_eq!(diff.left_excluded_control_records, 1);
     assert_eq!(diff.right_excluded_control_records, 1);
-    assert_eq!(diff.changes.len(), 4);
+    assert_eq!(diff.normalized_changes.len(), 4);
 
     let changed_open = diff
-        .changes
+        .normalized_changes
         .iter()
         .find(|change| change.kind == DeltaKind::Changed && change.syscall == "openat")
         .unwrap();
@@ -86,7 +86,7 @@ fn synthetic_pair_reports_observed_file_network_and_process_deltas_with_evidence
     );
 
     let added_child = diff
-        .changes
+        .normalized_changes
         .iter()
         .find(|change| change.kind == DeltaKind::Added && change.syscall == "execve")
         .unwrap();
@@ -96,7 +96,7 @@ fn synthetic_pair_reports_observed_file_network_and_process_deltas_with_evidence
     assert_eq!(added_child.after[0].line_number, 3);
 
     let connection_changes: Vec<_> = diff
-        .changes
+        .normalized_changes
         .iter()
         .filter(|change| change.syscall == "connect")
         .collect();
@@ -129,11 +129,138 @@ fn timestamp_and_pid_prefix_changes_do_not_create_deltas() {
         parse(b"9999 1800000000.999999 statx(AT_FDCWD, \"/tmp/item\", 0, STATX_ALL, 0x1) = 0\n");
 
     let diff = compare_traces(&left, &right).unwrap();
-    assert!(diff.changes.is_empty());
+    assert!(diff.normalized_changes.is_empty());
     assert_eq!(left.records[0].process_id, Some(10));
     assert_eq!(right.records[0].process_id, Some(9999));
     assert_ne!(left.records[0].timestamp, right.records[0].timestamp);
     assert_ne!(left.records[0].raw_line, right.records[0].raw_line);
+}
+
+#[test]
+fn v4_exposes_exact_raw_lines_separately_from_normalized_and_semantic_views() {
+    let left = parse(b"10 1700000000.000001 getpid() = 1\n");
+    let right = parse(b"20 1800000000.000001 getpid() = 1\n");
+    let diff = compare_traces(&left, &right).unwrap();
+
+    assert_eq!(diff.schema_version, 4);
+    assert!(diff.normalized_changes.is_empty());
+    assert_eq!(diff.raw_line_deltas.len(), 2);
+    assert_eq!(diff.raw_line_deltas[0].kind, DeltaKind::Added);
+    assert_eq!(diff.raw_line_deltas[0].evidence, right.records[0].evidence);
+    assert_eq!(diff.raw_line_deltas[1].kind, DeltaKind::Removed);
+    assert_eq!(diff.raw_line_deltas[1].evidence, left.records[0].evidence);
+
+    let empty = parse(b"");
+    let semantic = compare_traces(&left, &empty).unwrap();
+    assert_eq!(semantic.semantic_changes.len(), 1);
+    assert_eq!(
+        semantic.semantic_changes[0].before_outcome,
+        Some(sideeffect::model::SyscallOutcome::Unknown)
+    );
+    assert_eq!(semantic.semantic_changes[0].after_outcome, None);
+    assert_eq!(
+        semantic.semantic_changes[0].before,
+        vec![left.records[0].evidence.clone()]
+    );
+    assert!(semantic.semantic_changes[0].after.is_empty());
+    let json = serde_json::to_value(&semantic).unwrap();
+    assert!(json["raw_line_deltas"][0].get("raw_line").is_none());
+    assert_eq!(
+        diff.matching_policy
+            .normalization_ledger
+            .iter()
+            .map(|e| e.field.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "process_id",
+            "timestamp",
+            "record_kind",
+            "category",
+            "syscall",
+            "raw_arguments",
+            "raw_result",
+            "lexical_path_hint"
+        ]
+    );
+}
+
+#[test]
+fn raw_line_multisets_preserve_duplicate_syscall_and_control_rows_with_evidence() {
+    let syscall = b"1 close(3) = 0\n";
+    let control = b"+++ exited +++\n";
+    let left_bytes = [syscall.as_slice(), syscall, control, control].concat();
+    let right_bytes = [syscall.as_slice(), control].concat();
+    let left = parse(&left_bytes);
+    let right = parse(&right_bytes);
+
+    let diff = compare_traces(&left, &right).unwrap();
+    assert_eq!(diff.left_excluded_control_records, 2);
+    assert_eq!(diff.right_excluded_control_records, 1);
+    assert_eq!(diff.raw_line_deltas.len(), 2);
+    assert!(
+        diff.raw_line_deltas
+            .iter()
+            .all(|delta| delta.kind == DeltaKind::Removed)
+    );
+    assert_eq!(diff.raw_line_deltas[0].evidence, left.records[1].evidence);
+    assert_eq!(diff.raw_line_deltas[0].evidence.line_number, 2);
+    assert_eq!(
+        diff.raw_line_deltas[0].evidence.byte_offset,
+        syscall.len() as u64
+    );
+    assert_eq!(
+        diff.raw_line_deltas[0].evidence.byte_length,
+        (syscall.len() - 1) as u64
+    );
+    assert_eq!(diff.raw_line_deltas[1].evidence, left.records[3].evidence);
+    assert_eq!(diff.raw_line_deltas[1].evidence.line_number, 4);
+    assert_eq!(
+        diff.raw_line_deltas[1].evidence.byte_offset,
+        (syscall.len() * 2 + control.len()) as u64
+    );
+    assert_eq!(
+        diff.raw_line_deltas[1].evidence.byte_length,
+        (control.len() - 1) as u64
+    );
+
+    assert_eq!(diff.normalized_changes.len(), 1);
+    let normalized = &diff.normalized_changes[0];
+    assert_eq!(normalized.kind, DeltaKind::Removed);
+    assert_eq!(normalized.before, vec![left.records[1].evidence.clone()]);
+    assert!(normalized.after.is_empty());
+}
+
+#[test]
+fn raw_line_multisets_retain_crlf_bytes_while_normalized_rows_match() {
+    let left_bytes = b"1 1700000000.000001 close(3) = 0\n";
+    let right_bytes = b"8 1800000000.000002 close(3) = 0\r\n";
+    let left = parse(left_bytes);
+    let right = parse(right_bytes);
+
+    assert_eq!(left.records[0].raw_line, "1 1700000000.000001 close(3) = 0");
+    assert_eq!(
+        right.records[0].raw_line,
+        "8 1800000000.000002 close(3) = 0\r"
+    );
+    let diff = compare_traces(&left, &right).unwrap();
+    assert!(diff.normalized_changes.is_empty());
+    assert_eq!(diff.raw_line_deltas.len(), 2);
+    assert_eq!(diff.raw_line_deltas[0].kind, DeltaKind::Added);
+    assert_eq!(diff.raw_line_deltas[0].evidence, right.records[0].evidence);
+    assert_eq!(diff.raw_line_deltas[0].evidence.line_number, 1);
+    assert_eq!(diff.raw_line_deltas[0].evidence.byte_offset, 0);
+    assert_eq!(
+        diff.raw_line_deltas[0].evidence.byte_length,
+        (right_bytes.len() - 1) as u64
+    );
+    assert_eq!(diff.raw_line_deltas[1].kind, DeltaKind::Removed);
+    assert_eq!(diff.raw_line_deltas[1].evidence, left.records[0].evidence);
+    assert_eq!(diff.raw_line_deltas[1].evidence.line_number, 1);
+    assert_eq!(diff.raw_line_deltas[1].evidence.byte_offset, 0);
+    assert_eq!(
+        diff.raw_line_deltas[1].evidence.byte_length,
+        (left_bytes.len() - 1) as u64
+    );
 }
 
 #[test]
@@ -153,8 +280,8 @@ fn diff_matching_ignores_derived_lexical_hints_and_keeps_raw_arguments_authorita
         right.records[0].raw_arguments
     );
     let diff = compare_traces(&left, &right).unwrap();
-    assert_eq!(diff.changes.len(), 1);
-    let change = &diff.changes[0];
+    assert_eq!(diff.normalized_changes.len(), 1);
+    let change = &diff.normalized_changes[0];
     assert_eq!(change.kind, DeltaKind::Changed);
     assert_eq!(
         change.before_lexical_path_hint.unwrap().path,
@@ -190,20 +317,20 @@ fn derived_hints_do_not_pair_ambiguous_duplicate_raw_argument_rows() {
     });
 
     let diff = compare_traces(&left, &right).unwrap();
-    assert_eq!(diff.changes.len(), 4);
+    assert_eq!(diff.normalized_changes.len(), 4);
     assert!(
-        diff.changes
+        diff.normalized_changes
             .iter()
             .all(|change| change.kind != DeltaKind::Changed)
     );
     let removed_hints: Vec<_> = diff
-        .changes
+        .normalized_changes
         .iter()
         .filter(|change| change.kind == DeltaKind::Removed)
         .map(|change| change.before_lexical_path_hint.unwrap().path.as_str())
         .collect();
     let added_hints: Vec<_> = diff
-        .changes
+        .normalized_changes
         .iter()
         .filter(|change| change.kind == DeltaKind::Added)
         .map(|change| change.after_lexical_path_hint.unwrap().path.as_str())
@@ -227,8 +354,8 @@ fn grouped_evidence_omits_inconsistent_display_hints() {
 
     let right = parse(b"");
     let diff = compare_traces(&left, &right).unwrap();
-    assert_eq!(diff.changes.len(), 1);
-    let removed = &diff.changes[0];
+    assert_eq!(diff.normalized_changes.len(), 1);
+    let removed = &diff.normalized_changes[0];
     assert_eq!(removed.kind, DeltaKind::Removed);
     assert_eq!(removed.before.len(), 2);
     assert!(removed.before_lexical_path_hint.is_none());
@@ -242,8 +369,8 @@ fn multiplicity_is_compared_as_a_multiset() {
     let right = parse(b"2 1800000000.000001 openat(AT_FDCWD, \"/tmp/item\", O_RDONLY) = 3\n");
 
     let diff = compare_traces(&left, &right).unwrap();
-    assert_eq!(diff.changes.len(), 1);
-    let removed = &diff.changes[0];
+    assert_eq!(diff.normalized_changes.len(), 1);
+    let removed = &diff.normalized_changes[0];
     assert_eq!(removed.kind, DeltaKind::Removed);
     assert_eq!(removed.syscall, "openat");
     assert_eq!(removed.before_result, Some("3"));
@@ -258,19 +385,19 @@ fn changed_arguments_are_not_normalized_or_paired_as_result_changes() {
     let right = parse(b"2 1800000000.000001 connect(5, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr(\"203.0.113.7\")}, 16) = 0\n");
 
     let diff = compare_traces(&left, &right).unwrap();
-    assert_eq!(diff.changes.len(), 2);
+    assert_eq!(diff.normalized_changes.len(), 2);
     assert!(
-        diff.changes
+        diff.normalized_changes
             .iter()
             .any(|change| change.kind == DeltaKind::Removed)
     );
     assert!(
-        diff.changes
+        diff.normalized_changes
             .iter()
             .any(|change| change.kind == DeltaKind::Added)
     );
     assert!(
-        diff.changes
+        diff.normalized_changes
             .iter()
             .all(|change| change.kind != DeltaKind::Changed)
     );
@@ -282,8 +409,8 @@ fn pid_like_syscall_results_remain_exact_changed_values() {
     let right = parse(b"20 1800000000.000001 getpid() = 202\n");
 
     let diff = compare_traces(&left, &right).unwrap();
-    assert_eq!(diff.changes.len(), 1);
-    let changed = &diff.changes[0];
+    assert_eq!(diff.normalized_changes.len(), 1);
+    let changed = &diff.normalized_changes[0];
     assert_eq!(changed.kind, DeltaKind::Changed);
     assert_eq!(changed.category, EventCategory::Process);
     assert_eq!(changed.raw_arguments, "");
@@ -298,21 +425,21 @@ fn ambiguous_duplicate_result_changes_remain_added_and_removed() {
         parse(b"20 1800000000.000001 getpid() = 201\n20 1800000000.000002 getpid() = 202\n");
 
     let diff = compare_traces(&left, &right).unwrap();
-    assert_eq!(diff.changes.len(), 4);
+    assert_eq!(diff.normalized_changes.len(), 4);
     assert!(
-        diff.changes
+        diff.normalized_changes
             .iter()
             .all(|change| change.kind != DeltaKind::Changed)
     );
     assert_eq!(
-        diff.changes
+        diff.normalized_changes
             .iter()
             .filter(|change| change.kind == DeltaKind::Removed)
             .count(),
         2
     );
     assert_eq!(
-        diff.changes
+        diff.normalized_changes
             .iter()
             .filter(|change| change.kind == DeltaKind::Added)
             .count(),
@@ -330,7 +457,7 @@ fn continuation_rows_remain_separate_observations() {
     );
 
     let diff = compare_traces(&left, &right).unwrap();
-    assert!(diff.changes.is_empty());
+    assert!(diff.normalized_changes.is_empty());
 }
 
 #[test]
@@ -367,7 +494,7 @@ fn syscall_name_buckets_are_explicit_and_conservative() {
     let category = |document: &TraceDocument| {
         compare_traces(document, &parse(b""))
             .unwrap()
-            .changes
+            .normalized_changes
             .first()
             .map(|delta| delta.category)
     };
@@ -402,7 +529,7 @@ fn combined_record_budget_accepts_exact_limit_and_rejects_limit_plus_one() {
     let left = control_document(MAX_RECORDS);
     let right = control_document(MAX_RECORDS);
     let exact = compare_traces(&left, &right).unwrap();
-    assert!(exact.changes.is_empty());
+    assert!(exact.normalized_changes.is_empty());
     assert_eq!(exact.left_excluded_control_records, MAX_RECORDS as u64);
     assert_eq!(exact.right_excluded_control_records, MAX_RECORDS as u64);
 
@@ -468,7 +595,7 @@ fn control_document(count: usize) -> TraceDocument {
 }
 
 fn project<'a>(diff: &sideeffect::model::TraceDiff<'a>) -> Vec<DeltaProjection<'a>> {
-    diff.changes
+    diff.normalized_changes
         .iter()
         .map(|change| {
             (

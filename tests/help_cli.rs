@@ -26,6 +26,14 @@ fn help_command_and_flag_show_command_list() {
 
 #[test]
 fn focused_help_covers_command_and_nested_inventory_topics() {
+    let model_explain = run(&["help", "model-explain"]);
+    assert!(model_explain.status.success());
+    let model_explain_help = String::from_utf8_lossy(&model_explain.stdout);
+    assert!(model_explain_help.contains("select up to five syscall-result evidence IDs"));
+    assert!(model_explain_help.contains("SideEffect returns only the exact matching preview rows"));
+    assert!(model_explain_help.contains("not an answer or finding"));
+    assert!(!model_explain_help.contains("generated statement"));
+
     let record = run(&["record", "--help"]);
     assert!(record.status.success());
     let record_help = String::from_utf8_lossy(&record.stdout);
@@ -45,12 +53,26 @@ fn focused_help_covers_command_and_nested_inventory_topics() {
     assert!(events_help.contains("events --trace TRACE"));
     assert!(events_help.contains("writes JSON only"));
 
+    let graph = run(&["help", "graph"]);
+    assert!(graph.status.success());
+    let graph_help = String::from_utf8_lossy(&graph.stdout);
+    assert!(graph_help.contains("--format json|text|html"));
+    assert!(graph_help.contains("--output REPORT.html"));
+    assert!(graph_help.contains("restrictive CSP"));
+
     let diff = run(&["help", "diff"]);
     assert!(diff.status.success());
     let diff_help = String::from_utf8_lossy(&diff.stdout);
     assert!(diff_help.contains("diff --windows-runtime"));
     assert!(diff_help.contains("Windows summary v2"));
     assert!(diff_help.contains("unique supported changed identities as candidates"));
+
+    let compare_sessions = run(&["help", "compare-sessions"]);
+    assert!(compare_sessions.status.success());
+    let compare_sessions_help = String::from_utf8_lossy(&compare_sessions.stdout);
+    assert!(compare_sessions_help.contains("bounded item-level inventory and runtime evidence"));
+    assert!(compare_sessions_help.contains("does not establish causation or event absence"));
+    assert!(!compare_sessions_help.contains("only their declared collection metadata"));
 
     let associated = run(&["help", "associated-behavior"]);
     assert!(associated.status.success());
@@ -63,7 +85,10 @@ fn focused_help_covers_command_and_nested_inventory_topics() {
     let startup = run(&["help", "inventory", "startup"]);
     assert!(startup.status.success());
     let startup_help = String::from_utf8_lossy(&startup.stdout);
+    #[cfg(target_os = "linux")]
     assert!(startup_help.contains("configured entry ran"));
+    #[cfg(windows)]
+    assert!(startup_help.contains("trigger fired or a service ran"));
     #[cfg(target_os = "linux")]
     assert!(startup_help.contains("supported Linux"));
     #[cfg(windows)]

@@ -146,10 +146,7 @@ pub fn remove_catalog_model(
     let transaction = lock_registry()?;
     let mut registry = transaction.load()?;
     let resolved = registry.resolve(catalog.id, catalog.task)?;
-    let expected = directory.join(catalog.filename);
-    if resolved.path != expected {
-        return Err("verified catalog model resolved outside its private store path".to_owned());
-    }
+    let expected = verified_catalog_path(&directory, &resolved.path, catalog.filename)?;
     registry
         .selected_by_task
         .retain(|_, selected| selected != catalog.id);
@@ -157,6 +154,29 @@ pub fn remove_catalog_model(
     fs::remove_file(&expected)
         .map_err(|_| "could not remove the verified catalog model file".to_owned())?;
     Ok(expected)
+}
+
+/// Check the resolved catalog file against the canonical private store path.
+/// `canonicalize` may add a Windows extended-length prefix, so compare like
+/// with like while still requiring the exact catalog filename directly under
+/// the store directory.
+fn verified_catalog_path(
+    directory: &Path,
+    resolved_path: &Path,
+    filename: &str,
+) -> Result<PathBuf, String> {
+    let rejected = || "verified catalog model resolved outside its private store path".to_owned();
+    let store = fs::canonicalize(directory).map_err(|_| rejected())?;
+    let expected = directory.join(filename);
+    let canonical_expected = fs::canonicalize(&expected).map_err(|_| rejected())?;
+    let canonical_resolved = fs::canonicalize(resolved_path).map_err(|_| rejected())?;
+    if canonical_expected != canonical_resolved
+        || canonical_expected.parent() != Some(store.as_path())
+        || canonical_expected.file_name() != Path::new(filename).file_name()
+    {
+        return Err(rejected());
+    }
+    Ok(canonical_expected)
 }
 
 fn receipt(catalog: &CatalogModel, path: PathBuf) -> InstallReceipt {
@@ -362,5 +382,94 @@ impl Drop for StagingFile {
         if self.armed {
             let _ = fs::remove_file(&self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod catalog_path_tests {
+    use super::verified_catalog_path;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDirectory(PathBuf);
+
+    impl TempDirectory {
+        fn new() -> Self {
+            loop {
+                let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "sideeffect-catalog-path-{}-{id}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("could not create temporary model directory: {error}"),
+                }
+            }
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn accepts_canonical_resolved_path_for_exact_catalog_filename() {
+        let directory = TempDirectory::new();
+        let filename = "pinned-model.gguf";
+        let expected = directory.0.join(filename);
+        fs::write(&expected, b"synthetic model fixture").unwrap();
+        let resolved = fs::canonicalize(&expected).unwrap();
+
+        let verified = verified_catalog_path(&directory.0, &resolved, filename).unwrap();
+
+        assert_eq!(verified, resolved);
+        assert_eq!(
+            verified.parent(),
+            Some(fs::canonicalize(&directory.0).unwrap().as_path())
+        );
+    }
+
+    #[test]
+    fn rejects_a_different_file_even_when_it_is_in_the_private_store() {
+        let directory = TempDirectory::new();
+        let expected = directory.0.join("pinned-model.gguf");
+        let other = directory.0.join("other-model.gguf");
+        fs::write(&expected, b"expected synthetic file").unwrap();
+        fs::write(&other, b"other synthetic file").unwrap();
+
+        assert!(
+            verified_catalog_path(
+                &directory.0,
+                &fs::canonicalize(other).unwrap(),
+                "pinned-model.gguf"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_a_resolved_file_outside_the_private_store() {
+        let store = TempDirectory::new();
+        let outside = TempDirectory::new();
+        let expected = store.0.join("pinned-model.gguf");
+        let external = outside.0.join("pinned-model.gguf");
+        fs::write(&expected, b"expected synthetic file").unwrap();
+        fs::write(&external, b"external synthetic file").unwrap();
+
+        assert!(
+            verified_catalog_path(
+                &store.0,
+                &fs::canonicalize(external).unwrap(),
+                "pinned-model.gguf"
+            )
+            .is_err()
+        );
     }
 }

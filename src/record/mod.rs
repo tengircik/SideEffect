@@ -5,8 +5,7 @@ mod paths;
 mod windows;
 #[cfg(windows)]
 mod windows_etw;
-#[cfg(windows)]
-mod windows_io_decode;
+pub(crate) mod windows_io_decode;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -29,7 +28,8 @@ pub use windows_etw::{
     WindowsRuntimeCapture, record_windows_runtime_capture,
 };
 #[cfg(windows)]
-pub(crate) use windows_etw::{
+pub(crate) use windows_io_decode::{FilePathCrossCheck, FilePathInput, cross_check_file_path};
+pub(crate) use windows_io_decode::{
     NetworkPayloadCrossCheck, NetworkPayloadInput, cross_check_network_payload,
 };
 

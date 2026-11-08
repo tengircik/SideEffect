@@ -13,11 +13,12 @@ const BUNDLE_TRACE_NAME: &[u8] = b"trace.strace";
 const MANIFEST_NAME: &[u8] = b"run.json";
 const REPORT_NAME: &[u8] = b"report.html";
 const PRIVATE_FILE_NAME: &[u8] = b"private-output";
-const SESSION_ARTIFACT_NAMES: [&[u8]; 7] = [
+const SESSION_ARTIFACT_NAMES: [&[u8]; 8] = [
     b"packages.json",
     b"processes.json",
     b"startup.json",
     b"path-executables.json",
+    b"root-snapshot.json",
     b"permissions.json",
     b"run.json",
     b"trace.strace",
@@ -55,7 +56,7 @@ pub struct AnchoredOutput {
 
 /// Anchored private staging for a bounded audit-session directory.
 ///
-/// Only the six fixed source artifact names and `session.json` are accepted. Source artifacts
+/// Only the fixed source artifact names and `session.json` are accepted. Source artifacts
 /// must be written before the manifest, which is the final file added to the staged directory.
 #[derive(Debug)]
 pub struct SessionOutput {
@@ -66,7 +67,7 @@ pub struct SessionOutput {
     stage_name: OsString,
     stage_device: libc::dev_t,
     stage_inode: libc::ino_t,
-    artifact_identities: [Option<(libc::dev_t, libc::ino_t)>; 7],
+    artifact_identities: [Option<(libc::dev_t, libc::ino_t)>; 8],
     manifest_identity: Option<(libc::dev_t, libc::ino_t)>,
     total_bytes: usize,
     file_limit: usize,
@@ -124,7 +125,7 @@ impl SessionOutput {
             stage_name,
             stage_device: stage_stat.st_dev,
             stage_inode: stage_stat.st_ino,
-            artifact_identities: [None; 7],
+            artifact_identities: [None; 8],
             manifest_identity: None,
             total_bytes: 0,
             file_limit,
@@ -826,7 +827,7 @@ fn publish_private_session(
         ));
     }
     let mut total = manifest.len();
-    let mut seen = [false; 7];
+    let mut seen = [false; 8];
     for (name, bytes) in artifacts {
         if bytes.len() > max_file_bytes {
             return Err(io::Error::new(
@@ -1373,7 +1374,7 @@ fn unlink_entry_if_same(dir_fd: i32, name: &[u8], device: libc::dev_t, inode: li
 
 fn has_exact_session_entries(
     directory_fd: i32,
-    artifacts: &[Option<(libc::dev_t, libc::ino_t)>; 7],
+    artifacts: &[Option<(libc::dev_t, libc::ino_t)>; 8],
 ) -> bool {
     let duplicate = unsafe { libc::fcntl(directory_fd, libc::F_DUPFD_CLOEXEC, 0) };
     if duplicate < 0 {
@@ -1389,7 +1390,7 @@ fn has_exact_session_entries(
         .filter(|identity| identity.is_some())
         .count()
         + 1;
-    let mut seen_artifacts = [false; 7];
+    let mut seen_artifacts = [false; 8];
     let mut saw_manifest = false;
     let mut count = 0usize;
     loop {

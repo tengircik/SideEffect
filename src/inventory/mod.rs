@@ -1,34 +1,62 @@
 //! Read-only, on-demand system inventory sources.
 
+#[cfg(target_os = "linux")]
+mod access;
 mod debian;
+#[cfg(windows)]
+mod effective_access_windows;
 mod model;
 mod package_diff;
 #[cfg(target_os = "linux")]
 mod packages;
 #[cfg(windows)]
 mod packages_windows;
+mod path_executable_diff;
 mod path_executables;
-mod permission_diff;
+pub(crate) mod permission_diff;
 #[cfg(target_os = "linux")]
 mod permissions;
 #[cfg(windows)]
 mod permissions_windows;
-mod process_diff;
+pub(crate) mod process_diff;
 #[cfg(target_os = "linux")]
 mod processes;
 #[cfg(windows)]
 mod processes_windows;
+mod root_snapshot;
+mod root_snapshot_diff;
 #[cfg(target_os = "linux")]
 mod startup;
 mod startup_diff;
 #[cfg(target_os = "linux")]
 mod startup_legacy;
+mod startup_state;
 #[cfg(windows)]
 mod startup_windows;
+#[cfg(windows)]
+mod startup_wmi;
 #[cfg(target_os = "linux")]
 mod systemd_units;
+#[cfg(windows)]
+mod windows_app_paths;
+mod windows_app_paths_diff;
+#[cfg(windows)]
+mod windows_msix;
+mod windows_msix_diff;
 mod windows_software_diff;
 
+#[cfg(target_os = "linux")]
+pub use access::{
+    ACCESS_ANALYSIS_SCHEMA, ACCESS_ANALYSIS_SCHEMA_VERSION, AccessAnalysisDocument,
+    AccessConclusion, AccessOperation, FactStatus, KernelProbeStatus,
+    analyze_current_process_access,
+};
+#[cfg(windows)]
+pub use effective_access_windows::{
+    WindowsAccessConclusion, WindowsAccessControlEvidence, WindowsAccessControlStatus,
+    WindowsAccessOperation, WindowsAccessStatus, WindowsDaclDecision, WindowsDaclEvaluationResult,
+    evaluate_windows_dacl_for_process,
+};
 pub use model::{
     INVENTORY_SCHEMA, INVENTORY_SCHEMA_VERSION, InventoryDiagnostic, InventoryDocument,
     InventoryEvidence, InventoryPackage, InventorySource, InventorySourceStatus, InventoryStatus,
@@ -38,6 +66,10 @@ pub use package_diff::{
     PackageComparisonError, PackageComparisonStatus, PackageEvidenceReference, PackageFacts,
     PackageIdentity, PackageInventoryComparison, PackageInventoryDelta, PackageSourceComparison,
     compare_package_inventories, compare_package_inventory_json,
+};
+pub use path_executable_diff::{
+    PathEntryFacts, PathExecutableDelta, PathExecutableDiff, PathExecutableDiffCounts,
+    PathExecutableDiffError, compare_path_executable_inventory_json,
 };
 pub use path_executables::{PathExecutableInventory, collect_path_executables};
 pub use permission_diff::{
@@ -52,6 +84,19 @@ pub use process_diff::{
 pub use startup_diff::{
     StartupDelta, StartupDiffCounts, StartupDiffError, StartupDiffStatus, StartupEvidenceSide,
     StartupInventoryDiff, compare_startup_inventory_json, is_startup_inventory_json,
+};
+pub use windows_app_paths_diff::{
+    WindowsAppPathsChangeKind, WindowsAppPathsComparisonDiagnostic, WindowsAppPathsComparisonError,
+    WindowsAppPathsComparisonStatus, WindowsAppPathsCounts, WindowsAppPathsDelta,
+    WindowsAppPathsEvidenceReference, WindowsAppPathsFacts, WindowsAppPathsIdentity,
+    WindowsAppPathsInventoryComparison, WindowsAppPathsValueFacts,
+    compare_windows_app_paths_inventory_json,
+};
+pub use windows_msix_diff::{
+    WindowsMsixChangeKind, WindowsMsixComparisonDiagnostic, WindowsMsixComparisonError,
+    WindowsMsixComparisonStatus, WindowsMsixCounts, WindowsMsixDelta, WindowsMsixEvidenceReference,
+    WindowsMsixFacts, WindowsMsixIdentity, WindowsMsixInventoryComparison,
+    compare_windows_msix_inventory_json,
 };
 pub use windows_software_diff::{
     WindowsSoftwareChangeKind, WindowsSoftwareComparisonCounts,
@@ -90,8 +135,9 @@ pub use permissions_windows::{
 pub use processes::{
     MAX_AGGREGATE_NAMESPACE_LINK_BYTES, MAX_AGGREGATE_STATUS_BYTES, MAX_NAMESPACE_LINK_BYTES,
     MAX_PROCESS_DIRECTORIES, MAX_PROCESS_STAT_BYTES, NamespacePidEvidence, NamespacePidStatus,
-    PROCESS_NAMESPACES, ProcessDiagnostic, ProcessEvidence, ProcessExecutableEvidence,
-    ProcessExecutableLink, ProcessExecutableLinkStatus, ProcessInventoryDocument,
+    PROCESS_NAMESPACES, PidNamespaceIdentityEvidence, ProcessDiagnostic, ProcessEvidence,
+    ProcessExecutableEvidence, ProcessExecutableLink, ProcessExecutableLinkStatus,
+    ProcessIdentityDomain, ProcessIdentityDomainStatus, ProcessInventoryDocument,
     ProcessInventorySource, ProcessInventoryStatus, ProcessNamespace, ProcessNamespaceEvidence,
     ProcessNamespaceStatus, ProcessRow, ProcessStartTime, ProcessStartTimeEvidence,
     ProcessStartTimeStatus, collect_processes, collect_processes_from,
@@ -103,6 +149,16 @@ pub use processes_windows::{
     WindowsProcessImageStatus, WindowsProcessInventoryDocument, WindowsProcessInventoryStatus,
     WindowsProcessRow, WindowsProcessTokenContext, WindowsProcessTokenContextStatus,
     WindowsProcessTokenField, WindowsProcessTokenFieldStatus, collect_windows_processes,
+};
+pub use root_snapshot::{
+    MAX_ROOT_AGGREGATE_HASH_BYTES, MAX_ROOT_ENTRIES, MAX_ROOT_FILE_HASH_BYTES, ROOT_HASH_DEADLINE,
+    ROOT_SNAPSHOT_HASH_SCHEMA_VERSION, ROOT_SNAPSHOT_SCHEMA, ROOT_SNAPSHOT_SCHEMA_VERSION,
+    RootContentHashing, RootDiagnostic, RootEntry, RootEntryEvidence, RootIdentity, RootSnapshot,
+    RootSnapshotLimits, collect_root_snapshot, collect_root_snapshot_with_hash,
+};
+pub use root_snapshot_diff::{
+    RootSnapshotDelta, RootSnapshotDiff, RootSnapshotDiffCounts, RootSnapshotDiffError,
+    RootSnapshotSide, compare_selected_root_inventory_json, is_selected_root_inventory_json,
 };
 #[cfg(target_os = "linux")]
 pub use startup::{
@@ -117,11 +173,33 @@ pub use startup_legacy::{
 };
 #[cfg(windows)]
 pub use startup_windows::{
-    WindowsRegistryStartupEntry, WindowsRegistryStartupEvidence, WindowsRegistryView,
-    WindowsScheduledTaskStartupEntry, WindowsScheduledTaskStartupEvidence,
+    WindowsDelayedAutoStart, WindowsRegistryStartupEntry, WindowsRegistryStartupEvidence,
+    WindowsRegistryView, WindowsScheduledTaskStartupEntry, WindowsScheduledTaskStartupEvidence,
     WindowsServiceStartupEntry, WindowsServiceStartupEvidence, WindowsStartupDiagnostic,
     WindowsStartupFolderEntry, WindowsStartupFolderEvidence, WindowsStartupInventoryDocument,
     WindowsStartupSource, WindowsStartupStatus, collect_windows_startup,
 };
+#[cfg(windows)]
+pub(crate) use startup_windows::{
+    collect_windows_startup_v5, collect_windows_startup_v6, collect_windows_startup_v7,
+    collect_windows_startup_v8, collect_windows_startup_v9,
+};
+#[cfg(windows)]
+pub use startup_wmi::{
+    WmiConsumerStatus, WmiEventConsumer, WmiEventFilter, WmiFilterConsumerBinding,
+    WmiReferenceStatus, WmiSubscriptionEvidence,
+};
 #[cfg(target_os = "linux")]
 pub use systemd_units::{UnitInventory as SystemdUnitInventory, UnitRecord as SystemdUnitRecord};
+#[cfg(windows)]
+pub use windows_app_paths::{
+    AppPathDiagnostic, AppPathEntry, AppPathEvidence, AppPathRegistryView, AppPathSource,
+    AppPathStatus, AppPathValue, MAX_AGGREGATE_NAME_UNITS as APP_PATHS_MAX_AGGREGATE_NAME_UNITS,
+    MAX_AGGREGATE_VALUE_BYTES as APP_PATHS_MAX_AGGREGATE_VALUE_BYTES,
+    MAX_ENTRIES as APP_PATHS_MAX_ENTRIES, MAX_NAME_UNITS as APP_PATHS_MAX_NAME_UNITS,
+    MAX_SCAN_DURATION_MS as APP_PATHS_MAX_SCAN_DURATION_MS,
+    MAX_VALUE_BYTES as APP_PATHS_MAX_VALUE_BYTES, WindowsAppPathInventoryDocument,
+    collect_windows_app_paths,
+};
+#[cfg(windows)]
+pub use windows_msix::{WindowsMsixInventoryDocument, WindowsMsixStatus, collect_windows_msix};

@@ -8,16 +8,26 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
 pub const AUDIT_SESSION_SCHEMA: &str = "sideeffect.audit_session";
-pub const AUDIT_SESSION_SCHEMA_VERSION: u32 = 6;
+pub const AUDIT_SESSION_SCHEMA_VERSION: u32 = 15;
 pub const AUDIT_SESSION_V1_SCHEMA_VERSION: u32 = 1;
 pub const AUDIT_SESSION_V2_SCHEMA_VERSION: u32 = 2;
 pub const AUDIT_SESSION_V3_SCHEMA_VERSION: u32 = 3;
 pub const AUDIT_SESSION_V4_SCHEMA_VERSION: u32 = 4;
 pub const AUDIT_SESSION_V5_SCHEMA_VERSION: u32 = 5;
+pub const AUDIT_SESSION_V6_SCHEMA_VERSION: u32 = 6;
+pub const AUDIT_SESSION_V7_SCHEMA_VERSION: u32 = 7;
+pub const AUDIT_SESSION_V8_SCHEMA_VERSION: u32 = 8;
+pub const AUDIT_SESSION_V9_SCHEMA_VERSION: u32 = 9;
+pub const AUDIT_SESSION_V10_SCHEMA_VERSION: u32 = 10;
+pub const AUDIT_SESSION_V11_SCHEMA_VERSION: u32 = 11;
+pub const AUDIT_SESSION_V12_SCHEMA_VERSION: u32 = 12;
+pub const AUDIT_SESSION_V13_SCHEMA_VERSION: u32 = 13;
+pub const AUDIT_SESSION_V14_SCHEMA_VERSION: u32 = 14;
+pub const AUDIT_SESSION_V15_SCHEMA_VERSION: u32 = 15;
 pub const COVERAGE_MANIFEST_V1_VERSION: u32 = 1;
 pub const COVERAGE_MANIFEST_VERSION: u32 = 2;
 pub const MAX_AUDIT_SESSION_MANIFEST_BYTES: usize = 512 * 1024;
-pub const MAX_SESSION_SOURCES: usize = 8;
+pub const MAX_SESSION_SOURCES: usize = 9;
 pub const MAX_SESSION_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_SESSION_TOTAL_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_SESSION_TIMESTAMP_UNIX_MS: u128 = 253_402_300_799_999;
@@ -251,6 +261,9 @@ pub enum SourceRole {
     Startup,
     Runtime,
     PathExecutables,
+    SelectedRoot,
+    Msix,
+    AppPaths,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -366,6 +379,8 @@ pub enum ArtifactKind {
     Permissions,
     Startup,
     WindowsSoftware,
+    WindowsMsix,
+    WindowsAppPaths,
     WindowsProcesses,
     WindowsPermissions,
     WindowsStartup,
@@ -373,6 +388,7 @@ pub enum ArtifactKind {
     RuntimeTrace,
     WindowsRuntimeCapture,
     PathExecutables,
+    SelectedRoot,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -425,7 +441,16 @@ impl AuditSessionManifest {
                 Some(context),
                 AUDIT_SESSION_V4_SCHEMA_VERSION
                 | AUDIT_SESSION_V5_SCHEMA_VERSION
-                | AUDIT_SESSION_SCHEMA_VERSION,
+                | AUDIT_SESSION_V6_SCHEMA_VERSION
+                | AUDIT_SESSION_V7_SCHEMA_VERSION
+                | AUDIT_SESSION_V8_SCHEMA_VERSION
+                | AUDIT_SESSION_V9_SCHEMA_VERSION
+                | AUDIT_SESSION_V10_SCHEMA_VERSION
+                | AUDIT_SESSION_V11_SCHEMA_VERSION
+                | AUDIT_SESSION_V12_SCHEMA_VERSION
+                | AUDIT_SESSION_V13_SCHEMA_VERSION
+                | AUDIT_SESSION_V14_SCHEMA_VERSION
+                | AUDIT_SESSION_V15_SCHEMA_VERSION,
             ) => {
                 for fact in [&context.os_name, &context.os_version] {
                     match (fact.status, &fact.value) {
@@ -451,7 +476,16 @@ impl AuditSessionManifest {
                 | AUDIT_SESSION_V3_SCHEMA_VERSION
                 | AUDIT_SESSION_V4_SCHEMA_VERSION
                 | AUDIT_SESSION_V5_SCHEMA_VERSION
-                | AUDIT_SESSION_SCHEMA_VERSION,
+                | AUDIT_SESSION_V6_SCHEMA_VERSION
+                | AUDIT_SESSION_V7_SCHEMA_VERSION
+                | AUDIT_SESSION_V8_SCHEMA_VERSION
+                | AUDIT_SESSION_V9_SCHEMA_VERSION
+                | AUDIT_SESSION_V10_SCHEMA_VERSION
+                | AUDIT_SESSION_V11_SCHEMA_VERSION
+                | AUDIT_SESSION_V12_SCHEMA_VERSION
+                | AUDIT_SESSION_V13_SCHEMA_VERSION
+                | AUDIT_SESSION_V14_SCHEMA_VERSION
+                | AUDIT_SESSION_V15_SCHEMA_VERSION,
             ) => {
                 if !matches!(
                     coverage.version,
@@ -506,16 +540,41 @@ impl AuditSessionManifest {
                 return Err(ValidationError::SourcePlatformMismatch);
             }
             validate_bounded_text(&source.scope, MAX_SCOPE_BYTES, "scope")?;
-            if self.schema_version < AUDIT_SESSION_SCHEMA_VERSION
+            if self.schema_version < AUDIT_SESSION_V6_SCHEMA_VERSION
                 && source.role == SourceRole::PathExecutables
             {
                 return Err(ValidationError::InvalidSchema);
             }
+            if self.schema_version < AUDIT_SESSION_V7_SCHEMA_VERSION
+                && source.role == SourceRole::SelectedRoot
+            {
+                return Err(ValidationError::InvalidSchema);
+            }
+            if self.schema_version < AUDIT_SESSION_V9_SCHEMA_VERSION
+                && source.role == SourceRole::Msix
+            {
+                return Err(ValidationError::InvalidSchema);
+            }
+            if self.schema_version < AUDIT_SESSION_V11_SCHEMA_VERSION
+                && source.role == SourceRole::AppPaths
+            {
+                return Err(ValidationError::InvalidSchema);
+            }
             match (&source.collector, self.schema_version) {
-                (None, 1..=AUDIT_SESSION_V5_SCHEMA_VERSION) => {}
+                (None, 1..=AUDIT_SESSION_V6_SCHEMA_VERSION) => {}
                 (
                     Some(identity),
-                    AUDIT_SESSION_V5_SCHEMA_VERSION | AUDIT_SESSION_SCHEMA_VERSION,
+                    AUDIT_SESSION_V5_SCHEMA_VERSION
+                    | AUDIT_SESSION_V6_SCHEMA_VERSION
+                    | AUDIT_SESSION_V7_SCHEMA_VERSION
+                    | AUDIT_SESSION_V8_SCHEMA_VERSION
+                    | AUDIT_SESSION_V9_SCHEMA_VERSION
+                    | AUDIT_SESSION_V10_SCHEMA_VERSION
+                    | AUDIT_SESSION_V11_SCHEMA_VERSION
+                    | AUDIT_SESSION_V12_SCHEMA_VERSION
+                    | AUDIT_SESSION_V13_SCHEMA_VERSION
+                    | AUDIT_SESSION_V14_SCHEMA_VERSION
+                    | AUDIT_SESSION_V15_SCHEMA_VERSION,
                 ) => {
                     validate_collector_identity(identity, &source.platform, source.role)?;
                 }
@@ -610,7 +669,12 @@ impl AuditSessionManifest {
                     || !source_artifact_kinds.insert(artifact.kind)
                     || artifact.path != path
                     || artifact.schema != schema
-                    || !artifact_version_supported(artifact.kind, artifact.schema_version, version)
+                    || !artifact_version_supported(
+                        artifact.kind,
+                        artifact.schema_version,
+                        version,
+                        self.schema_version,
+                    )
                 {
                     return Err(ValidationError::ArtifactContractMismatch);
                 }
@@ -939,9 +1003,31 @@ fn runtime_coverage_detail(manifest: &CoverageManifest) -> Option<&RuntimeCovera
         .and_then(|source| source.runtime_detail.as_ref())
 }
 
-fn artifact_version_supported(kind: ArtifactKind, observed: u32, current: u32) -> bool {
+fn artifact_version_supported(
+    kind: ArtifactKind,
+    observed: u32,
+    current: u32,
+    session_version: u32,
+) -> bool {
+    if kind == ArtifactKind::WindowsStartup {
+        return match session_version {
+            AUDIT_SESSION_V1_SCHEMA_VERSION..=AUDIT_SESSION_V9_SCHEMA_VERSION => {
+                matches!(observed, 4 | 5)
+            }
+            AUDIT_SESSION_V10_SCHEMA_VERSION | AUDIT_SESSION_V11_SCHEMA_VERSION => observed == 6,
+            AUDIT_SESSION_V12_SCHEMA_VERSION => observed == 7,
+            AUDIT_SESSION_V13_SCHEMA_VERSION => observed == 8,
+            AUDIT_SESSION_V14_SCHEMA_VERSION => observed == 9,
+            AUDIT_SESSION_V15_SCHEMA_VERSION => observed == 10,
+            _ => false,
+        };
+    }
     observed == current
-        || (matches!(observed, 1 | 2)
+        || (kind == ArtifactKind::Startup && matches!(observed, 2 | 3))
+        || (kind == ArtifactKind::SelectedRoot
+            && session_version >= AUDIT_SESSION_V8_SCHEMA_VERSION
+            && observed == 2)
+        || (matches!(observed, 1..=4)
             && matches!(
                 kind,
                 ArtifactKind::Processes | ArtifactKind::WindowsProcesses
@@ -953,13 +1039,19 @@ fn expected_artifacts(
     platform: &str,
 ) -> Result<Vec<ArtifactKind>, ValidationError> {
     match platform {
+        "linux" if matches!(role, SourceRole::Msix | SourceRole::AppPaths) => {
+            Err(ValidationError::UnsupportedArtifactPlatform)
+        }
         "linux" => Ok(match role {
             SourceRole::Packages => vec![ArtifactKind::Packages],
             SourceRole::Processes => vec![ArtifactKind::Processes],
             SourceRole::Permissions => vec![ArtifactKind::Permissions],
             SourceRole::Startup => vec![ArtifactKind::Startup],
             SourceRole::PathExecutables => vec![ArtifactKind::PathExecutables],
+            SourceRole::SelectedRoot => vec![ArtifactKind::SelectedRoot],
             SourceRole::Runtime => vec![ArtifactKind::RuntimeManifest, ArtifactKind::RuntimeTrace],
+            SourceRole::Msix => return Err(ValidationError::UnsupportedArtifactPlatform),
+            SourceRole::AppPaths => return Err(ValidationError::UnsupportedArtifactPlatform),
         }),
         "windows" => Ok(match role {
             SourceRole::Packages => vec![ArtifactKind::WindowsSoftware],
@@ -967,7 +1059,10 @@ fn expected_artifacts(
             SourceRole::Permissions => vec![ArtifactKind::WindowsPermissions],
             SourceRole::Startup => vec![ArtifactKind::WindowsStartup],
             SourceRole::PathExecutables => vec![ArtifactKind::PathExecutables],
+            SourceRole::SelectedRoot => vec![ArtifactKind::SelectedRoot],
             SourceRole::Runtime => vec![ArtifactKind::WindowsRuntimeCapture],
+            SourceRole::Msix => vec![ArtifactKind::WindowsMsix],
+            SourceRole::AppPaths => vec![ArtifactKind::WindowsAppPaths],
         }),
         _ => Err(ValidationError::UnsupportedArtifactPlatform),
     }
@@ -978,12 +1073,17 @@ fn artifact_contract(
 ) -> Result<(&'static str, &'static str, u32), ValidationError> {
     Ok(match kind {
         ArtifactKind::Packages => ("packages.json", "sideeffect.inventory", 2),
-        ArtifactKind::Processes => ("processes.json", "sideeffect.process_inventory", 3),
+        ArtifactKind::Processes => ("processes.json", "sideeffect.process_inventory", 5),
         ArtifactKind::Permissions => ("permissions.json", "sideeffect.permission_inventory", 1),
-        ArtifactKind::Startup => ("startup.json", "sideeffect.startup_inventory", 2),
+        ArtifactKind::Startup => ("startup.json", "sideeffect.startup_inventory", 3),
         ArtifactKind::PathExecutables => (
             "path-executables.json",
             "sideeffect.path_executable_inventory",
+            1,
+        ),
+        ArtifactKind::SelectedRoot => (
+            "root-snapshot.json",
+            "sideeffect.selected_root_inventory",
             1,
         ),
         ArtifactKind::WindowsSoftware => (
@@ -991,10 +1091,16 @@ fn artifact_contract(
             "sideeffect.windows_software_inventory",
             1,
         ),
+        ArtifactKind::WindowsMsix => ("msix.windows.json", "sideeffect.windows_msix_inventory", 1),
+        ArtifactKind::WindowsAppPaths => (
+            "app-paths.windows.json",
+            "sideeffect.windows_app_path_inventory",
+            1,
+        ),
         ArtifactKind::WindowsProcesses => (
             "processes.windows.json",
             "sideeffect.windows_process_inventory",
-            3,
+            4,
         ),
         ArtifactKind::WindowsPermissions => (
             "permissions.windows.json",
@@ -1004,7 +1110,7 @@ fn artifact_contract(
         ArtifactKind::WindowsStartup => (
             "startup.windows.json",
             "sideeffect.windows_startup_inventory",
-            4,
+            9,
         ),
         ArtifactKind::RuntimeManifest => ("run.json", "sideeffect.run", 2),
         ArtifactKind::RuntimeTrace => ("trace.strace", "strace_text", 1),
@@ -1047,12 +1153,16 @@ pub fn collector_identity(platform: &str, role: SourceRole) -> CollectorIdentity
         ("linux", SourceRole::Permissions) => "linux.selected_path_permissions",
         ("linux", SourceRole::Startup) => "linux.curated_startup_sources",
         ("linux", SourceRole::PathExecutables) => "linux.path_executable_candidates",
+        ("linux", SourceRole::SelectedRoot) => "linux.selected_root_directory",
         ("linux", SourceRole::Runtime) => "linux.strace_runtime",
         ("windows", SourceRole::Packages) => "windows.software_registry",
+        ("windows", SourceRole::Msix) => "windows.msix_package_registrations",
+        ("windows", SourceRole::AppPaths) => "windows.app_paths_registry_registrations",
         ("windows", SourceRole::Processes) => "windows.toolhelp_processes",
         ("windows", SourceRole::Permissions) => "windows.selected_path_permissions",
         ("windows", SourceRole::Startup) => "windows.curated_startup_sources",
         ("windows", SourceRole::PathExecutables) => "windows.path_executable_candidates",
+        ("windows", SourceRole::SelectedRoot) => "windows.selected_root_directory",
         ("windows", SourceRole::Runtime) => "windows.etw_runtime",
         _ => "unknown",
     };
@@ -1376,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn v5_remains_readable_and_rejects_the_v6_path_executable_role() {
+    fn v5_and_v6_keep_their_exact_historical_role_allowlists() {
         let mut v5 = valid_manifest();
         v5.schema_version = super::AUDIT_SESSION_V5_SCHEMA_VERSION;
         assert!(v5.validate().is_ok());
@@ -1399,6 +1509,97 @@ mod tests {
         path_v5.coverage_manifest = Some(CoverageManifest::from_sources(&path_v5.sources));
         path_v5.schema_version = super::AUDIT_SESSION_V5_SCHEMA_VERSION;
         assert_eq!(path_v5.validate(), Err(ValidationError::InvalidSchema));
+
+        let mut path_v6 = path_v5.clone();
+        path_v6.schema_version = super::AUDIT_SESSION_V6_SCHEMA_VERSION;
+        assert!(path_v6.validate().is_ok());
+        assert!(parse_manifest(&serde_json::to_vec(&path_v6).unwrap()).is_ok());
+
+        for version in 1..=super::AUDIT_SESSION_V6_SCHEMA_VERSION {
+            let mut root_legacy = valid_manifest();
+            root_legacy.schema_version = version;
+            root_legacy.sources[0].role = SourceRole::SelectedRoot;
+            root_legacy.sources[0].collector = (version >= super::AUDIT_SESSION_V5_SCHEMA_VERSION)
+                .then(|| super::collector_identity("linux", SourceRole::SelectedRoot));
+            root_legacy.sources[0].scope =
+                "one explicitly selected directory and direct-child metadata only".to_owned();
+            root_legacy.sources[0].artifacts[0] = SessionArtifactRef {
+                kind: ArtifactKind::SelectedRoot,
+                path: "root-snapshot.json".to_owned(),
+                schema: "sideeffect.selected_root_inventory".to_owned(),
+                schema_version: 1,
+                byte_length: 1,
+                sha256: "0".repeat(64),
+            };
+            root_legacy.host_context = (version >= super::AUDIT_SESSION_V4_SCHEMA_VERSION)
+                .then(|| valid_manifest().host_context.unwrap());
+            root_legacy.coverage_manifest = if version == super::AUDIT_SESSION_V1_SCHEMA_VERSION {
+                None
+            } else {
+                Some(CoverageManifest::from_sources(&root_legacy.sources))
+            };
+            assert_eq!(
+                root_legacy.validate(),
+                Err(ValidationError::InvalidSchema),
+                "v{version} must reject selected root"
+            );
+        }
+
+        let root_manifest = |session_version: u32, artifact_version: u32| {
+            let mut manifest = valid_manifest();
+            manifest.schema_version = session_version;
+            manifest.sources[0].role = SourceRole::SelectedRoot;
+            manifest.sources[0].collector =
+                Some(super::collector_identity("linux", SourceRole::SelectedRoot));
+            manifest.sources[0].scope = if session_version == super::AUDIT_SESSION_V7_SCHEMA_VERSION {
+                "one explicitly selected directory and direct-child metadata only"
+            } else {
+                "one explicitly selected directory and direct-child metadata; optional regular-file content fingerprints"
+            }.to_owned();
+            manifest.sources[0].artifacts[0] = SessionArtifactRef {
+                kind: ArtifactKind::SelectedRoot,
+                path: "root-snapshot.json".to_owned(),
+                schema: "sideeffect.selected_root_inventory".to_owned(),
+                schema_version: artifact_version,
+                byte_length: 1,
+                sha256: "0".repeat(64),
+            };
+            manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
+            manifest
+        };
+        assert!(
+            root_manifest(super::AUDIT_SESSION_V7_SCHEMA_VERSION, 1)
+                .validate()
+                .is_ok()
+        );
+        assert_eq!(
+            root_manifest(super::AUDIT_SESSION_V7_SCHEMA_VERSION, 2).validate(),
+            Err(ValidationError::ArtifactContractMismatch),
+            "v7 must retain the historical selected-root v1 contract"
+        );
+        assert!(
+            root_manifest(super::AUDIT_SESSION_V8_SCHEMA_VERSION, 2)
+                .validate()
+                .is_ok(),
+            "v8 must retain its selected-root v2 contract"
+        );
+        assert!(
+            root_manifest(super::AUDIT_SESSION_SCHEMA_VERSION, 1)
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            root_manifest(super::AUDIT_SESSION_SCHEMA_VERSION, 2)
+                .validate()
+                .is_ok()
+        );
+        let mut unsupported_root = root_manifest(super::AUDIT_SESSION_SCHEMA_VERSION, 2);
+        unsupported_root.sources[0].artifacts[0].schema_version = 3;
+        assert_eq!(
+            unsupported_root.validate(),
+            Err(ValidationError::ArtifactContractMismatch),
+            "unknown selected-root schema versions must be rejected"
+        );
     }
 
     #[test]
@@ -2143,19 +2344,372 @@ mod tests {
         );
     }
 
+    fn windows_msix_manifest() -> AuditSessionManifest {
+        let mut manifest = valid_manifest();
+        manifest.schema_version = super::AUDIT_SESSION_V9_SCHEMA_VERSION;
+        manifest.platform = "windows".to_owned();
+        manifest.architecture = "x86_64".to_owned();
+        manifest.host_context.as_mut().unwrap().os_name.value = Some("Windows".to_owned());
+        let source = &mut manifest.sources[0];
+        source.role = SourceRole::Msix;
+        source.collector = Some(super::collector_identity("windows", SourceRole::Msix));
+        source.platform = "windows".to_owned();
+        source.scope = "bounded current-user MSIX package registrations".to_owned();
+        source.artifacts = vec![SessionArtifactRef {
+            kind: ArtifactKind::WindowsMsix,
+            path: "msix.windows.json".to_owned(),
+            schema: "sideeffect.windows_msix_inventory".to_owned(),
+            schema_version: 1,
+            byte_length: 1,
+            sha256: "a".repeat(64),
+        }];
+        manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
+        manifest
+    }
+
+    fn windows_app_paths_manifest() -> AuditSessionManifest {
+        let mut manifest = windows_msix_manifest();
+        manifest.schema_version = super::AUDIT_SESSION_V11_SCHEMA_VERSION;
+        let source = &mut manifest.sources[0];
+        source.role = SourceRole::AppPaths;
+        source.collector = Some(super::collector_identity("windows", SourceRole::AppPaths));
+        source.scope = "selected Windows App Paths registry views".to_owned();
+        source.artifacts = vec![SessionArtifactRef {
+            kind: ArtifactKind::WindowsAppPaths,
+            path: "app-paths.windows.json".to_owned(),
+            schema: "sideeffect.windows_app_path_inventory".to_owned(),
+            schema_version: 1,
+            byte_length: 1,
+            sha256: "b".repeat(64),
+        }];
+        manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
+        manifest
+    }
+
     #[test]
-    fn process_artifact_contracts_accept_legacy_v1_v2_and_current_v3() {
+    fn msix_session_contract_is_windows_only_and_v9_only() {
+        use super::{AUDIT_SESSION_V8_SCHEMA_VERSION, AUDIT_SESSION_V9_SCHEMA_VERSION};
+
+        let valid = windows_msix_manifest();
+        assert_eq!(valid.schema_version, AUDIT_SESSION_V9_SCHEMA_VERSION);
+        assert!(valid.validate().is_ok());
+
+        let mut legacy = valid.clone();
+        legacy.schema_version = AUDIT_SESSION_V8_SCHEMA_VERSION;
+        assert_eq!(legacy.validate(), Err(ValidationError::InvalidSchema));
+
+        let mut linux = valid.clone();
+        linux.platform = "linux".to_owned();
+        linux.sources[0].platform = "linux".to_owned();
+        linux.sources[0].collector = Some(super::collector_identity("linux", SourceRole::Msix));
+        assert_eq!(
+            linux.validate(),
+            Err(ValidationError::UnsupportedArtifactPlatform)
+        );
+
+        let mut wrong_artifact = valid.clone();
+        wrong_artifact.sources[0].artifacts[0].kind = ArtifactKind::WindowsSoftware;
+        wrong_artifact.sources[0].artifacts[0].path = "software.windows.json".to_owned();
+        wrong_artifact.sources[0].artifacts[0].schema =
+            "sideeffect.windows_software_inventory".to_owned();
+        assert_eq!(
+            wrong_artifact.validate(),
+            Err(ValidationError::ArtifactContractMismatch)
+        );
+
+        let mut missing = valid.clone();
+        missing.sources[0].artifacts.clear();
+        assert_eq!(
+            missing.validate(),
+            Err(ValidationError::ArtifactSetMismatch)
+        );
+
+        let mut extra = valid;
+        extra.sources[0].artifacts.push(SessionArtifactRef {
+            kind: ArtifactKind::WindowsSoftware,
+            path: "software.windows.json".to_owned(),
+            schema: "sideeffect.windows_software_inventory".to_owned(),
+            schema_version: 1,
+            byte_length: 1,
+            sha256: "b".repeat(64),
+        });
+        assert_eq!(extra.validate(), Err(ValidationError::ArtifactSetMismatch));
+    }
+
+    #[test]
+    fn app_paths_session_contract_is_windows_only_and_v11_only() {
+        use super::{AUDIT_SESSION_V10_SCHEMA_VERSION, AUDIT_SESSION_V11_SCHEMA_VERSION};
+
+        let valid = windows_app_paths_manifest();
+        assert_eq!(valid.schema_version, AUDIT_SESSION_V11_SCHEMA_VERSION);
+        assert!(valid.validate().is_ok());
+
+        let mut legacy = valid.clone();
+        legacy.schema_version = AUDIT_SESSION_V10_SCHEMA_VERSION;
+        assert_eq!(legacy.validate(), Err(ValidationError::InvalidSchema));
+
+        let mut linux = valid.clone();
+        linux.platform = "linux".to_owned();
+        linux.sources[0].platform = "linux".to_owned();
+        linux.sources[0].collector = Some(super::collector_identity("linux", SourceRole::AppPaths));
+        assert_eq!(
+            linux.validate(),
+            Err(ValidationError::UnsupportedArtifactPlatform)
+        );
+    }
+
+    #[test]
+    fn process_artifact_contracts_accept_legacy_versions_and_platform_current_versions() {
         for kind in [ArtifactKind::Processes, ArtifactKind::WindowsProcesses] {
-            assert!(super::artifact_version_supported(kind, 1, 3));
-            assert!(super::artifact_version_supported(kind, 2, 3));
-            assert!(super::artifact_version_supported(kind, 3, 3));
-            assert!(!super::artifact_version_supported(kind, 4, 3));
+            let current = if kind == ArtifactKind::Processes {
+                5
+            } else {
+                4
+            };
+            for old in 1..current {
+                assert!(super::artifact_version_supported(
+                    kind,
+                    old,
+                    current,
+                    super::AUDIT_SESSION_SCHEMA_VERSION,
+                ));
+            }
+            assert!(super::artifact_version_supported(
+                kind,
+                current,
+                current,
+                super::AUDIT_SESSION_SCHEMA_VERSION,
+            ));
+            assert!(!super::artifact_version_supported(
+                kind,
+                current + 1,
+                current,
+                super::AUDIT_SESSION_SCHEMA_VERSION,
+            ));
         }
         assert!(!super::artifact_version_supported(
             ArtifactKind::Packages,
             1,
-            2
+            2,
+            super::AUDIT_SESSION_SCHEMA_VERSION,
         ));
+    }
+
+    #[test]
+    fn startup_artifact_contracts_accept_legacy_and_current_versions() {
+        for (kind, current, legacy) in [
+            (ArtifactKind::Startup, 3, 2),
+            (ArtifactKind::WindowsStartup, 10, 4),
+        ] {
+            let legacy_session_version = if kind == ArtifactKind::WindowsStartup {
+                super::AUDIT_SESSION_V9_SCHEMA_VERSION
+            } else {
+                super::AUDIT_SESSION_SCHEMA_VERSION
+            };
+            let current_session = if kind == ArtifactKind::WindowsStartup {
+                super::AUDIT_SESSION_V15_SCHEMA_VERSION
+            } else {
+                super::AUDIT_SESSION_SCHEMA_VERSION
+            };
+            assert!(super::artifact_version_supported(
+                kind,
+                current,
+                current,
+                current_session
+            ));
+            assert!(super::artifact_version_supported(
+                kind,
+                legacy,
+                current,
+                legacy_session_version,
+            ));
+            assert!(!super::artifact_version_supported(
+                kind,
+                legacy + 10,
+                current,
+                super::AUDIT_SESSION_SCHEMA_VERSION,
+            ));
+        }
+        assert!(!super::artifact_version_supported(
+            ArtifactKind::WindowsStartup,
+            6,
+            6,
+            super::AUDIT_SESSION_V9_SCHEMA_VERSION,
+        ));
+    }
+
+    #[test]
+    fn windows_startup_v6_is_v10_only_and_older_contract_stays_v5() {
+        let mut manifest = windows_msix_manifest();
+        manifest.schema_version = super::AUDIT_SESSION_V10_SCHEMA_VERSION;
+        let source = &mut manifest.sources[0];
+        source.role = SourceRole::Startup;
+        source.collector = Some(super::collector_identity("windows", SourceRole::Startup));
+        source.scope =
+            "selected Windows startup sources including local ROOT\\subscription WMI rows"
+                .to_owned();
+        source.artifacts[0] = SessionArtifactRef {
+            kind: ArtifactKind::WindowsStartup,
+            path: "startup.windows.json".to_owned(),
+            schema: "sideeffect.windows_startup_inventory".to_owned(),
+            schema_version: 6,
+            byte_length: 1,
+            sha256: "a".repeat(64),
+        };
+        manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
+        assert!(manifest.validate().is_ok());
+
+        let mut v10_with_v5 = manifest.clone();
+        v10_with_v5.sources[0].artifacts[0].schema_version = 5;
+        assert_eq!(
+            v10_with_v5.validate(),
+            Err(ValidationError::ArtifactContractMismatch)
+        );
+
+        let mut v9 = manifest.clone();
+        v9.schema_version = super::AUDIT_SESSION_V9_SCHEMA_VERSION;
+        v9.sources[0].artifacts[0].schema_version = 5;
+        assert!(v9.validate().is_ok());
+        v9.sources[0].artifacts[0].schema_version = 6;
+        assert_eq!(
+            v9.validate(),
+            Err(ValidationError::ArtifactContractMismatch)
+        );
+    }
+
+    #[test]
+    fn windows_startup_v7_is_v12_only_and_v10_v11_remain_pinned_to_v6() {
+        let mut manifest = windows_msix_manifest();
+        manifest.schema_version = super::AUDIT_SESSION_V12_SCHEMA_VERSION;
+        let source = &mut manifest.sources[0];
+        source.role = SourceRole::Startup;
+        source.collector = Some(super::collector_identity("windows", SourceRole::Startup));
+        source.scope = "selected Windows startup sources".to_owned();
+        source.artifacts[0] = SessionArtifactRef {
+            kind: ArtifactKind::WindowsStartup,
+            path: "startup.windows.json".to_owned(),
+            schema: "sideeffect.windows_startup_inventory".to_owned(),
+            schema_version: 7,
+            byte_length: 1,
+            sha256: "a".repeat(64),
+        };
+        manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
+        assert!(manifest.validate().is_ok());
+
+        for old_version in [
+            super::AUDIT_SESSION_V10_SCHEMA_VERSION,
+            super::AUDIT_SESSION_V11_SCHEMA_VERSION,
+        ] {
+            let mut old_envelope = manifest.clone();
+            old_envelope.schema_version = old_version;
+            assert_eq!(
+                old_envelope.validate(),
+                Err(ValidationError::ArtifactContractMismatch)
+            );
+            old_envelope.sources[0].artifacts[0].schema_version = 6;
+            assert!(old_envelope.validate().is_ok());
+        }
+
+        let mut v12_with_v6 = manifest;
+        v12_with_v6.sources[0].artifacts[0].schema_version = 6;
+        assert_eq!(
+            v12_with_v6.validate(),
+            Err(ValidationError::ArtifactContractMismatch)
+        );
+    }
+
+    #[test]
+    fn windows_startup_v8_is_v13_only_and_v12_remains_pinned_to_v7() {
+        let mut manifest = windows_msix_manifest();
+        manifest.schema_version = super::AUDIT_SESSION_V13_SCHEMA_VERSION;
+        let source = &mut manifest.sources[0];
+        source.role = SourceRole::Startup;
+        source.collector = Some(super::collector_identity("windows", SourceRole::Startup));
+        source.scope =
+            "selected Windows startup sources including delayed-auto-start configuration"
+                .to_owned();
+        source.artifacts[0] = SessionArtifactRef {
+            kind: ArtifactKind::WindowsStartup,
+            path: "startup.windows.json".to_owned(),
+            schema: "sideeffect.windows_startup_inventory".to_owned(),
+            schema_version: 8,
+            byte_length: 1,
+            sha256: "a".repeat(64),
+        };
+        manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
+        assert!(manifest.validate().is_ok());
+
+        let mut v12_with_v8 = manifest.clone();
+        v12_with_v8.schema_version = super::AUDIT_SESSION_V12_SCHEMA_VERSION;
+        assert_eq!(
+            v12_with_v8.validate(),
+            Err(ValidationError::ArtifactContractMismatch)
+        );
+
+        let mut v12 = manifest;
+        v12.schema_version = super::AUDIT_SESSION_V12_SCHEMA_VERSION;
+        v12.sources[0].artifacts[0].schema_version = 7;
+        assert!(v12.validate().is_ok());
+    }
+
+    #[test]
+    fn windows_startup_v9_is_v14_only_and_v10_is_v15_only() {
+        let mut manifest = windows_msix_manifest();
+        manifest.schema_version = super::AUDIT_SESSION_V14_SCHEMA_VERSION;
+        let source = &mut manifest.sources[0];
+        source.role = SourceRole::Startup;
+        source.collector = Some(super::collector_identity("windows", SourceRole::Startup));
+        source.scope =
+            "selected Windows startup sources with SCM dependency configuration".to_owned();
+        source.artifacts[0] = SessionArtifactRef {
+            kind: ArtifactKind::WindowsStartup,
+            path: "startup.windows.json".to_owned(),
+            schema: "sideeffect.windows_startup_inventory".to_owned(),
+            schema_version: 9,
+            byte_length: 1,
+            sha256: "a".repeat(64),
+        };
+        manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
+        assert!(manifest.validate().is_ok());
+
+        for (session_version, artifact_version) in [
+            (super::AUDIT_SESSION_V13_SCHEMA_VERSION, 8),
+            (super::AUDIT_SESSION_V12_SCHEMA_VERSION, 7),
+        ] {
+            let mut historical = manifest.clone();
+            historical.schema_version = session_version;
+            historical.sources[0].artifacts[0].schema_version = artifact_version;
+            assert!(historical.validate().is_ok());
+        }
+        let mut v13_with_v9 = manifest;
+        v13_with_v9.schema_version = super::AUDIT_SESSION_V13_SCHEMA_VERSION;
+        assert_eq!(
+            v13_with_v9.validate(),
+            Err(ValidationError::ArtifactContractMismatch)
+        );
+
+        let mut v10 = windows_msix_manifest();
+        v10.schema_version = super::AUDIT_SESSION_V15_SCHEMA_VERSION;
+        let source = &mut v10.sources[0];
+        source.role = SourceRole::Startup;
+        source.collector = Some(super::collector_identity("windows", SourceRole::Startup));
+        source.scope = "selected Windows startup sources with SCM trigger configuration".to_owned();
+        source.artifacts[0] = SessionArtifactRef {
+            kind: ArtifactKind::WindowsStartup,
+            path: "startup.windows.json".to_owned(),
+            schema: "sideeffect.windows_startup_inventory".to_owned(),
+            schema_version: 10,
+            byte_length: 1,
+            sha256: "a".repeat(64),
+        };
+        v10.coverage_manifest = Some(CoverageManifest::from_sources(&v10.sources));
+        assert!(v10.validate().is_ok());
+        let mut v14_with_v10 = v10;
+        v14_with_v10.schema_version = super::AUDIT_SESSION_V14_SCHEMA_VERSION;
+        assert_eq!(
+            v14_with_v10.validate(),
+            Err(ValidationError::ArtifactContractMismatch)
+        );
     }
 
     #[test]

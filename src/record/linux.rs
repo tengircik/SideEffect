@@ -1334,7 +1334,7 @@ mod tests {
             &format!("{}\nexec sleep 10", write_trace_script("close(1) = 0\\n")),
             "timed.run",
             64,
-            Duration::from_millis(100),
+            Duration::from_secs(1),
         )
         .unwrap();
         assert!(outcome.time_limit_reached);
@@ -1342,7 +1342,7 @@ mod tests {
         let manifest_bytes = fs::read(outcome.bundle_path.join("run.json")).unwrap();
         let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
         assert_eq!(manifest["schema_version"], 2);
-        assert_eq!(manifest["capture"]["time_limit_milliseconds"], 100);
+        assert_eq!(manifest["capture"]["time_limit_milliseconds"], 1000);
         assert_eq!(manifest["capture"]["stop_reason"], "time_limit_reached");
         assert_eq!(manifest["capture"]["completeness"], "unknown");
         let text = String::from_utf8(manifest_bytes).unwrap();

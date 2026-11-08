@@ -42,11 +42,34 @@ fn live_proc_inventory_writes_private_schema_without_fixed_count_assumptions() {
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     let value: serde_json::Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
     assert_eq!(value["schema"], "sideeffect.process_inventory");
-    assert_eq!(value["schema_version"], 3);
+    assert_eq!(value["schema_version"], 5);
+    assert_eq!(value["boot_epoch"]["status"], "observed");
+    assert_eq!(
+        value["boot_epoch"]["normalized_id"].as_str().unwrap().len(),
+        36
+    );
+    assert_eq!(
+        value["boot_epoch"]["evidence"]["source"],
+        "/proc/sys/kernel/random/boot_id"
+    );
+    assert_eq!(
+        value["boot_epoch"]["evidence"]["record_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
     assert_eq!(value["platform"], "linux");
     assert_eq!(
         value["scope"],
-        "visible_numeric_proc_status_stat_executable_and_namespace_entries"
+        "visible_numeric_proc_status_stat_executable_and_namespace_entries_and_self_pid_namespace"
+    );
+    assert_eq!(value["identity_domain"]["status"], "observed_hint");
+    assert_eq!(value["identity_domain"]["kind"], "linux_boot_pid_namespace");
+    assert!(value["identity_domain"]["value"].as_str().is_some());
+    assert_eq!(
+        value["identity_domain"]["pid_namespace_evidence"]["source"],
+        "/proc/self/ns/pid"
     );
     assert!(value["capture_started_at_unix_ms"].as_u64().is_some());
     assert!(value["capture_ended_at_unix_ms"].as_u64().is_some());
