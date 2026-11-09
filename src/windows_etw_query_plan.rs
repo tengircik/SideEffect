@@ -176,7 +176,7 @@ fn schema() -> Value {
         filters.insert(name.to_owned(), value);
     }
     json!({"anyOf":[
-        {"type":"object","additionalProperties":false,"required":["decision","abstain_reason","filters"],"properties":{"decision":{"const":"abstain"},"abstain_reason":{"enum":["ambiguous","unsupported_scope","insufficient_evidence"]},"filters":{"type":"object","additionalProperties":false,"required":filters.keys().collect::<Vec<_>>(),"properties":filters.iter().map(|(k,v)|(k.clone(),json!({"const":null}))).collect::<serde_json::Map<_,_>>()}}},
+        {"type":"object","additionalProperties":false,"required":["decision","abstain_reason","filters"],"properties":{"decision":{"const":"abstain"},"abstain_reason":{"enum":["ambiguous","unsupported_scope","insufficient_evidence"]},"filters":{"type":"object","additionalProperties":false,"required":filters.keys().collect::<Vec<_>>(),"properties":filters.iter().map(|(k,_)|(k.clone(),json!({"const":null}))).collect::<serde_json::Map<_,_>>()}}},
         {"type":"object","additionalProperties":false,"required":["decision","abstain_reason","filters"],"properties":{"decision":{"const":"filter"},"abstain_reason":{"type":"null"},"filters":{"type":"object","additionalProperties":false,"required":filters.keys().collect::<Vec<_>>(),"properties":filters}}}
     ]})
 }
@@ -321,8 +321,7 @@ fn corroboration(
     let Some(sidecar) = event.observation_decoding.as_ref() else {
         return Ok((None, Some("observation_decoder_unavailable")));
     };
-    let payload =
-        hex::decode(&event.raw_payload_hex).map_err(|_| "validated ETW payload hex was invalid")?;
+    let payload = decode_lower_hex_payload(&event.raw_payload_hex)?;
     let width = match event.header_flags {
         f if f & 0x20 != 0 && f & 0x40 == 0 => Some(PointerWidth::Bits32),
         f if f & 0x40 != 0 && f & 0x20 == 0 => Some(PointerWidth::Bits64),
@@ -353,6 +352,44 @@ fn corroboration(
         Some(observation) => Ok((Some(observation), None)),
         None => Ok((None, Some("observation_missing_after_redecode"))),
     }
+}
+
+fn decode_lower_hex_payload(value: &str) -> Result<Vec<u8>, String> {
+    let byte_len = value.len() / 2;
+    if value.len() % 2 != 0
+        || byte_len > crate::windows_runtime::MAX_WINDOWS_RUNTIME_EVENT_PAYLOAD_BYTES
+    {
+        return Err("validated ETW payload hex has an invalid or oversized length".to_owned());
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(byte_len)
+        .map_err(|_| "could not allocate the bounded ETW payload buffer".to_owned())?;
+    for pair in value.as_bytes().chunks_exact(2) {
+        let high = lower_hex_nibble(pair[0]).ok_or("validated ETW payload hex is invalid")?;
+        let low = lower_hex_nibble(pair[1]).ok_or("validated ETW payload hex is invalid")?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn lower_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn encode_lower_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        output.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        output.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    output
 }
 
 fn corroborated_decoded(
@@ -755,6 +792,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bounded_lowercase_hex_decoder_accepts_only_bounded_lowercase_pairs() {
+        let bytes = [0x00, 0x09, 0x7f, 0xa0, 0xff];
+        let encoded = encode_lower_hex(&bytes);
+        assert_eq!(decode_lower_hex_payload(&encoded).unwrap(), bytes.to_vec());
+        assert!(decode_lower_hex_payload("0A").is_err());
+        assert!(decode_lower_hex_payload("0").is_err());
+        assert!(
+            decode_lower_hex_payload(
+                &"00".repeat(crate::windows_runtime::MAX_WINDOWS_RUNTIME_EVENT_PAYLOAD_BYTES + 1)
+            )
+            .is_err()
+        );
+    }
+
     fn synthetic_network_event() -> crate::windows_runtime::NativeRuntimeEvent {
         use crate::record::windows_io_decode::{PointerWidth, decode_classic_event};
         let mut payload = Vec::new();
@@ -791,7 +843,7 @@ mod tests {
             header_thread_id: 888,
             header_flags: 0x0040,
             timestamp_qpc: 123,
-            raw_payload_hex: hex::encode(&payload),
+            raw_payload_hex: encode_lower_hex(&payload),
             payload_decoding: None,
             observation_decoding: Some(serde_json::to_value(decoded).unwrap()),
         }
