@@ -9728,6 +9728,7 @@ fn read_bounded(path: &OsString) -> Result<Vec<u8>, String> {
     read_trace_file(Path::new(path), MAX_TRACE_BYTES)
 }
 
+#[cfg(all(windows, target_arch = "x86_64"))]
 fn read_bounded_windows_runtime(path: &OsString) -> Result<Vec<u8>, String> {
     read_input_file(
         Path::new(path),

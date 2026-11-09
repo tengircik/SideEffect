@@ -96,6 +96,7 @@ fn etw_query_preview_cli_and_stale_digest_contract_are_distinct_and_confirmation
     assert_eq!(value["schema"], "sideeffect.windows_etw_query_preview");
     assert_eq!(value["coverage"]["capture_completeness"], "unknown");
     assert_eq!(value["model_id"], model.id());
+    assert_eq!(value["model_sha256"], model.sha256());
     assert!(
         !value["prompt"]
             .as_str()
