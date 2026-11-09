@@ -20,10 +20,10 @@ class WindowsEtwQueryCorpusTests(unittest.TestCase):
         cls.corpus, cls.digest, cls.summary = evaluator.load_corpus()
 
     def test_pinned_synthetic_development_corpus_and_oracles_are_consistent(self) -> None:
-        self.assertEqual(self.summary["cases"], 11)
+        self.assertEqual(self.summary["cases"], 13)
         self.assertEqual(self.summary["fixtures"], 2)
-        self.assertEqual(self.summary["answerable_cases"], 6)
-        self.assertEqual(self.summary["must_abstain_cases"], 5)
+        self.assertEqual(self.summary["answerable_cases"], 7)
+        self.assertEqual(self.summary["must_abstain_cases"], 6)
         self.assertEqual(self.summary["semantic_quality_assessed"], False)
         self.assertEqual(self.corpus["label_review_status"], "unreviewed_labels_not_semantically_validated")
         self.assertEqual(self.digest, evaluator.EXPECTED_CORPUS_SHA256)

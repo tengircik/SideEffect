@@ -76,11 +76,11 @@ class WindowsEtwQueryRunnerTests(unittest.TestCase):
         report = runner.run_corpus(sideeffect_command=["sideeffect.exe"], backend="auto", runtime=None,
                                    timeout_seconds=45, environment=environment, invoke=fake_invoke)
         self.assertEqual(len(calls), len(self.corpus["cases"]) * 2)
-        self.assertEqual(report["counts"], {"cases": 11, "completed": 11, "failed": 0})
-        self.assertEqual(report["metrics"]["exact_plan_cases"], 11)
-        self.assertEqual(report["metrics"]["exact_result_cases"], 11)
-        self.assertEqual(report["metrics"]["answerable_plan_accuracy"], {"correct": 6, "total": 6})
-        self.assertEqual(report["metrics"]["must_abstain_accuracy"], {"correct": 5, "total": 5})
+        self.assertEqual(report["counts"], {"cases": 13, "completed": 13, "failed": 0})
+        self.assertEqual(report["metrics"]["exact_plan_cases"], 13)
+        self.assertEqual(report["metrics"]["exact_result_cases"], 13)
+        self.assertEqual(report["metrics"]["answerable_plan_accuracy"], {"correct": 7, "total": 7})
+        self.assertEqual(report["metrics"]["must_abstain_accuracy"], {"correct": 6, "total": 6})
         self.assertEqual(report["metrics"]["false_filters_on_must_abstain"], 0)
         self.assertEqual(report["metrics"]["permutation_groups"], {"passed": 1, "total": 1})
         self.assertNotIn("case_id", json.dumps(report))
@@ -98,9 +98,9 @@ class WindowsEtwQueryRunnerTests(unittest.TestCase):
         report = runner.run_corpus(sideeffect_command=["sideeffect.exe"], backend="auto", runtime=None,
                                    invoke=fail_preview)
         self.assertEqual(report["run"], None)
-        self.assertEqual(report["counts"], {"cases": 11, "completed": 0, "failed": 11})
-        self.assertEqual(report["metrics"]["answerable_plan_accuracy"], {"correct": 0, "total": 6})
-        self.assertEqual(report["metrics"]["must_abstain_accuracy"], {"correct": 0, "total": 5})
+        self.assertEqual(report["counts"], {"cases": 13, "completed": 0, "failed": 13})
+        self.assertEqual(report["metrics"]["answerable_plan_accuracy"], {"correct": 0, "total": 7})
+        self.assertEqual(report["metrics"]["must_abstain_accuracy"], {"correct": 0, "total": 6})
 
 
 if __name__ == "__main__":
