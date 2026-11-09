@@ -118,6 +118,11 @@ jobs:
           python3 -m unittest discover -s tests/fixtures/local_query_plan_v3_development -p 'test_*.py' -v
           python3 scripts/test_evaluate_local_query_plan_v3.py
 
+      - name: Validate native Windows ETW query development corpus
+        run: |
+          python3 scripts/evaluate_local_model_windows_etw_query.py --check-corpus
+          python3 tests/test_local_model_windows_etw_query.py
+
       - name: Test Linux release archive smoke validator
         run: python3 tests/test_smoke_linux_release_archive.py
 
