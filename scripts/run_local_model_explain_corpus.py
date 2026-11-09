@@ -88,6 +88,7 @@ def _invoke(
     *,
     timeout_seconds: float,
     output_limit: int = MAX_COMMAND_OUTPUT_BYTES,
+    env: dict[str, str] | None = None,
 ) -> tuple[int | None, bytes, str | None]:
     """Run one argv vector with bounded captured output and no shell."""
     if not argv or not all(isinstance(part, str) and part for part in argv):
@@ -100,6 +101,7 @@ def _invoke(
             stderr=subprocess.PIPE,
             shell=False,
             close_fds=True,
+            env=env,
             cwd=evaluator.ROOT,
             **_process_group_kwargs(),
         )
