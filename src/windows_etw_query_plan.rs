@@ -392,6 +392,7 @@ fn encode_lower_hex(bytes: &[u8]) -> String {
     output
 }
 
+#[cfg(test)]
 fn corroborated_decoded(
     event: &crate::windows_runtime::NativeRuntimeEvent,
 ) -> Result<Option<Value>, String> {
@@ -586,6 +587,7 @@ pub fn preview_bytes(
     Ok(preview)
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 fn matches(row: &Value, f: &EtwFilters) -> bool {
     let str_eq = |expected: &Option<String>, key: &str| {
         expected
@@ -607,6 +609,7 @@ fn matches(row: &Value, f: &EtwFilters) -> bool {
         })
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 fn strip_runtime_suffix(output: &[u8]) -> &[u8] {
     let Ok(text) = std::str::from_utf8(output) else {
         return output;
@@ -620,6 +623,7 @@ fn strip_runtime_suffix(output: &[u8]) -> &[u8] {
     output
 }
 
+#[cfg(all(windows, target_arch = "x86_64"))]
 fn result_from_preview(
     preview: Preview,
     capture: crate::windows_runtime::WindowsRuntimeCapture,
