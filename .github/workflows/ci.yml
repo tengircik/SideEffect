@@ -332,7 +332,7 @@ jobs:
             $stdoutPath = Join-Path $logRoot 'stdout.txt'
             $stderrPath = Join-Path $logRoot 'stderr.txt'
             $testPath = Join-Path $codeRoot 'tests/test_install_sideeffect_llama_runtime_windows.ps1'
-            $arguments = @('-NoProfile', '-File', "`"$testPath`"")
+            $arguments = @('-NoProfile', '-File', "`"$testPath`"", '-TemporaryRoot', "`"$logRoot`"")
             $process = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList $arguments -Credential ([PSCredential]::new($account, $password)) -LoadUserProfile -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -Wait -PassThru
             if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath }
             if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath }

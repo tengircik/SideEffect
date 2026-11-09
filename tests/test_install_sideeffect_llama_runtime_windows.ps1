@@ -1,7 +1,9 @@
 # Standalone behavioral tests for scripts/SideEffectRuntimeLifecycle.psm1.
 # Compatible with Windows PowerShell 5.1; uses only disposable local files.
 [CmdletBinding()]
-param()
+param(
+    [string] $TemporaryRoot = [IO.Path]::GetTempPath()
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -42,7 +44,7 @@ if ($runningElevated) {
     Assert-SideEffectRuntimeNotElevated
 }
 
-$temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ('sideeffect-runtime-lifecycle-' + [Guid]::NewGuid().ToString('N'))
+$temporaryRoot = Join-Path $TemporaryRoot ('sideeffect-runtime-lifecycle-' + [Guid]::NewGuid().ToString('N'))
 $localAppData = Join-Path $temporaryRoot 'LocalAppData'
 $release = 'b11938'
 $relativePath = "SideEffect\runtimes\llama.cpp\$release\windows-x64"
