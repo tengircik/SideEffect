@@ -287,16 +287,60 @@ jobs:
       - name: Parse Windows local runtime installer
         shell: pwsh
         run: |
-          $tokens = $null
-          $parseErrors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile(
-            (Join-Path $PWD 'scripts/install_sideeffect_llama_runtime_windows.ps1'),
-            [ref] $tokens,
-            [ref] $parseErrors
-          ) | Out-Null
-          if ($parseErrors.Count -gt 0) {
-            $parseErrors | Format-List *
-            exit 1
+          $paths = @(
+            'scripts/install_sideeffect_llama_runtime_windows.ps1',
+            'scripts/SideEffectRuntimeLifecycle.psm1',
+            'tests/test_install_sideeffect_llama_runtime_windows.ps1'
+          )
+          foreach ($relativePath in $paths) {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $PWD $relativePath),
+              [ref] $tokens,
+              [ref] $parseErrors
+            ) | Out-Null
+            if ($parseErrors.Count -gt 0) {
+              $parseErrors | Format-List *
+              exit 1
+            }
+          }
+
+      - name: Test Windows local runtime lifecycle
+        shell: pwsh
+        run: |
+          $testUser = 'seci' + [Guid]::NewGuid().ToString('N').Substring(0, 12)
+          $passwordText = [Guid]::NewGuid().ToString('N') + 'Aa1!'
+          $password = ConvertTo-SecureString $passwordText -AsPlainText -Force
+          $testRoot = Join-Path $env:RUNNER_TEMP ('sideeffect-lifecycle-' + [Guid]::NewGuid().ToString('N'))
+          $codeRoot = Join-Path $testRoot 'repo'
+          $logRoot = Join-Path $testRoot 'logs'
+          $account = "$env:COMPUTERNAME\$testUser"
+          New-Item -ItemType Directory -Path (Join-Path $codeRoot 'scripts') -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $codeRoot 'tests') -Force | Out-Null
+          New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
+          Copy-Item scripts/SideEffectRuntimeLifecycle.psm1 (Join-Path $codeRoot 'scripts/SideEffectRuntimeLifecycle.psm1')
+          Copy-Item tests/test_install_sideeffect_llama_runtime_windows.ps1 (Join-Path $codeRoot 'tests/test_install_sideeffect_llama_runtime_windows.ps1')
+          $userCreated = $false
+          try {
+            New-LocalUser -Name $testUser -Password $password -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword | Out-Null
+            $userCreated = $true
+            & icacls.exe $testRoot /grant "${account}:(OI)(CI)(RX)" /T /C | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Could not grant the temporary test user read access to its disposable test files.' }
+            & icacls.exe $logRoot /grant "${account}:(OI)(CI)(M)" /T /C | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Could not grant the temporary test user access to its disposable test files.' }
+            $stdoutPath = Join-Path $logRoot 'stdout.txt'
+            $stderrPath = Join-Path $logRoot 'stderr.txt'
+            $testPath = Join-Path $codeRoot 'tests/test_install_sideeffect_llama_runtime_windows.ps1'
+            $arguments = @('-NoProfile', '-File', "`"$testPath`"")
+            $process = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList $arguments -Credential ([PSCredential]::new($account, $password)) -LoadUserProfile -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -Wait -PassThru
+            if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath }
+            if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath }
+            if ($process.ExitCode -ne 0) { throw "Windows lifecycle tests failed with exit code $($process.ExitCode)." }
+          }
+          finally {
+            if ($userCreated) { Remove-LocalUser -Name $testUser -ErrorAction SilentlyContinue }
+            Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
           }
 
       - name: Report Windows version
