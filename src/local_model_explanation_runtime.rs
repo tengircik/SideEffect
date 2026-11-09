@@ -17,6 +17,8 @@ const MAX_RUNTIME_OUTPUT_BYTES: usize = 64 * 1024;
 const MODEL_TIMEOUT_SECONDS: u64 = 120;
 const MODEL_CONTEXT_TOKENS: &str = "8192";
 const MODEL_OUTPUT_TOKENS: &str = "512";
+#[cfg(all(windows, target_arch = "x86_64"))]
+const MAX_QUERY_RUNTIME_OUTPUT_BYTES: usize = 16 * 1024;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const MODEL_PROCESS_MEMORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 #[cfg(windows)]
@@ -478,6 +480,111 @@ fn run_windows(
         MODEL_PROCESS_MEMORY_LIMIT_BYTES,
     )?;
     finish_inference(preview, result, use_cuda, backend_status)
+}
+
+/// Run one bounded schema-constrained Windows inference for a separate
+/// source-specific contract. The caller validates the returned JSON itself.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub fn run_windows_constrained_json(
+    prompt: &str,
+    system_prompt: &str,
+    output_schema: &Value,
+    backend: ExplanationBackendPreference,
+    runtime_path: &Path,
+    model: &crate::model_manager::ResolvedModel,
+    max_model_bytes: u64,
+) -> Result<(Vec<u8>, &'static str, &'static str), String> {
+    use crate::local_model_runtime::{
+        copy_verified_model_windows, create_private_temp_dir_windows, run_bounded_windows,
+        write_private_file_windows,
+    };
+    use std::time::Duration;
+
+    if prompt.len() > 96 * 1024 || system_prompt.len() > 16 * 1024 {
+        return Err("constrained local inference prompt exceeds its byte limit".to_owned());
+    }
+    crate::local_model::validate_resolved_model(model, max_model_bytes)?;
+    let runtime = canonical_regular_file(runtime_path, "runtime")?;
+    let source_model = canonical_regular_file(&model.path, "model")?;
+    verify_runtime(&runtime, |arguments| {
+        run_bounded_windows(
+            &runtime,
+            arguments,
+            None,
+            Duration::from_secs(10),
+            MAX_RUNTIME_DIAGNOSTIC_BYTES,
+            1024 * 1024 * 1024,
+        )
+    })?;
+    let cuda_available = list_cuda_devices(
+        &runtime,
+        |arguments| {
+            run_bounded_windows(
+                &runtime,
+                arguments,
+                None,
+                Duration::from_secs(10),
+                MAX_RUNTIME_DIAGNOSTIC_BYTES,
+                1024 * 1024 * 1024,
+            )
+        },
+        backend,
+    )?;
+    let (use_cuda, backend_status) = choose_backend(backend, cuda_available)?;
+    let temporary_guard = create_private_temp_dir_windows()?;
+    let temporary = temporary_guard.path();
+    let staged_model = temporary.join("model.gguf");
+    copy_verified_model_windows(
+        &source_model,
+        &staged_model,
+        &model.sha256,
+        model.size_bytes,
+    )?;
+    let prompt_path = temporary.join("model-prompt.json");
+    let system_path = temporary.join("system-prompt.txt");
+    let schema_path = temporary.join("output-schema.json");
+    write_private_file_windows(&prompt_path, prompt.as_bytes())?;
+    write_private_file_windows(&system_path, system_prompt.as_bytes())?;
+    let schema_bytes = serde_json::to_vec(output_schema)
+        .map_err(|_| "could not encode constrained output schema")?;
+    write_private_file_windows(&schema_path, &schema_bytes)?;
+    let arguments = runtime_arguments(
+        &staged_model,
+        &prompt_path,
+        &system_path,
+        &schema_path,
+        use_cuda,
+    )?;
+    let output = run_bounded_windows(
+        &runtime,
+        &arguments,
+        Some(temporary),
+        Duration::from_secs(MODEL_TIMEOUT_SECONDS),
+        MAX_QUERY_RUNTIME_OUTPUT_BYTES,
+        MODEL_PROCESS_MEMORY_LIMIT_BYTES,
+    )?;
+    if output.stdout.truncated || output.stderr.truncated {
+        return Err("local model exceeded its bounded output limit".to_owned());
+    }
+    if !output.status.success() {
+        return Err(if use_cuda {
+            "CUDA model inference failed; output discarded and no CPU fallback was attempted"
+                .to_owned()
+        } else {
+            "CPU model inference failed; output discarded".to_owned()
+        });
+    }
+    if use_cuda && !cuda_offload_confirmed(&String::from_utf8_lossy(&output.stderr.bytes)) {
+        return Err(
+            "runtime completed without verifiable CUDA layer-offload evidence; output discarded"
+                .to_owned(),
+        );
+    }
+    Ok((
+        output.stdout.bytes,
+        if use_cuda { "cuda" } else { "cpu" },
+        backend_status,
+    ))
 }
 
 fn verify_runtime<F, O>(runtime: &Path, mut run: F) -> Result<(), String>

@@ -267,49 +267,81 @@ fn doctor_rejects_nonmatching_evidence_and_query_runtime_versions() {
 
 #[cfg(windows)]
 #[test]
-fn doctor_reports_evidence_and_query_as_unsupported_without_device_checks() {
+fn doctor_reports_evidence_as_unsupported_without_device_checks() {
     let model_store = EmptyModelStore::new();
-    for task in ["evidence", "query"] {
-        let output = model_store
-            .command()
-            .args([
-                "model",
-                "doctor",
-                "--task",
-                task,
-                "--runtime",
-                "unused-runtime.exe",
-            ])
-            .output()
-            .unwrap();
+    let output = model_store
+        .command()
+        .args([
+            "model",
+            "doctor",
+            "--task",
+            "evidence",
+            "--runtime",
+            "unused-runtime.exe",
+        ])
+        .output()
+        .unwrap();
 
-        assert_eq!(output.status.code(), Some(2));
-        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(report["schema_version"], 2);
-        assert_eq!(report["task"], task);
-        assert_eq!(report["supported_here"], false);
-        assert_eq!(
-            report["runtime"]["executable_status"],
-            "unsupported_platform"
-        );
-        let expected_contract = match task {
-            "evidence" => "version: 6000 (4762ad731)",
-            "query" => "0.7.0-dev (build 11938, commit 19cce6919)",
-            _ => unreachable!(),
-        };
-        assert_eq!(
-            report["runtime"]["expected_version_contract"],
-            expected_contract
-        );
-        assert!(
-            report["runtime"]["executable_diagnostic"]
-                .as_str()
-                .unwrap()
-                .contains("Linux x86_64 only")
-        );
-        assert_eq!(report["runtime"]["device_check_status"], "not_applicable");
-        assert_eq!(report["inference_not_run"], true);
-        assert_eq!(report["weights_not_loaded"], true);
-        assert_eq!(report["quality_assessment_performed_by_doctor"], false);
-    }
+    assert_eq!(output.status.code(), Some(2));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["task"], "evidence");
+    assert_eq!(report["supported_here"], false);
+    assert_eq!(
+        report["runtime"]["executable_status"],
+        "unsupported_platform"
+    );
+    assert_eq!(
+        report["runtime"]["expected_version_contract"],
+        "version: 6000 (4762ad731)"
+    );
+    assert!(
+        report["runtime"]["executable_diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("Linux x86_64 only")
+    );
+    assert_eq!(report["runtime"]["device_check_status"], "not_applicable");
+    assert_eq!(report["inference_not_run"], true);
+    assert_eq!(report["weights_not_loaded"], true);
+    assert_eq!(report["quality_assessment_performed_by_doctor"], false);
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[test]
+fn doctor_reports_query_as_supported_etw_with_cpu_device_check_skipped() {
+    let model = SelectedTestModel::new("query");
+    let output = model
+        .command()
+        .args(["model", "doctor", "--task", "query", "--runtime"])
+        .arg(missing_runtime_path())
+        .args(["--backend", "cpu"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["task"], "query");
+    assert_eq!(report["supported_here"], true);
+    assert_eq!(report["selected_model"]["status"], "verified");
+    assert_eq!(report["selected_model"]["id"], model.id());
+    assert_eq!(report["runtime"]["executable_status"], "unavailable");
+    assert_eq!(
+        report["runtime"]["expected_source_revision"],
+        "19cce6919992fdffd92e0ac152caaf1e2b8f254e"
+    );
+    assert_eq!(
+        report["runtime"]["expected_version_contract"],
+        "pinned commit reported by --version"
+    );
+    assert_eq!(report["runtime"]["requested_backend"], "cpu");
+    assert_eq!(
+        report["runtime"]["device_check_status"],
+        "not_applicable_cpu_requested"
+    );
+    assert_eq!(report["runtime"]["gpu_inference_status"], "not_run");
+    assert_eq!(report["inference_not_run"], true);
+    assert_eq!(report["weights_not_loaded"], true);
+    assert_eq!(report["quality_assessment_performed_by_doctor"], false);
 }

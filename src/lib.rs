@@ -31,6 +31,7 @@ pub mod query;
 pub mod record;
 pub mod startup_correlation;
 pub mod trace;
+pub mod windows_etw_query_plan;
 pub mod windows_runtime;
 pub mod windows_runtime_attribution;
 pub mod windows_runtime_diff;
