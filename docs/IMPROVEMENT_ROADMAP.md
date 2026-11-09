@@ -25,6 +25,8 @@ The short Linux benchmark method is documented in [TRACE_BENCHMARKING.md](TRACE_
 
 The Windows x86_64 ETW query-plan slice is now implemented as an opt-in native-Windows preview and digest-confirmed inference workflow with strict ETW-only filters. It has a 13-case public synthetic development corpus and an aggregate-only actual-CLI runner, but the labels are unreviewed and literal-selector focused. Independent label review, a separately held qualification corpus, its quality/evaluation gate, and real Windows model-quality acceptance remain open; implementation is not qualification.
 
+The Linux query-plan v3 development corpus now has a question-only reviewer packet preparer and an aggregate-only validator that checks returned plans and compares reviewer agreement by both case and intent group. The workflow is available for review handoff, but no completed independent reviews exist. Its public labels remain visible, so the workflow cannot prove blinding or label truth, create a hidden holdout, or qualify a model. CI covers the handoff/validator contracts; actual human review, a separately held corpus, frozen quality thresholds, and real-model evaluation remain release gates.
+
 ## Product outcome and boundaries
 
 The intended outcome is an on-demand local audit that helps a user discover software, inspect bounded configuration and access facts, capture selected runtime activity, compare scoped snapshots, and investigate evidence-linked changes. A GUI may make these relationships easier to review, but it must expose the same source scope and uncertainty as the CLI.

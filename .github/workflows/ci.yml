@@ -117,6 +117,7 @@ jobs:
           python3 tests/fixtures/local_query_plan_v3_development/validate_corpus.py
           python3 -m unittest discover -s tests/fixtures/local_query_plan_v3_development -p 'test_*.py' -v
           python3 scripts/test_evaluate_local_query_plan_v3.py
+          python3 scripts/test_local_query_plan_v3_reviews.py
 
       - name: Validate native Windows ETW query development corpus
         run: |
