@@ -23,7 +23,7 @@ These are audited status summaries. “Accepted for the documented bounded sourc
 
 The short Linux benchmark method is documented in [TRACE_BENCHMARKING.md](TRACE_BENCHMARKING.md); the 10k–1M scale procedure is documented in [TRACE_SCALE_BENCHMARKING.md](TRACE_SCALE_BENCHMARKING.md). WSL2 measurements are not native-Linux or release-performance acceptance. R9 evaluation details and frozen results remain in the task-specific evaluation documents; schema-valid output alone is not evidence of useful analysis.
 
-The Windows x86_64 ETW query-plan slice is now implemented as an opt-in native-Windows preview and digest-confirmed inference workflow with strict ETW-only filters. It reuses the bounded Windows explanation runtime runner, but its quality/evaluation gate, semantic corpora, and real Windows model-quality acceptance remain entirely open; implementation is not qualification.
+The Windows x86_64 ETW query-plan slice is now implemented as an opt-in native-Windows preview and digest-confirmed inference workflow with strict ETW-only filters. It has a 13-case public synthetic development corpus and an aggregate-only actual-CLI runner, but the labels are unreviewed and literal-selector focused. Independent label review, a separately held qualification corpus, its quality/evaluation gate, and real Windows model-quality acceptance remain open; implementation is not qualification.
 
 ## Product outcome and boundaries
 
