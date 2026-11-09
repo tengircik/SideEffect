@@ -23,7 +23,7 @@ import evaluate_local_model_windows_etw_explain as capture_contract
 ROOT = Path(__file__).resolve().parents[1]
 CORPUS_PATH = ROOT / "tests" / "fixtures" / "local_model_windows_etw_query_v1" / "corpus.json"
 FIXTURE_DIRECTORY = CORPUS_PATH.parent
-EXPECTED_CORPUS_SHA256 = "7950a9621d5444534d82587b89aac817939209f653a6355aa299da10e524de70"
+EXPECTED_CORPUS_SHA256 = "015aa36516c2215dc1528a5b0681543a17476f920be03dc1a82c75c6595c7694"
 MAX_CORPUS_BYTES = 128 * 1024
 MAX_FIXTURE_BYTES = 512 * 1024
 MAX_CASES = 64
