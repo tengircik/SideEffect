@@ -123,6 +123,7 @@ jobs:
           python3 scripts/evaluate_local_model_windows_etw_query.py --check-corpus
           python3 tests/test_local_model_windows_etw_query.py
           python3 tests/test_run_local_model_windows_etw_query_corpus.py
+          python3 tests/test_prepare_local_model_windows_etw_query_review.py
 
       - name: Test Linux release archive smoke validator
         run: python3 tests/test_smoke_linux_release_archive.py
