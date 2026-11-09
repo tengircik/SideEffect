@@ -30,6 +30,26 @@ MAX_PRIVATE_MAP_BYTES = 64 * 1024
 MAX_RATIONALE_BYTES = 2048
 REVIEW_SCHEMA = "sideeffect.windows_etw_query_blind_label_review"
 REVIEW_SCHEMA_VERSION = 1
+REVIEW_EVALUATION_STATUS = "public_synthetic_development_only_not_a_qualification_holdout"
+REVIEWER_TASK = (
+    "Independently translate each English question into one supported exact-match plan over only the listed corroborated facts."
+)
+REVIEWER_RULES = [
+    "Do not infer facts that are absent from the listed evidence.",
+    "Use only the finite fields and values described by supported_plan_schema.",
+    "Use exact equality; multiple filters are combined with AND.",
+    "Abstain when the question is ambiguous, unsupported, or cannot be answered from the available scope.",
+    "For decision=filter, set abstain_reason to null and provide one through four non-null filters.",
+    "For decision=abstain, provide an allowed abstain_reason and leave every filter null.",
+    "Do not inspect model outputs or expected labels while preparing this review.",
+    "Use a pseudonymous reviewer_id, an ISO-8601 UTC reviewed_at_utc ending in Z, and set independence_declaration true only if you did not inspect expected labels before completing this review.",
+    "Complete reviewer_metadata and every case.review object; keep the case order and review IDs unchanged.",
+]
+REVIEWER_METADATA_CONTRACT = {
+    "reviewer_id": "required pseudonymous identifier, 1..64 UTF-8 bytes",
+    "reviewed_at_utc": "required ISO-8601 UTC timestamp ending in Z",
+    "independence_declaration": "required boolean; true means the reviewer did not inspect expected labels before completing the review",
+}
 QUERYABLE_EVENT_KINDS = sorted(evaluator.EVENT_KINDS)
 SUPPORTED_PLAN_SCHEMA = {
     "required_keys": ["decision", "abstain_reason", "filters"],
@@ -180,20 +200,10 @@ def prepare_review(corpus: dict[str, Any], corpus_sha256: str) -> tuple[dict[str
         "schema": REVIEW_SCHEMA,
         "schema_version": REVIEW_SCHEMA_VERSION,
         "review_batch_id": "B-" + secrets.token_hex(16),
-        "evaluation_status": "public_synthetic_development_only_not_a_qualification_holdout",
+        "evaluation_status": REVIEW_EVALUATION_STATUS,
         "reviewer_instructions": {
-            "task": "Independently translate each English question into one supported exact-match plan over only the listed corroborated facts.",
-            "rules": [
-                "Do not infer facts that are absent from the listed evidence.",
-                "Use only the finite fields and values described by supported_plan_schema.",
-                "Use exact equality; multiple filters are combined with AND.",
-                "Abstain when the question is ambiguous, unsupported, or cannot be answered from the available scope.",
-                "For decision=filter, set abstain_reason to null and provide one through four non-null filters.",
-                "For decision=abstain, provide an allowed abstain_reason and leave every filter null.",
-                "Do not inspect model outputs or expected labels while preparing this review.",
-                "Use a pseudonymous reviewer_id, an ISO-8601 UTC reviewed_at_utc ending in Z, and set independence_declaration true only if you did not inspect expected labels before completing this review.",
-                "Complete reviewer_metadata and every case.review object; keep the case order and review IDs unchanged.",
-            ],
+            "task": REVIEWER_TASK,
+            "rules": REVIEWER_RULES,
         },
         "supported_plan_schema": SUPPORTED_PLAN_SCHEMA,
         "reviewer_metadata": {
@@ -201,11 +211,7 @@ def prepare_review(corpus: dict[str, Any], corpus_sha256: str) -> tuple[dict[str
             "reviewed_at_utc": "",
             "independence_declaration": None,
         },
-        "reviewer_metadata_contract": {
-            "reviewer_id": "required pseudonymous identifier, 1..64 UTF-8 bytes",
-            "reviewed_at_utc": "required ISO-8601 UTC timestamp ending in Z",
-            "independence_declaration": "required boolean; true means the reviewer did not inspect expected labels before completing the review",
-        },
+        "reviewer_metadata_contract": REVIEWER_METADATA_CONTRACT,
         "cases": packets,
     }
     mapping = {
