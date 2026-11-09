@@ -23,6 +23,7 @@ pub mod local_model_explanation;
 pub mod local_model_explanation_runtime;
 pub(crate) mod local_model_runtime;
 pub mod local_query_plan;
+pub mod windows_etw_query_plan;
 pub mod model;
 pub mod model_installer;
 pub mod model_manager;

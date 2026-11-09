@@ -103,6 +103,8 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect model-explain --question <question> --backend auto|cpu|cuda [--runtime <llama-completion>] --confirm-sha256 <preview-digest> --windows-runtime <capture.json>\n\
        sideeffect model-query-preview --question <question> <strace-trace-file>\n\
        sideeffect model-query --question <question> [--runtime <llama-completion>] --confirm-sha256 <preview-digest> <strace-trace-file>\n\
+       sideeffect model-etw-query-preview --question <question> --backend auto|cpu|cuda --windows-runtime <capture.json> (native Windows x86_64)\n\
+       sideeffect model-etw-query --question <question> --backend auto|cpu|cuda [--runtime <llama-completion>] --confirm-sha256 <preview-digest> --windows-runtime <capture.json> (native Windows x86_64)\n\
        sideeffect query --query <query.json> --trace <trace> | --windows-runtime <capture.json>\n\
        sideeffect query --query <query.json> --session <session-directory> --source runtime|selected_root|startup|packages|processes|permissions\n\
        sideeffect model list | show <id> | install <id> | setup <id> [--runtime <existing-file>] | add | select <task> <id> | remove <id>\n\
@@ -477,6 +479,60 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             if command == "model-query-preview" && question_flag == "--question" =>
         {
             model_query_preview_file(question, path)
+        }
+        [
+            command,
+            question_flag,
+            question,
+            backend_flag,
+            backend,
+            windows_flag,
+            capture,
+        ] if command == "model-etw-query-preview"
+            && question_flag == "--question"
+            && backend_flag == "--backend"
+            && windows_flag == "--windows-runtime" =>
+        {
+            model_etw_query_preview_file(question, backend, capture)
+        }
+        [
+            command,
+            question_flag,
+            question,
+            backend_flag,
+            backend,
+            confirm_flag,
+            digest,
+            windows_flag,
+            capture,
+        ] if command == "model-etw-query"
+            && question_flag == "--question"
+            && backend_flag == "--backend"
+            && confirm_flag == "--confirm-sha256"
+            && windows_flag == "--windows-runtime" =>
+        {
+            model_etw_query_file(question, backend, None, digest, capture)
+        }
+        [
+            command,
+            question_flag,
+            question,
+            backend_flag,
+            backend,
+            runtime_flag,
+            runtime,
+            confirm_flag,
+            digest,
+            windows_flag,
+            capture,
+        ] if command == "model-etw-query"
+            && question_flag == "--question"
+            && backend_flag == "--backend"
+            && runtime_flag == "--runtime"
+            && confirm_flag == "--confirm-sha256"
+            && windows_flag == "--windows-runtime" =>
+        {
+            model_etw_query_file(question, backend, Some(runtime), digest, capture)
         }
         [
             command,
@@ -2110,10 +2166,10 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect attribute --windows-runtime CAPTURE.json\nWrites a separate evidence-linked candidate view over a validated Windows ETW v3 capture. Descendant process links require supported process-start payloads and observed active parent IDs. Network association uses the decoded payload process ID. File and disk header PIDs remain context candidates, not ownership. Capture bytes are unchanged. Missing lifecycle data, ambiguity, unsupported records, or reported/unavailable loss is surfaced as partial or unassigned evidence; no causal or absence claims are made."
         }
         "model" => {
-            "Usage: sideeffect model list\n       sideeffect model show ID\n       sideeffect model install ID\n       sideeffect model setup ID [--runtime EXISTING_FILE]\n       sideeffect model setup --interactive\n       sideeffect model add --name NAME --path FILE --for evidence|explanation|query [--license ID]\n       sideeffect model select evidence|explanation|query ID\n       sideeffect model remove ID\n       sideeffect model runtime set evidence|explanation|query EXISTING_FILE\n       sideeffect model runtime show [evidence|explanation|query]\n       sideeffect model runtime clear evidence|explanation|query\n       sideeffect model doctor --task evidence|explanation|query [--runtime TASK_RUNTIME] [--backend auto|cpu|cuda]\n\nLists pinned catalog candidates and user-provided models. Catalog evaluation status is shown separately from runtime compatibility. Installing a catalog model requires explicit license acceptance; analysis never downloads weights implicitly. Interactive setup asks for a task supported on this platform, then lists only compatible pinned models with exact size and evaluation status/note. No model is recommended. It permits cancellation and uses the same license confirmation and pinned download flow as setup ID. Runtime configuration is optional and can be configured later; setup does not download or execute a runtime. The setup command installs and selects the model for its declared task. An optional --runtime path records an existing runtime for that task without executing or downloading it; model doctor checks the task-specific runtime contract. Runtime configuration stores a per-task path without executing the file; runtime revision checks happen only when doctor or analysis is run. Evidence and query runtime checks are supported on Linux x86_64; explanation checks are supported on Linux x86_64 and native Windows. Device enumeration applies only to explanation. Doctor does not run inference, load weights, or assess answer quality. Catalog models still carry their task-specific evaluation warnings, and no model is approved for answer quality. Registering a local model records its size and SHA-256, but does not verify task compatibility, licensing, or quality. Removing a custom registration leaves the model file untouched. Select a model for its task before running a model preview."
+            "Usage: sideeffect model list\n       sideeffect model show ID\n       sideeffect model install ID\n       sideeffect model setup ID [--runtime EXISTING_FILE]\n       sideeffect model setup --interactive\n       sideeffect model add --name NAME --path FILE --for evidence|explanation|query [--license ID]\n       sideeffect model select evidence|explanation|query ID\n       sideeffect model remove ID\n       sideeffect model runtime set evidence|explanation|query EXISTING_FILE\n       sideeffect model runtime show [evidence|explanation|query]\n       sideeffect model runtime clear evidence|explanation|query\n       sideeffect model doctor --task evidence|explanation|query [--runtime TASK_RUNTIME] [--backend auto|cpu|cuda]\n\nLists pinned catalog candidates and user-provided models. Catalog evaluation status is shown separately from runtime compatibility. Installing a catalog model requires explicit license acceptance; analysis never downloads weights implicitly. Interactive setup asks for a task supported on this platform, then lists only compatible pinned models with exact size and evaluation status/note. No model is recommended. It permits cancellation and uses the same license confirmation and pinned download flow as setup ID. Runtime configuration is optional and can be configured later; setup does not download or execute a runtime. The setup command installs and selects the model for its declared task. An optional --runtime path records an existing runtime for that task without executing or downloading it; model doctor checks the task-specific runtime contract. Runtime configuration stores a per-task path without executing the file; runtime revision checks happen only when doctor or analysis is run. Evidence and Linux syscall-query runtime checks are supported on Linux x86_64; native Windows x86_64 query uses the separate ETW workflow and explanation runtime; explanation supports Linux x86_64 and native Windows. Device enumeration applies to explanation and native Windows x86_64 ETW query. Doctor does not run inference, load weights, or assess answer quality. Catalog models still carry their task-specific evaluation warnings, and no model is approved for answer quality. Registering a local model records its size and SHA-256, but does not verify task compatibility, licensing, or quality. Removing a custom registration leaves the model file untouched. Select a model for its task before running a model preview."
         }
         "model doctor" => {
-            "Usage: sideeffect model doctor --task evidence|explanation|query [--runtime TASK_RUNTIME] [--backend auto|cpu|cuda]\nUses --runtime when supplied, otherwise the configured runtime for that task. It checks the selected model registration and SHA-256, then runs the task's bounded runtime version check. Evidence requires the llama.cpp b6000 version prefix; query requires the exact pinned 0.7.0-dev build/commit version; explanation checks the pinned commit and may enumerate devices. Evidence and query are supported only on Linux x86_64. --backend applies only to explanation. The JSON schema v2 report states that inference was not run, weights were not loaded, and this doctor did not assess model quality; catalog evaluation metadata is reported separately. A reported CUDA device is not proof of successful GPU inference. Doctor executes the selected runtime as code; trust it separately."
+            "Usage: sideeffect model doctor --task evidence|explanation|query [--runtime TASK_RUNTIME] [--backend auto|cpu|cuda]\nUses --runtime when supplied, otherwise the configured runtime for that task. It checks the selected model registration and SHA-256, then runs the task's bounded runtime version check. Evidence requires the llama.cpp b6000 version prefix; Linux syscall query requires the exact pinned 0.7.0-dev build/commit; explanation and native Windows x86_64 ETW query check the pinned explanation-runtime commit and may enumerate devices. Evidence and Linux syscall query are supported on Linux x86_64; explanation is supported on native Windows and ETW query on native Windows x86_64. --backend applies to explanation and native Windows x86_64 ETW query. The JSON schema v2 report states that inference was not run, weights were not loaded, and this doctor did not assess model quality; catalog evaluation metadata is reported separately. A reported CUDA device is not proof of successful GPU inference. Doctor executes the selected runtime as code; trust it separately."
         }
         "model setup" => {
             "Usage: sideeffect model setup MODEL_ID [--runtime EXISTING_FILE]\n       sideeffect model setup --interactive\nInteractive setup asks for a supported task and lists only compatible pinned catalog models with exact size and evaluation status/note; no model is recommended. You can cancel at either selection prompt. Setup then uses the existing explicit license confirmation and pinned download flow after explicit typed acceptance. Runtime configuration is optional and can be set later with `model runtime set`; this flow does not download or run a runtime. MODEL_ID setup verifies the exact pinned file after explicit typed license acceptance, then selects it for its declared task. Optional --runtime records an already obtained runtime path for that task after setup succeeds; it does not download or execute the runtime. Run 'sideeffect model doctor --task TASK' to check the configured task runtime."
@@ -2150,6 +2206,12 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         }
         "model-query" => {
             "Usage: sideeffect model-query --question QUESTION [--runtime LLAMA_COMPLETION] --confirm-sha256 REQUEST_SHA256 TRACE\nRuns the selected optional local query model on Linux x86_64 only after explicit preview-digest confirmation, using --runtime when supplied or the configured query runtime. It executes only validated exact-match AND filters over observed typed facts, never commands or model-authored expressions. No model is downloaded during analysis or evidence uploaded. Model results are unverified review aids. See docs/LOCAL_QUERY_PLAN_EVALUATION.md."
+        }
+        "model-etw-query-preview" => {
+            "Usage: sideeffect model-etw-query-preview --question QUESTION --backend auto|cpu|cuda --windows-runtime CAPTURE.json (native Windows x86_64 only)\nPreviews a bounded exact-match plan over selected ETW v3 FileIo, network, and DiskIo fields that are re-decoded and corroborated against their sidecars. Process payloads requiring live TDH schema are not exposed; header PID/TID are not queryable. Query facts are shown for review but are not sent to the model. Partial/loss/unknown coverage is retained; inference is not run. This workflow is experimental and unqualified. See docs/LOCAL_QUERY_PLAN_EVALUATION.md."
+        }
+        "model-etw-query" => {
+            "Usage: sideeffect model-etw-query --question QUESTION --backend auto|cpu|cuda [--runtime LLAMA_COMPLETION] --confirm-sha256 REQUEST_SHA256 --windows-runtime CAPTURE.json (native Windows x86_64 only)\nRuns an opt-in local Windows inference only after exact preview-digest confirmation. SideEffect validates a strict ETW-only plan and applies deterministic exact-match AND filters, returning capture-linked W… evidence references. No syscall semantics, header PID/TID identity, or undecoded process payload is exposed. The workflow is experimental and no model is quality-qualified. Inference does not download models or upload data; Windows Job Objects are not a network-isolation or GPU-memory boundary."
         }
         _ => return Err(format!("unknown help topic: {topic}\n\n{USAGE}")),
     };
@@ -7360,6 +7422,13 @@ fn model_preview_file(question: &OsString, path: &OsString) -> Result<ExitCode, 
     })
 }
 
+#[cfg(windows)]
+fn model_query_preview_file(question: &OsString, path: &OsString) -> Result<ExitCode, String> {
+    let _ = (question, path);
+    Err("model-query-preview is the Linux syscall query workflow; use model-etw-query-preview for native Windows ETW".to_owned())
+}
+
+#[cfg(not(windows))]
 fn model_query_preview_file(question: &OsString, path: &OsString) -> Result<ExitCode, String> {
     let question = question
         .to_str()
@@ -7375,6 +7444,88 @@ fn model_query_preview_file(question: &OsString, path: &OsString) -> Result<Exit
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn model_etw_query_preview_file(
+    question: &OsString,
+    backend: &OsString,
+    path: &OsString,
+) -> Result<ExitCode, String> {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        let question = question
+            .to_str()
+            .ok_or("ETW query question must be valid UTF-8")?;
+        let backend = parse_explanation_backend(backend)?;
+        let bytes = read_bounded_windows_runtime(path)?;
+        let model = selected_model_identity(ModelTask::QueryPlan)?;
+        let preview =
+            sideeffect::windows_etw_query_plan::preview_bytes(&bytes, question, &model, backend)?;
+        let partial = preview.coverage["query_status"] == "partial_or_unknown";
+        write_json(&preview, "experimental Windows ETW query preview")?;
+        Ok(if partial {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        })
+    }
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    {
+        let _ = (question, backend, path);
+        Err("model-etw-query-preview is supported on native Windows x86_64 only".to_owned())
+    }
+}
+
+fn model_etw_query_file(
+    question: &OsString,
+    backend: &OsString,
+    runtime: Option<&OsString>,
+    digest: &OsString,
+    path: &OsString,
+) -> Result<ExitCode, String> {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        let question = question
+            .to_str()
+            .ok_or("ETW query question must be valid UTF-8")?;
+        let backend = parse_explanation_backend(backend)?;
+        let digest = digest
+            .to_str()
+            .ok_or("preview digest must be 64 lowercase hexadecimal characters")?;
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("preview digest must be 64 lowercase hexadecimal characters".to_owned());
+        }
+        let bytes = read_bounded_windows_runtime(path)?;
+        let model = selected_model_identity(ModelTask::QueryPlan)?;
+        let runtime = resolve_runtime_path(ModelTask::QueryPlan, runtime)?;
+        let result = sideeffect::windows_etw_query_plan::analyze_bytes(
+            &bytes, question, backend, &runtime, &model, digest,
+        )?;
+        let partial = result.collection_status
+            != sideeffect::windows_runtime::CollectionStatus::Complete
+            || result.capture_completeness != "complete"
+            || !result.diagnostics.is_empty()
+            || !result.event_loss.loss_statistics_available
+            || !result.event_loss.final_snapshot_available
+            || result.event_loss.events_lost > 0
+            || result.event_loss.log_buffers_lost > 0
+            || result.event_loss.real_time_buffers_lost > 0;
+        write_json(&result, "experimental Windows ETW query result")?;
+        Ok(if partial {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        })
+    }
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    {
+        let _ = (question, backend, runtime, digest, path);
+        Err("model-etw-query is supported on native Windows x86_64 only".to_owned())
+    }
 }
 
 fn model_explanation_preview_file(
@@ -7443,6 +7594,18 @@ fn parse_explanation_backend(
     }
 }
 
+#[cfg(windows)]
+fn model_query_file(
+    question: &OsString,
+    runtime: Option<&OsString>,
+    digest: &OsString,
+    trace: &OsString,
+) -> Result<ExitCode, String> {
+    let _ = (question, runtime, digest, trace);
+    Err("model-query is the Linux syscall query workflow; use model-etw-query for native Windows ETW".to_owned())
+}
+
+#[cfg(not(windows))]
 fn model_query_file(
     question: &OsString,
     runtime: Option<&OsString>,
@@ -7676,8 +7839,14 @@ fn model_doctor(
         Some(value) => value.to_str(),
     }
     .ok_or_else(|| "backend must be valid UTF-8".to_owned())?;
-    if model_task != ModelTask::Explanation && backend.is_some() {
-        return Err("--backend is supported only for --task explanation".to_owned());
+    if model_task != ModelTask::Explanation
+        && !(cfg!(all(windows, target_arch = "x86_64")) && model_task == ModelTask::QueryPlan)
+        && backend.is_some()
+    {
+        return Err(
+            "--backend is supported only for explanation and native Windows x86_64 ETW query"
+                .to_owned(),
+        );
     }
     let backend = match backend_name {
         "auto" => sideeffect::local_model_explanation::ExplanationBackendPreference::Auto,
@@ -7707,11 +7876,17 @@ fn model_doctor(
     let expected_revision = match model_task {
         ModelTask::EvidenceSelection => sideeffect::local_model::RUNTIME_REVISION,
         ModelTask::Explanation => sideeffect::local_model_explanation::EXPLANATION_RUNTIME_REVISION,
+        ModelTask::QueryPlan if cfg!(all(windows, target_arch = "x86_64")) => {
+            sideeffect::local_model_explanation::EXPLANATION_RUNTIME_REVISION
+        }
         ModelTask::QueryPlan => sideeffect::local_query_plan::LOCAL_QUERY_PLAN_RUNTIME_REVISION,
     };
     let expected_version = match model_task {
         ModelTask::EvidenceSelection => sideeffect::local_model::RUNTIME_VERSION_PREFIX,
         ModelTask::Explanation => "pinned commit reported by --version",
+        ModelTask::QueryPlan if cfg!(all(windows, target_arch = "x86_64")) => {
+            "pinned commit reported by --version"
+        }
         ModelTask::QueryPlan => sideeffect::local_query_plan::LOCAL_QUERY_PLAN_RUNTIME_VERSION,
     };
     let supported_here = model_task_supported_here(model_task);
@@ -7736,7 +7911,7 @@ fn model_doctor(
                 "expected_version_contract": expected_version,
                 "executable_status": "not_configured_or_unavailable",
                 "executable_diagnostic": error,
-                "device_check_status": if model_task == ModelTask::Explanation && backend != sideeffect::local_model_explanation::ExplanationBackendPreference::Cpu { "not_checked" } else { "not_applicable" },
+            "device_check_status": if (model_task == ModelTask::Explanation || (cfg!(all(windows, target_arch = "x86_64")) && model_task == ModelTask::QueryPlan)) && backend != sideeffect::local_model_explanation::ExplanationBackendPreference::Cpu { "not_checked" } else { "not_applicable" },
                 "device_diagnostic": null,
                 "backend_readiness": "blocked_runtime_unavailable",
                 "gpu_inference_status": "not_run"
@@ -7765,7 +7940,7 @@ fn model_doctor(
         "quality_assessment_performed_by_doctor": false,
         "limitations": [
             "Runtime output identifies only a reported version or commit string; it does not authenticate the executable or its loaded libraries.",
-            "Device enumeration is performed only for explanation and does not prove successful GPU inference or measure GPU memory.",
+            "Device enumeration is performed only for explanation and native Windows ETW query and does not prove successful GPU inference or measure GPU memory.",
             "Model registration and hash checks do not establish runtime compatibility or answer quality. Doctor does not load weights or run inference."
         ]
     });
@@ -7809,6 +7984,31 @@ fn doctor_task_runtime(
             })
         }
         ModelTask::EvidenceSelection => doctor_pinned_version_runtime(task, runtime_path),
+        ModelTask::QueryPlan if cfg!(all(windows, target_arch = "x86_64")) => {
+            let runtime = sideeffect::local_model_explanation_runtime::doctor_explanation_runtime(
+                runtime_path,
+                backend,
+            );
+            let device_check_status = if backend
+                == sideeffect::local_model_explanation::ExplanationBackendPreference::Cpu
+            {
+                "not_applicable_cpu_requested"
+            } else {
+                runtime.cuda_device_status
+            };
+            serde_json::json!({
+                "runtime_path": runtime.runtime_path,
+                "expected_source_revision": runtime.expected_source_revision,
+                "expected_version_contract": "pinned commit reported by --version",
+                "executable_status": runtime.executable_status,
+                "executable_diagnostic": runtime.executable_diagnostic,
+                "requested_backend": runtime.requested_backend,
+                "device_check_status": device_check_status,
+                "device_diagnostic": runtime.device_diagnostic,
+                "backend_readiness": runtime.backend_readiness,
+                "gpu_inference_status": runtime.gpu_inference_status
+            })
+        }
         ModelTask::QueryPlan => doctor_pinned_version_runtime(task, runtime_path),
     }
 }
@@ -8690,7 +8890,14 @@ fn model_task_cli_name(task: ModelTask) -> &'static str {
 
 fn model_task_platform(task: ModelTask) -> &'static str {
     match task {
-        ModelTask::EvidenceSelection | ModelTask::QueryPlan => "Linux x86_64 only",
+        ModelTask::EvidenceSelection => "Linux x86_64 only",
+        ModelTask::QueryPlan if cfg!(all(windows, target_arch = "x86_64")) => {
+            "Linux x86_64 and native Windows x86_64 (ETW query experiment)"
+        }
+        ModelTask::QueryPlan if cfg!(windows) => {
+            "Linux x86_64 only (Windows ETW query supports x86_64)"
+        }
+        ModelTask::QueryPlan => "Linux x86_64 only",
         ModelTask::Explanation => "Linux x86_64 and native Windows",
     }
 }
@@ -8712,6 +8919,7 @@ fn model_task_supported_here(task: ModelTask) -> bool {
     #[cfg(windows)]
     {
         task == ModelTask::Explanation
+            || (cfg!(target_arch = "x86_64") && task == ModelTask::QueryPlan)
     }
     #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), windows)))]
     {
@@ -9518,6 +9726,14 @@ fn write_buffer(buffer: &CappedBuffer, description: &str) -> Result<(), String> 
 
 fn read_bounded(path: &OsString) -> Result<Vec<u8>, String> {
     read_trace_file(Path::new(path), MAX_TRACE_BYTES)
+}
+
+fn read_bounded_windows_runtime(path: &OsString) -> Result<Vec<u8>, String> {
+    read_input_file(
+        Path::new(path),
+        sideeffect::windows_runtime::MAX_WINDOWS_RUNTIME_DOCUMENT_BYTES,
+        "Windows ETW query capture",
+    )
 }
 
 fn read_trace_file(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
