@@ -244,7 +244,7 @@ The separate `sideeffect.package_query` v1 exact query now covers Linux package 
 
 ### R9 — Optional AI investigation evaluation and implementation
 
-**Status:** active again by current product direction; implementation remains experimental, incomplete, and not release-approved. No model is approved, and core product workflows do not depend on one. A proposed qualification protocol is recorded in [`LOCAL_MODEL_QUALIFICATION_PROTOCOL.md`](LOCAL_MODEL_QUALIFICATION_PROTOCOL.md); it is not approved or executed, and candidate-specific pass criteria still require review and freezing before inference. Any future implementation and qualification must pass the deterministic evidence, privacy, security, resource, and quality gates below.
+**Status:** active again by current product direction; implementation remains experimental, incomplete, and not release-approved. No model is approved, and core product workflows do not depend on one. [`LOCAL_MODEL_QUALIFICATION_PROTOCOL.md`](LOCAL_MODEL_QUALIFICATION_PROTOCOL.md) now records maintainer v1 thresholds for future qualification runs, preserving the frozen Linux evidence/query gates and defining proposed explanation/Windows ETW gates. The protocol has not been independently approved or executed; each exact candidate tuple still requires a fresh, separately held, independently reviewed qualification set and a pinned run plan before inference. Any future implementation and qualification must pass the deterministic evidence, privacy, security, resource, and quality gates below.
 
 **Purpose:** evaluate whether an optional local model can help a user navigate already validated evidence without becoming a collector, fact source, or required runtime.
 
