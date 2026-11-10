@@ -1,0 +1,68 @@
+name: Published Linux archive acceptance
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/published-linux-acceptance.yml
+      - scripts/smoke_linux_release_archive.py
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag
+        required: true
+        default: v0.1.0
+
+permissions:
+  contents: read
+  attestations: read
+
+jobs:
+  verify-published-archive:
+    if: github.repository == 'tengircik/SideEffect'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the archive smoke checker
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify provenance of the published archive
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || 'v0.1.0' }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'Expected a numeric release tag such as v0.1.0' >&2
+            exit 1
+          fi
+          asset="sideeffect-${RELEASE_TAG}-linux-x86_64.tar.gz"
+          download="$RUNNER_TEMP/published-sideeffect"
+          mkdir -m 700 "$download"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$asset" --pattern SHA256SUMS --dir "$download"
+          expected=$(awk -v asset="$asset" '$2 == asset || $2 == "*" asset { print $1 }' \
+            "$download/SHA256SUMS")
+          if [[ ! "$expected" =~ ^[[:xdigit:]]{64}$ ]]; then
+            echo 'Expected exactly one SHA-256 checksum for the Linux archive' >&2
+            exit 1
+          fi
+          printf '%s  %s\n' "$expected" "$asset" | (cd "$download" && sha256sum --check --strict)
+          gh attestation verify "$download/$asset" --repo "$GITHUB_REPOSITORY" \
+            --source-ref "refs/tags/$RELEASE_TAG" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+            --deny-self-hosted-runners
+
+      - name: Extract and invoke the verified archive on Ubuntu
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || 'v0.1.0' }}
+        run: |
+          set -euo pipefail
+          asset="sideeffect-${RELEASE_TAG}-linux-x86_64.tar.gz"
+          python3 scripts/smoke_linux_release_archive.py \
+            --archive "$RUNNER_TEMP/published-sideeffect/$asset" \
+            --version "${RELEASE_TAG#v}" --temp-dir "$RUNNER_TEMP"
