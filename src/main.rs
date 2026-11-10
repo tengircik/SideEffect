@@ -1991,7 +1991,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect events --trace TRACE\n       sideeffect events --windows-runtime CAPTURE.json (native Windows)\nAdapts one local runtime source into a versioned common event envelope and writes JSON only. Source-local order and timestamps are preserved; no cross-platform ordering, parentage, ownership, or causation is inferred. Partial or unknown source status exits with status 2. Windows runtime input is strictly bounded and schema-validated before adaptation."
         }
         "query" => {
-            "Usage: sideeffect query --query QUERY.json --trace TRACE [--format json|text]\n       sideeffect query --query QUERY.json --windows-runtime CAPTURE.json [--format json|text] (native Windows)\n       sideeffect query --query QUERY.json --session SESSION_DIR --source runtime|selected_root|startup|packages|processes|permissions [--format json|text]\n       sideeffect query --query QUERY.json --session SESSION_DIR --session SESSION_DIR --source runtime|selected_root|startup|packages|processes|permissions [--format json|text] (2..16 sessions)\nRuns a versioned, read-only exact-filter query over runtime evidence selected-root snapshots, startup, package, process, or selected-path permission rows in explicitly selected verified sessions. Process query schema v1 accepts exact case-sensitive process_id and image_name filters over Linux v3-v5 or Windows v3-v4 snapshots; PIDs are snapshot-local, results retain row evidence and artifact digests, and no-match does not establish absence. Permission query schema v1 uses exact lowercase path_hex in native Linux path-byte or Windows UTF-16LE encoding; it returns the selected path row as captured and does not calculate effective access. Event query schema v2 adds path_exact (exact equality); v3 adds path_prefix (case-sensitive literal string starts_with). Both apply only to observed Linux lexical hints or raw-payload-validated Windows ETW FileIo names. Prefix matching can match sibling spellings such as /tmp/a and /tmp/abc; it does not mean directory containment. Neither filter normalizes, case-folds, resolves, or globs paths; unsupported/pathless rows cannot match, and zero matches do not establish absence. Query schemas v1/v2 remain accepted for their original filters. Other event filters are exact event_kind, operation_kind, syscall outcome, and source-local evidence locators; process_observation_id is supported for one runtime source only. Evidence locators match the complete source-native tuple and are rejected across sessions. Inventory query schema v1 accepts exact native-encoding root_path_hex and entry_name_hex filters; Linux values encode bytes and Windows values encode UTF-16LE. Startup query uses a separate sideeffect.startup_query v1 contract with exact case-sensitive UTF-8 string equality over a native row field and optional native source/table selector; Windows raw UTF-16 fields can be selected through their artifact-provided lowercase hexadecimal values. It preserves full matched rows, source evidence, and RFC 6901 JSON pointers without normalizing identities across platforms. Startup artifacts are capped at 64 MiB, traversal at 20,000 rows, aggregate verified artifacts at 256 MiB, total work at 10 seconds, and output at 8 MiB. Query JSON is capped at 16 KiB, each path filter at 8 KiB, matching rows at 5,000, multi-session verified artifact bytes at 256 MiB, total work at 10 seconds checked between sessions, and serialized output at 8 MiB. Selected-root v1/v2 documents are strictly validated with 10,000-entry and 8 MiB aggregate encoded-name caps. Results retain session/source status, diagnostics, artifact digests, and direct-child entry ordinals. Missing and partial sources remain not checked or partial. Invalid sessions or malformed documents fail the request. Partial or unknown evidence exits with status 2."
+            "Usage: sideeffect query --query QUERY.json --trace TRACE [--format json|text]\n       sideeffect query --query QUERY.json --windows-runtime CAPTURE.json [--format json|text] (native Windows)\n       sideeffect query --query QUERY.json --session SESSION_DIR --source runtime|selected_root|startup|packages|processes|permissions [--format json|text]\n       sideeffect query --query QUERY.json --session SESSION_DIR --session SESSION_DIR --source runtime|selected_root|startup|packages|processes|permissions [--format json|text] (2..16 sessions)\nRuns a versioned, read-only filter query over runtime evidence, selected-root snapshots, startup, package, process, or selected-path permission rows in explicitly selected verified sessions. Process query schema v1 accepts exact case-sensitive process_id and image_name filters over Linux v3-v5 or Windows v3-v4 snapshots; PIDs are snapshot-local, results retain row evidence and artifact digests, and no-match does not establish absence. Permission query schema v1 uses exact lowercase path_hex in native Linux path-byte or Windows UTF-16LE encoding; it returns the selected path row as captured and does not calculate effective access. Event query schema v2 adds path_exact (exact equality); v3 adds path_prefix (case-sensitive literal string starts_with). Both apply only to observed Linux lexical hints or raw-payload-validated Windows ETW FileIo names. Prefix matching can match sibling spellings such as /tmp/a and /tmp/abc; it does not mean directory containment. Neither filter normalizes, case-folds, resolves, or globs paths; unsupported/pathless rows cannot match, and zero matches do not establish absence. Event query schema v4 adds inclusive timestamp bounds over one source clock (strace_decimal or etw_qpc_ticks). Timestamp filters require one runtime source. Query schemas v1 through v3 remain accepted for their existing filters. Other event filters are exact event_kind, operation_kind, syscall outcome, and source-local evidence locators; process_observation_id is supported for one runtime source only. Evidence locators match the complete source-native tuple and are rejected across sessions. Inventory query schema v1 accepts exact native-encoding root_path_hex and entry_name_hex filters; Linux values encode bytes and Windows values encode UTF-16LE. Startup query uses a separate sideeffect.startup_query v1 contract with exact case-sensitive UTF-8 string equality over a native row field and optional native source/table selector; Windows raw UTF-16 fields can be selected through their artifact-provided lowercase hexadecimal values. It preserves full matched rows, source evidence, and RFC 6901 JSON pointers without normalizing identities across platforms. Startup artifacts are capped at 64 MiB, traversal at 20,000 rows, aggregate verified artifacts at 256 MiB, total work at 10 seconds, and output at 8 MiB. Query JSON is capped at 16 KiB, each path filter at 8 KiB, matching rows at 5,000, multi-session verified artifact bytes at 256 MiB, total work at 10 seconds checked between sessions, and serialized output at 8 MiB. Selected-root v1/v2 documents are strictly validated with 10,000-entry and 8 MiB aggregate encoded-name caps. Results retain session/source status, diagnostics, artifact digests, and direct-child entry ordinals. Missing and partial sources remain not checked or partial. Invalid sessions or malformed documents fail the request. Partial or unknown evidence exits with status 2."
         }
         "graph" => {
             "Usage: sideeffect graph --trace TRACE [--format json|text|html] [--output REPORT.html] [--event-kind KIND | --process-observation ID]\n       sideeffect graph --windows-runtime CAPTURE.json [--startup STARTUP.json] [--format json|text|html] [--output REPORT.html] [--event-kind KIND | --process-observation ID] (native Windows)\nBuilds a bounded source-local graph of event rows, process observations, reported PID context, and evidence-linked relationships. Optional Windows --startup adds exact-path SCM service-to-process-start candidates with references into both inputs; a candidate does not show that a service launched or caused a process. JSON remains the default; --format text writes an 8 MiB-bounded ASCII-only terminal summary to stdout. --format html requires --output and writes a bounded static offline HTML report without replacing existing files. The report uses a restrictive CSP, has no scripts or external assets, and escapes source values. --event-kind selects exact event-kind matches. --process-observation selects a source-local ProcessObservation ID (not a PID or cross-capture ID) and retains events linked to that observation plus its direct process relationships. Retained links preserve their status and basis; diagnostics and source status remain for the full input. An empty event selection is not evidence of absence. PID-only context nodes are kept separate and never merged into process instances. Edges do not establish ownership, causation, or a complete process tree. Partial or unknown source status exits with status 2."
@@ -4207,6 +4207,12 @@ fn query_command(arguments: &[OsString]) -> Result<ExitCode, String> {
                     .to_owned(),
             );
         }
+        if query.filters.timestamp.is_some() {
+            return Err(
+                "timestamp filters require one runtime source and cannot be used across sessions"
+                    .to_owned(),
+            );
+        }
         let result = query_verified_session_runtimes(&session_paths, &query)?;
         let complete = result.complete;
         write_multi_session_query_result(&result, output_format)?;
@@ -5656,9 +5662,23 @@ fn format_event_query_text(result: &sideeffect::query::EventQueryResult) -> Resu
             .as_ref()
             .map(|observation| format!(" path={}", terminal_safe_text(&observation.path)))
             .unwrap_or_default();
+        let timestamp = if result.filter.timestamp.is_some() {
+            event
+                .source_timestamp
+                .as_ref()
+                .map_or_else(String::new, |timestamp| {
+                    format!(
+                        " timestamp={} ({})",
+                        terminal_safe_text(&timestamp.value),
+                        terminal_safe_text(&timestamp.clock_unit)
+                    )
+                })
+        } else {
+            String::new()
+        };
         writeln!(
             text,
-            "- #{} {} [{}] evidence={}{}",
+            "- #{} {} [{}] evidence={}{}{}",
             event.source_local_ordinal,
             terminal_safe_text(&event.event_kind),
             match &event.operation {
@@ -5666,7 +5686,8 @@ fn format_event_query_text(result: &sideeffect::query::EventQueryResult) -> Resu
                 sideeffect::event::OperationSemantics::NativeObservation => "native_observation",
             },
             evidence,
-            path
+            path,
+            timestamp
         )
         .map_err(|_| "could not format event query text".to_owned())?;
         check_event_query_text_limit(&text)?;

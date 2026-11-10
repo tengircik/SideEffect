@@ -66,6 +66,10 @@ pub struct SourceTimestamp {
     pub clock_unit: String,
 }
 
+pub(crate) const STRACE_TIMESTAMP_CLOCK: &str =
+    "strace_timestamp_decimal; unit not independently verified";
+pub(crate) const ETW_TIMESTAMP_CLOCK: &str = "ETW_QPC_ticks";
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EvidenceReference {
@@ -1396,7 +1400,7 @@ pub fn from_linux_strace(
             source_local_ordinal: ordinal,
             source_timestamp: record.timestamp.as_ref().map(|value| SourceTimestamp {
                 value: value.clone(),
-                clock_unit: "strace_timestamp_decimal; unit not independently verified".to_owned(),
+                clock_unit: STRACE_TIMESTAMP_CLOCK.to_owned(),
             }),
             event_kind,
             operation: OperationSemantics::SyscallAttempt {
@@ -2190,7 +2194,7 @@ fn from_windows_etw_source(capture: &impl EtwCaptureView) -> CommonEventEnvelope
             source_local_ordinal: expected,
             source_timestamp: Some(SourceTimestamp {
                 value: event.timestamp_qpc.to_string(),
-                clock_unit: "ETW_QPC_ticks".to_owned(),
+                clock_unit: ETW_TIMESTAMP_CLOCK.to_owned(),
             }),
             event_kind: event.event_kind.to_owned(),
             operation: OperationSemantics::NativeObservation,
