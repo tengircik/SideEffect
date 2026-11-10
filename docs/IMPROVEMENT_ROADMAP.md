@@ -4,7 +4,7 @@
 
 This roadmap is based on the repository documentation and the technical critiques listed in the traceability matrix below. It is a planning synthesis, not a new code audit. Existing implementation status remains governed by `PRODUCT.md`, `ARCHITECTURE.md`, `PLAN.md`, the [source acceptance matrix](SOURCE_ACCEPTANCE.md), compatibility records, and the security policy. A planned capability does not imply that a collector can observe every relevant system action.
 
-## Implementation status (2026-11-08)
+## Implementation status (2026-11-10)
 
 These are audited status summaries. “Accepted for the documented bounded source set” records a gate decision limited to the named scope; it does not imply exhaustive coverage or release approval. “Partial” means useful code exists while the named phase gate remains open.
 
@@ -24,6 +24,8 @@ These are audited status summaries. “Accepted for the documented bounded sourc
 The short Linux benchmark method is documented in [TRACE_BENCHMARKING.md](TRACE_BENCHMARKING.md); the 10k–1M scale procedure is documented in [TRACE_SCALE_BENCHMARKING.md](TRACE_SCALE_BENCHMARKING.md). WSL2 measurements are not native-Linux or release-performance acceptance. R9 evaluation details and frozen results remain in the task-specific evaluation documents; schema-valid output alone is not evidence of useful analysis.
 
 The Windows x86_64 ETW query-plan slice is now implemented as an opt-in native-Windows preview and digest-confirmed inference workflow with strict ETW-only filters. It has a 13-case public synthetic development corpus and an aggregate-only actual-CLI runner, but the labels are unreviewed and literal-selector focused. Independent label review, a separately held qualification corpus, its quality/evaluation gate, and real Windows model-quality acceptance remain open; implementation is not qualification.
+
+On 2026-11-10, three small model candidates completed all 13 cases of that Windows ETW query corpus through the actual CUDA inference path after the Windows runner output cap was aligned with its 64 KiB per-stream bound. Each candidate produced only 4/13 exact plans, 0/7 exact plans on answerable cases, and 1/7 exact deterministic result sets on answerable cases; the 6/6 required-abstain decision count does not validate abstention reasons. These runs confirm bounded runtime execution on this one Windows host, not query usefulness, semantic quality, a release gate, or model qualification. Full candidate identities, latencies, output limitations, and GPU measurement limits are recorded in [`LOCAL_QUERY_PLAN_EVALUATION.md`](LOCAL_QUERY_PLAN_EVALUATION.md#native-windows-cuda-evaluation--2026-11-10).
 
 The Linux query-plan v3 development corpus now has a question-only reviewer packet preparer and an aggregate-only validator that checks returned plans and compares reviewer agreement by both case and intent group. The workflow is available for review handoff, but no completed independent reviews exist. Its public labels remain visible, so the workflow cannot prove blinding or label truth, create a hidden holdout, or qualify a model. CI covers the handoff/validator contracts; actual human review, a separately held corpus, frozen quality thresholds, and real-model evaluation remain release gates.
 
