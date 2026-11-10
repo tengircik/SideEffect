@@ -476,7 +476,7 @@ if ($Action -eq 'remove') {
 }
 
 $assets = $Assets[$Backend]
-$totalDownloadBytes = ($assets | Measure-Object -Property Size -Sum).Sum
+$totalDownloadBytes = Get-SideEffectRuntimeAssetTotalSize -Assets $assets
 $expectedConfirmation = "INSTALL LLAMA.CPP $Release $($Backend.ToUpperInvariant())"
 Write-Host "This downloads executable code from the pinned llama.cpp GitHub release ($Release)."
 Write-Host "Backend: $Backend; total download: $totalDownloadBytes bytes (~$([Math]::Round($totalDownloadBytes / 1000000)) MB; up to 2 GiB extracted)."

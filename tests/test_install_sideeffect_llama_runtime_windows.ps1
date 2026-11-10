@@ -29,6 +29,22 @@ function Assert-Throws {
     Assert-True -Condition $threw -Message $Message
 }
 
+$cpuAssets = @(@{ Name = 'cpu-runtime.zip'; Size = 24260998L })
+$cudaAssets = @(
+    @{ Name = 'cuda-runtime.zip'; Size = 279447765L },
+    @{ Name = 'cuda-libraries.zip'; Size = 391443627L }
+)
+Assert-True -Condition ((Get-SideEffectRuntimeAssetTotalSize -Assets $cpuAssets) -eq 24260998L) `
+    -Message 'CPU runtime total must sum its pinned archive size'
+Assert-True -Condition ((Get-SideEffectRuntimeAssetTotalSize -Assets $cudaAssets) -eq 670891392L) `
+    -Message 'CUDA runtime total must sum both pinned archive sizes'
+Assert-Throws -Action {
+    Get-SideEffectRuntimeAssetTotalSize -Assets @(@{ Name = 'missing-size.zip' })
+} -Message 'missing pinned asset sizes must be rejected'
+Assert-Throws -Action {
+    Get-SideEffectRuntimeAssetTotalSize -Assets @(@{ Name = 'invalid-size.zip'; Size = 0L })
+} -Message 'non-positive pinned asset sizes must be rejected'
+
 $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 try {
     $runningElevated = ([Security.Principal.WindowsPrincipal]::new($currentIdentity)).IsInRole(

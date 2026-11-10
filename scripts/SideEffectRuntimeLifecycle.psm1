@@ -21,6 +21,29 @@ function Assert-SideEffectRuntimeNotElevated {
     }
 }
 
+function Get-SideEffectRuntimeAssetTotalSize {
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary[]] $Assets)
+
+    if ($Assets.Count -eq 0) {
+        throw 'At least one pinned runtime asset is required.'
+    }
+
+    [long] $totalBytes = 0
+    foreach ($asset in $Assets) {
+        if (-not $asset.Contains('Size') -or $asset['Size'] -isnot [long] -or $asset['Size'] -le 0) {
+            throw 'A pinned runtime asset has an invalid size.'
+        }
+
+        [long] $size = $asset['Size']
+        if ($totalBytes -gt ([long]::MaxValue - $size)) {
+            throw 'The pinned runtime asset total exceeds the supported integer range.'
+        }
+        $totalBytes += $size
+    }
+
+    return $totalBytes
+}
+
 function Get-SideEffectRuntimeInstallPath {
     param(
         [Parameter(Mandatory = $true)][string] $LocalAppData,
@@ -401,4 +424,4 @@ function Remove-SideEffectRuntimeInstallation {
     }
 }
 
-Export-ModuleMember -Function Assert-SideEffectRuntimeNotElevated, Get-SideEffectRuntimeInstallPath, New-SideEffectRuntimeManifest, Test-SideEffectRuntimeInstallation, Remove-SideEffectRuntimeInstallation
+Export-ModuleMember -Function Assert-SideEffectRuntimeNotElevated, Get-SideEffectRuntimeAssetTotalSize, Get-SideEffectRuntimeInstallPath, New-SideEffectRuntimeManifest, Test-SideEffectRuntimeInstallation, Remove-SideEffectRuntimeInstallation
