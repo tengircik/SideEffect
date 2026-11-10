@@ -18,7 +18,9 @@ const MODEL_TIMEOUT_SECONDS: u64 = 120;
 const MODEL_CONTEXT_TOKENS: &str = "8192";
 const MODEL_OUTPUT_TOKENS: &str = "512";
 #[cfg(all(windows, target_arch = "x86_64"))]
-const MAX_QUERY_RUNTIME_OUTPUT_BYTES: usize = 16 * 1024;
+// Use the Windows runner's hard per-stream ceiling. The caller still validates
+// the model response against the strict 4 KiB plan contract before using it.
+const MAX_QUERY_RUNTIME_OUTPUT_BYTES: usize = MAX_RUNTIME_OUTPUT_BYTES;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const MODEL_PROCESS_MEMORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 #[cfg(windows)]
