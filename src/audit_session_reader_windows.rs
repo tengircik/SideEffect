@@ -8,9 +8,10 @@ use crate::fingerprint::sha256_hex;
 use serde::Deserializer;
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -129,6 +130,7 @@ pub fn read_verified_session(path: &Path) -> Result<VerifiedAuditSession, Sessio
     let held_metadata = directory_lock.metadata()?;
     if !held_metadata.is_dir()
         || held_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !owner_only_acl_handle(&directory_lock)?
     {
         return Err(SessionReadError::InvalidSessionDirectory);
     }
@@ -221,10 +223,7 @@ fn read_named(
 ) -> Result<Vec<u8>, SessionReadError> {
     let path = directory.join(name);
     let before = fs::symlink_metadata(&path).map_err(SessionReadError::Io)?;
-    if !before.is_file()
-        || before.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || !owner_only_acl(&path)?
-    {
+    if !before.is_file() || before.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(SessionReadError::InvalidPrivateEntry(label(name)));
     }
     if usize::try_from(before.len()).unwrap_or(usize::MAX) > max {
@@ -241,6 +240,9 @@ fn read_named(
         || opened.len() != before.len()
     {
         return Err(SessionReadError::EntryChanged(label(name)));
+    }
+    if !owner_only_acl_handle(&file)? {
+        return Err(SessionReadError::InvalidPrivateEntry(label(name)));
     }
     let limit = if manifest {
         MAX_AUDIT_SESSION_MANIFEST_BYTES
@@ -374,8 +376,19 @@ fn label(path: &str) -> &'static str {
 // Windows publication creates a protected DACL. The reader accepts only an explicit
 // non-inheriting DACL with a single allow ACE for the current user SID.
 pub(crate) fn owner_only_acl(path: &Path) -> io::Result<bool> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, READ_CONTROL};
+    let file = OpenOptions::new()
+        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Ok(false);
+    }
+    owner_only_acl_handle(&file)
+}
+
+pub(crate) fn owner_only_acl_handle(file: &File) -> io::Result<bool> {
     use std::ffi::c_void;
-    use std::os::windows::ffi::OsStrExt;
     type Handle = *mut c_void;
     #[repr(C)]
     struct AclSize {
@@ -385,8 +398,8 @@ pub(crate) fn owner_only_acl(path: &Path) -> io::Result<bool> {
     }
     #[link(name = "advapi32")]
     unsafe extern "system" {
-        fn GetNamedSecurityInfoW(
-            name: *mut u16,
+        fn GetSecurityInfo(
+            handle: Handle,
             object_type: u32,
             information: u32,
             owner: *mut *mut c_void,
@@ -433,13 +446,12 @@ pub(crate) fn owner_only_acl(path: &Path) -> io::Result<bool> {
         mask: u32,
         sid_start: u32,
     }
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut owner = std::ptr::null_mut();
     let mut dacl = std::ptr::null_mut();
     let mut sd = std::ptr::null_mut();
     let status = unsafe {
-        GetNamedSecurityInfoW(
-            wide.as_ptr() as *mut _,
+        GetSecurityInfo(
+            file.as_raw_handle(),
             1,
             0x1 | 0x4,
             &mut owner,
@@ -562,6 +574,8 @@ fn owner_only_acl_contract(
 
 #[cfg(test)]
 mod tests {
+    use std::os::windows::fs::OpenOptionsExt;
+
     use super::{
         SessionReadError, owner_only_acl, owner_only_acl_contract, read_verified_session,
         verify_schema,
@@ -656,7 +670,13 @@ mod tests {
         let files = [("session.json", b"fixture".as_slice())];
         crate::record::publish_private_windows_directory(&destination, &files, 1024).unwrap();
         assert!(owner_only_acl(&destination).unwrap());
-        assert!(owner_only_acl(&destination.join("session.json")).unwrap());
+        let file = super::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(destination.join("session.json"))
+            .unwrap();
+        assert!(super::owner_only_acl_handle(&file).unwrap());
+        drop(file);
         std::fs::remove_dir_all(root).unwrap();
     }
 
