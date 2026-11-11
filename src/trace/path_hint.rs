@@ -80,7 +80,7 @@ pub fn derive_lexical_path_hint(syscall: &str, raw_arguments: &str) -> Option<Le
     })
 }
 
-fn split_top_level_arguments(raw: &str, expected_arguments: usize) -> Option<Vec<&str>> {
+pub(super) fn split_top_level_arguments(raw: &str, expected_arguments: usize) -> Option<Vec<&str>> {
     let mut parts = Vec::new();
     let mut stack = Vec::new();
     let mut start = 0;
