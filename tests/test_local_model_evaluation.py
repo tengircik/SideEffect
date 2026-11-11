@@ -242,7 +242,8 @@ class EvaluationHelperTests(unittest.TestCase):
             fixture.write_bytes(b"synthetic evidence\n")
             digest = hashlib.sha256(fixture.read_bytes()).hexdigest()
             corpus = {"trace_sha256": {fixture.name: digest}}
-            temporary, copies = evaluation.prepare_verified_fixtures(root, corpus)
+            equivalent_root = root / ".." / root.name
+            temporary, copies = evaluation.prepare_verified_fixtures(equivalent_root, corpus)
             try:
                 self.assertEqual(copies[fixture.name].read_bytes(), fixture.read_bytes())
             finally:

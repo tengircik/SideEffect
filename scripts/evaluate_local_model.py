@@ -602,6 +602,7 @@ def repository_provenance(repository: Path, *, require_clean: bool) -> dict[str,
 def prepare_verified_fixtures(
     root: Path, corpus: dict[str, Any]
 ) -> tuple[tempfile.TemporaryDirectory, dict[str, Path]]:
+    root = root.resolve(strict=True)
     expected_hashes = corpus["trace_sha256"]
     fixture_dir = tempfile.TemporaryDirectory(prefix="sideeffect-m8-fixtures-")
     private_root = Path(fixture_dir.name)
