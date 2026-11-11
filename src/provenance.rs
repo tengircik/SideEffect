@@ -8,7 +8,7 @@ use ring::rand::SystemRandom;
 use ring::signature::{self, Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
@@ -244,30 +244,19 @@ pub fn publish_envelope(
 }
 
 pub fn load_private_key(path: &Path) -> Result<Vec<u8>, ProvenanceError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() {
-        return Err(ProvenanceError::InvalidInput(
-            "private key must be a regular file, not a link or special file",
-        ));
+    let (file, metadata) = open_bounded_regular(
+        path,
+        MAX_KEY_FILE_BYTES,
+        "private key must be a regular file, not a link or special file",
+    )?;
+    if !opened_file_is_private(&file, &metadata)? {
+        #[cfg(target_os = "linux")]
+        let message = "private key must be owned by the current user with no group or other access";
+        #[cfg(windows)]
+        let message = "private key must have a protected current-user-only DACL";
+        return Err(ProvenanceError::InvalidInput(message));
     }
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::MetadataExt;
-        // SAFETY: geteuid has no preconditions and does not mutate memory.
-        let current_uid = unsafe { libc::geteuid() };
-        if metadata.uid() != current_uid || metadata.mode() & 0o077 != 0 {
-            return Err(ProvenanceError::InvalidInput(
-                "private key must be owned by the current user with no group or other access",
-            ));
-        }
-    }
-    #[cfg(windows)]
-    if !crate::audit_session_reader_windows::owner_only_acl(path)? {
-        return Err(ProvenanceError::InvalidInput(
-            "private key must have a protected current-user-only DACL",
-        ));
-    }
-    let bytes = read_limited(path, MAX_KEY_FILE_BYTES, "private key")?;
+    let bytes = read_opened_bounded(file, metadata.len(), MAX_KEY_FILE_BYTES)?;
     Ed25519KeyPair::from_pkcs8(&bytes).map_err(|_| ProvenanceError::InvalidKey)?;
     Ok(bytes)
 }
@@ -648,8 +637,7 @@ fn validate_trust_store(store: &Path) -> Result<(), ProvenanceError> {
     validate_trust_store_parent(parent)?;
     validate_trust_store_directory(store)?;
     let marker_path = store.join(TRUST_STORE_MARKER);
-    validate_trust_store_file(&marker_path)?;
-    let bytes = read_limited(&marker_path, MAX_TRUST_RECORD_BYTES, "trust-store marker")?;
+    let bytes = read_private_trust_file(&marker_path)?;
     let marker: TrustStoreMarker =
         serde_json::from_slice(&bytes).map_err(|_| ProvenanceError::InvalidStore)?;
     if marker.schema != TRUST_STORE_SCHEMA || marker.schema_version != TRUST_STORE_VERSION {
@@ -679,30 +667,32 @@ fn validate_trust_store_directory(store: &Path) -> Result<(), ProvenanceError> {
     Ok(())
 }
 
-fn validate_trust_store_file(path: &Path) -> Result<(), ProvenanceError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() {
+fn read_private_trust_file(path: &Path) -> Result<Vec<u8>, ProvenanceError> {
+    let (file, metadata) = open_bounded_regular(
+        path,
+        MAX_TRUST_RECORD_BYTES,
+        "input must be a regular file, not a link or special file",
+    )?;
+    if !opened_file_is_private(&file, &metadata)? {
         return Err(ProvenanceError::InvalidStore);
     }
+    read_opened_bounded(file, metadata.len(), MAX_TRUST_RECORD_BYTES)
+}
+
+fn opened_file_is_private(_file: &File, _metadata: &Metadata) -> io::Result<bool> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::MetadataExt;
         // SAFETY: geteuid has no preconditions and does not mutate memory.
         let current_uid = unsafe { libc::geteuid() };
-        if metadata.uid() != current_uid || metadata.mode() & 0o077 != 0 {
-            return Err(ProvenanceError::InvalidStore);
-        }
+        Ok(_metadata.uid() == current_uid && _metadata.mode() & 0o077 == 0)
     }
     #[cfg(windows)]
-    if !crate::audit_session_reader_windows::owner_only_acl(path)? {
-        return Err(ProvenanceError::InvalidStore);
-    }
-    Ok(())
+    crate::audit_session_reader_windows::owner_only_acl_handle(_file)
 }
 
 fn read_trust_record(path: &Path) -> Result<TrustedKeyRecord, ProvenanceError> {
-    validate_trust_store_file(path)?;
-    let bytes = read_limited(path, MAX_TRUST_RECORD_BYTES, "trusted key record")?;
+    let bytes = read_private_trust_file(path)?;
     let record: TrustedKeyRecord =
         serde_json::from_slice(&bytes).map_err(|_| ProvenanceError::InvalidStore)?;
     let public_key =
@@ -742,9 +732,25 @@ fn valid_trust_label(label: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b" ._@-".contains(&byte))
 }
 
-fn read_limited(path: &Path, limit: usize, description: &str) -> Result<Vec<u8>, ProvenanceError> {
+fn read_limited(path: &Path, limit: usize, _description: &str) -> Result<Vec<u8>, ProvenanceError> {
+    let (file, metadata) = open_bounded_regular(
+        path,
+        limit,
+        "input must be a regular file, not a link or special file",
+    )?;
+    read_opened_bounded(file, metadata.len(), limit)
+}
+
+fn open_bounded_regular(
+    path: &Path,
+    limit: usize,
+    not_regular: &'static str,
+) -> Result<(File, Metadata), ProvenanceError> {
     let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() || metadata.len() > limit as u64 {
+    if !metadata.file_type().is_file() {
+        return Err(ProvenanceError::InvalidInput(not_regular));
+    }
+    if metadata.len() > limit as u64 {
         return Err(ProvenanceError::InvalidInput(
             "input must be a bounded regular file",
         ));
@@ -761,12 +767,10 @@ fn read_limited(path: &Path, limit: usize, description: &str) -> Result<Vec<u8>,
         use std::os::windows::fs::OpenOptionsExt;
         options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
     }
-    let mut file = options.open(path)?;
+    let file = options.open(path)?;
     let opened_metadata = file.metadata()?;
     if !opened_metadata.is_file() {
-        return Err(ProvenanceError::InvalidInput(
-            "input must be a regular file, not a link or special file",
-        ));
+        return Err(ProvenanceError::InvalidInput(not_regular));
     }
     #[cfg(windows)]
     {
@@ -777,7 +781,20 @@ fn read_limited(path: &Path, limit: usize, description: &str) -> Result<Vec<u8>,
             ));
         }
     }
-    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(limit));
+    if opened_metadata.len() > limit as u64 {
+        return Err(ProvenanceError::InvalidInput(
+            "input exceeds its size limit",
+        ));
+    }
+    Ok((file, opened_metadata))
+}
+
+fn read_opened_bounded(
+    mut file: File,
+    length: u64,
+    limit: usize,
+) -> Result<Vec<u8>, ProvenanceError> {
+    let mut bytes = Vec::with_capacity((length as usize).min(limit));
     file.by_ref()
         .take(limit as u64 + 1)
         .read_to_end(&mut bytes)?;
@@ -789,7 +806,6 @@ fn read_limited(path: &Path, limit: usize, description: &str) -> Result<Vec<u8>,
     if bytes.is_empty() {
         return Err(ProvenanceError::InvalidInput("input file is empty"));
     }
-    let _ = description;
     Ok(bytes)
 }
 
