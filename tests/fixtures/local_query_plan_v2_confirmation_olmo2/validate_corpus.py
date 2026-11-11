@@ -14,6 +14,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 REPOSITORY = ROOT.parents[2]
+sys.path.insert(0, str(REPOSITORY / "scripts"))
 FIELDS = {"syscall", "outcome", "observed_errno", "lexical_path_exact", "process_id", "caller_task_id", "child_pid", "relation_type"}
 SYSCALLS = {"execve", "execveat", "openat", "openat2", "connect"}
 OUTCOMES = {"success", "failure", "in_progress", "unknown"}

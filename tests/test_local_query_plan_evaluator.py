@@ -11,6 +11,7 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
 SCRIPT = ROOT / "scripts" / "evaluate_local_query_plan.py"
 SPEC = importlib.util.spec_from_file_location("sideeffect_query_plan_evaluator", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None

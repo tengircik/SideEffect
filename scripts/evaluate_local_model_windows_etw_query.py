@@ -12,10 +12,11 @@ import hashlib
 import ipaddress
 import json
 import re
-import stat
 import sys
 from pathlib import Path
 from typing import Any
+
+from bounded_input import read_regular_file as read_bounded_input
 
 import evaluate_local_model_windows_etw_explain as capture_contract
 
@@ -62,18 +63,11 @@ def _exact_keys(value: Any, keys: set[str], label: str) -> dict[str, Any]:
 
 def _read_regular_file(path: Path, limit: int, label: str) -> bytes:
     try:
-        info = path.lstat()
-    except OSError as error:
-        raise ContractError(f"cannot inspect {label}: {error}") from error
-    _require(stat.S_ISREG(info.st_mode), f"{label} must be a regular non-symlink file")
-    _require(info.st_size <= limit, f"{label} exceeds its byte limit")
-    try:
-        with path.open("rb") as stream:
-            raw = stream.read(limit + 1)
+        return read_bounded_input(path, limit, label)
+    except ValueError as error:
+        raise ContractError(str(error)) from error
     except OSError as error:
         raise ContractError(f"cannot read {label}: {error}") from error
-    _require(len(raw) <= limit, f"{label} grew beyond its byte limit")
-    return raw
 
 
 def _decode(raw: bytes, label: str) -> Any:
