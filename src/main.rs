@@ -6010,8 +6010,10 @@ fn publish_graph_html(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     }
     #[cfg(windows)]
     {
-        publish_private_windows_file(path, bytes, MAX_REPORT_BYTES).map_err(|_| {
-            "could not publish event graph HTML without replacing an existing file".to_owned()
+        publish_private_windows_file(path, bytes, MAX_REPORT_BYTES).map_err(|error| {
+            format!(
+                "could not publish event graph HTML without replacing an existing file ({error})"
+            )
         })
     }
     #[cfg(not(any(target_os = "linux", windows)))]
@@ -6196,8 +6198,10 @@ fn publish_timeline_html(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     }
     #[cfg(windows)]
     {
-        publish_private_windows_file(path, bytes, MAX_REPORT_BYTES).map_err(|_| {
-            "could not publish event timeline HTML without replacing an existing file".to_owned()
+        publish_private_windows_file(path, bytes, MAX_REPORT_BYTES).map_err(|error| {
+            format!(
+                "could not publish event timeline HTML without replacing an existing file ({error})"
+            )
         })
     }
     #[cfg(not(any(target_os = "linux", windows)))]
