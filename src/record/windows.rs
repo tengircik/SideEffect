@@ -1,33 +1,39 @@
 //! Windows private, no-clobber output publication.
 
 use std::ffi::{OsStr, c_void};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::mem::size_of;
+use std::mem::{offset_of, size_of};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
-use std::ptr::null_mut;
+use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
+    FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation, NtCreateFile,
+    NtSetInformationFile,
+};
+use windows_sys::Win32::Foundation::{
+    GENERIC_WRITE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo, SYNCHRONIZE,
+    SetFileInformationByHandle,
+};
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 type Handle = *mut c_void;
 const TOKEN_QUERY: u32 = 0x0008;
 const TOKEN_USER_CLASS: u32 = 1;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
-const ERROR_ALREADY_EXISTS: i32 = 183;
-const GENERIC_WRITE: u32 = 0x4000_0000;
-const CREATE_NEW: u32 = 1;
-const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
 const MAX_PRIVATE_DIRECTORY_FILES: usize = 8;
 static NEXT_STAGE_ID: AtomicU64 = AtomicU64::new(0);
-
-#[repr(C)]
-struct SecurityAttributes {
-    length: u32,
-    security_descriptor: *mut c_void,
-    inherit_handle: i32,
-}
 
 #[repr(C)]
 struct SidAndAttributes {
@@ -45,19 +51,7 @@ unsafe extern "system" {
     fn GetCurrentProcess() -> Handle;
     fn LocalFree(memory: Handle) -> Handle;
     fn GetCurrentProcessId() -> u32;
-    fn CreateDirectoryW(path: *const u16, attributes: *const SecurityAttributes) -> i32;
-    fn CreateFileW(
-        path: *const u16,
-        access: u32,
-        share: u32,
-        attributes: *const c_void,
-        creation: u32,
-        flags: u32,
-        template: Handle,
-    ) -> Handle;
-    fn MoveFileExW(source: *const u16, destination: *const u16, flags: u32) -> i32;
-    fn DeleteFileW(path: *const u16) -> i32;
-    fn RemoveDirectoryW(path: *const u16) -> i32;
+
 }
 
 #[link(name = "advapi32")]
@@ -104,45 +98,19 @@ unsafe extern "system" {
     fn CloseHandle(handle: Handle) -> i32;
 }
 
-struct Stage {
-    directory: PathBuf,
-    payload: PathBuf,
+struct StagedOutput<'a> {
+    object: File,
+    children: Vec<&'a str>,
+    cleanup_pending: bool,
 }
 
-impl Drop for Stage {
+impl Drop for StagedOutput<'_> {
     fn drop(&mut self) {
-        if let Ok(path) = wide_z(&self.payload) {
-            // SAFETY: cleanup only targets the unique private staging entry created below.
-            unsafe { DeleteFileW(path.as_ptr()) };
-        }
-        if let Ok(path) = wide_z(&self.directory) {
-            // SAFETY: cleanup only targets the unique private staging directory created below.
-            unsafe { RemoveDirectoryW(path.as_ptr()) };
-        }
+        let _ = self.cleanup();
     }
 }
 
-struct DirectoryStage {
-    directory: PathBuf,
-    files: Vec<PathBuf>,
-}
-
-impl Drop for DirectoryStage {
-    fn drop(&mut self) {
-        for file in &self.files {
-            if let Ok(path) = wide_z(file) {
-                // SAFETY: cleanup only targets a file created in this unique private stage.
-                unsafe { DeleteFileW(path.as_ptr()) };
-            }
-        }
-        if let Ok(path) = wide_z(&self.directory) {
-            // SAFETY: cleanup only targets the unique private staging directory created below.
-            unsafe { RemoveDirectoryW(path.as_ptr()) };
-        }
-    }
-}
-
-/// Publishes bytes through an owner-only sibling staging directory and never replaces a file.
+/// Publishes bytes through an owner-only sibling file and never replaces a file.
 pub fn publish_private_file(
     destination: &Path,
     bytes: &[u8],
@@ -154,55 +122,13 @@ pub fn publish_private_file(
             format!("private output exceeds the {max_bytes} byte limit"),
         ));
     }
-    let file_name = destination
-        .file_name()
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "output path has no file name")
-        })?;
-    let parent = destination
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let parent = parent.canonicalize()?;
-    let destination = parent.join(file_name);
+    let (parent, destination, name) = open_output_parent(destination)?;
     let descriptor = current_user_security_descriptor()?;
-    let attributes = SecurityAttributes {
-        length: size_of::<SecurityAttributes>() as u32,
-        security_descriptor: descriptor.0,
-        inherit_handle: 0,
-    };
-    let stage = create_stage(&parent, &attributes)?;
-    let payload_name = wide_z(&stage.payload)?;
-    let handle = unsafe {
-        CreateFileW(
-            payload_name.as_ptr(),
-            GENERIC_WRITE,
-            0,
-            &attributes as *const SecurityAttributes as *const c_void,
-            CREATE_NEW,
-            FILE_ATTRIBUTE_NORMAL,
-            null_mut(),
-        )
-    };
-    if handle as isize == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: CreateFileW returned a new valid, exclusively opened handle.
-    let mut file = unsafe { File::from_raw_handle(handle) };
-    file.write_all(bytes)?;
-    file.flush()?;
-    file.sync_all()?;
-    drop(file);
-
-    let source = wide_z(&stage.payload)?;
-    let target = wide_z(&destination)?;
-    if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let result = destination;
-    drop(stage);
-    Ok(result)
+    let mut stage = create_stage(&parent, &descriptor, false)?;
+    let result =
+        write_payload(&mut stage.object, bytes).and_then(|()| stage.publish(&parent, &name));
+    stage.finish(result)?;
+    Ok(destination)
 }
 
 /// Atomically publishes a private, fixed-name directory without replacing an existing path.
@@ -243,60 +169,219 @@ pub fn publish_private_directory(
         }
     }
 
-    let file_name = destination
-        .file_name()
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "output path has no file name")
-        })?;
+    let (parent, destination, name) = open_output_parent(destination)?;
+    let descriptor = current_user_security_descriptor()?;
+    let mut stage = create_stage(&parent, &descriptor, true)?;
+    let result = (|| {
+        for (name, bytes) in files {
+            let mut file = open_child(&stage.object, OsStr::new(name), false, Some(&descriptor))?;
+            stage.children.push(name);
+            write_payload(&mut file, bytes)?;
+            // Windows requires child files to be closed before renaming the directory.
+        }
+        stage.publish(&parent, &name)
+    })();
+    stage.finish(result)?;
+    Ok(destination)
+}
+
+fn write_payload(file: &mut File, bytes: &[u8]) -> io::Result<()> {
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()
+}
+
+fn open_output_parent(destination: &Path) -> io::Result<(File, PathBuf, Vec<u16>)> {
+    let name = destination.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "output path has no file name")
+    })?;
+    let name_utf16 = component_utf16(name)?;
     let parent = destination
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let parent = parent.canonicalize()?;
-    let destination = parent.join(file_name);
-    let descriptor = current_user_security_descriptor()?;
-    let attributes = SecurityAttributes {
-        length: size_of::<SecurityAttributes>() as u32,
-        security_descriptor: descriptor.0,
-        inherit_handle: 0,
-    };
-    let mut stage = create_directory_stage(&parent, &attributes)?;
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()?;
+    let handle = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&parent)?;
+    let metadata = handle.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "output parent is not an ordinary directory",
+        ));
+    }
+    Ok((handle, parent.join(name), name_utf16))
+}
 
-    for (name, bytes) in files {
-        let path = stage.directory.join(name);
-        let wide = wide_z(&path)?;
-        let handle = unsafe {
-            CreateFileW(
-                wide.as_ptr(),
-                GENERIC_WRITE,
-                0,
-                &attributes as *const SecurityAttributes as *const c_void,
-                CREATE_NEW,
-                FILE_ATTRIBUTE_NORMAL,
-                null_mut(),
+impl StagedOutput<'_> {
+    fn publish(&mut self, parent: &File, name: &[u16]) -> io::Result<()> {
+        let name_bytes = std::mem::size_of_val(name);
+        let filename_offset = offset_of!(FILE_RENAME_INFORMATION, FileName);
+        let length = size_of::<FILE_RENAME_INFORMATION>() + name_bytes;
+        let mut storage = vec![0usize; length.div_ceil(size_of::<usize>())];
+        let buffer = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        let mut status_block = IO_STATUS_BLOCK::default();
+        // SAFETY: Storage is zeroed and pointer-aligned, and has room for the header and name.
+        // Parent and source handles remain open for the call. The zeroed replace flag forbids clobbering.
+        let status = unsafe {
+            (*buffer).RootDirectory = parent.as_raw_handle();
+            (*buffer).FileNameLength = name_bytes as u32;
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                storage
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .add(filename_offset)
+                    .cast::<u16>(),
+                name.len(),
+            );
+            NtSetInformationFile(
+                self.object.as_raw_handle(),
+                &mut status_block,
+                buffer.cast(),
+                length as u32,
+                FileRenameInformation,
             )
         };
-        if handle as isize == -1 {
-            return Err(io::Error::last_os_error());
+        if status < 0 {
+            // SAFETY: The value is the NTSTATUS returned by NtSetInformationFile.
+            return Err(io::Error::from_raw_os_error(
+                unsafe { RtlNtStatusToDosError(status) } as i32,
+            ));
         }
-        stage.files.push(path);
-        // SAFETY: CreateFileW returned a new valid, exclusively opened file handle.
-        let mut file = unsafe { File::from_raw_handle(handle) };
-        file.write_all(bytes)?;
-        file.flush()?;
-        file.sync_all()?;
+        self.cleanup_pending = false;
+        Ok(())
     }
 
-    let source = wide_z(&stage.directory)?;
-    let target = wide_z(&destination)?;
-    if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+    fn finish(&mut self, result: io::Result<()>) -> io::Result<()> {
+        let Err(error) = result else { return Ok(()) };
+        match self.cleanup() {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(io::Error::other(format!(
+                "{error}. Staging cleanup also failed ({cleanup})"
+            ))),
+        }
+    }
+
+    fn cleanup(&mut self) -> io::Result<()> {
+        if !self.cleanup_pending {
+            return Ok(());
+        }
+        self.cleanup_pending = false;
+        let mut result = Ok(());
+        for name in &self.children {
+            // The staging directory is still held, private, and opened without delete sharing.
+            let child = open_child(&self.object, OsStr::new(name), false, None)
+                .and_then(|child| discard(&child));
+            result = result.and(child);
+        }
+        result.and(discard(&self.object))
+    }
+}
+
+fn discard(file: &File) -> io::Result<()> {
+    let information = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: This requests deletion of the opened object when its handle closes.
+    let marked = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            (&information as *const FILE_DISPOSITION_INFO).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if marked == 0 {
         return Err(io::Error::last_os_error());
     }
-    stage.files.clear();
-    let result = destination;
-    drop(stage);
-    Ok(result)
+    Ok(())
+}
+
+fn component_utf16(name: &OsStr) -> io::Result<Vec<u16>> {
+    let units: Vec<_> = name.encode_wide().take(256).collect();
+    if units.is_empty()
+        || units.len() > 255
+        || units == [b'.' as u16]
+        || units == [b'.' as u16, b'.' as u16]
+        || units.iter().any(|&unit| {
+            unit < 32 || u8::try_from(unit).is_ok_and(|byte| b"<>:\"/\\|?*".contains(&byte))
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "output file name is not a valid single Windows component",
+        ));
+    }
+    Ok(units)
+}
+
+fn open_child(
+    parent: &File,
+    name: &OsStr,
+    directory: bool,
+    descriptor: Option<&LocalAllocation>,
+) -> io::Result<File> {
+    let mut units = component_utf16(name)?;
+    let length = (units.len() * size_of::<u16>()) as u16;
+    let name = UNICODE_STRING {
+        Length: length,
+        MaximumLength: length,
+        Buffer: units.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.as_raw_handle(),
+        ObjectName: &name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: descriptor.map_or(null(), |value| value.0.cast_const().cast()),
+        SecurityQualityOfService: null(),
+    };
+    let mut status_block = IO_STATUS_BLOCK::default();
+    let mut handle = null_mut();
+    let options = FILE_OPEN_REPARSE_POINT
+        | FILE_SYNCHRONOUS_IO_NONALERT
+        | if directory {
+            FILE_DIRECTORY_FILE
+        } else {
+            FILE_NON_DIRECTORY_FILE
+        };
+    let access = DELETE
+        | SYNCHRONIZE
+        | if descriptor.is_some() {
+            GENERIC_WRITE
+        } else {
+            0
+        };
+    // SAFETY: The parent handle, descriptor, name, and output pointers remain valid for the synchronous call.
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            access,
+            &attributes,
+            &mut status_block,
+            null(),
+            FILE_ATTRIBUTE_NORMAL,
+            0,
+            if descriptor.is_some() {
+                FILE_CREATE
+            } else {
+                FILE_OPEN
+            },
+            options,
+            null(),
+            0,
+        )
+    };
+    if status < 0 {
+        // SAFETY: The value is the NTSTATUS returned by NtCreateFile.
+        return Err(io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(status) } as i32,
+        ));
+    }
+    // SAFETY: A successful NtCreateFile returned a handle owned by this caller.
+    Ok(unsafe { File::from_raw_handle(handle) })
 }
 
 fn validate_flat_file_name(name: &str) -> io::Result<()> {
@@ -316,54 +401,32 @@ fn validate_flat_file_name(name: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn create_directory_stage(
-    parent: &Path,
-    attributes: &SecurityAttributes,
-) -> io::Result<DirectoryStage> {
+fn create_stage<'a>(
+    parent: &File,
+    descriptor: &LocalAllocation,
+    directory: bool,
+) -> io::Result<StagedOutput<'a>> {
     for _ in 0..32 {
         let id = NEXT_STAGE_ID.fetch_add(1, Ordering::Relaxed);
-        let name = format!(".sideeffect-private-dir-{}-{id}", unsafe {
-            GetCurrentProcessId()
-        });
-        let directory = parent.join(name);
-        let wide = wide_z(&directory)?;
-        if unsafe { CreateDirectoryW(wide.as_ptr(), attributes) } != 0 {
-            return Ok(DirectoryStage {
-                directory,
-                files: Vec::new(),
-            });
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS) {
-            return Err(error);
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not allocate a unique private staging directory",
-    ))
-}
-
-fn create_stage(parent: &Path, attributes: &SecurityAttributes) -> io::Result<Stage> {
-    for _ in 0..32 {
-        let id = NEXT_STAGE_ID.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: GetCurrentProcessId takes no arguments.
         let name = format!(".sideeffect-private-{}-{id}", unsafe {
             GetCurrentProcessId()
         });
-        let directory = parent.join(name);
-        let wide = wide_z(&directory)?;
-        if unsafe { CreateDirectoryW(wide.as_ptr(), attributes) } != 0 {
-            let payload = directory.join("inventory.json");
-            return Ok(Stage { directory, payload });
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS) {
-            return Err(error);
+        match open_child(parent, OsStr::new(&name), directory, Some(descriptor)) {
+            Ok(object) => {
+                return Ok(StagedOutput {
+                    object,
+                    children: Vec::new(),
+                    cleanup_pending: true,
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
         }
     }
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
-        "could not allocate a unique private staging directory",
+        "could not allocate a unique private staging object",
     ))
 }
 
@@ -582,6 +645,58 @@ mod tests {
         let entries = fs::read_dir(&parent).unwrap().count();
         assert_eq!(entries, 0);
         fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn stage_directory_remains_pinned_until_cleanup() {
+        let root = temp_dir();
+        let (parent, _, _) = open_output_parent(&root.join("audit")).unwrap();
+        let descriptor = current_user_security_descriptor().unwrap();
+        let mut stage = create_stage(&parent, &descriptor, true).unwrap();
+        let name = "session.json";
+        let child = open_child(&stage.object, OsStr::new(name), false, Some(&descriptor)).unwrap();
+        stage.children.push(name);
+        drop(child);
+
+        let stage_path = fs::read_dir(&root).unwrap().next().unwrap().unwrap().path();
+        assert!(fs::rename(&stage_path, root.join("other")).is_err());
+        drop(stage);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        drop(parent);
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn publication_error_reports_incomplete_staging_cleanup() {
+        let root = temp_dir();
+        let destination = root.join("audit");
+        fs::create_dir(&destination).unwrap();
+        let (parent, _, name) = open_output_parent(&destination).unwrap();
+        let descriptor = current_user_security_descriptor().unwrap();
+        let mut stage = create_stage(&parent, &descriptor, true).unwrap();
+        let extra = OsStr::new("extra.json");
+        drop(open_child(&stage.object, extra, false, Some(&descriptor)).unwrap());
+        let stage_path = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path != &destination)
+            .unwrap();
+
+        let publication = stage.publish(&parent, &name);
+        assert_eq!(
+            publication.as_ref().unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        let error = stage.finish(publication).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("Staging cleanup also failed"));
+        drop(stage);
+        assert!(destination.is_dir());
+        fs::remove_file(stage_path.join(extra)).unwrap();
+        fs::remove_dir(stage_path).unwrap();
+        fs::remove_dir(destination).unwrap();
+        drop(parent);
+        fs::remove_dir(root).unwrap();
     }
 
     fn assert_owner_only_dacl(path: &Path) {
