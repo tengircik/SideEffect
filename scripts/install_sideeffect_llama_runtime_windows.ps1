@@ -123,6 +123,7 @@ function Download-VerifiedAsset {
     $response = $null
     $inputStream = $null
     $outputStream = $null
+    $hasher = $null
 
     try {
         $response = Get-RedirectedResponse -Client $client -StartUri $Uri
@@ -159,12 +160,12 @@ function Download-VerifiedAsset {
 
         $outputStream.Flush($true)
         $actualHash = [BitConverter]::ToString($hasher.GetHashAndReset()).Replace('-', '').ToLowerInvariant()
-        $hasher.Dispose()
         if ($received -ne $Asset.Size -or $actualHash -cne $Asset.Sha256) {
             throw 'The runtime archive failed its pinned size or SHA-256 check.'
         }
     }
     finally {
+        if ($null -ne $hasher) { $hasher.Dispose() }
         if ($null -ne $outputStream) { $outputStream.Dispose() }
         if ($null -ne $inputStream) { $inputStream.Dispose() }
         if ($null -ne $response) { $response.Dispose() }
@@ -260,13 +261,14 @@ function Expand-VerifiedArchive {
             $parent = [System.IO.Path]::GetDirectoryName($target.Path)
             [System.IO.Directory]::CreateDirectory($parent) | Out-Null
             $input = $entry.Open()
-            $output = [System.IO.File]::Open(
-                $target.Path,
-                [System.IO.FileMode]::CreateNew,
-                [System.IO.FileAccess]::Write,
-                [System.IO.FileShare]::None
-            )
+            $output = $null
             try {
+                $output = [System.IO.File]::Open(
+                    $target.Path,
+                    [System.IO.FileMode]::CreateNew,
+                    [System.IO.FileAccess]::Write,
+                    [System.IO.FileShare]::None
+                )
                 [long] $written = 0
                 $buffer = [byte[]]::new($DownloadBufferBytes)
                 while (($read = $input.Read($buffer, 0, $buffer.Length)) -gt 0) {
@@ -285,8 +287,12 @@ function Expand-VerifiedArchive {
                 }
             }
             finally {
-                $output.Dispose()
-                $input.Dispose()
+                try {
+                    if ($null -ne $output) { $output.Dispose() }
+                }
+                finally {
+                    $input.Dispose()
+                }
             }
         }
     }
