@@ -73,6 +73,47 @@ fn output_contains_bytes(output: &Output, needle: &[u8]) -> bool {
 }
 
 #[test]
+fn provenance_exports_only_the_public_key_and_never_replaces_a_file() {
+    let temp = TestDirectory::new();
+    let (private, public) = generate_pair(&temp.0, "original");
+    let expected = fs::read(&public).unwrap();
+    let original_private = fs::read(&private).unwrap();
+    fs::remove_file(public).unwrap();
+    let destination = temp.0.join("recovered.hex");
+    let export = |destination: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+            .args(["provenance", "key-export-public"])
+            .arg(&private)
+            .arg(destination)
+            .output()
+            .unwrap()
+    };
+    let output = export(&destination);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected_fingerprint = sideeffect::provenance::public_key_id(&expected).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        expected_fingerprint
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(fs::read(&destination).unwrap(), expected);
+    assert!(key_check(&private, &destination).status.success());
+
+    fs::write(&destination, b"preserve existing output").unwrap();
+    for path in [&destination, &private] {
+        let output = export(path);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+    }
+    assert_eq!(fs::read(&destination).unwrap(), b"preserve existing output");
+    assert_eq!(fs::read(&private).unwrap(), original_private);
+}
+
+#[test]
 fn provenance_key_check_cli_is_read_only_and_does_not_disclose_private_material() {
     let temp = TestDirectory::new();
     let (private, public) = generate_pair(&temp.0, "current");
