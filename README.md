@@ -208,7 +208,26 @@ Schema v3 adds a literal string-prefix filter:
 }
 ```
 
-`path_prefix` is case-sensitive and compares the observed path spelling as text. For example, `/tmp/app` also matches `/tmp/apple`; this is not directory containment. Neither path filter resolves symlinks or canonicalizes paths. Query v1 and v2 remain accepted for their existing filters; event-query, session-result, and multi-session-result schemas are v3.
+`path_prefix` is case-sensitive and compares the observed path spelling as text. For example, `/tmp/app` also matches `/tmp/apple`; this is not directory containment. Neither path filter resolves symlinks or canonicalizes paths.
+
+Schema v4 adds an inclusive timestamp filter for one runtime source:
+
+```json
+{
+  "schema": "sideeffect.event_query",
+  "schema_version": 4,
+  "filters": {
+    "timestamp": {
+      "clock": "strace_decimal",
+      "from_inclusive": "1700000000.1",
+      "to_inclusive": "1700000000.25"
+    }
+  },
+  "limit": 100
+}
+```
+
+Use `strace_decimal` for Linux decimal timestamps or `etw_qpc_ticks` for native Windows ETW signed integer ticks. Supply one or both bounds as strings. Equal bounds select one numeric timestamp. The filter preserves the source timestamp spelling, event order, and evidence links. It excludes rows without a comparable timestamp and rejects a clock mismatch or a timestamp filter across sessions. The bounds apply to the recorded clock only. Existing v1–v3 queries keep v3 output, and v4 queries emit v4 results.
 
 Apply it directly to a Linux trace or Windows ETW capture:
 

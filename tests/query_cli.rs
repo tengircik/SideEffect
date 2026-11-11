@@ -64,6 +64,7 @@ fn cli_query_keeps_raw_evidence_and_emits_safe_text_or_json() {
     );
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["schema"], "sideeffect.event_query_result");
+    assert_eq!(result["schema_version"], 3);
     assert_eq!(result["matched_count"], 1);
     assert_eq!(result["events"][0]["event_kind"], "openat");
     assert_eq!(result["events"][0]["evidence"]["kind"], "raw_trace_record");
@@ -79,6 +80,73 @@ fn cli_query_keeps_raw_evidence_and_emits_safe_text_or_json() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("1 result(s)"));
     assert!(text.contains("raw_trace_record"));
+}
+
+#[test]
+fn cli_query_v4_compares_decimal_timestamps_without_changing_evidence() {
+    let mut files = TempFiles(Vec::new());
+    let trace = files.write(
+        "trace",
+        b"123 9.99 close(3) = 0\n123 10.100 close(4) = 0\n123 010.19 close(5) = 0\n123 10.200 close(6) = 0\n123 10.201 close(7) = 0\n123 close(8) = 0\n",
+    );
+    let query = files.write(
+        "json",
+        br#"{"schema":"sideeffect.event_query","schema_version":4,"filters":{"event_kind":"close","timestamp":{"clock":"strace_decimal","from_inclusive":"10.1","to_inclusive":"10.20"}}}"#,
+    );
+    let output = run(&trace, &query, "json");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["schema_version"], 4);
+    assert_eq!(result["matched_count"], 3);
+    assert_eq!(result["events"][0]["source_timestamp"]["value"], "10.100");
+    assert_eq!(result["events"][1]["source_timestamp"]["value"], "010.19");
+    assert_eq!(result["events"][2]["source_timestamp"]["value"], "10.200");
+    assert_eq!(result["events"][2]["evidence"]["line_number"], 4);
+    let text = run(&trace, &query, "text");
+    assert!(text.status.success());
+    assert!(
+        String::from_utf8_lossy(&text.stdout)
+            .contains("timestamp=10.100 (strace_timestamp_decimal")
+    );
+
+    let wrong_clock = files.write(
+        "json",
+        br#"{"schema":"sideeffect.event_query","schema_version":4,"filters":{"timestamp":{"clock":"etw_qpc_ticks","from_inclusive":"10"}}}"#,
+    );
+    let output = run(&trace, &wrong_clock, "json");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("clock does not match"));
+}
+
+#[test]
+fn cli_query_rejects_timestamp_filter_for_multiple_sessions_before_opening_them() {
+    let mut files = TempFiles(Vec::new());
+    let query = files.write(
+        "json",
+        br#"{"schema":"sideeffect.event_query","schema_version":4,"filters":{"timestamp":{"clock":"strace_decimal","to_inclusive":"10.0"}}}"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["query", "--query"])
+        .arg(query)
+        .args([
+            "--session",
+            "unused-1",
+            "--session",
+            "unused-2",
+            "--source",
+            "runtime",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("timestamp filters require one runtime source")
+    );
 }
 
 #[test]
@@ -337,4 +405,26 @@ fn cli_query_uses_native_windows_runtime_fixture_and_preserves_unknown_completen
     let exact: serde_json::Value = serde_json::from_slice(&exact.stdout).unwrap();
     assert_eq!(exact["matched_count"], 1);
     assert_eq!(exact["source_state"]["completeness"], "unknown");
+
+    let timestamp_query = files.write(
+        "query.json",
+        br#"{"schema":"sideeffect.event_query","schema_version":4,"filters":{"timestamp":{"clock":"etw_qpc_ticks","from_inclusive":"-2","to_inclusive":"10"}}}"#,
+    );
+    let timestamp = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["query", "--query"])
+        .arg(timestamp_query)
+        .args(["--windows-runtime"])
+        .arg(&capture_path)
+        .output()
+        .unwrap();
+    assert_eq!(timestamp.status.code(), Some(2));
+    let timestamp: serde_json::Value = serde_json::from_slice(&timestamp.stdout).unwrap();
+    assert_eq!(timestamp["schema_version"], 4);
+    assert_eq!(timestamp["matched_count"], 1);
+    assert_eq!(timestamp["source_state"]["completeness"], "unknown");
+    assert_eq!(timestamp["events"][0]["source_timestamp"]["value"], "10");
+    assert_eq!(
+        timestamp["events"][0]["evidence"],
+        exact["events"][0]["evidence"]
+    );
 }

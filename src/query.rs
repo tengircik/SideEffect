@@ -1,4 +1,4 @@
-//! Bounded, read-only exact filters over the versioned common event envelope.
+//! Bounded, read-only filters over the versioned common event envelope.
 //!
 //! Query results preserve source status, diagnostics, event evidence, and the
 //! source-local process links needed to inspect the selected rows. Path filtering
@@ -6,6 +6,7 @@
 
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt;
 use std::marker::PhantomData;
@@ -16,19 +17,20 @@ use crate::audit_session::{
     SessionArtifactRef, SessionStatus, SourceRole, SourceStatus,
 };
 use crate::event::{
-    CommonEvent, CommonEventEnvelope, EventDiagnostic, EventProcessLink, OperationSemantics,
-    ProcessObservation, ProcessRelationship, SourceCompleteness, SourceDescriptor, SourceState,
+    CommonEvent, CommonEventEnvelope, ETW_TIMESTAMP_CLOCK, EventDiagnostic, EventProcessLink,
+    OperationSemantics, ProcessObservation, ProcessRelationship, STRACE_TIMESTAMP_CLOCK,
+    SourceCompleteness, SourceDescriptor, SourcePlatform, SourceState,
 };
 use crate::model::SyscallOutcome;
 
 pub const QUERY_SCHEMA: &str = "sideeffect.event_query";
-pub const QUERY_SCHEMA_VERSION: u32 = 3;
+pub const QUERY_SCHEMA_VERSION: u32 = 4;
 pub const QUERY_RESULT_SCHEMA: &str = "sideeffect.event_query_result";
-pub const QUERY_RESULT_SCHEMA_VERSION: u32 = 3;
+pub const QUERY_RESULT_SCHEMA_VERSION: u32 = 4;
 pub const SESSION_QUERY_RESULT_SCHEMA: &str = "sideeffect.session_event_query_result";
-pub const SESSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 3;
+pub const SESSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 4;
 pub const MULTI_SESSION_QUERY_RESULT_SCHEMA: &str = "sideeffect.multi_session_event_query_result";
-pub const MULTI_SESSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 3;
+pub const MULTI_SESSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 4;
 pub const MAX_QUERY_SESSIONS: usize = 16;
 pub const MAX_MULTI_SESSION_RESULTS: usize = MAX_QUERY_RESULTS;
 pub const MAX_MULTI_SESSION_INPUT_BYTES: u64 = 256 * 1024 * 1024;
@@ -3057,9 +3059,106 @@ pub struct EventQueryFilters {
     /// This can also match a sibling spelling such as `/tmp/a` and `/tmp/abc`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_prefix: Option<String>,
+    /// Inclusive bounds in one source's recorded clock, without clock conversion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<TimestampFilter>,
     /// Exact source-local evidence tuple; not portable across captures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<EvidenceFilter>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimestampClock {
+    StraceDecimal,
+    EtwQpcTicks,
+}
+
+impl TimestampClock {
+    fn compare(self, left: &str, right: &str) -> Option<Ordering> {
+        match self {
+            Self::StraceDecimal => {
+                let (left_whole, left_fraction) = decimal_timestamp_parts(left)?;
+                let (right_whole, right_fraction) = decimal_timestamp_parts(right)?;
+                Some(
+                    left_whole
+                        .len()
+                        .cmp(&right_whole.len())
+                        .then_with(|| left_whole.cmp(right_whole))
+                        .then_with(|| left_fraction.cmp(right_fraction)),
+                )
+            }
+            Self::EtwQpcTicks => Some(left.parse::<i64>().ok()?.cmp(&right.parse().ok()?)),
+        }
+    }
+}
+
+fn decimal_timestamp_parts(value: &str) -> Option<(&str, &str)> {
+    let (whole, fraction) = value.split_once('.')?;
+    if whole.is_empty()
+        || fraction.is_empty()
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((
+        whole.trim_start_matches('0'),
+        fraction.trim_end_matches('0'),
+    ))
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimestampFilter {
+    pub clock: TimestampClock,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_inclusive: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_inclusive: Option<String>,
+}
+
+impl TimestampFilter {
+    fn validate(&self) -> Result<(), String> {
+        let start = self.from_inclusive.as_deref();
+        let end = self.to_inclusive.as_deref();
+        if start.is_none() && end.is_none() {
+            return Err("timestamp requires from_inclusive or to_inclusive".to_owned());
+        }
+        for bound in [start, end].into_iter().flatten() {
+            if bound.len() > MAX_FILTER_TEXT_BYTES || self.clock.compare(bound, bound).is_none() {
+                return Err(format!(
+                    "timestamp bounds must be valid for the selected clock and at most {MAX_FILTER_TEXT_BYTES} bytes"
+                ));
+            }
+        }
+        if let (Some(start), Some(end)) = (start, end) {
+            if self.clock.compare(start, end) == Some(Ordering::Greater) {
+                return Err("timestamp from_inclusive must not exceed to_inclusive".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    fn matches(&self, timestamp: &crate::event::SourceTimestamp) -> bool {
+        let clock_unit = match self.clock {
+            TimestampClock::StraceDecimal => STRACE_TIMESTAMP_CLOCK,
+            TimestampClock::EtwQpcTicks => ETW_TIMESTAMP_CLOCK,
+        };
+        timestamp.clock_unit == clock_unit
+            && self.from_inclusive.as_deref().is_none_or(|start| {
+                self.clock
+                    .compare(&timestamp.value, start)
+                    .is_some_and(Ordering::is_ge)
+            })
+            && self.to_inclusive.as_deref().is_none_or(|end| {
+                self.clock
+                    .compare(&timestamp.value, end)
+                    .is_some_and(Ordering::is_le)
+            })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3092,9 +3191,9 @@ impl EventQuery {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema != QUERY_SCHEMA || !matches!(self.schema_version, 1..=3) {
+        if self.schema != QUERY_SCHEMA || !matches!(self.schema_version, 1..=QUERY_SCHEMA_VERSION) {
             return Err(format!(
-                "query schema must be {QUERY_SCHEMA} version 1, 2, or 3"
+                "query schema must be {QUERY_SCHEMA} version 1, 2, 3, or 4"
             ));
         }
         if self.schema_version == 1 && self.filters.path_exact.is_some() {
@@ -3102,6 +3201,12 @@ impl EventQuery {
         }
         if self.schema_version < 3 && self.filters.path_prefix.is_some() {
             return Err("path_prefix requires event query schema version 3".to_owned());
+        }
+        if let Some(timestamp) = &self.filters.timestamp {
+            if self.schema_version < 4 {
+                return Err("timestamp requires event query schema version 4".to_owned());
+            }
+            timestamp.validate()?;
         }
         if self.limit == 0 || self.limit as usize > MAX_QUERY_RESULTS {
             return Err(format!(
@@ -3268,7 +3373,7 @@ pub fn session_query_result(
 ) -> SessionEventQueryResult {
     SessionEventQueryResult {
         schema: SESSION_QUERY_RESULT_SCHEMA,
-        schema_version: SESSION_QUERY_RESULT_SCHEMA_VERSION,
+        schema_version: event_query_result.schema_version,
         session: SessionQueryIdentity {
             session_id: manifest.session_id.clone(),
             manifest_schema_version: manifest.schema_version,
@@ -3316,9 +3421,13 @@ pub fn multi_session_query_result(
             "multi-session query result requires 2..={MAX_QUERY_SESSIONS} sessions"
         ));
     }
+    let schema_version = sessions[0].schema_version;
     let mut session_ids = HashSet::with_capacity(sessions.len());
     let mut matched_count = 0usize;
     for session in &sessions {
+        if session.schema_version != schema_version {
+            return Err("multi-session query results must use the same schema version".to_owned());
+        }
         if !session_ids.insert(session.session.session_id.as_str()) {
             return Err("multi-session query result contains duplicate session IDs".to_owned());
         }
@@ -3334,7 +3443,7 @@ pub fn multi_session_query_result(
     let complete = sessions.iter().all(session_source_is_complete);
     Ok(MultiSessionEventQueryResult {
         schema: MULTI_SESSION_QUERY_RESULT_SCHEMA,
-        schema_version: MULTI_SESSION_QUERY_RESULT_SCHEMA_VERSION,
+        schema_version,
         session_count: sessions.len(),
         matched_count,
         complete,
@@ -3351,6 +3460,15 @@ pub fn execute_query(
         || envelope.schema_version != crate::event::COMMON_EVENT_SCHEMA_VERSION
     {
         return Err("query input has an unsupported common event envelope".to_owned());
+    }
+    if let Some(timestamp) = &query.filters.timestamp {
+        if !matches!(
+            (timestamp.clock, envelope.source.platform),
+            (TimestampClock::StraceDecimal, SourcePlatform::Linux)
+                | (TimestampClock::EtwQpcTicks, SourcePlatform::Windows)
+        ) {
+            return Err("timestamp clock does not match the runtime source".to_owned());
+        }
     }
 
     let started = Instant::now();
@@ -3421,7 +3539,11 @@ pub fn execute_query(
     let matched_count = matched.len();
     Ok(EventQueryResult {
         schema: QUERY_RESULT_SCHEMA,
-        schema_version: QUERY_RESULT_SCHEMA_VERSION,
+        schema_version: if query.schema_version == 4 {
+            QUERY_RESULT_SCHEMA_VERSION
+        } else {
+            3
+        },
         source: envelope.source.clone(),
         source_state: envelope.source_state.clone(),
         filter: query.filters.clone(),
@@ -3439,6 +3561,14 @@ fn matches_event(
     process_evidence: Option<&HashSet<EvidenceKey>>,
     filters: &EventQueryFilters,
 ) -> bool {
+    if filters.timestamp.as_ref().is_some_and(|filter| {
+        event
+            .source_timestamp
+            .as_ref()
+            .is_none_or(|timestamp| !filter.matches(timestamp))
+    }) {
+        return false;
+    }
     if filters.path_exact.as_ref().is_some_and(|path| {
         event
             .path_observation
@@ -3724,6 +3854,54 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_query_rejects_invalid_or_unbounded_clock_values() {
+        for (version, timestamp) in [
+            (
+                3,
+                serde_json::json!({"clock":"strace_decimal", "from_inclusive":"1.0"}),
+            ),
+            (4, serde_json::json!({"clock":"strace_decimal"})),
+            (
+                4,
+                serde_json::json!({"clock":"strace_decimal", "from_inclusive":"1.02", "to_inclusive":"1.001"}),
+            ),
+            (
+                4,
+                serde_json::json!({"clock":"strace_decimal", "from_inclusive":"1e2"}),
+            ),
+            (
+                4,
+                serde_json::json!({"clock":"strace_decimal", "from_inclusive":1}),
+            ),
+            (
+                4,
+                serde_json::json!({"clock":"etw_qpc_ticks", "to_inclusive":"9223372036854775808"}),
+            ),
+            (
+                4,
+                serde_json::json!({"clock":"etw_qpc_ticks", "to_inclusive":"10.0"}),
+            ),
+            (
+                4,
+                serde_json::json!({"clock":"wall_time", "from_inclusive":"1.0"}),
+            ),
+            (
+                4,
+                serde_json::json!({"clock":"strace_decimal", "from_inclusive":format!("1.{}", "0".repeat(MAX_FILTER_TEXT_BYTES))}),
+            ),
+        ] {
+            let json = serde_json::json!({
+                "schema": QUERY_SCHEMA, "schema_version": version,
+                "filters": {"timestamp": timestamp}
+            });
+            assert!(
+                EventQuery::from_json(&serde_json::to_vec(&json).unwrap()).is_err(),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
     fn query_exact_filters_preserve_full_source_diagnostics_and_evidence() {
         let trace = b"1700000000.000001 connect(3, {sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr(\"127.0.0.1\")}, 16) = -1 ECONNREFUSED (Connection refused)\ninvalid row\n";
         let envelope = linux_envelope(trace);
@@ -3737,6 +3915,7 @@ mod tests {
                     process_observation_id: None,
                     path_exact: None,
                     path_prefix: None,
+                    timestamp: None,
                     evidence: None,
                 },
                 10,

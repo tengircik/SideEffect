@@ -733,6 +733,7 @@ fn session_query_uses_verified_windows_etw_artifact_and_keeps_capture_status_unk
     );
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["schema"], "sideeffect.session_event_query_result");
+    assert_eq!(result["schema_version"], 3);
     assert_eq!(result["session"]["status"], "partial");
     assert_eq!(result["runtime_source"]["status"], "partial");
     assert_eq!(result["capture"]["collection_status"], "complete");
@@ -752,6 +753,34 @@ fn session_query_uses_verified_windows_etw_artifact_and_keeps_capture_status_unk
     assert_eq!(
         result["event_query_result"]["events"][0]["evidence"]["kind"],
         "windows_etw_record"
+    );
+
+    let timestamp_query = directory.0.join("timestamp-query.json");
+    fs::write(
+        &timestamp_query,
+        br#"{"schema":"sideeffect.event_query","schema_version":4,"filters":{"timestamp":{"clock":"etw_qpc_ticks","from_inclusive":"10","to_inclusive":"10"}}}"#,
+    ).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["query", "--query"])
+        .arg(timestamp_query)
+        .arg("--session")
+        .arg(session)
+        .args(["--source", "runtime"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let timestamp: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(timestamp["schema_version"], 4);
+    assert_eq!(timestamp["event_query_result"]["schema_version"], 4);
+    assert_eq!(timestamp["event_query_result"]["matched_count"], 1);
+    assert_eq!(timestamp["capture"], result["capture"]);
+    assert_eq!(
+        timestamp["runtime_source"]["artifacts"],
+        result["runtime_source"]["artifacts"]
+    );
+    assert_eq!(
+        timestamp["event_query_result"]["events"],
+        result["event_query_result"]["events"]
     );
 }
 
