@@ -13,6 +13,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 REPOSITORY = ROOT.parents[2]
+sys.path.insert(0, str(REPOSITORY / "scripts"))
 REFERENCE_VALIDATOR = (
     REPOSITORY
     / "tests"

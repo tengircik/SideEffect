@@ -93,6 +93,52 @@ fn fixture(status: CollectionStatus) -> Vec<u8> {
     serde_json::to_vec(&capture).unwrap()
 }
 
+#[cfg(windows)]
+#[test]
+fn timeline_html_publishes_partial_etw_evidence_without_clobbering() {
+    let (capture_path, report_path) = html_paths();
+    fs::write(&capture_path, fixture(CollectionStatus::Partial)).unwrap();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+            .args(["timeline", "--windows-runtime"])
+            .arg(&capture_path)
+            .args([
+                "--event-kind",
+                "process_start",
+                "--format",
+                "html",
+                "--output",
+            ])
+            .arg(&report_path)
+            .output()
+            .unwrap()
+    };
+
+    let first = run();
+    assert_eq!(
+        first.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(first.stdout.is_empty());
+    let html = fs::read_to_string(&report_path).unwrap();
+    assert!(html.contains(
+        "Source completeness</bdi></dt><dd><bdi dir=\"auto\" class=\"value\">partial</bdi>"
+    ));
+    assert!(html.contains("synthetic_fixture_partial_source"));
+    assert!(html.contains("windows_etw_record ordinal=1 json_pointer="));
+    assert!(html.contains(">/events/0</bdi> raw_payload_sha256="));
+    assert!(html.contains("script-src 'none'"));
+
+    let second = run();
+    assert_eq!(second.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&second.stderr).contains("without replacing an existing file"));
+    assert_eq!(fs::read(&report_path).unwrap(), html.as_bytes());
+    fs::remove_file(capture_path).unwrap();
+    fs::remove_file(report_path).unwrap();
+}
+
 fn with_input(bytes: &[u8]) -> (PathBuf, Output) {
     let path = std::env::temp_dir().join(format!(
         "sideeffect-windows-runtime-inspect-{}-{}.json",

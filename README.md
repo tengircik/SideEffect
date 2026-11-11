@@ -30,7 +30,7 @@ In Codex, Claude Code, Cursor, Gemini CLI, GitHub Copilot, OpenCode, Windsurf, o
 
 The agent reads the repository's installation guide, installs the skill for its current client, installs the CLI using the supported method for your computer, and verifies both. It does not start an audit. This requires an agent that can access GitHub and run local setup commands. CLI installation from source requires Rust/Cargo 1.85 or later to already be installed; the agent must tell you if a prerequisite is missing. See the complete [Agent Skill installation guide](docs/AGENT_SKILL.md).
 
-The community skill installer requires Node.js 22.20 or later. The [v0.1.0 release](https://github.com/tengircik/SideEffect/releases/tag/v0.1.0) provides Linux x86_64 and Windows x64 CLI archives; installing a release binary does not require Rust. The Windows archive passed fresh checksum, attestation, extraction, and invocation checks. The Linux checksum matched, but attestation verification and archive installation remain unverified; see the [release acceptance record](docs/RELEASE_ACCEPTANCE.md). The [installation guide](docs/INSTALL.md) shows checksum and build-provenance verification. To build from source instead, use the instructions below.
+The community skill installer requires Node.js 22.20 or later. The [v0.1.0 release](https://github.com/tengircik/SideEffect/releases/tag/v0.1.0) provides Linux x86_64 and Windows x64 CLI archives; installing a release binary does not require Rust. Both archives passed checksum and attestation verification. Extraction and invocation passed on native Windows, hosted Ubuntu 24.04, and WSL2 Ubuntu. See the [release acceptance record](docs/RELEASE_ACCEPTANCE.md) for the tested scope and open update checks. The [installation guide](docs/INSTALL.md) shows checksum and build-provenance verification. To build from source instead, use the instructions below.
 
 ```sh
 DISABLE_TELEMETRY=1 npx skills add https://github.com/tengircik/SideEffect/tree/ea7c5ef17ca16263afb62026e36c42d135bf6de8/.agents/skills/sideeffect-audit -g --copy
@@ -208,7 +208,26 @@ Schema v3 adds a literal string-prefix filter:
 }
 ```
 
-`path_prefix` is case-sensitive and compares the observed path spelling as text. For example, `/tmp/app` also matches `/tmp/apple`; this is not directory containment. Neither path filter resolves symlinks or canonicalizes paths. Query v1 and v2 remain accepted for their existing filters; event-query, session-result, and multi-session-result schemas are v3.
+`path_prefix` is case-sensitive and compares the observed path spelling as text. For example, `/tmp/app` also matches `/tmp/apple`; this is not directory containment. Neither path filter resolves symlinks or canonicalizes paths.
+
+Schema v4 adds an inclusive timestamp filter for one runtime source:
+
+```json
+{
+  "schema": "sideeffect.event_query",
+  "schema_version": 4,
+  "filters": {
+    "timestamp": {
+      "clock": "strace_decimal",
+      "from_inclusive": "1700000000.1",
+      "to_inclusive": "1700000000.25"
+    }
+  },
+  "limit": 100
+}
+```
+
+Use `strace_decimal` for Linux decimal timestamps or `etw_qpc_ticks` for native Windows ETW signed integer ticks. Supply one or both bounds as strings. Equal bounds select one numeric timestamp. The filter preserves the source timestamp spelling, event order, and evidence links. It excludes rows without a comparable timestamp and rejects a clock mismatch or a timestamp filter across sessions. The bounds apply to the recorded clock only. Existing v1–v3 queries keep v3 output, and v4 queries emit v4 results.
 
 Apply it directly to a Linux trace or Windows ETW capture:
 

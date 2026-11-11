@@ -108,6 +108,7 @@ jobs:
 
       - name: Validate local explanation evaluator contracts
         run: |
+          python3 -m unittest discover -s tests -p test_local_model_evaluation.py
           python3 tests/test_local_model_explain_evaluator.py
           python3 tests/test_local_model_explain_review_packet.py
           python3 tests/test_run_local_model_explain_corpus.py
@@ -360,6 +361,8 @@ jobs:
       - name: Validate local explanation evaluator contracts
         shell: pwsh
         run: |
+          py -3 -m unittest discover -s tests -p test_local_model_evaluation.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           py -3 tests/test_local_model_explain_evaluator.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           py -3 tests/test_local_model_explain_review_packet.py

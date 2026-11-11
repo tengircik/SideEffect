@@ -19,7 +19,7 @@ def preview(facts: list[dict[str, Any]], question: str) -> dict[str, Any]:
         "schema": "sideeffect.local_model_preview",
         "schema_version": evaluation.EXPECTED_SCHEMA_VERSION,
         "model_sha256": evaluation.EXPECTED_MODEL_SHA256,
-        "model_repository_revision": evaluation.EXPECTED_MODEL_REPOSITORY_REVISION,
+        "model_repository_revision": "user-provided",
         "runtime_source_revision": evaluation.EXPECTED_RUNTIME_SOURCE_REVISION,
         "request_sha256": "a" * 64,
         "prompt": json.dumps({"user_question": question, "observed_syscall_results": facts}),
@@ -49,7 +49,7 @@ def analysis(selection: list[str], summary: dict[str, Any] | None = None) -> dic
         "selection_label": evaluation.EXPECTED_SELECTION_LABEL,
         "request_sha256": "a" * 64,
         "model_sha256": evaluation.EXPECTED_MODEL_SHA256,
-        "model_repository_revision": evaluation.EXPECTED_MODEL_REPOSITORY_REVISION,
+        "model_repository_revision": "user-provided",
         "runtime_source_revision": evaluation.EXPECTED_RUNTIME_SOURCE_REVISION,
         "evidence_summary": summary or {"parse_status": "complete"},
         "selection": {"evidence_ids": selection},
@@ -242,7 +242,8 @@ class EvaluationHelperTests(unittest.TestCase):
             fixture.write_bytes(b"synthetic evidence\n")
             digest = hashlib.sha256(fixture.read_bytes()).hexdigest()
             corpus = {"trace_sha256": {fixture.name: digest}}
-            temporary, copies = evaluation.prepare_verified_fixtures(root, corpus)
+            equivalent_root = root / ".." / root.name
+            temporary, copies = evaluation.prepare_verified_fixtures(equivalent_root, corpus)
             try:
                 self.assertEqual(copies[fixture.name].read_bytes(), fixture.read_bytes())
             finally:

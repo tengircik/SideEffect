@@ -301,8 +301,11 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
         Some("partial" | "unknown")
     ));
     assert_eq!(timeline["filter"]["event_kind"], "file_io_observation");
-    assert!(
-        timeline["items"].as_array().unwrap().iter().any(|event| {
+    let file_event = timeline["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| {
             event["event_kind"] == "file_io_observation"
                 && event["evidence"]["kind"] == "windows_etw_record"
                 && event["evidence"]["json_pointer"]
@@ -311,9 +314,33 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
                 && event["evidence"]["raw_payload_sha256"]
                     .as_str()
                     .is_some_and(|digest| digest.len() == 64)
-        }),
-        "live ETW timeline should retain a filtered file event with exact source evidence"
-    );
+        })
+        .expect("live ETW timeline should retain a filtered file event with exact source evidence");
+    let report_path = directory.join("timeline.html");
+    let html_result = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["timeline", "--windows-runtime"])
+        .arg(&output)
+        .args([
+            "--event-kind",
+            "file_io_observation",
+            "--format",
+            "html",
+            "--output",
+        ])
+        .arg(&report_path)
+        .output()
+        .unwrap();
+    assert_eq!(html_result.status.code(), Some(2));
+    let html = fs::read_to_string(&report_path).unwrap();
+    fs::remove_file(report_path).unwrap();
+    let evidence = &file_event["evidence"];
+    assert!(html.contains("script-src 'none'"));
+    assert!(html.contains(&format!(
+        "windows_etw_record ordinal={} json_pointer=<bdi dir=\"auto\" class=\"value\">{}</bdi> raw_payload_sha256=<bdi dir=\"auto\" class=\"value\">{}</bdi>",
+        evidence["record_ordinal"].as_u64().unwrap(),
+        evidence["json_pointer"].as_str().unwrap(),
+        evidence["raw_payload_sha256"].as_str().unwrap(),
+    )), "live ETW HTML timeline should retain the same evidence locator as JSON");
     let graph = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .args(["graph", "--windows-runtime"])
         .arg(&output)

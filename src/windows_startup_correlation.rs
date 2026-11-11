@@ -758,6 +758,23 @@ fn parse_startup_inventory(bytes: &[u8]) -> Result<StartupInput, String> {
     ) {
         return Err("Windows startup inventory has an unsupported status".to_owned());
     }
+    if status == "complete"
+        && object
+            .get("sources")
+            .and_then(Value::as_array)
+            .is_none_or(|sources| {
+                sources.iter().any(|source| {
+                    !matches!(
+                        source.get("status").and_then(Value::as_str),
+                        Some("complete" | "not_present")
+                    )
+                })
+            })
+    {
+        return Err(
+            "Windows startup inventory claims complete status with an incomplete source".to_owned(),
+        );
+    }
     let actions = object
         .get("scheduled_task_actions")
         .and_then(Value::as_array)
@@ -2326,6 +2343,30 @@ mod tests {
             }),
             observation_decoding: None,
         }
+    }
+
+    #[test]
+    fn complete_inventory_requires_complete_or_absent_sources() {
+        let mut inventory: Value =
+            serde_json::from_slice(&startup_bytes(vec![], "complete")).unwrap();
+        inventory["sources"] = serde_json::json!([{
+            "id": "registry",
+            "status": "not_present",
+            "entries_seen": 0,
+            "diagnostics": []
+        }]);
+        assert!(parse_startup_inventory(&serde_json::to_vec(&inventory).unwrap()).is_ok());
+
+        inventory["sources"][0]["status"] = serde_json::json!("partial");
+        let result = parse_startup_inventory(&serde_json::to_vec(&inventory).unwrap());
+        assert_eq!(
+            result.err().as_deref(),
+            Some("Windows startup inventory claims complete status with an incomplete source")
+        );
+
+        inventory["status"] = serde_json::json!("partial");
+        let parsed = parse_startup_inventory(&serde_json::to_vec(&inventory).unwrap()).unwrap();
+        assert_eq!(parsed.status, "partial");
     }
 
     #[test]
