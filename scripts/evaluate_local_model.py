@@ -10,7 +10,6 @@ import json
 import os
 import re
 import signal
-import stat
 import statistics
 import subprocess
 import sys
@@ -20,6 +19,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+if __package__:
+    from .bounded_input import open_regular_file, read_regular_file
+else:
+    from bounded_input import open_regular_file, read_regular_file
 
 
 MAX_CORPUS_BYTES = 64 * 1024
@@ -51,13 +55,10 @@ class OutputLimitExceeded(RuntimeError):
 
 def verify_model_candidate(path: Path) -> Path:
     """Verify the exact pinned model through a no-follow bounded file handle."""
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags)
+    descriptor = open_regular_file(path)
     try:
         metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_MODEL_BYTES:
+        if metadata.st_size > MAX_MODEL_BYTES:
             raise ValueError("model candidate must be a bounded regular file")
         hasher = hashlib.sha256()
         total = 0
@@ -466,10 +467,11 @@ def validate_preview(preview: Any) -> dict[str, Any]:
 def load_corpus(
     path: Path, *, enforce_preregistered: bool = False
 ) -> tuple[Path, dict[str, Any]]:
-    root = path.resolve(strict=True).parent
-    if not path.is_file() or path.stat().st_size > MAX_CORPUS_BYTES:
-        raise ValueError(f"corpus must be a regular file no larger than {MAX_CORPUS_BYTES} bytes")
-    with path.open("rb") as source:
+    resolved = path.resolve(strict=True)
+    root = resolved.parent
+    with os.fdopen(open_regular_file(resolved), "rb") as source:
+        if os.fstat(source.fileno()).st_size > MAX_CORPUS_BYTES:
+            raise ValueError(f"corpus must be a regular file no larger than {MAX_CORPUS_BYTES} bytes")
         raw = source.read(MAX_CORPUS_BYTES + 1)
     if len(raw) > MAX_CORPUS_BYTES:
         raise ValueError(f"corpus exceeds {MAX_CORPUS_BYTES} bytes")
@@ -600,6 +602,7 @@ def repository_provenance(repository: Path, *, require_clean: bool) -> dict[str,
 def prepare_verified_fixtures(
     root: Path, corpus: dict[str, Any]
 ) -> tuple[tempfile.TemporaryDirectory, dict[str, Path]]:
+    root = root.resolve(strict=True)
     expected_hashes = corpus["trace_sha256"]
     fixture_dir = tempfile.TemporaryDirectory(prefix="sideeffect-m8-fixtures-")
     private_root = Path(fixture_dir.name)
@@ -607,14 +610,9 @@ def prepare_verified_fixtures(
     try:
         for name, expected_digest in expected_hashes.items():
             source = (root / name).resolve(strict=True)
-            if source.parent != root or not source.is_file():
+            if source.parent != root:
                 raise ValueError(f"trace fixture must be a regular file directly under the corpus directory: {name}")
-            if source.stat().st_size > MAX_TRACE_FIXTURE_BYTES:
-                raise ValueError(f"trace fixture exceeds {MAX_TRACE_FIXTURE_BYTES} bytes: {name}")
-            with source.open("rb") as stream:
-                content = stream.read(MAX_TRACE_FIXTURE_BYTES + 1)
-            if len(content) > MAX_TRACE_FIXTURE_BYTES:
-                raise ValueError(f"trace fixture exceeds {MAX_TRACE_FIXTURE_BYTES} bytes: {name}")
+            content = read_regular_file(source, MAX_TRACE_FIXTURE_BYTES, f"trace fixture {name}")
             actual_digest = hashlib.sha256(content).hexdigest()
             if actual_digest != expected_digest:
                 raise ValueError(f"trace fixture SHA-256 mismatch: {name}")
