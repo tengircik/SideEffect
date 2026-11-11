@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from bounded_input import open_regular_file as _open_regular_nofollow
+
 
 MAX_CORPUS_BYTES = 128 * 1024
 MAX_HOLDOUT_MANIFEST_BYTES = 64 * 1024
@@ -469,20 +471,6 @@ def _read_bounded_regular_nofollow(path: Path, byte_limit: int, label: str) -> b
 
 def _positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
-
-
-def _open_regular_nofollow(path: Path) -> int:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(path, flags)
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise ValueError(f"input must be a regular file: {path.name}")
-        return fd
-    except Exception:
-        os.close(fd)
-        raise
 
 
 def verify_model_candidate(path: Path) -> tuple[str, int]:

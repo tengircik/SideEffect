@@ -21,6 +21,8 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
+from bounded_input import read_regular_file as read_bounded_input
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CORPUS_RELATIVE_PATH = Path("tests/fixtures/local_model_explain_v1/corpus.json")
@@ -227,18 +229,11 @@ def _verify_review_packets(directory: Path, rows: list[dict[str, Any]], corpus: 
 
 def _read_regular_file(path: Path, limit: int, label: str) -> bytes:
     try:
-        metadata = path.lstat()
-    except OSError as error:
-        raise ContractError(f"cannot inspect {label}: {error}") from error
-    _require(stat.S_ISREG(metadata.st_mode), f"{label} must be a regular non-symlink file")
-    _require(metadata.st_size <= limit, f"{label} exceeds {limit} bytes")
-    try:
-        with path.open("rb") as stream:
-            raw = stream.read(limit + 1)
+        return read_bounded_input(path, limit, label)
+    except ValueError as error:
+        raise ContractError(str(error)) from error
     except OSError as error:
         raise ContractError(f"cannot read {label}: {error}") from error
-    _require(len(raw) <= limit, f"{label} grew beyond {limit} bytes while reading")
-    return raw
 
 
 def load_corpus() -> tuple[dict[str, Any], str]:
