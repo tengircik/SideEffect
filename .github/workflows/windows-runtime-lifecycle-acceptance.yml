@@ -65,7 +65,8 @@ jobs:
           [CmdletBinding()]
           param(
               [Parameter(Mandatory = $true)][string] $InstallerPath,
-              [Parameter(Mandatory = $true)][string] $LogRoot
+              [Parameter(Mandatory = $true)][string] $LogRoot,
+              [Parameter(Mandatory = $true)][string] $ExpectedSid
           )
 
           Set-StrictMode -Version Latest
@@ -77,16 +78,54 @@ jobs:
           $expectedSchema = 'sideeffect.windows_llama_runtime_install'
           $manifestName = '.sideeffect-runtime-manifest.json'
           $childTimeoutMinutes = 20
-          # A fresh local account can report an empty LocalApplicationData folder until its
-          # known folders are initialized; create it, then require the normal lookup to work.
-          [Environment]::GetFolderPath(
-              [Environment+SpecialFolder]::LocalApplicationData,
-              [Environment+SpecialFolderOption]::Create
-          ) | Out-Null
+          # The credential logon can inherit the launching account's profile environment. Resolve
+          # this process's own profile from its SID and use only that profile from here on.
+          $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          if ($currentSid -cne $ExpectedSid) {
+              throw "The lifecycle driver is running as SID $currentSid instead of the expected disposable account SID $ExpectedSid."
+          }
+          $profileKey = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\' + $ExpectedSid
+          if (-not (Test-Path -LiteralPath $profileKey)) {
+              throw "No profile registry entry was found for the disposable account SID $ExpectedSid."
+          }
+          $profileImagePath = [string](Get-ItemProperty -LiteralPath $profileKey -Name 'ProfileImagePath').ProfileImagePath
+          if ([string]::IsNullOrWhiteSpace($profileImagePath) -or
+              -not (Test-Path -LiteralPath $profileImagePath -PathType Container)) {
+              throw "The disposable account profile directory is missing: $profileImagePath"
+          }
+          $profileDirectory = [System.IO.Path]::GetFullPath($profileImagePath).TrimEnd('\')
+          $profileOwner = $null
+          try {
+              $profileOwner = ([System.Security.Principal.NTAccount]::new(
+                  (Get-Acl -LiteralPath $profileDirectory).Owner
+              )).Translate([System.Security.Principal.SecurityIdentifier]).Value
+          }
+          catch {
+              throw "The owner of the disposable account profile directory could not be resolved: $($_.Exception.Message)"
+          }
+          if ($profileOwner -cne $ExpectedSid) {
+              throw "The profile directory $profileDirectory is not owned by the disposable account SID $ExpectedSid."
+          }
+
+          $env:USERPROFILE = $profileDirectory
+          $env:LOCALAPPDATA = Join-Path $profileDirectory 'AppData\Local'
+          $env:APPDATA = Join-Path $profileDirectory 'AppData\Roaming'
+          if (-not (Test-Path -LiteralPath $env:LOCALAPPDATA -PathType Container)) {
+              New-Item -ItemType Directory -Path $env:LOCALAPPDATA -Force | Out-Null
+          }
+
+          # Read the known folder without requesting creation, and require it to resolve inside the
+          # verified profile before probing the returned path at all.
           $localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
-          if ([string]::IsNullOrWhiteSpace($localAppData) -or
-              -not (Test-Path -LiteralPath $localAppData -PathType Container)) {
-              throw 'The disposable account has no usable LocalApplicationData known folder; the runtime lifecycle cannot run.'
+          if ([string]::IsNullOrWhiteSpace($localAppData)) {
+              throw 'The disposable account has no LocalApplicationData known folder; the runtime lifecycle cannot run.'
+          }
+          $localAppData = [System.IO.Path]::GetFullPath($localAppData).TrimEnd('\')
+          if (-not $localAppData.StartsWith($profileDirectory + '\', [StringComparison]::OrdinalIgnoreCase)) {
+              throw "The LocalApplicationData known folder $localAppData is outside the disposable account profile $profileDirectory."
+          }
+          if (-not (Test-Path -LiteralPath $localAppData -PathType Container)) {
+              throw "The disposable account LocalApplicationData directory is missing: $localAppData"
           }
           $destination = Join-Path $localAppData ('SideEffect\runtimes\llama.cpp\' + $expectedRelease + '\windows-x64\' + $expectedBackend)
 
@@ -220,9 +259,10 @@ jobs:
             & icacls.exe $logRoot /grant "${account}:(OI)(CI)(M)" /T /C | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'Could not grant the temporary test user access to its disposable log directory.' }
 
+            $testSid = $testUserObject.SID
             $stdoutPath = Join-Path $logRoot 'driver-stdout.txt'
             $stderrPath = Join-Path $logRoot 'driver-stderr.txt'
-            $arguments = @('-NoProfile', '-File', "`"$driverPath`"", '-InstallerPath', "`"$(Join-Path $codeRoot 'scripts/install_sideeffect_llama_runtime_windows.ps1')`"", '-LogRoot', "`"$logRoot`"")
+            $arguments = @('-NoProfile', '-File', "`"$driverPath`"", '-InstallerPath', "`"$(Join-Path $codeRoot 'scripts/install_sideeffect_llama_runtime_windows.ps1')`"", '-LogRoot', "`"$logRoot`"", '-ExpectedSid', $testSid.Value)
             $process = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList $arguments -Credential ([PSCredential]::new($account, $password)) -LoadUserProfile -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
             if (-not $process.WaitForExit(25 * 60 * 1000)) {
               try { $process.Kill() } catch { }
