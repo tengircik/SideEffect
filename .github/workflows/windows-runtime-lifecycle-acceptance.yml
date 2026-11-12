@@ -1,0 +1,248 @@
+name: Windows CPU runtime lifecycle acceptance
+
+# Acceptance check for the optional pinned llama.cpp helper:
+# scripts/install_sideeffect_llama_runtime_windows.ps1.
+#
+# It runs the real helper as a disposable standard local account on a hosted
+# Windows runner: install, hash-backed inspect, remove, and a final inspect
+# that must report not_installed. The downloaded runtime is never executed.
+#
+# The pull_request trigger is limited to this file so the job can be exercised
+# on a branch before it exists on the default branch, where workflow_dispatch
+# would be the only entry point. It is gated to same-repository pull requests;
+# no pull_request_target, no secrets, and no write permissions are used.
+
+on:
+  pull_request:
+    branches: [main, codex/windows-runtime-lifecycle]
+    paths:
+      - .github/workflows/windows-runtime-lifecycle-acceptance.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-runtime-lifecycle:
+    name: Install, inspect, remove, and re-inspect CPU runtime
+    if: >-
+      github.repository == 'tengircik/SideEffect' &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Run the CPU runtime lifecycle as a disposable standard user
+        shell: pwsh
+        run: |
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw 'Lifecycle acceptance creates a local test account and requires an already-administrative Windows runner token.'
+          }
+
+          $testUser = 'secpu' + [Guid]::NewGuid().ToString('N').Substring(0, 12)
+          $passwordText = [Guid]::NewGuid().ToString('N') + 'Aa1!'
+          $password = ConvertTo-SecureString $passwordText -AsPlainText -Force
+          $testRoot = Join-Path $env:RUNNER_TEMP ('sideeffect-cpu-lifecycle-' + [Guid]::NewGuid().ToString('N'))
+          $codeRoot = Join-Path $testRoot 'repo'
+          $logRoot = Join-Path $testRoot 'logs'
+          $account = "$env:COMPUTERNAME\$testUser"
+
+          New-Item -ItemType Directory -Path (Join-Path $codeRoot 'scripts') -Force | Out-Null
+          New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
+          Copy-Item scripts/install_sideeffect_llama_runtime_windows.ps1 (Join-Path $codeRoot 'scripts/install_sideeffect_llama_runtime_windows.ps1')
+          Copy-Item scripts/SideEffectRuntimeLifecycle.psm1 (Join-Path $codeRoot 'scripts/SideEffectRuntimeLifecycle.psm1')
+
+          $driverPath = Join-Path $logRoot 'run-lifecycle.ps1'
+          Set-Content -LiteralPath $driverPath -Encoding utf8 -Value @'
+          [CmdletBinding()]
+          param(
+              [Parameter(Mandatory = $true)][string] $InstallerPath,
+              [Parameter(Mandatory = $true)][string] $LogRoot
+          )
+
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          $expectedRelease = 'b11938'
+          $expectedRevision = '19cce6919992fdffd92e0ac152caaf1e2b8f254e'
+          $expectedBackend = 'cpu'
+          $expectedSchema = 'sideeffect.windows_llama_runtime_install'
+          $manifestName = '.sideeffect-runtime-manifest.json'
+          $childTimeoutMinutes = 20
+          $destination = Join-Path $env:LOCALAPPDATA ('SideEffect\runtimes\llama.cpp\' + $expectedRelease + '\windows-x64\' + $expectedBackend)
+
+          function Get-InspectionPayload {
+              param([Parameter(Mandatory = $true)][AllowEmptyString()][string] $Text)
+
+              $lines = @($Text -split "`r?`n")
+              $start = -1
+              for ($index = 0; $index -lt $lines.Count; $index++) {
+                  if ($lines[$index].Trim() -ceq '{') { $start = $index; break }
+              }
+              if ($start -lt 0) { throw 'Inspect output did not contain a JSON object.' }
+              return (($lines[$start..($lines.Count - 1)] -join "`n") | ConvertFrom-Json)
+          }
+
+          function Invoke-Installer {
+              param(
+                  [Parameter(Mandatory = $true)][ValidateSet('install', 'inspect', 'remove')][string] $Action,
+                  [Parameter(Mandatory = $false)][AllowEmptyString()][string] $ConfirmationText = ''
+              )
+
+              $stdoutPath = Join-Path $LogRoot ("$Action-stdout.txt")
+              $stderrPath = Join-Path $LogRoot ("$Action-stderr.txt")
+              $confirmationPath = Join-Path $LogRoot ("$Action-confirmation.txt")
+              Set-Content -LiteralPath $confirmationPath -Value $ConfirmationText -Encoding ASCII
+              $arguments = @('-NoProfile', '-File', ('"' + $InstallerPath + '"'), '-Backend', $expectedBackend, '-Action', $Action)
+              $process = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+                  -ArgumentList $arguments `
+                  -RedirectStandardInput $confirmationPath `
+                  -RedirectStandardOutput $stdoutPath `
+                  -RedirectStandardError $stderrPath `
+                  -PassThru
+              if (-not $process.WaitForExit($childTimeoutMinutes * 60 * 1000)) {
+                  try { $process.Kill() } catch { }
+                  throw "The $Action step exceeded $childTimeoutMinutes minutes and was terminated."
+              }
+              $process.Refresh()
+              $stdout = if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath -Raw } else { '' }
+              $stderr = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw } else { '' }
+              Write-Host "----- $Action stdout -----"
+              Write-Host $stdout
+              Write-Host "----- $Action stderr -----"
+              Write-Host $stderr
+              return [pscustomobject]@{
+                  ExitCode = $process.ExitCode
+                  Stdout = $stdout
+                  Stderr = $stderr
+              }
+          }
+
+          $install = Invoke-Installer -Action 'install' -ConfirmationText ("INSTALL LLAMA.CPP " + $expectedRelease + ' CPU')
+          if ($install.ExitCode -ne 0) { throw "The pinned installer failed with exit code $($install.ExitCode)." }
+
+          $manifestPath = Join-Path $destination $manifestName
+          if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+              throw "The install manifest is missing at $manifestPath."
+          }
+          $manifestBytes = [System.IO.File]::ReadAllBytes($manifestPath)
+          $manifest = ([System.Text.Encoding]::UTF8.GetString($manifestBytes)) | ConvertFrom-Json
+          if ($manifest.schema -cne $expectedSchema) { throw "Unexpected manifest schema: $($manifest.schema)" }
+          if ([int]$manifest.version -ne 1) { throw "Unexpected manifest version: $($manifest.version)" }
+          if ($manifest.release -cne $expectedRelease) { throw "Unexpected manifest release: $($manifest.release)" }
+          if ($manifest.revision -cne $expectedRevision) { throw "Unexpected manifest revision: $($manifest.revision)" }
+          if ($manifest.backend -cne $expectedBackend) { throw "Unexpected manifest backend: $($manifest.backend)" }
+          $manifestFiles = @($manifest.files)
+          if ($manifestFiles.Count -eq 0) { throw 'The install manifest lists no files.' }
+          $manifestSha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          $executables = @(Get-ChildItem -LiteralPath $destination -Filter 'llama-completion.exe' -File -Recurse)
+          if ($executables.Count -ne 1) {
+              throw "Expected exactly one installed llama-completion.exe, found $($executables.Count)."
+          }
+
+          $inspect = Invoke-Installer -Action 'inspect'
+          if ($inspect.ExitCode -ne 0) { throw "Inspect reported exit code $($inspect.ExitCode)." }
+          $inspection = Get-InspectionPayload -Text $inspect.Stdout
+          if ($inspection.status -cne 'verified') {
+              throw "Inspect status was '$($inspection.status)', not 'verified'."
+          }
+          if ($inspection.release -cne $expectedRelease) { throw "Inspect release was '$($inspection.release)'." }
+          if ($inspection.revision -cne $expectedRevision) { throw "Inspect revision was '$($inspection.revision)'." }
+          if ($inspection.backend -cne $expectedBackend) { throw "Inspect backend was '$($inspection.backend)'." }
+          if (([string]$inspection.path).TrimEnd('\') -ine $destination.TrimEnd('\')) {
+              throw "Inspect path '$($inspection.path)' did not match '$destination'."
+          }
+          if ([int]$inspection.file_count -ne $manifestFiles.Count) {
+              throw "Inspect counted $($inspection.file_count) files but the manifest lists $($manifestFiles.Count)."
+          }
+          if ([string]$inspection.manifest_sha256 -cne $manifestSha256) {
+              throw 'Inspect manifest_sha256 does not match an independent SHA-256 of the manifest bytes.'
+          }
+          $expectedTotal = [long](($manifestFiles | Measure-Object -Property size -Sum).Sum)
+          if ([long]$inspection.total_bytes -ne $expectedTotal) {
+              throw "Inspect total_bytes $($inspection.total_bytes) did not match the manifest total $expectedTotal."
+          }
+          $expectedPaths = @($manifestFiles | ForEach-Object { [string]$_.path } | Sort-Object)
+          $reportedPaths = @($inspection.file_paths | ForEach-Object { [string]$_ } | Sort-Object)
+          if ($expectedPaths.Count -ne $reportedPaths.Count) {
+              throw 'Inspect reported a different number of file paths than the manifest.'
+          }
+          for ($index = 0; $index -lt $expectedPaths.Count; $index++) {
+              if ($expectedPaths[$index] -cne $reportedPaths[$index]) {
+                  throw "Inspect path '$($reportedPaths[$index])' did not match manifest path '$($expectedPaths[$index])'."
+              }
+          }
+
+          $remove = Invoke-Installer -Action 'remove' -ConfirmationText ("REMOVE LLAMA.CPP " + $expectedRelease + ' CPU')
+          if ($remove.ExitCode -ne 0) { throw "Removal failed with exit code $($remove.ExitCode)." }
+          if (Test-Path -LiteralPath $destination) {
+              throw "The runtime directory still exists after removal: $destination"
+          }
+
+          $finalInspect = Invoke-Installer -Action 'inspect'
+          if ($finalInspect.ExitCode -ne 0) { throw "The final inspect failed with exit code $($finalInspect.ExitCode)." }
+          $finalStatus = Get-InspectionPayload -Text $finalInspect.Stdout
+          if ($finalStatus.status -cne 'not_installed') {
+              throw "The final inspect status was '$($finalStatus.status)', not 'not_installed'."
+          }
+
+          Write-Output ''
+          Write-Output 'Lifecycle acceptance passed: install, verified inspect, removal, and not_installed re-inspect.'
+          Write-Output 'The downloaded runtime executable was never started.'
+          '@
+
+          $testUserObject = $null
+          $failure = $null
+          try {
+            $testUserObject = New-LocalUser -Name $testUser -Password $password -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword
+            & icacls.exe $testRoot /grant "${account}:(OI)(CI)(RX)" /T /C | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Could not grant the temporary test user read access to its disposable test files.' }
+            & icacls.exe $logRoot /grant "${account}:(OI)(CI)(M)" /T /C | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Could not grant the temporary test user access to its disposable log directory.' }
+
+            $stdoutPath = Join-Path $logRoot 'driver-stdout.txt'
+            $stderrPath = Join-Path $logRoot 'driver-stderr.txt'
+            $arguments = @('-NoProfile', '-File', "`"$driverPath`"", '-InstallerPath', "`"$(Join-Path $codeRoot 'scripts/install_sideeffect_llama_runtime_windows.ps1')`"", '-LogRoot', "`"$logRoot`"")
+            $process = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList $arguments -Credential ([PSCredential]::new($account, $password)) -LoadUserProfile -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
+            if (-not $process.WaitForExit(25 * 60 * 1000)) {
+              try { $process.Kill() } catch { }
+              throw 'The standard-user lifecycle driver exceeded 25 minutes and was terminated.'
+            }
+            $process.Refresh()
+            if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath }
+            if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath }
+            if ($process.ExitCode -ne 0) { throw "The standard-user lifecycle driver failed with exit code $($process.ExitCode)." }
+          }
+          catch {
+            $failure = $_
+            throw
+          }
+          finally {
+            if ($null -ne $testUserObject) {
+              $testSid = $testUserObject.SID
+              Remove-LocalUser -SID $testSid -ErrorAction SilentlyContinue
+              $profile = Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$($testSid.Value)'" -ErrorAction SilentlyContinue
+              if ($null -ne $profile) { Remove-CimInstance -InputObject $profile -ErrorAction SilentlyContinue }
+            }
+            $resolvedTestRoot = [System.IO.Path]::GetFullPath($testRoot).TrimEnd('\')
+            $resolvedRunnerTemp = [System.IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
+            if ([System.IO.Path]::GetDirectoryName($resolvedTestRoot) -ieq $resolvedRunnerTemp -and
+                (Split-Path -Leaf $resolvedTestRoot) -match '^sideeffect-cpu-lifecycle-[0-9a-f]{32}$') {
+              Remove-Item -LiteralPath $resolvedTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            else {
+              Write-Host "Skipped cleanup of unexpected test root: $resolvedTestRoot"
+            }
+            if ($null -ne $failure) {
+              Write-Output "Lifecycle acceptance failed: $($failure.Exception.Message)"
+            }
+          }
