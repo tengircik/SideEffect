@@ -267,6 +267,20 @@ pub fn load_public_key(path: &Path) -> Result<Vec<u8>, ProvenanceError> {
     Ok(bytes)
 }
 
+/// Derive a public verification key from a protected private key and publish it
+/// to a new file. Returns the SHA-256 fingerprint of the raw public key.
+pub fn export_public_key(
+    private_path: &Path,
+    output_path: &Path,
+) -> Result<String, ProvenanceError> {
+    let private_bytes = load_private_key(private_path)?;
+    let key =
+        Ed25519KeyPair::from_pkcs8(&private_bytes).map_err(|_| ProvenanceError::InvalidKey)?;
+    let public = key.public_key().as_ref();
+    publish_private(output_path, encode_hex(public).as_bytes())?;
+    Ok(encode_hex(&Sha256::digest(public)))
+}
+
 /// Check a protected private key against a bounded public-key file.
 ///
 /// Returns only the matching public key fingerprint. This validates that the
