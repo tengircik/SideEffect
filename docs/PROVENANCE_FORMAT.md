@@ -15,6 +15,46 @@ The JSON envelope fields are `schema`, `schema_version`, `algorithm`, `key_id`, 
 
 V1 is exact-byte compatible: do not normalize, parse-and-reserialize, or otherwise rewrite a v1 manifest before hashing. A whitespace-only change therefore invalidates its signature. The CLI validates the session manifest and all declared artifact hashes before signing or verifying. The low-level v1 signing primitive accepts bounded bytes and does not itself parse a session; callers that need the CLI's validation guarantee must use the session reader first. Existing v1 envelopes and `sideeffect.audit_session` session formats v1-v10 remain signed over their exact bytes; the signature format does not migrate or rewrite session manifests.
 
+## Signing preview
+
+`sideeffect provenance preview-session SESSION_DIR` is a read-only preview of what `sign-session` would bind. It uses the same verified native session reader and the same exact `session.json` bytes: it validates the manifest, every declared artifact length and SHA-256, and each JSON artifact's declared schema/version before writing anything. It does not read a key, prompt for confirmation, publish a file, or create a signature.
+
+On success it writes one JSON document to stdout and exits 0:
+
+```json
+{
+  "schema": "sideeffect.provenance_signing_preview",
+  "schema_version": 1,
+  "manifest_schema": "sideeffect.audit_session",
+  "manifest_schema_version": 15,
+  "manifest_sha256": "<lowercase hex of the exact session.json bytes>",
+  "signed_input": "exact_session_json_bytes",
+  "binds": {
+    "exact_manifest_bytes": true,
+    "session_identifier_present": true,
+    "host_context_present": true,
+    "observed_os_metadata_present": true,
+    "coverage_manifest_present": true,
+    "collector_identity_present": true,
+    "collector_provider_identity_present": false,
+    "requested_settings_present": false,
+    "effective_settings_present": false,
+    "applied_limits_present": false,
+    "runtime_loss_metadata_present": false,
+    "diagnostics_present": false,
+    "artifact_hashes_present": true,
+    "source_count": 2,
+    "artifact_count": 3
+  }
+}
+```
+
+The document is fixed and bounded: `binds` has only the presence flags and counts shown above. `observed_os_metadata_present` is true only when the manifest's `host_context` includes an observed OS name or OS version value. The counts are declared manifest counts, not proof that the session covered those sources or artifacts. The artifact count is a count of declared references whose bytes and hashes were checked; artifact digest values are not copied into the summary.
+
+The preview intentionally omits session identifiers, host and collector values, scope and path text, command text, setting and limit values, diagnostic codes, artifact digests, and all other free text. It reports only that those categories are present or absent. It does not authenticate the session or its creator, does not establish collector honesty or capture completeness, and does not verify signer identity or trust. The shown digest identifies the exact bytes a signature would cover; it is not a safety verdict and may reveal equality across repeated captures.
+
+A failed verification exits 1 with no JSON on stdout. Malformed, unsupported, enlarged, or digest-mismatched sessions are reported as errors rather than summarized.
+
 ## Local public-key trust store
 
 Use `sideeffect provenance key-export-public PRIVATE_KEY.pk8 NEW_PUBLIC_KEY.hex` to recreate a missing public verification file from its protected Ed25519 private key. The command writes the same lowercase-hex public format as `keygen` to a new file and prints its SHA-256 fingerprint. The private key stays in its original file. An existing output path causes the command to fail.
