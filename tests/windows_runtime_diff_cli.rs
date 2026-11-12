@@ -90,6 +90,17 @@ fn event(ordinal: u64, kind: &str) -> NativeRuntimeEvent {
             "network",
             json!({"transport":"tcp","operation":"connect"}),
         )),
+        // Decoded observation whose activity kind is not semantically classified.
+        "unknown.activity" => Some((
+            "{00000000-0000-0000-0000-000000000001}",
+            2,
+            0,
+            "io_observation",
+            "sideeffect.unsupported_activity",
+            0,
+            "other",
+            json!({"operation":"future"}),
+        )),
         _ => None,
     };
     let observation =
@@ -266,15 +277,15 @@ fn json_compares_observed_category_counts_and_preserves_ordinals() {
     assert_eq!(output.status.code(), Some(0));
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["schema"], "sideeffect.windows_runtime_diff_summary");
-    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["schema_version"], 4);
     assert_eq!(
         report["algorithm"]["id"],
-        "windows_etw_exact_multiset_and_unique_candidate_diff"
+        "windows_etw_exact_multiset_candidate_and_semantic_diff"
     );
-    assert_eq!(report["algorithm"]["version"], 2);
+    assert_eq!(report["algorithm"]["version"], 3);
     assert_eq!(
         report["algorithm"]["basis"],
-        "fixed_category_counts_plus_exact_record_multiset_and_unique_identity_candidates"
+        "fixed_category_counts_plus_exact_record_multiset_unique_identity_candidates_and_supported_semantic_annotations"
     );
     assert_eq!(report["comparison_status"], "complete");
     assert_eq!(report["capture_completeness"], "unknown");
@@ -358,6 +369,58 @@ fn json_compares_observed_category_counts_and_preserves_ordinals() {
                     .contains("exact normalized event records")
             })
     );
+}
+
+#[test]
+fn fixture_records_whose_raw_payload_cannot_be_redecoded_are_not_annotated() {
+    let before = capture(
+        CollectionStatus::Complete,
+        &["process.start", "file.read_request", "unknown.activity"],
+    );
+    let after = capture(
+        CollectionStatus::Complete,
+        &["process.start", "network.tcp.connect"],
+    );
+    let (_temp, output) = run_diff(&before, &after, &[]);
+    assert_eq!(output.status.code(), Some(0));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["diagnostics"],
+        json!(["event_deltas_without_a_supported_raw_verified_semantic_class"])
+    );
+    assert_eq!(report["semantic_changes"].as_array().unwrap().len(), 0);
+    assert!(report["event_changes"].as_array().unwrap().len() >= 3);
+
+    let (_temp, text_output) = run_diff(&before, &after, &["--format", "text"]);
+    assert_eq!(text_output.status.code(), Some(0));
+    let text = String::from_utf8(text_output.stdout).unwrap();
+    assert!(text.contains("Semantic annotations for supported raw-verified records"));
+    assert!(text.contains("No event-view entries had a supported semantic class"));
+    assert!(text.contains("do not establish success, absence, attribution, or causation"));
+}
+
+#[test]
+fn partial_capture_stays_unannotated_when_raw_evidence_is_not_corroborated() {
+    let before = capture(CollectionStatus::Complete, &["network.tcp.connect"]);
+    let after = capture(CollectionStatus::Partial, &[]);
+    let (_temp, output) = run_diff(&before, &after, &[]);
+    assert_eq!(output.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let change = report["event_changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["category"] == "network.tcp.connect")
+        .unwrap();
+    assert_eq!(change["status"], "observed_only_before");
+    assert!(
+        change["diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("other_capture_is_incomplete")
+    );
+    assert_eq!(report["semantic_changes"].as_array().unwrap().len(), 0);
+    assert!(report["comparison_status"] == "partial");
 }
 
 #[test]

@@ -82,10 +82,42 @@ pub fn write_windows_runtime_diff_text<W: Write>(
     for change in &summary.event_changes {
         write_event_delta(writer, change)?;
     }
+    writer.write_all(
+        b"\nSemantic annotations for supported raw-verified records (linked to event-view entries):\n",
+    )?;
+    if summary.semantic_changes.is_empty() {
+        writer.write_all(b"  No event-view entries had a supported semantic class.\n")?;
+    }
+    for change in &summary.semantic_changes {
+        write!(
+            writer,
+            "  event_change={} status={} class={} kind=",
+            change.event_change_index,
+            event_status_name(change.change_kind),
+            semantic_class_name(change.record_class)
+        )?;
+        write_quoted(writer, &change.event_kind)?;
+        writer.write_all(b" operation=")?;
+        match &change.operation {
+            Some(operation) => write_quoted(writer, operation)?,
+            None => writer.write_all(b"none")?,
+        }
+        writer.write_all(b" before_ordinals=")?;
+        write_ordinals(writer, &change.before_event_ordinals)?;
+        writer.write_all(b" after_ordinals=")?;
+        write_ordinals(writer, &change.after_event_ordinals)?;
+        writer.write_all(b"\n")?;
+        if let Some(diagnostic) = change.diagnostic {
+            writer.write_all(b"    Diagnostic: ")?;
+            write_quoted(writer, diagnostic)?;
+            writer.write_all(b"\n")?;
+        }
+    }
     writer.write_all(b"\nInterpretation limits:\n")?;
     writer.write_all(b"  Exact unchanged groups compare normalized records as multisets, ignoring only capture-local ordinal and QPC timestamp.\n")?;
     writer.write_all(b"  Candidate-changed groups use a unique operation/path or process/image key; this does not prove the same execution.\n")?;
     writer.write_all(b"  One-sided observations are not removals or additions; incomplete capture evidence can hide records.\n")?;
+    writer.write_all(b"  Semantic annotations name only a supported record class and decoded operation; they do not establish success, absence, attribution, or causation.\n")?;
     writer.write_all(b"  A count difference does not establish event absence, operation success, causation, or target attribution.\n")?;
     writer.write_all(b"  Capture completeness remains unknown, even when both producers report complete collection.\n")?;
     writer.write_all(b"  Event ordinals refer to positions in their own capture documents, not source byte offsets.\n")?;
@@ -173,6 +205,14 @@ fn write_event_references<W: Write>(
     Ok(())
 }
 
+fn semantic_class_name(value: crate::windows_runtime_diff::SemanticEventClass) -> &'static str {
+    match value {
+        crate::windows_runtime_diff::SemanticEventClass::FileIoEvent => "file_io_event",
+        crate::windows_runtime_diff::SemanticEventClass::DiskIoEvent => "disk_io_event",
+        crate::windows_runtime_diff::SemanticEventClass::NetworkEvent => "network_event",
+    }
+}
+
 fn event_status_name(value: EventDeltaStatus) -> &'static str {
     match value {
         EventDeltaStatus::Unchanged => "unchanged",
@@ -233,7 +273,7 @@ mod tests {
     fn text_is_terminal_safe_and_states_comparison_limits() {
         let mut summary = WindowsRuntimeDiffSummary {
             schema: "sideeffect.windows_runtime_diff_summary",
-            schema_version: 3,
+            schema_version: 4,
             algorithm: crate::windows_runtime_diff::ComparisonAlgorithm {
                 id: "test\u{1b}[31m",
                 version: 2,
@@ -290,6 +330,7 @@ mod tests {
                 source_values_retained_as: "before/after event references timestamp_qpc",
             }],
             event_changes: vec![],
+            semantic_changes: vec![],
             diagnostics: vec!["partial"],
             limitations: vec![],
         };
@@ -355,6 +396,7 @@ mod tests {
         assert!(output.contains("Before event ordinals: 1"));
         assert!(output.contains("After event ordinals: none"));
         assert!(output.contains("Exact-match normalization ledger"));
+        assert!(output.contains("Semantic annotations for supported raw-verified records"));
         assert!(output.contains("same fingerprint=false"));
         assert!(output.contains("field=\"timestamp_qpc\""));
     }

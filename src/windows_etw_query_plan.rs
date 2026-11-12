@@ -311,7 +311,11 @@ pub fn validate_plan(bytes: &[u8]) -> Result<EtwPlan, String> {
     Ok(plan)
 }
 
-fn corroboration(
+/// Re-decode a retained raw file/disk/network payload and require the complete
+/// typed observation to equal the stored sidecar. Process payloads are refused
+/// because their reproduction needs live TDH schema metadata. The diff's
+/// semantic layer reuses this check rather than trusting sidecar-only fields.
+pub(crate) fn corroboration(
     event: &crate::windows_runtime::NativeRuntimeEvent,
 ) -> Result<(Option<Value>, Option<&'static str>), String> {
     use crate::record::windows_io_decode::{DecodeStatus, PointerWidth, decode_classic_event};

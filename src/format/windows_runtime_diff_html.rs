@@ -145,6 +145,44 @@ pub fn write_windows_runtime_diff_html<W: Write>(
         write_evidence(writer, &change.after)?;
         writer.write_all(b"</dd></dl></article>")?;
     }
+    writer.write_all(b"</section>\n<section><h2>Semantic annotations (")?;
+    write!(writer, "{}", summary.semantic_changes.len())?;
+    writer.write_all(b")</h2><p>Only supported records whose descriptor, raw payload, and decoded observation validated are annotated. Each annotation links to its event-view entry, which retains the evidence references. Annotations name a record class and decoded operation; they do not establish success, absence, attribution, or causation.</p>")?;
+    if summary.semantic_changes.is_empty() {
+        writer.write_all(b"<p>No event-view entries had a supported semantic class.</p>")?;
+    } else {
+        writer.write_all(b"<ul>")?;
+    }
+    for change in &summary.semantic_changes {
+        writer.write_all(b"<li><dl><dt>Event-view entry</dt><dd>")?;
+        write!(writer, "{}", change.event_change_index)?;
+        writer.write_all(b"</dd><dt>Status</dt><dd>")?;
+        write_value(writer, event_status(change.change_kind))?;
+        writer.write_all(b"</dd><dt>Record class</dt><dd>")?;
+        write_value(writer, semantic_class(change.record_class))?;
+        writer.write_all(b"</dd><dt>Raw-verified descriptor kind</dt><dd>")?;
+        write_value(writer, &change.event_kind)?;
+        writer.write_all(b"</dd><dt>Decoded operation</dt><dd>")?;
+        if let Some(operation) = &change.operation {
+            write_value(writer, operation)?;
+        } else {
+            writer.write_all(b"none")?;
+        }
+        writer.write_all(b"</dd><dt>Before event ordinals</dt><dd class=\"ordinals\">")?;
+        write_ordinals(writer, &change.before_event_ordinals)?;
+        writer.write_all(b"</dd><dt>After event ordinals</dt><dd class=\"ordinals\">")?;
+        write_ordinals(writer, &change.after_event_ordinals)?;
+        writer.write_all(b"</dd><dt>Diagnostic</dt><dd>")?;
+        if let Some(diagnostic) = change.diagnostic {
+            write_value(writer, diagnostic)?;
+        } else {
+            writer.write_all(b"none")?;
+        }
+        writer.write_all(b"</dd></dl></li>")?;
+    }
+    if !summary.semantic_changes.is_empty() {
+        writer.write_all(b"</ul>")?;
+    }
     writer.write_all(b"</section>\n<section><h2>Diagnostics (")?;
     write!(writer, "{}", summary.diagnostics.len())?;
     writer.write_all(b")</h2><ul>")?;
@@ -186,6 +224,14 @@ fn write_evidence<W: Write>(
         write_value(writer, reference.category)?;
     }
     Ok(())
+}
+
+fn semantic_class(value: crate::windows_runtime_diff::SemanticEventClass) -> &'static str {
+    match value {
+        crate::windows_runtime_diff::SemanticEventClass::FileIoEvent => "file I/O event",
+        crate::windows_runtime_diff::SemanticEventClass::DiskIoEvent => "disk I/O event",
+        crate::windows_runtime_diff::SemanticEventClass::NetworkEvent => "network event",
+    }
 }
 
 fn event_status(value: EventDeltaStatus) -> &'static str {
@@ -294,7 +340,7 @@ mod tests {
     fn summary(before_hash: &str, after_hash: &str) -> WindowsRuntimeDiffSummary {
         WindowsRuntimeDiffSummary {
             schema: "sideeffect.windows_runtime_diff_summary",
-            schema_version: 3,
+            schema_version: 4,
             algorithm: ComparisonAlgorithm {
                 id: "windows_etw_exact_multiset_and_unique_candidate_diff",
                 version: 2,
@@ -351,6 +397,7 @@ mod tests {
                 source_values_retained_as: "before/after event references timestamp_qpc",
             }],
             event_changes: vec![],
+            semantic_changes: vec![],
             diagnostics: vec!["one_or_both_captures_report_partial_collection"],
             limitations: vec![],
         }
@@ -398,6 +445,7 @@ mod tests {
         assert!(html.contains(">none</dd>"));
         assert!(html.contains("candidate matching does not establish event identity"));
         assert!(html.contains("Exact-match normalization ledger"));
+        assert!(html.contains("Semantic annotations"));
         assert!(html.contains("Same validated representation fingerprint"));
         assert!(html.contains("timestamp_qpc"));
         assert!(
