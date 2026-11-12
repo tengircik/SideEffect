@@ -1,8 +1,11 @@
-//! Bounded aggregate and event-level comparisons for validated Windows ETW captures.
+//! Bounded aggregate, event-level, and conservative semantic comparisons for
+//! validated Windows ETW captures.
 //!
-//! This module compares observed record counts by a fixed event category. It
-//! never pairs individual ETW records or infers command attribution, absence,
-//! causation, or capture completeness.
+//! The semantic layer annotates only supported records whose raw payload and
+//! decoded observation already validated. It names the record class and the
+//! decoded operation and links back to the event view; it never pairs records
+//! by itself or infers attribution, absence, success, causation, or capture
+//! completeness.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -12,7 +15,7 @@ use std::io::{self, Write};
 use crate::windows_runtime::{CollectionStatus, MAX_WINDOWS_RUNTIME_EVENTS, WindowsRuntimeCapture};
 
 pub const WINDOWS_RUNTIME_DIFF_SUMMARY_SCHEMA: &str = "sideeffect.windows_runtime_diff_summary";
-pub const WINDOWS_RUNTIME_DIFF_SUMMARY_SCHEMA_VERSION: u32 = 3;
+pub const WINDOWS_RUNTIME_DIFF_SUMMARY_SCHEMA_VERSION: u32 = 4;
 const MAX_EVENT_DIFF_KEY_BYTES: usize = 128 * 1024 * 1024;
 const MAX_EVENT_DIFF_ROWS: usize = MAX_WINDOWS_RUNTIME_EVENTS * 2;
 const PROCESS_PROVIDER_GUID: &str = "3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c";
@@ -46,6 +49,10 @@ pub struct WindowsRuntimeDiffSummary {
     /// Event-level differences. Exact records are multiset-compared; uncertain
     /// cross-capture identity is explicitly left unpaired or marked candidate.
     pub event_changes: Vec<EventDelta>,
+    /// Conservative typed annotations for supported raw-verified records only.
+    /// Each entry links to its source entry in `event_changes`, which retains
+    /// the full evidence references.
+    pub semantic_changes: Vec<SemanticEventChange>,
     pub diagnostics: Vec<&'static str>,
     pub limitations: Vec<&'static str>,
 }
@@ -90,6 +97,34 @@ pub struct EventEvidenceReference {
     pub opcode: u8,
     pub event_kind: String,
     pub category: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticEventClass {
+    FileIoEvent,
+    DiskIoEvent,
+    NetworkEvent,
+}
+
+/// A narrow annotation of one event-view entry. It records only the supported
+/// record class, the raw-verified descriptor kind, and the decoded operation.
+/// One-sided inputs keep their original diagnostic and are never described as
+/// removals or additions.
+#[derive(Clone, Debug, Serialize)]
+pub struct SemanticEventChange {
+    /// One-based position in `event_changes`; that entry holds the evidence.
+    pub event_change_index: u64,
+    pub change_kind: EventDeltaStatus,
+    pub record_class: SemanticEventClass,
+    pub event_kind: String,
+    /// Decoded operation for file/disk/network records; null for process rows.
+    pub operation: Option<String>,
+    pub before_event_ordinals: Vec<u64>,
+    pub after_event_ordinals: Vec<u64>,
+    pub confidence: &'static str,
+    pub basis: &'static str,
+    pub diagnostic: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -229,14 +264,19 @@ pub fn compare_windows_runtime_captures(
     if ambiguous_candidate_group_count > 0 {
         diagnostics.push("ambiguous_candidate_identities_were_left_unpaired");
     }
+    let (semantic_changes, unclassified_event_delta_count) =
+        build_semantic_changes(before, after, &event_changes)?;
+    if unclassified_event_delta_count > 0 {
+        diagnostics.push("event_deltas_without_a_supported_raw_verified_semantic_class");
+    }
 
     Ok(WindowsRuntimeDiffSummary {
         schema: WINDOWS_RUNTIME_DIFF_SUMMARY_SCHEMA,
         schema_version: WINDOWS_RUNTIME_DIFF_SUMMARY_SCHEMA_VERSION,
         algorithm: ComparisonAlgorithm {
-            id: "windows_etw_exact_multiset_and_unique_candidate_diff",
-            version: 2,
-            basis: "fixed_category_counts_plus_exact_record_multiset_and_unique_identity_candidates",
+            id: "windows_etw_exact_multiset_candidate_and_semantic_diff",
+            version: 3,
+            basis: "fixed_category_counts_plus_exact_record_multiset_unique_identity_candidates_and_supported_semantic_annotations",
         },
         comparison_status: if partial {
             ComparisonStatus::Partial
@@ -267,12 +307,15 @@ pub fn compare_windows_runtime_captures(
             },
         ],
         event_changes,
+        semantic_changes,
         diagnostics,
         limitations: vec![
-            "The v1 fixed-category count and ordinal fields preserve their semantics; v2 additionally compares exact normalized event records as multisets.",
+            "The v1 fixed-category count and ordinal fields preserve their semantics; v2 additionally compares exact normalized event records as multisets, and v4 adds conservative semantic annotations.",
             "Exact event equality excludes only the capture-local record ordinal and QPC timestamp; provider, descriptor, header context, raw payload, and decode status/content remain part of identity.",
             "Candidate-changed rows use a unique same-file-operation/path or same-process-event/image-path identity and do not prove the same underlying execution.",
             "Ambiguous candidate identities are left unpaired; no event pair is inferred from category counts alone.",
+            "Semantic annotations cover only file/disk/network records whose retained raw payload re-decodes to exactly the stored observation sidecar; process payloads need live TDH metadata and remain event-level only.",
+            "A semantic annotation names the record class, raw-verified descriptor kind, and decoded operation; it does not establish success, completion, absence, attribution, or causation.",
             "One-sided observations are not removals or additions; partial collection, event loss, unavailable loss statistics, and capture diagnostics remain explicit.",
             "A difference does not establish that an operation was absent, completed, caused another event, or was attributable to the selected command.",
             "Producer collection statuses and loss evidence are preserved, but capture completeness remains unknown even when both inputs report complete collection.",
@@ -722,6 +765,125 @@ struct OneSidedGroupKey<'a> {
     event_id: u16,
     event_version: u8,
     opcode: u8,
+}
+
+/// Annotate event-view entries that already belong to a supported, raw-verified
+/// class. Unsupported records are skipped and reported by count so the caller
+/// can state that the semantic view is partial by construction.
+fn build_semantic_changes(
+    before: &WindowsRuntimeCapture,
+    after: &WindowsRuntimeCapture,
+    event_changes: &[EventDelta],
+) -> Result<(Vec<SemanticEventChange>, usize), String> {
+    let mut semantic = Vec::new();
+    semantic
+        .try_reserve(event_changes.len())
+        .map_err(|_| "could not reserve bounded Windows runtime semantic changes".to_owned())?;
+    let mut skipped = 0usize;
+    for (index, delta) in event_changes.iter().enumerate() {
+        let Some(record_class) = semantic_class(delta.category) else {
+            skipped = skipped.saturating_add(1);
+            continue;
+        };
+        let Some((event_kind, operation)) = corroborated_semantic_evidence(before, after, delta)
+        else {
+            skipped = skipped.saturating_add(1);
+            continue;
+        };
+        let event_change_index = u64::try_from(index + 1).map_err(|_| {
+            "Windows runtime semantic change index exceeds the supported range".to_owned()
+        })?;
+        semantic.push(SemanticEventChange {
+            event_change_index,
+            change_kind: delta.status,
+            record_class,
+            event_kind,
+            operation,
+            before_event_ordinals: delta
+                .before
+                .iter()
+                .map(|reference| reference.record_ordinal)
+                .collect(),
+            after_event_ordinals: delta
+                .after
+                .iter()
+                .map(|reference| reference.record_ordinal)
+                .collect(),
+            confidence: delta.confidence,
+            basis: delta.basis,
+            diagnostic: delta.diagnostic,
+        });
+    }
+    Ok((semantic, skipped))
+}
+
+/// Require every record referenced by one event-view entry to re-decode to
+/// exactly its stored sidecar before the entry is annotated. A group is
+/// suppressed when any referenced record is a TDH-dependent process payload,
+/// fails corroboration, or yields a different decoded operation.
+fn corroborated_semantic_evidence(
+    before: &WindowsRuntimeCapture,
+    after: &WindowsRuntimeCapture,
+    delta: &EventDelta,
+) -> Option<(String, Option<String>)> {
+    let mut event_kind: Option<String> = None;
+    let mut operation: Option<String> = None;
+    let mut seen = 0usize;
+    for (capture, references) in [(before, &delta.before), (after, &delta.after)] {
+        for reference in references {
+            let event = event_at_ordinal(capture, reference.record_ordinal)?;
+            if event.payload_decoding.is_some() {
+                return None;
+            }
+            let (corroborated, _reason) =
+                crate::windows_etw_query_plan::corroboration(event).ok()?;
+            let observation = corroborated?;
+            let current_operation = decoded_operation(&observation);
+            if seen == 0 {
+                event_kind = Some(event.event_kind.clone());
+                operation = current_operation;
+            } else if current_operation != operation {
+                return None;
+            }
+            seen = seen.saturating_add(1);
+        }
+    }
+    if seen == 0 {
+        return None;
+    }
+    Some((event_kind?, operation))
+}
+
+fn semantic_class(category: &str) -> Option<SemanticEventClass> {
+    if category.starts_with("file_io.") {
+        return Some(SemanticEventClass::FileIoEvent);
+    }
+    if category.starts_with("disk_io.") {
+        return Some(SemanticEventClass::DiskIoEvent);
+    }
+    if category.starts_with("network.") {
+        return Some(SemanticEventClass::NetworkEvent);
+    }
+    None
+}
+
+fn event_at_ordinal(
+    capture: &WindowsRuntimeCapture,
+    ordinal: u64,
+) -> Option<&crate::windows_runtime::NativeRuntimeEvent> {
+    let index = usize::try_from(ordinal).ok()?.checked_sub(1)?;
+    capture.events.get(index)
+}
+
+/// Read the operation from the re-decoded raw payload, never from the stored
+/// sidecar alone.
+fn decoded_operation(observation: &Value) -> Option<String> {
+    observation
+        .get("activity")?
+        .get("observation")?
+        .get("operation")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn event_references(
@@ -1456,7 +1618,10 @@ mod tests {
         let json = serde_json::to_value(&summary).unwrap();
 
         assert_eq!(summary.schema, WINDOWS_RUNTIME_DIFF_SUMMARY_SCHEMA);
-        assert_eq!(summary.schema_version, 3);
+        assert_eq!(
+            summary.schema_version,
+            WINDOWS_RUNTIME_DIFF_SUMMARY_SCHEMA_VERSION
+        );
         assert_eq!(summary.comparison_status, ComparisonStatus::Complete);
         assert_eq!(summary.capture_completeness, "unknown");
         assert!(
@@ -1468,7 +1633,7 @@ mod tests {
         assert_eq!(summary.after.document_sha256, "b".repeat(64));
         assert_eq!(
             json["algorithm"]["basis"],
-            "fixed_category_counts_plus_exact_record_multiset_and_unique_identity_candidates"
+            "fixed_category_counts_plus_exact_record_multiset_unique_identity_candidates_and_supported_semantic_annotations"
         );
 
         let category = |name| {
@@ -1805,6 +1970,195 @@ mod tests {
         let groups = group_event_ordinals(&capture).unwrap();
         assert_eq!(groups["unclassified"], [1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(groups.len(), 1);
+    }
+
+    fn encode_hex(bytes: &[u8]) -> String {
+        let mut text = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            text.push_str(&format!("{byte:02x}"));
+        }
+        text
+    }
+
+    fn raw_network_connect_event(ordinal: u64, destination_port: u16) -> NativeRuntimeEvent {
+        use crate::record::windows_io_decode::{DecodeStatus, PointerWidth, decode_classic_event};
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&4242_u32.to_le_bytes());
+        payload.extend_from_slice(&12_u32.to_le_bytes());
+        payload.extend_from_slice(&[203, 0, 113, 8]);
+        payload.extend_from_slice(&[192, 0, 2, 4]);
+        payload.extend_from_slice(&destination_port.to_be_bytes());
+        payload.extend_from_slice(&50_000_u16.to_be_bytes());
+        for value in [1460_u16, 1, 1, 7] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        payload.extend_from_slice(&65_535_u32.to_le_bytes());
+        payload.extend_from_slice(&1_i16.to_le_bytes());
+        payload.extend_from_slice(&2_i16.to_le_bytes());
+        payload.extend_from_slice(&99_u32.to_le_bytes());
+        payload.extend_from_slice(&0x7788_u64.to_le_bytes());
+        let decoded = decode_classic_event(
+            TCP_IP_PROVIDER_GUID,
+            0,
+            2,
+            12,
+            Some(PointerWidth::Bits64),
+            &payload,
+        );
+        assert_eq!(decoded.status, DecodeStatus::Decoded);
+        let mut event = observation_event(ordinal, serde_json::to_value(&decoded).unwrap());
+        set_descriptor(
+            &mut event,
+            TCP_IP_PROVIDER_GUID,
+            2,
+            12,
+            "network_observation",
+        );
+        event.header_flags = 0x0040;
+        event.raw_payload_hex = encode_hex(&payload);
+        event
+    }
+
+    #[test]
+    fn semantic_changes_require_raw_sidecar_agreement_and_link_to_event_view() {
+        let before = capture(
+            CollectionStatus::Complete,
+            vec![
+                process_event(1, "process_start", ProcessDecodeStatus::Decoded),
+                raw_network_connect_event(2, 443),
+                observed_event(
+                    3,
+                    decoded_activity("file", serde_json::json!({"operation":"read_request"})),
+                    FILE_IO_PROVIDER_GUID,
+                    2,
+                    67,
+                    "file_io_observation",
+                ),
+            ],
+            &"a".repeat(64),
+        );
+        let after = capture(
+            CollectionStatus::Complete,
+            vec![
+                process_event(1, "process_start", ProcessDecodeStatus::Decoded),
+                raw_network_connect_event(2, 443),
+            ],
+            &"b".repeat(64),
+        );
+        let summary = compare_windows_runtime_captures(&before, &after).unwrap();
+        assert_eq!(
+            summary.diagnostics,
+            ["event_deltas_without_a_supported_raw_verified_semantic_class"]
+        );
+        assert_eq!(summary.semantic_changes.len(), 1);
+        let change = &summary.semantic_changes[0];
+        assert_eq!(change.record_class, SemanticEventClass::NetworkEvent);
+        assert_eq!(change.operation.as_deref(), Some("connect"));
+        assert_eq!(change.change_kind, EventDeltaStatus::Unchanged);
+        let delta = &summary.event_changes[change.event_change_index as usize - 1];
+        assert_eq!(
+            delta
+                .before
+                .iter()
+                .map(|reference| reference.record_ordinal)
+                .collect::<Vec<_>>(),
+            change.before_event_ordinals
+        );
+        assert_eq!(
+            delta
+                .after
+                .iter()
+                .map(|reference| reference.record_ordinal)
+                .collect::<Vec<_>>(),
+            change.after_event_ordinals
+        );
+    }
+
+    fn raw_file_create_name_event(
+        ordinal: u64,
+        path: &str,
+        file_object: u64,
+    ) -> NativeRuntimeEvent {
+        use crate::record::windows_io_decode::{DecodeStatus, PointerWidth, decode_classic_event};
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&file_object.to_le_bytes());
+        for unit in path.encode_utf16().chain(std::iter::once(0)) {
+            payload.extend_from_slice(&unit.to_le_bytes());
+        }
+        let decoded = decode_classic_event(
+            FILE_IO_PROVIDER_GUID,
+            0,
+            2,
+            32,
+            Some(PointerWidth::Bits64),
+            &payload,
+        );
+        assert_eq!(decoded.status, DecodeStatus::Decoded);
+        let mut event = observation_event(ordinal, serde_json::to_value(&decoded).unwrap());
+        set_descriptor(
+            &mut event,
+            FILE_IO_PROVIDER_GUID,
+            2,
+            32,
+            "file_io_observation",
+        );
+        event.header_flags = 0x0040;
+        event.raw_payload_hex = encode_hex(&payload);
+        event
+    }
+
+    #[test]
+    fn semantic_annotations_never_reference_a_sidecar_mismatched_record() {
+        let before = capture(
+            CollectionStatus::Complete,
+            vec![raw_network_connect_event(1, 443)],
+            &"a".repeat(64),
+        );
+        let mut mismatch = raw_network_connect_event(1, 443);
+        mismatch.observation_decoding.as_mut().unwrap()["observation"]["activity"]["observation"]
+            ["destination_port"] = serde_json::json!(80);
+        let after = capture(CollectionStatus::Complete, vec![mismatch], &"b".repeat(64));
+        let summary = compare_windows_runtime_captures(&before, &after).unwrap();
+        assert_eq!(summary.semantic_changes.len(), 1);
+        let change = &summary.semantic_changes[0];
+        assert_eq!(change.change_kind, EventDeltaStatus::ObservedOnlyBefore);
+        assert_eq!(change.before_event_ordinals, [1]);
+        assert!(change.after_event_ordinals.is_empty());
+        assert!(
+            !summary
+                .semantic_changes
+                .iter()
+                .any(|change| !change.after_event_ordinals.is_empty())
+        );
+        assert!(
+            summary
+                .diagnostics
+                .contains(&"event_deltas_without_a_supported_raw_verified_semantic_class")
+        );
+    }
+
+    #[test]
+    fn mixed_candidate_pair_with_one_mismatched_sidecar_is_not_annotated() {
+        let before = capture(
+            CollectionStatus::Complete,
+            vec![raw_file_create_name_event(1, r"C:\Apps\worker.exe", 10)],
+            &"a".repeat(64),
+        );
+        let mut changed = raw_file_create_name_event(1, r"C:\Apps\worker.exe", 20);
+        changed.observation_decoding.as_mut().unwrap()["observation"]["activity"]["observation"]
+            ["file_object"] = serde_json::json!(21);
+        let after = capture(CollectionStatus::Complete, vec![changed], &"b".repeat(64));
+        let summary = compare_windows_runtime_captures(&before, &after).unwrap();
+        assert!(summary.event_changes.iter().any(|delta| {
+            delta.status == EventDeltaStatus::CandidateChanged
+                && delta.basis == "unique_file_operation_and_literal_path"
+        }));
+        assert!(summary.semantic_changes.is_empty());
+        assert!(
+            summary
+                .diagnostics
+                .contains(&"event_deltas_without_a_supported_raw_verified_semantic_class")
+        );
     }
 
     #[test]
