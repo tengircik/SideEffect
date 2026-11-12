@@ -152,7 +152,12 @@ jobs:
               $confirmationPath = Join-Path $LogRoot ("$Action-confirmation.txt")
               Set-Content -LiteralPath $confirmationPath -Value $ConfirmationText -Encoding ASCII
               $arguments = @('-NoProfile', '-File', ('"' + $InstallerPath + '"'), '-Backend', $expectedBackend, '-Action', $Action)
-              $process = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+              # Windows PowerShell 5.1 must be able to autoload its own utility cmdlets such as
+              # Get-FileHash; point the child at its built-in Modules directory explicitly.
+              $windowsPowerShellRoot = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0'
+              $windowsPowerShellModules = Join-Path $windowsPowerShellRoot 'Modules'
+              $process = Start-Process -FilePath (Join-Path $windowsPowerShellRoot 'powershell.exe') `
+                  -Environment @{ PSModulePath = $windowsPowerShellModules } `
                   -ArgumentList $arguments `
                   -RedirectStandardInput $confirmationPath `
                   -RedirectStandardOutput $stdoutPath `
