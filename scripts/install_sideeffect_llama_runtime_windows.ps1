@@ -113,6 +113,9 @@ function Download-VerifiedAsset {
         [Parameter(Mandatory = $true)][string] $Destination
     )
 
+    # Windows PowerShell 5.1 does not load System.Net.Http by default, so its HTTP types are
+    # unavailable in a clean process until the assembly is loaded explicitly here.
+    Add-Type -AssemblyName System.Net.Http
     $handler = [System.Net.Http.HttpClientHandler]::new()
     $handler.AllowAutoRedirect = $false
     $handler.UseDefaultCredentials = $false
