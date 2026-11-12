@@ -5690,9 +5690,22 @@ fn format_event_query_text(result: &sideeffect::query::EventQueryResult) -> Resu
         } else {
             String::new()
         };
+        let endpoints = if result.network_endpoints.is_some() {
+            event
+                .network_endpoints
+                .map_or_else(String::new, |endpoints| {
+                    let mut value = format!(" destination={}", endpoints.destination);
+                    if let Some(source) = endpoints.source {
+                        value.push_str(&format!(" source={source}"));
+                    }
+                    value
+                })
+        } else {
+            String::new()
+        };
         writeln!(
             text,
-            "- #{} {} [{}] evidence={}{}{}",
+            "- #{} {} [{}] evidence={}{}{}{}",
             event.source_local_ordinal,
             terminal_safe_text(&event.event_kind),
             match &event.operation {
@@ -5701,7 +5714,8 @@ fn format_event_query_text(result: &sideeffect::query::EventQueryResult) -> Resu
             },
             evidence,
             path,
-            timestamp
+            timestamp,
+            endpoints
         )
         .map_err(|_| "could not format event query text".to_owned())?;
         check_event_query_text_limit(&text)?;
@@ -10095,6 +10109,7 @@ mod tests {
             },
             filter: sideeffect::query::EventQueryFilters::default(),
             matched_count: 1,
+            network_endpoints: None,
             events: vec![sideeffect::event::CommonEvent {
                 source_local_ordinal: 1,
                 source_timestamp: None,
@@ -10106,6 +10121,7 @@ mod tests {
                     byte_length: 1,
                 },
                 identity_context: Vec::new(),
+                network_endpoints: None,
                 path_observation: None,
             }],
             event_process_links: Vec::new(),

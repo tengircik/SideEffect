@@ -127,6 +127,15 @@ pub struct CommonEvent {
     pub identity_context: Vec<EventIdentityContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path_observation: Option<EventPathObservation>,
+    #[serde(skip)]
+    pub network_endpoints: Option<EventNetworkEndpoints>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct EventNetworkEndpoints {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<std::net::SocketAddr>,
+    pub destination: std::net::SocketAddr,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1402,7 +1411,6 @@ pub fn from_linux_strace(
                 value: value.clone(),
                 clock_unit: STRACE_TIMESTAMP_CLOCK.to_owned(),
             }),
-            event_kind,
             operation: OperationSemantics::SyscallAttempt {
                 result: record.outcome,
             },
@@ -1418,6 +1426,13 @@ pub fn from_linux_strace(
                     lexical_basis: hint.basis,
                 },
             }),
+            network_endpoints: record.raw_arguments.as_deref().and_then(|arguments| {
+                crate::trace::derive_connect_endpoint(&event_kind, arguments)
+            }).map(|destination| EventNetworkEndpoints {
+                source: None,
+                destination,
+            }),
+            event_kind,
         };
         if let Some(task_id) = record.process_id {
             if let std::collections::btree_map::Entry::Vacant(entry) =
@@ -2201,6 +2216,21 @@ fn from_windows_etw_source(capture: &impl EtwCaptureView) -> CommonEventEnvelope
             evidence,
             identity_context,
             path_observation,
+            network_endpoints: if event.event_kind == "network_observation" {
+                match cross_check_etw_network_payload(&event) {
+                    crate::record::NetworkPayloadCrossCheck::Matched {
+                        source,
+                        destination,
+                        ..
+                    } => Some(EventNetworkEndpoints {
+                        source: Some(source),
+                        destination,
+                    }),
+                    _ => None,
+                }
+            } else {
+                None
+            },
         });
     }
     let loss = capture.event_loss();
@@ -3206,33 +3236,11 @@ impl NetworkPayloadPidCheck {
 
 #[cfg(windows)]
 fn cross_checked_network_payload_pid(event: &EtwEventView<'_>) -> NetworkPayloadPidCheck {
-    let Some(raw_payload) = decode_hex(event.raw_payload_hex) else {
-        let network_provider = normalized_guid(event.provider_guid).is_some_and(|guid| {
-            matches!(
-                guid.as_str(),
-                "9a280ac0-c8e0-11d1-84e2-00c04fb998a2" | "bf3a50c5-a9c9-4988-a005-2df0b7c80f80"
-            )
-        });
-        return if network_provider {
-            NetworkPayloadPidCheck::Malformed
-        } else {
-            NetworkPayloadPidCheck::NotNetworkProvider
-        };
-    };
-    match crate::record::cross_check_network_payload(crate::record::NetworkPayloadInput {
-        provider_guid: event.provider_guid,
-        event_id: event.event_id,
-        event_version: event.event_version,
-        opcode: event.opcode,
-        header_flags: event.header_flags,
-        event_kind: event.event_kind,
-        raw_payload: &raw_payload,
-        serialized_decoding: event.observation_decoding,
-    }) {
+    match cross_check_etw_network_payload(event) {
         crate::record::NetworkPayloadCrossCheck::NotNetworkProvider => {
             NetworkPayloadPidCheck::NotNetworkProvider
         }
-        crate::record::NetworkPayloadCrossCheck::Matched(pid) => {
+        crate::record::NetworkPayloadCrossCheck::Matched { pid, .. } => {
             NetworkPayloadPidCheck::Matched(pid)
         }
         crate::record::NetworkPayloadCrossCheck::Mismatch(pid) => {
@@ -3244,6 +3252,36 @@ fn cross_checked_network_payload_pid(event: &EtwEventView<'_>) -> NetworkPayload
             NetworkPayloadPidCheck::InvalidProcessId
         }
     }
+}
+
+#[cfg(windows)]
+fn cross_check_etw_network_payload(
+    event: &EtwEventView<'_>,
+) -> crate::record::NetworkPayloadCrossCheck {
+    use crate::record::NetworkPayloadCrossCheck;
+    let Some(raw_payload) = decode_hex(event.raw_payload_hex) else {
+        let network_provider = normalized_guid(event.provider_guid).is_some_and(|guid| {
+            matches!(
+                guid.as_str(),
+                "9a280ac0-c8e0-11d1-84e2-00c04fb998a2" | "bf3a50c5-a9c9-4988-a005-2df0b7c80f80"
+            )
+        });
+        return if network_provider {
+            NetworkPayloadCrossCheck::Malformed
+        } else {
+            NetworkPayloadCrossCheck::NotNetworkProvider
+        };
+    };
+    crate::record::cross_check_network_payload(crate::record::NetworkPayloadInput {
+        provider_guid: event.provider_guid,
+        event_id: event.event_id,
+        event_version: event.event_version,
+        opcode: event.opcode,
+        header_flags: event.header_flags,
+        event_kind: event.event_kind,
+        raw_payload: &raw_payload,
+        serialized_decoding: event.observation_decoding,
+    })
 }
 
 /// Reuse the common event adapter's raw network decoder for offline attribution.

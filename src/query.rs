@@ -24,13 +24,13 @@ use crate::event::{
 use crate::model::SyscallOutcome;
 
 pub const QUERY_SCHEMA: &str = "sideeffect.event_query";
-pub const QUERY_SCHEMA_VERSION: u32 = 4;
+pub const QUERY_SCHEMA_VERSION: u32 = 5;
 pub const QUERY_RESULT_SCHEMA: &str = "sideeffect.event_query_result";
-pub const QUERY_RESULT_SCHEMA_VERSION: u32 = 4;
+pub const QUERY_RESULT_SCHEMA_VERSION: u32 = 5;
 pub const SESSION_QUERY_RESULT_SCHEMA: &str = "sideeffect.session_event_query_result";
-pub const SESSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 4;
+pub const SESSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 5;
 pub const MULTI_SESSION_QUERY_RESULT_SCHEMA: &str = "sideeffect.multi_session_event_query_result";
-pub const MULTI_SESSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 4;
+pub const MULTI_SESSION_QUERY_RESULT_SCHEMA_VERSION: u32 = 5;
 pub const MAX_QUERY_SESSIONS: usize = 16;
 pub const MAX_MULTI_SESSION_RESULTS: usize = MAX_QUERY_RESULTS;
 pub const MAX_MULTI_SESSION_INPUT_BYTES: u64 = 256 * 1024 * 1024;
@@ -3062,9 +3062,25 @@ pub struct EventQueryFilters {
     /// Inclusive bounds in one source's recorded clock, without clock conversion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<TimestampFilter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<EndpointFilter>,
     /// Exact source-local evidence tuple; not portable across captures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<EvidenceFilter>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointRole {
+    Source,
+    Destination,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointFilter {
+    pub role: EndpointRole,
+    pub address: std::net::SocketAddr,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3193,7 +3209,7 @@ impl EventQuery {
     pub fn validate(&self) -> Result<(), String> {
         if self.schema != QUERY_SCHEMA || !matches!(self.schema_version, 1..=QUERY_SCHEMA_VERSION) {
             return Err(format!(
-                "query schema must be {QUERY_SCHEMA} version 1, 2, 3, or 4"
+                "query schema must be {QUERY_SCHEMA} version 1 through {QUERY_SCHEMA_VERSION}"
             ));
         }
         if self.schema_version == 1 && self.filters.path_exact.is_some() {
@@ -3201,6 +3217,9 @@ impl EventQuery {
         }
         if self.schema_version < 3 && self.filters.path_prefix.is_some() {
             return Err("path_prefix requires event query schema version 3".to_owned());
+        }
+        if self.schema_version < 5 && self.filters.endpoint.is_some() {
+            return Err("endpoint requires event query schema version 5".to_owned());
         }
         if let Some(timestamp) = &self.filters.timestamp {
             if self.schema_version < 4 {
@@ -3301,11 +3320,19 @@ pub struct EventQueryResult {
     pub filter: EventQueryFilters,
     pub matched_count: usize,
     pub events: Vec<CommonEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_endpoints: Option<Vec<QueryEventNetworkEndpoints>>,
     pub event_process_links: Vec<EventProcessLink>,
     pub process_observations: Vec<ProcessObservation>,
     pub process_relationships: Vec<ProcessRelationship>,
     /// Diagnostics for the full source input, not merely the returned rows.
     pub diagnostics: Vec<EventDiagnostic>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct QueryEventNetworkEndpoints {
+    pub evidence: crate::event::EvidenceReference,
+    pub endpoints: crate::event::EventNetworkEndpoints,
 }
 
 /// One session-scoped runtime query. Manifest status and event parsing status
@@ -3537,18 +3564,26 @@ pub fn execute_query(
         }
     }
     let matched_count = matched.len();
+    let network_endpoints = (query.schema_version >= 5).then(|| {
+        matched
+            .iter()
+            .filter_map(|event| {
+                Some(QueryEventNetworkEndpoints {
+                    evidence: event.evidence.clone(),
+                    endpoints: event.network_endpoints?,
+                })
+            })
+            .collect()
+    });
     Ok(EventQueryResult {
         schema: QUERY_RESULT_SCHEMA,
-        schema_version: if query.schema_version == 4 {
-            QUERY_RESULT_SCHEMA_VERSION
-        } else {
-            3
-        },
+        schema_version: query.schema_version.max(3),
         source: envelope.source.clone(),
         source_state: envelope.source_state.clone(),
         filter: query.filters.clone(),
         matched_count,
         events: matched,
+        network_endpoints,
         event_process_links: links,
         process_observations,
         process_relationships,
@@ -3561,6 +3596,17 @@ fn matches_event(
     process_evidence: Option<&HashSet<EvidenceKey>>,
     filters: &EventQueryFilters,
 ) -> bool {
+    if filters.endpoint.is_some_and(|filter| {
+        let address = event
+            .network_endpoints
+            .and_then(|endpoints| match filter.role {
+                EndpointRole::Source => endpoints.source,
+                EndpointRole::Destination => Some(endpoints.destination),
+            });
+        address != Some(filter.address)
+    }) {
+        return false;
+    }
     if filters.timestamp.as_ref().is_some_and(|filter| {
         event
             .source_timestamp
@@ -3916,6 +3962,7 @@ mod tests {
                     path_exact: None,
                     path_prefix: None,
                     timestamp: None,
+                    endpoint: None,
                     evidence: None,
                 },
                 10,

@@ -1206,6 +1206,28 @@ if result != errno.ECONNREFUSED:
     );
 
     let evidence = &failed_connect["evidence"];
+    let query_path = directory.path().join("failed-endpoint-query.json");
+    let address = format!("127.0.0.1:{port}");
+    fs::write(&query_path, serde_json::to_vec(&serde_json::json!({
+        "schema": "sideeffect.event_query",
+        "schema_version": 5,
+        "filters": { "endpoint": { "role": "destination", "address": address }, "outcome": "failure" }
+    })).unwrap()).unwrap();
+    let query = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["query", "--query"])
+        .arg(&query_path)
+        .arg("--trace")
+        .arg(&trace_path)
+        .output()
+        .unwrap();
+    assert_success(&query, "query the refused loopback destination");
+    let result: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
+    assert_eq!(result["matched_count"], 1);
+    let observation = &result["network_endpoints"][0];
+    assert_eq!(observation["endpoints"]["destination"], address);
+    for field in ["line_number", "byte_offset", "byte_length"] {
+        assert_eq!(observation["evidence"][field], evidence[field]);
+    }
     let byte_offset = evidence["byte_offset"]
         .as_u64()
         .expect("failed connect byte offset") as usize;

@@ -1040,7 +1040,11 @@ mod tests {
                     raw_payload: &payload,
                     serialized_decoding: Some(&sidecar),
                 },),
-                NetworkPayloadCrossCheck::Matched(4242)
+                NetworkPayloadCrossCheck::Matched {
+                    pid: 4242,
+                    source: "127.0.0.1:50000".parse().unwrap(),
+                    destination: "127.0.0.1:443".parse().unwrap(),
+                }
             );
 
             let mut forged = sidecar;
