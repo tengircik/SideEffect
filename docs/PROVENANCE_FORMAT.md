@@ -17,6 +17,8 @@ V1 is exact-byte compatible: do not normalize, parse-and-reserialize, or otherwi
 
 ## Local public-key trust store
 
+Use `sideeffect provenance key-export-public PRIVATE_KEY.pk8 NEW_PUBLIC_KEY.hex` to recreate a missing public verification file from its protected Ed25519 private key. The command writes the same lowercase-hex public format as `keygen` to a new file and prints its SHA-256 fingerprint. The private key stays in its original file. An existing output path causes the command to fail.
+
 The implemented trust-store commands are explicit and offline:
 
 ```text
