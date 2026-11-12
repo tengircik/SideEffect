@@ -72,6 +72,145 @@ fn output_contains_bytes(output: &Output, needle: &[u8]) -> bool {
             .any(|stream| stream.windows(needle.len()).any(|window| window == needle))
 }
 
+const PACKAGES_ARTIFACT: &[u8] = br#"{"schema":"sideeffect.inventory","schema_version":2}"#;
+const SCOPE_MARKER: &str = "synthetic-scope-marker-value";
+const COLLECTOR_VERSION_MARKER: &str = "synthetic-collector-build-marker";
+const DIAGNOSTIC_MARKER: &str = "synthetic_diagnostic_marker";
+const HOST_NAME_MARKER: &str = "synthetic-host-name-marker";
+const HOST_VERSION_MARKER: &str = "synthetic-host-version-marker";
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Write a synthetic, private session directory. This is a test fixture, not a
+/// real capture; it exercises the same reader contract used by the CLI.
+fn write_private_session_directory(
+    parent: &std::path::Path,
+    name: &str,
+    manifest: &serde_json::Value,
+    artifacts: &[(&str, &[u8])],
+) -> PathBuf {
+    let directory = parent.join(name);
+    let manifest_bytes = serde_json::to_vec(manifest).unwrap();
+    let mut files: Vec<(&str, &[u8])> = vec![("session.json", manifest_bytes.as_slice())];
+    files.extend(artifacts.iter().copied());
+    #[cfg(windows)]
+    {
+        sideeffect::record::publish_private_windows_directory(&directory, &files, 1024 * 1024)
+            .unwrap();
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        for (file_name, bytes) in &files {
+            let path = directory.join(file_name);
+            fs::write(&path, bytes).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+    directory
+}
+
+fn current_fixture_manifest() -> serde_json::Value {
+    serde_json::json!({
+        "schema": "sideeffect.audit_session",
+        "schema_version": 15,
+        "session_id": "0123456789abcdef0123456789abcdef",
+        "platform": "linux",
+        "architecture": "x86_64",
+        "started_at_unix_ms": 1000,
+        "ended_at_unix_ms": 2000,
+        "interval_semantics": "best_effort_non_atomic",
+        "status": "complete",
+        "sources": [{
+            "role": "packages",
+            "collector": {
+                "id": "linux.debian_packages",
+                "version": COLLECTOR_VERSION_MARKER
+            },
+            "platform": "linux",
+            "scope": SCOPE_MARKER,
+            "started_at_unix_ms": 1000,
+            "ended_at_unix_ms": 2000,
+            "status": "complete",
+            "applied_limits": [{"code": "max_files", "value": 10}],
+            "requested_settings": [{"code": "include_paths", "value": 1}],
+            "effective_settings": [{"code": "include_paths", "value": 1}],
+            "diagnostic_codes": [DIAGNOSTIC_MARKER],
+            "artifacts": [{
+                "kind": "packages",
+                "path": "packages.json",
+                "schema": "sideeffect.inventory",
+                "schema_version": 2,
+                "byte_length": PACKAGES_ARTIFACT.len(),
+                "sha256": sha256_hex(PACKAGES_ARTIFACT)
+            }]
+        }],
+        "host_context": {
+            "os_name": {"status": "observed", "value": HOST_NAME_MARKER},
+            "os_version": {"status": "observed", "value": HOST_VERSION_MARKER},
+            "privilege": "not_elevated"
+        },
+        "coverage_manifest": {
+            "version": 2,
+            "sources": [{"role": "packages", "status": "observed"}]
+        }
+    })
+}
+
+fn minimal_fixture_manifest() -> serde_json::Value {
+    serde_json::json!({
+        "schema": "sideeffect.audit_session",
+        "schema_version": 3,
+        "session_id": "fedcba9876543210fedcba9876543210",
+        "platform": "linux",
+        "architecture": "x86_64",
+        "started_at_unix_ms": 3000,
+        "ended_at_unix_ms": 4000,
+        "interval_semantics": "best_effort_non_atomic",
+        "status": "partial",
+        "sources": [{
+            "role": "startup",
+            "platform": "linux",
+            "scope": "minimal-synthetic-scope-marker",
+            "started_at_unix_ms": 3000,
+            "ended_at_unix_ms": 4000,
+            "status": "unknown",
+            "applied_limits": [],
+            "diagnostic_codes": [],
+            "artifacts": []
+        }],
+        "coverage_manifest": {
+            "version": 1,
+            "sources": [{"role": "startup", "status": "unknown"}]
+        }
+    })
+}
+
+fn preview_session(session: &std::path::Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["provenance", "preview-session"])
+        .arg(session)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+fn sorted_keys(value: &serde_json::Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .expect("JSON object expected")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
 #[test]
 fn provenance_exports_only_the_public_key_and_never_replaces_a_file() {
     let temp = TestDirectory::new();
@@ -698,6 +837,210 @@ fn provenance_commands_reject_malformed_and_unknown_session_manifests() {
     assert_eq!(unsupported_verify.status.code(), Some(1));
     assert!(
         String::from_utf8_lossy(&unsupported_verify.stderr)
+            .contains("invalid audit-session manifest")
+    );
+}
+
+#[test]
+fn provenance_preview_session_reports_digest_and_fixed_categories_without_prompting() {
+    let temp = TestDirectory::new();
+    let session = write_private_session_directory(
+        &temp.0,
+        "synthetic-complete-session",
+        &current_fixture_manifest(),
+        &[("packages.json", PACKAGES_ARTIFACT)],
+    );
+
+    // `output()` connects stdin to null: a command that prompted for a signing
+    // confirmation would read EOF, cancel, and exit unsuccessfully.
+    let preview = preview_session(&session);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    assert!(preview.stderr.is_empty());
+
+    let text = String::from_utf8(preview.stdout).unwrap();
+    let document: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        sorted_keys(&document),
+        vec![
+            "binds",
+            "manifest_schema",
+            "manifest_schema_version",
+            "manifest_sha256",
+            "schema",
+            "schema_version",
+            "signed_input",
+        ]
+    );
+    assert_eq!(document["schema"], "sideeffect.provenance_signing_preview");
+    assert_eq!(document["schema_version"], 1);
+    assert_eq!(document["manifest_schema"], "sideeffect.audit_session");
+    assert_eq!(document["manifest_schema_version"], 15);
+    assert_eq!(document["signed_input"], "exact_session_json_bytes");
+    assert_eq!(
+        document["manifest_sha256"],
+        sha256_hex(&fs::read(session.join("session.json")).unwrap())
+    );
+
+    let binds = &document["binds"];
+    assert_eq!(
+        sorted_keys(binds),
+        vec![
+            "applied_limits_present",
+            "artifact_count",
+            "artifact_hashes_present",
+            "collector_identity_present",
+            "collector_provider_identity_present",
+            "coverage_manifest_present",
+            "diagnostics_present",
+            "effective_settings_present",
+            "exact_manifest_bytes",
+            "host_context_present",
+            "observed_os_metadata_present",
+            "requested_settings_present",
+            "runtime_loss_metadata_present",
+            "session_identifier_present",
+            "source_count",
+        ]
+    );
+    for (field, expected) in [
+        ("exact_manifest_bytes", serde_json::json!(true)),
+        ("session_identifier_present", serde_json::json!(true)),
+        ("host_context_present", serde_json::json!(true)),
+        ("observed_os_metadata_present", serde_json::json!(true)),
+        ("coverage_manifest_present", serde_json::json!(true)),
+        ("collector_identity_present", serde_json::json!(true)),
+        (
+            "collector_provider_identity_present",
+            serde_json::json!(false),
+        ),
+        ("requested_settings_present", serde_json::json!(true)),
+        ("effective_settings_present", serde_json::json!(true)),
+        ("applied_limits_present", serde_json::json!(true)),
+        ("runtime_loss_metadata_present", serde_json::json!(false)),
+        ("diagnostics_present", serde_json::json!(true)),
+        ("artifact_hashes_present", serde_json::json!(true)),
+        ("source_count", serde_json::json!(1)),
+        ("artifact_count", serde_json::json!(1)),
+    ] {
+        assert_eq!(binds[field], expected, "unexpected value for {field}");
+    }
+
+    for omitted in [
+        "0123456789abcdef0123456789abcdef",
+        SCOPE_MARKER,
+        COLLECTOR_VERSION_MARKER,
+        DIAGNOSTIC_MARKER,
+        HOST_NAME_MARKER,
+        HOST_VERSION_MARKER,
+        "packages.json",
+        sha256_hex(PACKAGES_ARTIFACT).as_str(),
+    ] {
+        assert!(
+            !text.contains(omitted),
+            "preview must omit manifest value {omitted}"
+        );
+    }
+
+    let help = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["help", "provenance", "preview-session"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(
+        String::from_utf8_lossy(&help.stdout)
+            .contains("Usage: sideeffect provenance preview-session SESSION_DIR")
+    );
+}
+
+#[test]
+fn provenance_preview_session_reports_absent_categories_for_minimal_manifest() {
+    let temp = TestDirectory::new();
+    let session = write_private_session_directory(
+        &temp.0,
+        "synthetic-minimal-session",
+        &minimal_fixture_manifest(),
+        &[],
+    );
+    let preview = preview_session(&session);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    assert!(preview.stderr.is_empty());
+
+    let text = String::from_utf8(preview.stdout).unwrap();
+    let document: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        document["manifest_sha256"],
+        sha256_hex(&fs::read(session.join("session.json")).unwrap())
+    );
+    assert_eq!(document["manifest_schema_version"], 3);
+
+    let binds = &document["binds"];
+    for (field, expected) in [
+        ("exact_manifest_bytes", serde_json::json!(true)),
+        ("session_identifier_present", serde_json::json!(true)),
+        ("host_context_present", serde_json::json!(false)),
+        ("observed_os_metadata_present", serde_json::json!(false)),
+        ("coverage_manifest_present", serde_json::json!(true)),
+        ("collector_identity_present", serde_json::json!(false)),
+        (
+            "collector_provider_identity_present",
+            serde_json::json!(false),
+        ),
+        ("requested_settings_present", serde_json::json!(false)),
+        ("effective_settings_present", serde_json::json!(false)),
+        ("applied_limits_present", serde_json::json!(false)),
+        ("runtime_loss_metadata_present", serde_json::json!(false)),
+        ("diagnostics_present", serde_json::json!(false)),
+        ("artifact_hashes_present", serde_json::json!(false)),
+        ("source_count", serde_json::json!(1)),
+        ("artifact_count", serde_json::json!(0)),
+    ] {
+        assert_eq!(binds[field], expected, "unexpected value for {field}");
+    }
+    assert!(!text.contains("minimal-synthetic-scope-marker"));
+    assert!(!text.contains("fedcba9876543210fedcba9876543210"));
+}
+
+#[test]
+fn provenance_preview_session_rejects_tampered_evidence_without_json_output() {
+    let temp = TestDirectory::new();
+    let tampered_artifact_session = write_private_session_directory(
+        &temp.0,
+        "synthetic-tampered-artifact-session",
+        &current_fixture_manifest(),
+        &[("packages.json", PACKAGES_ARTIFACT)],
+    );
+    let artifact_path = tampered_artifact_session.join("packages.json");
+    let mut tampered_artifact = fs::read(&artifact_path).unwrap();
+    tampered_artifact[0] = b' ';
+    fs::write(&artifact_path, &tampered_artifact).unwrap();
+    let artifact_preview = preview_session(&tampered_artifact_session);
+    assert_eq!(artifact_preview.status.code(), Some(1));
+    assert!(artifact_preview.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&artifact_preview.stderr)
+            .contains("does not match its declared SHA-256")
+    );
+
+    let malformed_manifest_session = write_private_session_directory(
+        &temp.0,
+        "synthetic-malformed-manifest-session",
+        &current_fixture_manifest(),
+        &[("packages.json", PACKAGES_ARTIFACT)],
+    );
+    fs::write(malformed_manifest_session.join("session.json"), b"{").unwrap();
+    let manifest_preview = preview_session(&malformed_manifest_session);
+    assert_eq!(manifest_preview.status.code(), Some(1));
+    assert!(manifest_preview.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&manifest_preview.stderr)
             .contains("invalid audit-session manifest")
     );
 }
