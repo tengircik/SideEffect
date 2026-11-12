@@ -389,22 +389,34 @@ fn session_signature_cli_round_trip_and_detects_manifest_byte_changes() {
     );
 
     let signature = temp.0.join("session.signature.json");
-    let mut sign = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
-        .arg("provenance")
-        .arg("sign-session")
-        .arg(&session)
-        .arg("--private-key")
-        .arg(&private)
-        .arg("--output")
-        .arg(&signature)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
     use std::io::Write;
-    sign.stdin.take().unwrap().write_all(b"sign\n").unwrap();
-    let signed = sign.wait_with_output().unwrap();
+    let sign = |confirmation: &[u8]| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+            .args(["provenance", "sign-session"])
+            .arg(&session)
+            .arg("--private-key")
+            .arg(&private)
+            .arg("--output")
+            .arg(&signature)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(confirmation).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    for (confirmation, error) in [
+        (b"sign".as_slice(), "confirmation must end with a newline"),
+        (b" sign\n", "session signing cancelled"),
+        (&[b' '; 129], "confirmation line exceeds its size limit"),
+    ] {
+        let rejected = sign(confirmation);
+        assert_eq!(rejected.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(error));
+        assert!(!signature.exists());
+    }
+    let signed = sign(b"sign\n");
     assert!(
         signed.status.success(),
         "{}",
