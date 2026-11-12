@@ -1,11 +1,13 @@
-name: Windows CPU runtime lifecycle acceptance
+name: Windows runtime lifecycle acceptance
 
 # Acceptance check for the optional pinned llama.cpp helper:
 # scripts/install_sideeffect_llama_runtime_windows.ps1.
 #
 # It runs the real helper as a disposable standard local account on a hosted
 # Windows runner: install, hash-backed inspect, remove, and a final inspect
-# that must report not_installed. The downloaded runtime is never executed.
+# that must report not_installed. The CPU and CUDA backends run as separate jobs
+# from the same allowlisted matrix value; neither job runs a GPU or the runtime.
+# The downloaded runtime is never executed.
 #
 # The pull_request trigger is limited to this file so the job can be exercised
 # on a branch before it exists on the default branch, where workflow_dispatch
@@ -23,14 +25,20 @@ permissions:
   contents: read
 
 jobs:
-  cpu-runtime-lifecycle:
-    name: Install, inspect, remove, and re-inspect CPU runtime
+  runtime-lifecycle:
+    name: Install, inspect, remove, and re-inspect ${{ matrix.backend }} runtime
     if: >-
       github.repository == 'tengircik/SideEffect' &&
       (github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: windows-2025
-    timeout-minutes: 30
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cpu, cuda]
+    env:
+      SIDEEFFECT_LIFECYCLE_BACKEND: ${{ matrix.backend }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -38,9 +46,14 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Run the CPU runtime lifecycle as a disposable standard user
+      - name: Run the ${{ matrix.backend }} runtime lifecycle as a disposable standard user
         shell: pwsh
         run: |
+          $backend = $env:SIDEEFFECT_LIFECYCLE_BACKEND
+          if ($backend -cnotin @('cpu', 'cuda')) {
+            throw "Unsupported lifecycle backend selector: $backend"
+          }
+
           $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
           $principal = [Security.Principal.WindowsPrincipal]::new($identity)
           if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -66,7 +79,8 @@ jobs:
           param(
               [Parameter(Mandatory = $true)][string] $InstallerPath,
               [Parameter(Mandatory = $true)][string] $LogRoot,
-              [Parameter(Mandatory = $true)][string] $ExpectedSid
+              [Parameter(Mandatory = $true)][string] $ExpectedSid,
+              [Parameter(Mandatory = $true)][ValidateSet('cpu', 'cuda')][string] $Backend
           )
 
           Set-StrictMode -Version Latest
@@ -74,10 +88,10 @@ jobs:
 
           $expectedRelease = 'b11938'
           $expectedRevision = '19cce6919992fdffd92e0ac152caaf1e2b8f254e'
-          $expectedBackend = 'cpu'
+          $expectedBackend = $Backend
           $expectedSchema = 'sideeffect.windows_llama_runtime_install'
           $manifestName = '.sideeffect-runtime-manifest.json'
-          $childTimeoutMinutes = 20
+          $childTimeoutMinutes = 30
           # The credential logon can inherit the launching account's profile environment. Resolve
           # this process's own profile from its SID and use only that profile from here on.
           $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -181,7 +195,7 @@ jobs:
               }
           }
 
-          $install = Invoke-Installer -Action 'install' -ConfirmationText ("INSTALL LLAMA.CPP " + $expectedRelease + ' CPU')
+          $install = Invoke-Installer -Action 'install' -ConfirmationText ("INSTALL LLAMA.CPP " + $expectedRelease + ' ' + $expectedBackend.ToUpperInvariant())
           if ($install.ExitCode -ne 0) { throw "The pinned installer failed with exit code $($install.ExitCode)." }
 
           $manifestPath = Join-Path $destination $manifestName
@@ -237,7 +251,7 @@ jobs:
               }
           }
 
-          $remove = Invoke-Installer -Action 'remove' -ConfirmationText ("REMOVE LLAMA.CPP " + $expectedRelease + ' CPU')
+          $remove = Invoke-Installer -Action 'remove' -ConfirmationText ("REMOVE LLAMA.CPP " + $expectedRelease + ' ' + $expectedBackend.ToUpperInvariant())
           if ($remove.ExitCode -ne 0) { throw "Removal failed with exit code $($remove.ExitCode)." }
           if (Test-Path -LiteralPath $destination) {
               throw "The runtime directory still exists after removal: $destination"
@@ -267,11 +281,11 @@ jobs:
             $testSid = $testUserObject.SID
             $stdoutPath = Join-Path $logRoot 'driver-stdout.txt'
             $stderrPath = Join-Path $logRoot 'driver-stderr.txt'
-            $arguments = @('-NoProfile', '-File', "`"$driverPath`"", '-InstallerPath', "`"$(Join-Path $codeRoot 'scripts/install_sideeffect_llama_runtime_windows.ps1')`"", '-LogRoot', "`"$logRoot`"", '-ExpectedSid', $testSid.Value)
+            $arguments = @('-NoProfile', '-File', "`"$driverPath`"", '-InstallerPath', "`"$(Join-Path $codeRoot 'scripts/install_sideeffect_llama_runtime_windows.ps1')`"", '-LogRoot', "`"$logRoot`"", '-ExpectedSid', $testSid.Value, '-Backend', $backend)
             $process = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList $arguments -Credential ([PSCredential]::new($account, $password)) -LoadUserProfile -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
-            if (-not $process.WaitForExit(25 * 60 * 1000)) {
+            if (-not $process.WaitForExit(35 * 60 * 1000)) {
               try { $process.Kill() } catch { }
-              throw 'The standard-user lifecycle driver exceeded 25 minutes and was terminated.'
+              throw 'The standard-user lifecycle driver exceeded 35 minutes and was terminated.'
             }
             $process.Refresh()
             if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath }
