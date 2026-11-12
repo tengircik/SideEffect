@@ -77,7 +77,18 @@ jobs:
           $expectedSchema = 'sideeffect.windows_llama_runtime_install'
           $manifestName = '.sideeffect-runtime-manifest.json'
           $childTimeoutMinutes = 20
-          $destination = Join-Path $env:LOCALAPPDATA ('SideEffect\runtimes\llama.cpp\' + $expectedRelease + '\windows-x64\' + $expectedBackend)
+          # A fresh local account can report an empty LocalApplicationData folder until its
+          # known folders are initialized; create it, then require the normal lookup to work.
+          [Environment]::GetFolderPath(
+              [Environment+SpecialFolder]::LocalApplicationData,
+              [Environment+SpecialFolderOption]::Create
+          ) | Out-Null
+          $localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+          if ([string]::IsNullOrWhiteSpace($localAppData) -or
+              -not (Test-Path -LiteralPath $localAppData -PathType Container)) {
+              throw 'The disposable account has no usable LocalApplicationData known folder; the runtime lifecycle cannot run.'
+          }
+          $destination = Join-Path $localAppData ('SideEffect\runtimes\llama.cpp\' + $expectedRelease + '\windows-x64\' + $expectedBackend)
 
           function Get-InspectionPayload {
               param([Parameter(Mandatory = $true)][AllowEmptyString()][string] $Text)
