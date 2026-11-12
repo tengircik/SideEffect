@@ -94,17 +94,17 @@ jobs:
               throw "The disposable account profile directory is missing: $profileImagePath"
           }
           $profileDirectory = [System.IO.Path]::GetFullPath($profileImagePath).TrimEnd('\')
-          $profileOwner = $null
-          try {
-              $profileOwner = ([System.Security.Principal.NTAccount]::new(
-                  (Get-Acl -LiteralPath $profileDirectory).Owner
-              )).Translate([System.Security.Principal.SecurityIdentifier]).Value
+          $profileItem = Get-Item -LiteralPath $profileDirectory -Force
+          if (($profileItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "The disposable account profile directory is a reparse point: $profileDirectory"
           }
-          catch {
-              throw "The owner of the disposable account profile directory could not be resolved: $($_.Exception.Message)"
+          $tokenAccountName = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+          $tokenAccountLeaf = ($tokenAccountName -split '\\')[-1]
+          if ((Split-Path -Leaf $profileDirectory) -cne $tokenAccountLeaf) {
+              throw "The profile directory $profileDirectory does not belong to the current account $tokenAccountName."
           }
-          if ($profileOwner -cne $ExpectedSid) {
-              throw "The profile directory $profileDirectory is not owned by the disposable account SID $ExpectedSid."
+          if ($tokenAccountLeaf -notmatch '^secpu[0-9a-f]{12}$') {
+              throw "The current account name $tokenAccountLeaf is not the disposable lifecycle account."
           }
 
           $env:USERPROFILE = $profileDirectory
