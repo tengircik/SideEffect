@@ -508,6 +508,7 @@ mod tests {
                             value: "/tmp/\x1b[31m\u{202e}".to_owned(),
                             ambiguity: "lexical\nonly".to_owned(),
                         }],
+                        network_endpoints: None,
                         path_observation: None,
                     }),
                     process_observation: None,

@@ -170,6 +170,17 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         [command, operation, private_path, public_path]
+            if command == "provenance" && operation == "key-export-public" =>
+        {
+            let fingerprint = sideeffect::provenance::export_public_key(
+                Path::new(private_path),
+                Path::new(public_path),
+            )
+            .map_err(|error| format!("could not export provenance public key: {error}"))?;
+            println!("{fingerprint}");
+            Ok(ExitCode::SUCCESS)
+        }
+        [command, operation, private_path, public_path]
             if command == "provenance" && operation == "key-check" =>
         {
             provenance_key_check(private_path, public_path)
@@ -1999,11 +2010,14 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         "timeline" => {
             "Usage: sideeffect timeline --trace TRACE [--format json|text|html] [--output NEW_REPORT.html] [--event-kind KIND] [--process-observation ID]\n       sideeffect timeline --windows-runtime CAPTURE.json [--format json|text|html] [--output NEW_REPORT.html] [--event-kind KIND] [--process-observation ID] (native Windows)\nBuilds a source-local timeline from bounded Linux strace or strictly validated Windows ETW v3 evidence. Items keep their source ordinal, original timestamp representation, and exact raw-record evidence reference; timestamps do not establish causal order. JSON remains the default; --format text writes a bounded ASCII-only terminal summary to stdout, escaping controls, line breaks, and non-ASCII source strings. --format html writes a bounded offline report to a new path using --output; existing files are never replaced. HTML may contain sensitive local evidence; review before sharing. --event-kind matches an exact event kind. --process-observation selects an emitted source-local ProcessObservation.source_local_id (not a PID or cross-capture ID), retains directly linked items and all their source-native links, and includes the selected observation with its evidence and end_evidence even if no item matches. For Linux task observations, evidence is the first observed row, not proof of task start, and end_evidence is an exact prefixed termination row when available. For Linux returned-child-PID observations, evidence is only the caller's syscall result row; no child-start event is asserted. When both filters are supplied, displayed items must match both. Link roles, statuses and bases remain visible. Filters may appear in either order; duplicates or missing values are errors. An empty result or missing link does not prove absence. Unsupported rows remain in diagnostics. Partial or unknown source status exits with status 2."
         }
+        "provenance key-export-public" => {
+            "Usage: sideeffect provenance key-export-public PRIVATE_KEY.pk8 NEW_PUBLIC_KEY.hex\nDerives the public verification key from a protected Ed25519 private key, writes the lowercase-hex public key to a new file, and prints its SHA-256 fingerprint."
+        }
         "provenance key-check" => {
             "Usage: sideeffect provenance key-check PRIVATE_KEY.pk8 PUBLIC_KEY.hex\nChecks that a protected Ed25519 private key derives the supplied public key. On a match, prints only that public key's SHA-256 fingerprint. This read-only check establishes pair consistency only; it does not recover keys or verify backup completeness or authenticity."
         }
         "provenance" => {
-            "Usage: sideeffect provenance keygen PRIVATE_KEY.pk8 PUBLIC_KEY.hex\n       sideeffect provenance key-check PRIVATE_KEY.pk8 PUBLIC_KEY.hex\n       sideeffect provenance sign-session SESSION_DIR --private-key PRIVATE_KEY.pk8 --output SIGNATURE.json\n       sideeffect provenance verify-session SESSION_DIR --signature SIGNATURE.json --public-key PUBLIC_KEY.hex [--trust-store DIR]\n       sideeffect provenance verify-session SESSION_DIR --signature SIGNATURE.json --trust-store DIR\n       sideeffect provenance trust import PUBLIC_KEY.hex --trust-store DIR --label LABEL\n       sideeffect provenance trust rotate OLD_KEY_ID NEW_PUBLIC_KEY.hex --trust-store DIR --label LABEL\n       sideeffect provenance trust list --trust-store DIR\n       sideeffect provenance trust remove KEY_ID --trust-store DIR\nCreates Ed25519 keys explicitly, checks a supplied private/public key pair without changing either file, signs the exact validated session.json bytes into a detached envelope, or verifies cryptographic validity offline. Trust is an explicit local user decision about a public key; a local label is not verified signer identity. Imports require typing the displayed key fingerprint. Rotation requires exact confirmation naming both fingerprints, adds the replacement before retiring the prior local trust decision, and never changes private-key files. Trust stores are selected explicitly and are protected for the current user. Signatures do not establish collector honesty or capture completeness."
+            "Usage: sideeffect provenance keygen PRIVATE_KEY.pk8 PUBLIC_KEY.hex\n       sideeffect provenance key-export-public PRIVATE_KEY.pk8 NEW_PUBLIC_KEY.hex\n       sideeffect provenance key-check PRIVATE_KEY.pk8 PUBLIC_KEY.hex\n       sideeffect provenance sign-session SESSION_DIR --private-key PRIVATE_KEY.pk8 --output SIGNATURE.json\n       sideeffect provenance verify-session SESSION_DIR --signature SIGNATURE.json --public-key PUBLIC_KEY.hex [--trust-store DIR]\n       sideeffect provenance verify-session SESSION_DIR --signature SIGNATURE.json --trust-store DIR\n       sideeffect provenance trust import PUBLIC_KEY.hex --trust-store DIR --label LABEL\n       sideeffect provenance trust rotate OLD_KEY_ID NEW_PUBLIC_KEY.hex --trust-store DIR --label LABEL\n       sideeffect provenance trust list --trust-store DIR\n       sideeffect provenance trust remove KEY_ID --trust-store DIR\nCreates Ed25519 keys explicitly, checks a supplied private/public key pair without changing either file, signs the exact validated session.json bytes into a detached envelope, or verifies cryptographic validity offline. Trust is an explicit local user decision about a public key; a local label is not verified signer identity. Imports require typing the displayed key fingerprint. Rotation requires exact confirmation naming both fingerprints, adds the replacement before retiring the prior local trust decision, and never changes private-key files. Trust stores are selected explicitly and are protected for the current user. Signatures do not establish collector honesty or capture completeness."
         }
         "diff" => {
             "Usage: sideeffect diff [--format json|text] LEFT RIGHT\n       sideeffect diff --format html --output REPORT.html LEFT RIGHT\n       sideeffect diff --bundles [--format json|text] LEFT_DIR RIGHT_DIR\n       sideeffect diff --windows-runtime [--format json|text] BEFORE.json AFTER.json\n       sideeffect diff --format html --output REPORT.html --windows-runtime BEFORE.json AFTER.json (native Windows)\nCompares complete parsed strace observations or validated Windows ETW captures. Windows summary v2 preserves category counts, compares exact normalized record multisets, and labels unique supported changed identities as candidates with source references. One-sided observations are not removals or additions; capture completeness remains unknown, and no causal or system-level absence claims are made. Windows HTML uses the protected current-user publisher and a static offline report. Input and report data may be sensitive."
@@ -5676,9 +5690,22 @@ fn format_event_query_text(result: &sideeffect::query::EventQueryResult) -> Resu
         } else {
             String::new()
         };
+        let endpoints = if result.network_endpoints.is_some() {
+            event
+                .network_endpoints
+                .map_or_else(String::new, |endpoints| {
+                    let mut value = format!(" destination={}", endpoints.destination);
+                    if let Some(source) = endpoints.source {
+                        value.push_str(&format!(" source={source}"));
+                    }
+                    value
+                })
+        } else {
+            String::new()
+        };
         writeln!(
             text,
-            "- #{} {} [{}] evidence={}{}{}",
+            "- #{} {} [{}] evidence={}{}{}{}",
             event.source_local_ordinal,
             terminal_safe_text(&event.event_kind),
             match &event.operation {
@@ -5687,7 +5714,8 @@ fn format_event_query_text(result: &sideeffect::query::EventQueryResult) -> Resu
             },
             evidence,
             path,
-            timestamp
+            timestamp,
+            endpoints
         )
         .map_err(|_| "could not format event query text".to_owned())?;
         check_event_query_text_limit(&text)?;
@@ -10081,6 +10109,7 @@ mod tests {
             },
             filter: sideeffect::query::EventQueryFilters::default(),
             matched_count: 1,
+            network_endpoints: None,
             events: vec![sideeffect::event::CommonEvent {
                 source_local_ordinal: 1,
                 source_timestamp: None,
@@ -10092,6 +10121,7 @@ mod tests {
                     byte_length: 1,
                 },
                 identity_context: Vec::new(),
+                network_endpoints: None,
                 path_observation: None,
             }],
             event_process_links: Vec::new(),

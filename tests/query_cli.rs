@@ -46,6 +46,47 @@ fn run(trace: &PathBuf, query: &PathBuf, format: &str) -> Output {
 }
 
 #[test]
+fn cli_query_matches_a_literal_connect_destination_and_keeps_attempt_evidence() {
+    let mut files = TempFiles(Vec::new());
+    let trace = files.write(
+        "trace",
+        br#"100.1 connect(3, {sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 ECONNREFUSED (Connection refused)
+100.2 connect(3, {sa_family=AF_INET, sin_port=htons(81), sin_addr=inet_addr("127.0.0.1")}, 16) = 0
+"#,
+    );
+    let query = files.write(
+        "json",
+        br#"{"schema":"sideeffect.event_query","schema_version":5,"filters":{"endpoint":{"role":"destination","address":"127.0.0.1:80"},"outcome":"failure"}}"#,
+    );
+    let output = run(&trace, &query, "json");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["schema_version"], 5);
+    assert_eq!(result["matched_count"], 1);
+    assert_eq!(result["events"][0]["evidence"]["line_number"], 1);
+    assert_eq!(
+        result["network_endpoints"][0]["evidence"],
+        result["events"][0]["evidence"]
+    );
+    assert_eq!(
+        result["network_endpoints"][0]["endpoints"],
+        serde_json::json!({"destination":"127.0.0.1:80"})
+    );
+
+    let output = run(&trace, &query, "text");
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("destination=127.0.0.1:80")
+    );
+}
+
+#[test]
 fn cli_query_keeps_raw_evidence_and_emits_safe_text_or_json() {
     let mut files = TempFiles(Vec::new());
     let trace = files.write(
@@ -65,6 +106,7 @@ fn cli_query_keeps_raw_evidence_and_emits_safe_text_or_json() {
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["schema"], "sideeffect.event_query_result");
     assert_eq!(result["schema_version"], 3);
+    assert!(result.get("network_endpoints").is_none());
     assert_eq!(result["matched_count"], 1);
     assert_eq!(result["events"][0]["event_kind"], "openat");
     assert_eq!(result["events"][0]["evidence"]["kind"], "raw_trace_record");
@@ -271,6 +313,62 @@ fn cli_query_filters_exact_raw_trace_evidence_and_keeps_full_input_status() {
     assert_eq!(wrong["matched_count"], 0);
     assert_eq!(wrong["source_state"], baseline["source_state"]);
     assert_eq!(wrong["diagnostics"], baseline["diagnostics"]);
+}
+
+#[cfg(windows)]
+#[test]
+fn cli_query_matches_only_raw_verified_windows_endpoints() {
+    use sha2::{Digest, Sha256};
+    use sideeffect::windows_runtime::WindowsRuntimeCapture;
+
+    let bytes =
+        include_bytes!("fixtures/local_model_windows_etw_query_v1/network-then-unknown.json");
+    let mut files = TempFiles(Vec::new());
+    let capture = files.write("json", bytes);
+    let query = files.write(
+        "query.json",
+        br#"{"schema":"sideeffect.event_query","schema_version":5,"filters":{"endpoint":{"role":"source","address":"127.0.0.1:50000"}}}"#,
+    );
+    let run_windows = |capture: &PathBuf| {
+        let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+            .args(["query", "--query"])
+            .arg(&query)
+            .arg("--windows-runtime")
+            .arg(capture)
+            .output()
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stderr)))
+    };
+    let result = run_windows(&capture);
+    assert_eq!(result["matched_count"], 1);
+    assert_eq!(
+        result["network_endpoints"][0]["evidence"],
+        result["events"][0]["evidence"]
+    );
+    assert_eq!(
+        result["network_endpoints"][0]["endpoints"],
+        serde_json::json!({
+            "source": "127.0.0.1:50000",
+            "destination": "127.0.0.1:443"
+        })
+    );
+
+    let mut inconsistent: WindowsRuntimeCapture = serde_json::from_slice(bytes).unwrap();
+    inconsistent.events[0]
+        .observation_decoding
+        .as_mut()
+        .unwrap()["observation"]["activity"]["observation"]["destination_port"] =
+        serde_json::json!(444);
+    inconsistent.document_sha256.clear();
+    inconsistent.document_sha256 = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&inconsistent).unwrap())
+    );
+    let inconsistent = files.write("json", &serde_json::to_vec(&inconsistent).unwrap());
+    let result = run_windows(&inconsistent);
+    assert_eq!(result["matched_count"], 0);
+    assert_eq!(result["network_endpoints"], serde_json::json!([]));
 }
 
 #[cfg(windows)]

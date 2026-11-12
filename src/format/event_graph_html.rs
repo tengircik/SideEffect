@@ -670,6 +670,7 @@ mod tests {
                             value: "<img src=x onerror=alert(1)>\u{202e}".to_owned(),
                             ambiguity: "lexical hint".to_owned(),
                         }],
+                        network_endpoints: None,
                         path_observation: Some(EventPathObservation {
                             path: "/tmp/<script>.txt".to_owned(),
                             basis: EventPathBasis::LinuxStraceLexicalHint {
