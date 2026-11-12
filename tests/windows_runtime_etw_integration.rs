@@ -242,7 +242,7 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
         }),
         "capture did not include the fixture's file-name event"
     );
-    let loopback_network_seen = events.iter().any(|event| {
+    let loopback_network_event = events.iter().find(|event| {
         event["observation_decoding"]["status"] == "decoded"
             && event["observation_decoding"]["observation"]["activity"]["kind"] == "network"
             && event["observation_decoding"]["observation"]["activity"]["observation"]["payload_process_id"] == target_pid
@@ -269,10 +269,53 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
             })
         })
         .collect::<Vec<_>>();
+    let loopback_network_event = loopback_network_event.unwrap_or_else(|| {
+        panic!(
+            "capture did not include the fixture's loopback network event with payload PID; network event summaries: {}",
+            serde_json::to_string(&network_event_summaries).unwrap()
+        );
+    });
+    let query_path = directory.join("loopback-query.json");
+    let address = format!("127.0.0.1:{port}");
+    fs::write(
+        &query_path,
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "sideeffect.event_query",
+            "schema_version": 5,
+            "filters": { "endpoint": { "role": "destination", "address": address } }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let query = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["query", "--query"])
+        .arg(&query_path)
+        .arg("--windows-runtime")
+        .arg(&output)
+        .output()
+        .unwrap();
+    fs::remove_file(&query_path).unwrap();
+    assert_eq!(
+        query.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&query.stderr)
+    );
+    let result: Value = serde_json::from_slice(&query.stdout).unwrap();
+    let record_ordinal = &loopback_network_event["record_ordinal"];
+    let observation = result["network_endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|observation| observation["evidence"]["record_ordinal"] == *record_ordinal)
+        .expect("endpoint query must retain the live target event");
+    assert_eq!(observation["endpoints"]["destination"], address);
     assert!(
-        loopback_network_seen,
-        "capture did not include the fixture's loopback network event with payload PID; network event summaries: {}",
-        serde_json::to_string(&network_event_summaries).unwrap()
+        result["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["evidence"] == observation["evidence"])
     );
     let events = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .args(["events", "--windows-runtime"])

@@ -42,6 +42,7 @@ fn timeline() -> EventTimeline {
                 byte_length: 12,
             },
             identity_context: vec![],
+            network_endpoints: None,
             path_observation: None,
         }],
         event_process_links: vec![EventProcessLink {

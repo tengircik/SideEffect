@@ -130,6 +130,15 @@ pub(crate) enum IpAddress {
     V6([u8; 16]),
 }
 
+impl IpAddress {
+    fn socket_addr(&self, port: u16) -> std::net::SocketAddr {
+        match *self {
+            Self::V4(bytes) => (std::net::Ipv4Addr::from(bytes), port).into(),
+            Self::V6(bytes) => (std::net::Ipv6Addr::from(bytes), port).into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) struct NetworkObservation {
@@ -256,7 +265,11 @@ pub(crate) fn decode_classic_event(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NetworkPayloadCrossCheck {
     NotNetworkProvider,
-    Matched(u32),
+    Matched {
+        pid: u32,
+        source: std::net::SocketAddr,
+        destination: std::net::SocketAddr,
+    },
     Mismatch(u32),
     Unsupported,
     Malformed,
@@ -388,7 +401,13 @@ pub(crate) fn cross_check_network_payload(
     if network.payload_process_id == 0 {
         NetworkPayloadCrossCheck::InvalidProcessId
     } else if matches {
-        NetworkPayloadCrossCheck::Matched(network.payload_process_id)
+        NetworkPayloadCrossCheck::Matched {
+            pid: network.payload_process_id,
+            source: network.source_address.socket_addr(network.source_port),
+            destination: network
+                .destination_address
+                .socket_addr(network.destination_port),
+        }
     } else {
         NetworkPayloadCrossCheck::Mismatch(network.payload_process_id)
     }

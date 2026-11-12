@@ -392,6 +392,7 @@ mod tests {
                     byte_length: 40,
                 },
                 identity_context: vec![],
+                network_endpoints: None,
                 path_observation: Some(EventPathObservation {
                     path: "/tmp/\x1b[31m\u{202e}".to_owned(),
                     basis: EventPathBasis::LinuxStraceLexicalHint {
@@ -493,6 +494,7 @@ mod tests {
                     value: "77".to_owned(),
                     ambiguity: "observed".to_owned(),
                 }],
+                network_endpoints: None,
                 path_observation: None,
             }],
             event_process_links: vec![EventProcessLink {

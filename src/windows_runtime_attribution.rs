@@ -358,7 +358,7 @@ fn summarize_capture(
 
         if is_network_provider_event(event) {
             let pid = match crate::event::cross_checked_native_network_payload_pid(event) {
-                crate::record::NetworkPayloadCrossCheck::Matched(pid) => pid,
+                crate::record::NetworkPayloadCrossCheck::Matched { pid, .. } => pid,
                 check => {
                     let (diagnostic, reason) = network_payload_failure(check);
                     push_diagnostic(&mut diagnostics, diagnostic);
@@ -677,7 +677,7 @@ fn network_payload_failure(
             "network_payload_invalid_process_id",
             "network_payload_process_id_is_zero_or_invalid",
         ),
-        crate::record::NetworkPayloadCrossCheck::Matched(_) => (
+        crate::record::NetworkPayloadCrossCheck::Matched { .. } => (
             "network_payload_unresolved",
             "network_payload_process_id_is_not_resolved",
         ),

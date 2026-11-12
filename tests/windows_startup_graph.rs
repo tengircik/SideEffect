@@ -55,6 +55,7 @@ fn graph() -> EventGraph {
                 operation: OperationSemantics::NativeObservation,
                 evidence,
                 identity_context: Vec::new(),
+                network_endpoints: None,
                 path_observation: None,
             }),
             process_observation: None,
