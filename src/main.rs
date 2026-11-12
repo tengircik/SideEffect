@@ -2480,17 +2480,7 @@ fn provenance_sign_session(
     println!(
         "Signing binds the exact session.json bytes and its declared artifact hashes. The signature does not establish signer identity or capture completeness."
     );
-    print!("Type 'sign' to continue: ");
-    io::stdout()
-        .flush()
-        .map_err(|error| format!("could not write signing confirmation: {error}"))?;
-    let mut confirmation = String::new();
-    io::stdin()
-        .read_line(&mut confirmation)
-        .map_err(|error| format!("could not read signing confirmation: {error}"))?;
-    if confirmation.trim() != "sign" {
-        return Err("session signing cancelled".to_owned());
-    }
+    confirm_provenance_action("sign", "session signing cancelled")?;
     let private = sideeffect::provenance::load_private_key(Path::new(key_path))
         .map_err(|error| format!("could not read private key: {error}"))?;
     let signed_at = std::time::SystemTime::now()
