@@ -3,7 +3,9 @@
 param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('cpu', 'cuda')]
-    [string] $Backend
+    [string] $Backend,
+    [ValidateSet('install', 'inspect', 'remove')]
+    [string] $Action = 'install'
 )
 
 Set-StrictMode -Version Latest
@@ -11,7 +13,7 @@ $ErrorActionPreference = 'Stop'
 
 $Release = 'b11938'
 $Revision = '19cce6919992fdffd92e0ac152caaf1e2b8f254e'
-$RuntimeRelativePath = 'SideEffect\runtimes\llama.cpp\b11938\windows-x64'
+$RuntimeRelativePath = "SideEffect\runtimes\llama.cpp\$Release\windows-x64"
 $MaximumArchiveEntries = 2048
 $MaximumSingleEntryBytes = 1GB
 $MaximumExpandedBytes = 2GB
@@ -25,6 +27,8 @@ $AllowedRedirectHosts = @(
     'release-assets.githubusercontent.com',
     'objects.githubusercontent.com'
 )
+
+Import-Module (Join-Path $PSScriptRoot 'SideEffectRuntimeLifecycle.psm1') -Force
 
 $Assets = @{
     cpu = @(
@@ -109,6 +113,9 @@ function Download-VerifiedAsset {
         [Parameter(Mandatory = $true)][string] $Destination
     )
 
+    # Windows PowerShell 5.1 does not load System.Net.Http by default, so its HTTP types are
+    # unavailable in a clean process until the assembly is loaded explicitly here.
+    Add-Type -AssemblyName System.Net.Http
     $handler = [System.Net.Http.HttpClientHandler]::new()
     $handler.AllowAutoRedirect = $false
     $handler.UseDefaultCredentials = $false
@@ -119,6 +126,7 @@ function Download-VerifiedAsset {
     $response = $null
     $inputStream = $null
     $outputStream = $null
+    $hasher = $null
 
     try {
         $response = Get-RedirectedResponse -Client $client -StartUri $Uri
@@ -155,12 +163,12 @@ function Download-VerifiedAsset {
 
         $outputStream.Flush($true)
         $actualHash = [BitConverter]::ToString($hasher.GetHashAndReset()).Replace('-', '').ToLowerInvariant()
-        $hasher.Dispose()
         if ($received -ne $Asset.Size -or $actualHash -cne $Asset.Sha256) {
             throw 'The runtime archive failed its pinned size or SHA-256 check.'
         }
     }
     finally {
+        if ($null -ne $hasher) { $hasher.Dispose() }
         if ($null -ne $outputStream) { $outputStream.Dispose() }
         if ($null -ne $inputStream) { $inputStream.Dispose() }
         if ($null -ne $response) { $response.Dispose() }
@@ -256,13 +264,14 @@ function Expand-VerifiedArchive {
             $parent = [System.IO.Path]::GetDirectoryName($target.Path)
             [System.IO.Directory]::CreateDirectory($parent) | Out-Null
             $input = $entry.Open()
-            $output = [System.IO.File]::Open(
-                $target.Path,
-                [System.IO.FileMode]::CreateNew,
-                [System.IO.FileAccess]::Write,
-                [System.IO.FileShare]::None
-            )
+            $output = $null
             try {
+                $output = [System.IO.File]::Open(
+                    $target.Path,
+                    [System.IO.FileMode]::CreateNew,
+                    [System.IO.FileAccess]::Write,
+                    [System.IO.FileShare]::None
+                )
                 [long] $written = 0
                 $buffer = [byte[]]::new($DownloadBufferBytes)
                 while (($read = $input.Read($buffer, 0, $buffer.Length)) -gt 0) {
@@ -281,8 +290,12 @@ function Expand-VerifiedArchive {
                 }
             }
             finally {
-                $output.Dispose()
-                $input.Dispose()
+                try {
+                    if ($null -ne $output) { $output.Dispose() }
+                }
+                finally {
+                    $input.Dispose()
+                }
             }
         }
     }
@@ -438,8 +451,41 @@ function Assert-NoReparsePointsBelowRoot {
     }
 }
 
+$appData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+$destination = Get-SideEffectRuntimeInstallPath -LocalAppData $appData -RelativePath $RuntimeRelativePath -Release $Release -Backend $Backend
+
+if ($Action -eq 'inspect') {
+    $inspection = Test-SideEffectRuntimeInstallation -Root $destination -Release $Release -Revision $Revision -Backend $Backend
+    $inspection | ConvertTo-Json -Depth 6
+    if ($inspection.status -eq 'unverified') { exit 2 }
+    exit 0
+}
+
+Assert-SideEffectRuntimeNotElevated
+
+if ($Action -eq 'remove') {
+    $inspection = Test-SideEffectRuntimeInstallation -Root $destination -Release $Release -Revision $Revision -Backend $Backend
+    if ($inspection.status -ne 'verified') {
+        $inspection | ConvertTo-Json -Depth 6
+        throw 'Removal refused: the runtime is missing, modified, or contains files outside its verified install manifest.'
+    }
+    Write-Host "Verified runtime directory: $destination"
+    Write-Host ("The removal deletes exactly this directory and its {0} manifest-listed files." -f $inspection.file_count)
+    Write-Host 'If this exact executable is registered for explanation, clear it first with: sideeffect model runtime clear explanation'
+    Write-Host 'If this exact executable is registered for ETW query, clear it first with: sideeffect model runtime clear query'
+    $expectedConfirmation = "REMOVE LLAMA.CPP $Release $($Backend.ToUpperInvariant())"
+    $confirmation = Read-Host "Type exactly '$expectedConfirmation' to continue"
+    if ($confirmation -cne $expectedConfirmation) {
+        throw 'Runtime removal cancelled; no files were changed.'
+    }
+    $result = Remove-SideEffectRuntimeInstallation -LocalAppData $appData -RelativePath $RuntimeRelativePath -Release $Release -Revision $Revision -Backend $Backend -Confirmation $confirmation
+    Write-Host "Removed the verified llama.cpp runtime directory: $($result.path)"
+    Write-Host 'No SideEffect registry entry or model weights were changed.'
+    exit 0
+}
+
 $assets = $Assets[$Backend]
-$totalDownloadBytes = ($assets | Measure-Object -Property Size -Sum).Sum
+$totalDownloadBytes = Get-SideEffectRuntimeAssetTotalSize -Assets $assets
 $expectedConfirmation = "INSTALL LLAMA.CPP $Release $($Backend.ToUpperInvariant())"
 Write-Host "This downloads executable code from the pinned llama.cpp GitHub release ($Release)."
 Write-Host "Backend: $Backend; total download: $totalDownloadBytes bytes (~$([Math]::Round($totalDownloadBytes / 1000000)) MB; up to 2 GiB extracted)."
@@ -457,17 +503,6 @@ if ($confirmation -cne $expectedConfirmation) {
     throw 'Runtime installation cancelled before network access.'
 }
 
-$appData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
-if ([string]::IsNullOrWhiteSpace($appData) -or -not (Test-Path -LiteralPath $appData -PathType Container)) {
-    throw 'LOCALAPPDATA is unavailable or is not a directory.'
-}
-$appDataItem = Get-Item -LiteralPath $appData -Force
-if (($appDataItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-    throw 'LOCALAPPDATA must not be a reparse point.'
-}
-
-$RuntimeBase = Join-Path $appData $RuntimeRelativePath
-$destination = Join-Path $RuntimeBase $Backend
 $parent = Split-Path -Parent $destination
 Assert-NoReparsePointsBelowRoot -Root $appData -Candidate $parent
 [System.IO.Directory]::CreateDirectory($parent) | Out-Null
@@ -511,6 +546,8 @@ try {
         Remove-Item -LiteralPath (Join-Path $stage 'cuda-libraries') -Recurse -Force
     }
 
+    New-SideEffectRuntimeManifest -Root $stage -Release $Release -Revision $Revision -Backend $Backend | Out-Null
+
     $runtimePath = [System.IO.Path]::GetFullPath($runtimeExecutables[0].FullName)
     if (-not $runtimePath.StartsWith(($stage.TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase)) {
         throw 'The runtime executable resolved outside its staging directory.'
@@ -523,9 +560,14 @@ try {
     Write-Host "Installed, hash-verified llama.cpp runtime build $Release ($Revision)."
     Write-Host "Installed directory: $destination"
     Write-Host 'The executable was not run and SideEffect registry was not changed.'
-    Write-Host 'Next, inspect and register it explicitly:'
+    Write-Host "Inspect this install with: powershell.exe -NoProfile -File .\scripts\install_sideeffect_llama_runtime_windows.ps1 -Backend $Backend -Action inspect"
+    Write-Host "Remove this install with: powershell.exe -NoProfile -File .\scripts\install_sideeffect_llama_runtime_windows.ps1 -Backend $Backend -Action remove"
+    Write-Host 'Next, inspect and register it explicitly for the task you intend to use:'
     Write-Host "sideeffect model runtime set explanation `"$runtimePath`""
-    Write-Host 'Then run: sideeffect model doctor --task explanation --backend auto'
+    Write-Host "sideeffect model runtime set query `"$runtimePath`"  # native Windows ETW query"
+    Write-Host 'Check the selected task with one of these commands:'
+    Write-Host 'sideeffect model doctor --task explanation --backend auto'
+    Write-Host 'sideeffect model doctor --task query --backend auto'
 }
 finally {
     if (-not $published -and (Test-Path -LiteralPath $stage -PathType Container)) {
