@@ -12,6 +12,20 @@ not use `sudo`; it does not point dpkg at the host package database. It
 verifies each installed version with `dpkg-query` using the private admin
 directory.
 
+The same fixed `/usr/bin/dpkg-query` invocation also emits its bounded tabular
+rows from that private admin directory at each lifecycle state. The test passes
+those exact output bytes through SideEffect's existing
+`parse_dpkg_query_output` parser, writes the resulting package inventory
+artifacts only inside the fixture, and runs the real
+`explain --inventory-diff` CLI across install, update, downgrade, and purge.
+It checks package version facts and each comparison's source ID, package
+identity, change kind, and evidence line/byte locator against the parsed source
+row. The package parser/diff acceptance is separate from
+`inventory packages`: that standalone command intentionally reads fixed host
+package-manager database paths and does not accept a caller-selected dpkg
+admin directory. This fixture therefore exercises the real parser and
+comparison CLI over isolated dpkg output, not the standalone host collector.
+
 For each package state, the test invokes the actual SideEffect
 `inventory root --hash-regular-files` CLI on the package's direct-child install
 directory and compares adjacent snapshots with `explain --inventory-diff`.

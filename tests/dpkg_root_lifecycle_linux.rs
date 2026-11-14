@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use serde_json::Value;
+use sideeffect::inventory::parse_dpkg_query_output;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -178,30 +179,117 @@ fn dpkg_purge(root: &Path, private_parent: &Path) {
     );
 }
 
-fn assert_private_dpkg_query(root: &Path, private_parent: &Path, expected_version: &str) {
+fn dpkg_query_inventory(root: &Path, private_parent: &Path, output_path: &Path) -> Value {
     let root = root.canonicalize().unwrap();
     let parent = private_parent.canonicalize().unwrap();
     assert!(root.starts_with(&parent));
     let admin = root.join("var/lib/dpkg");
     assert!(admin.starts_with(&root));
-    let showformat = "--showformat=${db:Status-Status}\t${Version}\n";
+    let showformat =
+        "--showformat=${binary:Package}\t${Version}\t${Architecture}\t${db:Status-Abbrev}\\n";
     let output = package_tool(DPKG_QUERY)
         .arg(format!("--admindir={}", admin.display()))
         .arg("--show")
         .arg(showformat)
-        .arg(PACKAGE_NAME)
         .env("TMPDIR", private_parent)
         .output()
-        .expect("launch dpkg-query with private admin directory");
+        .expect("launch bounded dpkg-query with private admin directory");
     assert!(
         output.status.success(),
         "private dpkg-query failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        format!("installed\t{expected_version}\n")
+    assert!(
+        output.stdout.len() <= 8 * 1024,
+        "private dpkg-query output exceeded the fixture bound"
     );
+    let document = parse_dpkg_query_output(&output.stdout, 0);
+    assert_eq!(
+        document.status,
+        sideeffect::inventory::InventoryStatus::Complete
+    );
+    assert_eq!(document.sources.len(), 1);
+    assert_eq!(document.sources[0].id, "dpkg_query");
+    assert_eq!(document.sources[0].records_seen, document.packages.len());
+    assert!(
+        document
+            .packages
+            .iter()
+            .all(|package| package.evidence.line > 0)
+    );
+    fs::write(output_path, serde_json::to_vec(&document).unwrap()).unwrap();
+    serde_json::from_slice(&fs::read(output_path).unwrap()).unwrap()
+}
+
+fn assert_package_version(document: &Value, expected_version: Option<&str>) {
+    assert_eq!(document["schema"], "sideeffect.inventory");
+    assert_eq!(document["schema_version"], 2);
+    assert_eq!(document["status"], "complete");
+    let matching = document["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|package| package["name"] == PACKAGE_NAME)
+        .collect::<Vec<_>>();
+    match expected_version {
+        Some(version) => {
+            assert_eq!(matching.len(), 1);
+            assert_eq!(matching[0]["version"], version);
+            assert_eq!(matching[0]["source_id"], "dpkg_query");
+            assert_eq!(matching[0]["evidence"]["line"], 1);
+            assert_eq!(matching[0]["evidence"]["byte_offset"], 0);
+            assert!(
+                matching[0]["evidence"]["raw_record"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(PACKAGE_NAME)
+            );
+        }
+        None => assert!(
+            matching.is_empty(),
+            "purged package remains in parsed private dpkg state"
+        ),
+    }
+}
+
+fn package_diff(before: &Path, after: &Path) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["explain", "--inventory-diff"])
+        .arg(before)
+        .arg(after)
+        .output()
+        .expect("launch SideEffect package inventory diff");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "SideEffect package inventory diff failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn assert_package_delta_evidence(
+    diff: &Value,
+    kind: &str,
+    before_line: Option<u64>,
+    after_line: Option<u64>,
+) {
+    assert_eq!(diff["schema"], "sideeffect.package_inventory_diff");
+    assert_eq!(diff["status"], "complete");
+    assert_eq!(diff["deltas"].as_array().unwrap().len(), 1);
+    let delta = &diff["deltas"][0];
+    assert_eq!(delta["kind"], kind);
+    assert_eq!(delta["identity"]["source_id"], "dpkg_query");
+    assert_eq!(delta["identity"]["name"], PACKAGE_NAME);
+    for (side, expected_line) in [("before", before_line), ("after", after_line)] {
+        match expected_line {
+            Some(line) => {
+                assert_eq!(delta[side]["evidence"]["line"], line);
+                assert!(delta[side]["evidence"]["byte_length"].as_u64().unwrap() > 0);
+            }
+            None => assert!(delta[side].is_null()),
+        }
+    }
 }
 
 fn snapshot(root: &Path, output_path: &Path) -> Value {
@@ -292,6 +380,11 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
     assert!(deb_v1.starts_with(private_parent));
     assert!(deb_v2.starts_with(private_parent));
 
+    let package_before_install_path = private_parent.join("packages-before-install.json");
+    let package_before_install =
+        dpkg_query_inventory(&private_root, private_parent, &package_before_install_path);
+    assert_package_version(&package_before_install, None);
+
     let before_install_path = private_parent.join("before-install.json");
     let before_install = snapshot(&install_root, &before_install_path);
     assert_eq!(before_install["status"], "complete");
@@ -304,7 +397,12 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
     );
 
     dpkg_install(&private_root, private_parent, &deb_v1, false);
-    assert_private_dpkg_query(&private_root, private_parent, "1.0-1");
+    let packages_v1_path = private_parent.join("packages-installed-v1.json");
+    let packages_v1 = dpkg_query_inventory(&private_root, private_parent, &packages_v1_path);
+    assert_package_version(&packages_v1, Some("1.0-1"));
+    let package_install_diff = package_diff(&package_before_install_path, &packages_v1_path);
+    assert_eq!(package_install_diff["counts"]["additions"], 1);
+    assert_package_delta_evidence(&package_install_diff, "added", None, Some(1));
     let v1_snapshot_path = private_parent.join("installed-v1.json");
     let v1_snapshot = snapshot(&install_root, &v1_snapshot_path);
     let v1_ordinal = snapshot_payload_hash(&v1_snapshot, payload_v1);
@@ -321,7 +419,12 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
     );
 
     dpkg_install(&private_root, private_parent, &deb_v2, false);
-    assert_private_dpkg_query(&private_root, private_parent, "2.0-1");
+    let packages_v2_path = private_parent.join("packages-installed-v2.json");
+    let packages_v2 = dpkg_query_inventory(&private_root, private_parent, &packages_v2_path);
+    assert_package_version(&packages_v2, Some("2.0-1"));
+    let package_update_diff = package_diff(&packages_v1_path, &packages_v2_path);
+    assert_eq!(package_update_diff["counts"]["changes"], 1);
+    assert_package_delta_evidence(&package_update_diff, "changed", Some(1), Some(1));
     let v2_snapshot_path = private_parent.join("installed-v2.json");
     let v2_snapshot = snapshot(&install_root, &v2_snapshot_path);
     let v2_ordinal = snapshot_payload_hash(&v2_snapshot, payload_v2);
@@ -348,7 +451,13 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
     );
 
     dpkg_install(&private_root, private_parent, &deb_v1, true);
-    assert_private_dpkg_query(&private_root, private_parent, "1.0-1");
+    let packages_downgraded_path = private_parent.join("packages-downgraded-v1.json");
+    let packages_downgraded =
+        dpkg_query_inventory(&private_root, private_parent, &packages_downgraded_path);
+    assert_package_version(&packages_downgraded, Some("1.0-1"));
+    let package_downgrade_diff = package_diff(&packages_v2_path, &packages_downgraded_path);
+    assert_eq!(package_downgrade_diff["counts"]["changes"], 1);
+    assert_package_delta_evidence(&package_downgrade_diff, "changed", Some(1), Some(1));
     let downgraded_snapshot_path = private_parent.join("downgraded-v1.json");
     let downgraded_snapshot = snapshot(&install_root, &downgraded_snapshot_path);
     let downgraded_ordinal = snapshot_payload_hash(&downgraded_snapshot, payload_v1);
@@ -375,15 +484,13 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
     );
 
     dpkg_purge(&private_root, private_parent);
-    let admin = private_root.join("var/lib/dpkg");
-    let query = package_tool(DPKG_QUERY)
-        .arg(format!("--admindir={}", admin.display()))
-        .arg("--show")
-        .arg(PACKAGE_NAME)
-        .env("TMPDIR", private_parent)
-        .output()
-        .expect("query private dpkg database after purge");
-    assert!(!query.status.success());
+    let packages_purged_path = private_parent.join("packages-purged.json");
+    let packages_purged =
+        dpkg_query_inventory(&private_root, private_parent, &packages_purged_path);
+    assert_package_version(&packages_purged, None);
+    let package_purge_diff = package_diff(&packages_downgraded_path, &packages_purged_path);
+    assert_eq!(package_purge_diff["counts"]["removals"], 1);
+    assert_package_delta_evidence(&package_purge_diff, "removed", Some(1), None);
     let purged_snapshot_path = private_parent.join("purged.json");
     let purged_snapshot = snapshot(&install_root, &purged_snapshot_path);
     assert_eq!(purged_snapshot["status"], "complete");
@@ -404,6 +511,7 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
     assert!(purge_diff["deltas"][0]["after"].is_null());
 
     assert!(private_root.starts_with(private_parent));
+    let admin = private_root.join("var/lib/dpkg");
     assert!(admin.starts_with(&private_root));
     let log = private_parent.join("dpkg.log");
     assert!(log.starts_with(private_parent));
