@@ -159,6 +159,16 @@ impl From<io::Error> for SessionReadError {
 /// lengths, digests, and native JSON schema/version where applicable. This is integrity
 /// checking against an untrusted manifest, not origin authentication or a safety verdict.
 pub fn read_verified_session(path: &Path) -> Result<VerifiedAuditSession, SessionReadError> {
+    let mut remaining = u64::MAX;
+    read_verified_session_with_budget(path, &mut remaining)
+}
+
+/// Verify a session while reserving each declared artifact against a caller-owned
+/// aggregate read budget before opening that artifact.
+pub fn read_verified_session_with_budget(
+    path: &Path,
+    remaining_artifact_bytes: &mut u64,
+) -> Result<VerifiedAuditSession, SessionReadError> {
     let directory = open_session_directory(path)?;
     let directory_stat = stat_fd(directory.as_raw_fd())?;
     if !private_directory(&directory_stat) {
@@ -180,6 +190,12 @@ pub fn read_verified_session(path: &Path) -> Result<VerifiedAuditSession, Sessio
     let mut total_bytes = manifest_read.bytes.len() as u64;
     for source in &manifest.sources {
         for reference in &source.artifacts {
+            if reference.byte_length > *remaining_artifact_bytes {
+                return Err(SessionReadError::EntryTooLarge(
+                    "aggregate baseline read budget",
+                ));
+            }
+            *remaining_artifact_bytes -= reference.byte_length;
             total_bytes = total_bytes
                 .checked_add(reference.byte_length)
                 .ok_or(SessionReadError::EntryTooLarge("session"))?;
@@ -190,8 +206,8 @@ pub fn read_verified_session(path: &Path) -> Result<VerifiedAuditSession, Sessio
             let read = read_named_file(
                 directory.as_raw_fd(),
                 name,
-                usize::try_from(MAX_SESSION_ARTIFACT_BYTES)
-                    .expect("64 MiB fits in usize on supported Linux x86_64"),
+                usize::try_from(reference.byte_length.min(MAX_SESSION_ARTIFACT_BYTES))
+                    .expect("artifact limit fits in usize on supported Linux x86_64"),
             )?;
             if read.bytes.len() as u64 != reference.byte_length {
                 return Err(SessionReadError::ArtifactLengthMismatch(fixed_label(
@@ -558,7 +574,10 @@ fn fixed_entry_label(name: &[u8]) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArtifactKind, AuditSessionManifest, SessionArtifactRef, read_verified_session};
+    use super::{
+        ArtifactKind, AuditSessionManifest, SessionArtifactRef, read_verified_session,
+        read_verified_session_with_budget,
+    };
     use crate::audit_session::{
         AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, AuditSessionSource, IntervalSemantics,
         SessionStatus, SourceRole, SourceStatus,
@@ -685,6 +704,20 @@ mod tests {
         assert_eq!(loaded.artifacts[0].kind, ArtifactKind::Packages);
         assert_eq!(loaded.artifacts[0].path, "packages.json");
         assert_eq!(loaded.artifacts[0].bytes, VALID_PACKAGE);
+    }
+
+    #[test]
+    fn aggregate_budget_is_reserved_before_artifact_open() {
+        let temporary = TestDirectory::new();
+        let session = temporary.0.join("session");
+        write_fixture(&session, VALID_PACKAGE);
+        let mut insufficient = (VALID_PACKAGE.len() - 1) as u64;
+        assert!(read_verified_session_with_budget(&session, &mut insufficient).is_err());
+        assert_eq!(insufficient, (VALID_PACKAGE.len() - 1) as u64);
+
+        let mut exact = VALID_PACKAGE.len() as u64;
+        assert!(read_verified_session_with_budget(&session, &mut exact).is_ok());
+        assert_eq!(exact, 0);
     }
 
     #[test]

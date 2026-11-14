@@ -115,6 +115,16 @@ impl From<ValidationError> for SessionReadError {
 }
 
 pub fn read_verified_session(path: &Path) -> Result<VerifiedAuditSession, SessionReadError> {
+    let mut remaining = u64::MAX;
+    read_verified_session_with_budget(path, &mut remaining)
+}
+
+/// Verify a session while reserving each declared artifact against a caller-owned
+/// aggregate read budget before opening that artifact.
+pub fn read_verified_session_with_budget(
+    path: &Path,
+    remaining_artifact_bytes: &mut u64,
+) -> Result<VerifiedAuditSession, SessionReadError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir()
         || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -159,6 +169,12 @@ pub fn read_verified_session(path: &Path) -> Result<VerifiedAuditSession, Sessio
     let mut artifacts = Vec::new();
     for source in &manifest.sources {
         for reference in &source.artifacts {
+            if reference.byte_length > *remaining_artifact_bytes {
+                return Err(SessionReadError::EntryTooLarge(
+                    "aggregate baseline read budget",
+                ));
+            }
+            *remaining_artifact_bytes -= reference.byte_length;
             total = total
                 .checked_add(reference.byte_length)
                 .ok_or(SessionReadError::EntryTooLarge("aggregate"))?;
@@ -169,7 +185,8 @@ pub fn read_verified_session(path: &Path) -> Result<VerifiedAuditSession, Sessio
             let bytes = read_named(
                 &canonical,
                 &reference.path,
-                MAX_SESSION_ARTIFACT_BYTES as usize,
+                usize::try_from(reference.byte_length.min(MAX_SESSION_ARTIFACT_BYTES))
+                    .expect("artifact limit fits in usize on supported Windows"),
                 false,
             )?;
             if bytes.len() as u64 != reference.byte_length {
@@ -909,6 +926,13 @@ mod tests {
         assert_eq!(verified.artifacts().len(), 1);
         assert_eq!(verified.artifacts()[0].path(), "runtime.windows.json");
         assert_eq!(verified.artifacts()[0].bytes(), runtime);
+
+        let mut insufficient = (runtime.len() - 1) as u64;
+        assert!(super::read_verified_session_with_budget(&destination, &mut insufficient).is_err());
+        assert_eq!(insufficient, (runtime.len() - 1) as u64);
+        let mut exact = runtime.len() as u64;
+        assert!(super::read_verified_session_with_budget(&destination, &mut exact).is_ok());
+        assert_eq!(exact, 0);
 
         assert!(
             crate::record::publish_private_windows_directory(&destination, &files, 8192).is_err()

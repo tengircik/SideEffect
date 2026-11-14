@@ -8,6 +8,7 @@ pub mod audit_session_reader_linux;
 pub mod audit_session_reader_windows;
 #[cfg(windows)]
 pub mod audit_session_windows;
+pub mod baseline;
 pub mod case;
 pub mod case_evidence;
 pub mod diff;
