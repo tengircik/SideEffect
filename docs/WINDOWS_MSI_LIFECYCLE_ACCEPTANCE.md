@@ -1,0 +1,9 @@
+# Windows MSI lifecycle acceptance
+
+The Windows CI matrix runs `scripts/test_windows_msi_lifecycle.ps1` on disposable GitHub-hosted Windows Server runners after building the SideEffect CLI. The script requires the hosted-runner markers, `RUNNER_TEMP`, `WIX`, WiX Toolset 3 (`candle.exe` and `light.exe`), and `msiexec.exe`. It rejects local and self-hosted execution before creating fixtures or invoking an installer.
+
+The test builds two local, scriptless MSI packages with a single `payload.bin` file. Both use per-user, limited-privilege installation and a shared upgrade code. The fixture has no custom actions, registry authoring, services, shortcuts, scheduled tasks, or persistence behavior. All package files, logs, snapshots, and the selected install root live under a unique child of `RUNNER_TEMP`. The script checks path containment and removes the test directory in its cleanup block. It does not request elevation or install software on a developer machine.
+
+The real Windows Installer sequence installs version 1, performs a major upgrade to version 2, then exercises a downgrade strategy by uninstalling version 2 and reinstalling version 1. It finally uninstalls version 1. At each lifecycle point the test checks current-user MSI registration, installed payload bytes, and SideEffect selected-root snapshots. It verifies observed SHA-256 values and addition, content-change, and removal diffs, including their selected-root evidence ordinals.
+
+This acceptance validates the synthetic fixture and the tested SideEffect selected-root workflow on the named hosted Windows images. It does not validate third-party installers, in-place MSI downgrade, system-wide installation, causal attribution, persistence detection, all Windows inventory sources, or complete filesystem coverage. The snapshots are before/after observations; they do not prove that MSI caused a change beyond the controlled fixture operations.
