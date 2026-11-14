@@ -87,6 +87,9 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect explain --diff <baseline-trace> <candidate-trace>\n\
        sideeffect explain --inventory-diff <before.json> <after.json>\n\
        sideeffect compare-sessions <before-session-directory> <after-session-directory>\n\
+       sideeffect baseline preview --label <label> --session <session-directory>...\n\
+       sideeffect baseline create --profile <new-profile.json> --label <label> --confirm-sha256 <preview-sha256> --session <session-directory>...\n\
+       sideeffect baseline compare --profile <profile.json> --baseline-session <session-directory>... --session <candidate-session-directory>...\n\
        sideeffect case init --output <new-case.json> --title <title> --session <session-directory>...\n\
        sideeffect case migrate --case <v1.json> --status draft|open --output <v2.json> --session <session-directory>...\n\
        sideeffect case set-status --case <v2.json> --status <status> --output <new-v2.json> --session <session-directory>...\n\
@@ -420,6 +423,9 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
         }
         [command, before, after] if command == "compare-sessions" => {
             compare_audit_sessions(before, after)
+        }
+        [command, operation, arguments @ ..] if command == "baseline" => {
+            baseline_command(operation, arguments)
         }
         [command, operation, arguments @ ..] if command == "case" => {
             case_command(operation, arguments)
@@ -2036,6 +2042,9 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         "compare-sessions" => {
             "Usage: sideeffect compare-sessions BEFORE_SESSION_DIR AFTER_SESSION_DIR\nVerifies both local audit sessions, reports metadata comparability, and compares bounded item-level inventory and runtime evidence from verified artifacts. Per-source status and evidence references remain visible; missing, partial, unsupported, or incompatible sources do not become empty results. This is not an exhaustive history or coverage claim, and it does not establish causation or event absence. Incomparable or partial results exit with status 2 and include stable reason codes."
         }
+        "baseline" => {
+            "Usage: sideeffect baseline preview --label LABEL --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect baseline create --profile NEW_PROFILE.json --label LABEL --confirm-sha256 PREVIEW_SHA256 --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect baseline compare --profile PROFILE.json --baseline-session SESSION_DIR [--baseline-session SESSION_DIR...] --session CANDIDATE_SESSION_DIR [--session CANDIDATE_SESSION_DIR...]\nPreviews a bounded set of 1..=16 verified audit sessions and prints a deterministic preview digest. Creating a profile requires the exact digest and writes a new current-user-private file without replacing an existing file. Partial, incomplete, or loss-affected inputs are shown with their unknown coverage but cannot be promoted into a profile. A profile records only reviewed observations: software and signer identity are not recorded. Comparison requires the exact approved baseline sessions and matching manifest digests; a missing, replaced, or additional session prevents item comparison and exits with status 2. Candidate item differences are reported against the existing evidence-linked session diff, but the candidate is never absorbed automatically. Removal and absence claims are withheld when either side declares incomplete or unknown coverage. Differences do not establish unsafe behavior, causation, or complete system coverage."
+        }
         "case" => {
             "Usage: sideeffect case init --output NEW_CASE.json --title TITLE --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case migrate --case V1_CASE.json --status draft|open --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case set-status --case V2_CASE.json --status draft|open|in_review|closed|cancelled --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-entry --case V2_CASE.json --entry ENTRY.json --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-note --case V2_CASE.json --id ENTRY_ID --text-file NOTE.txt --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case add-evidence --case V2_CASE.json --id ENTRY_ID --kind note|assertion --text-file TEXT.txt --evidence-file LOCATORS.json --output NEW_CASE.json --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect case show --case CASE.json [--format json|text]\n       sideeffect case resolve [--format json|text|html] [--output NEW_REPORT.html] [--redact GROUP...] [--preview-redaction] --case CASE.json --session SESSION_DIR [--session SESSION_DIR...]\nReads a bounded case summary with `case show` without sessions; it omits analyst text and raw evidence rows and marks all evidence not_resolved. Other operations create a private schema-v2 draft, explicitly migrate a schema-v1 case with a user-selected initial status, applies validated lifecycle transitions, appends analyst-authored entries or bounded text-file note/assertion conveniences with optional source locators to a draft/open v2 case, or resolves evidence against supplied verified sessions. Note text is labeled analyst_supplied_unverified. Each update writes a new private file and never replaces an existing file. Closed and cancelled cases are terminal. Case-authored assertions remain unverified; lifecycle status is an analyst workflow label. Hash checks establish byte consistency, not producer authenticity or capture completeness. JSON output may contain sensitive local evidence. HTML redaction groups are explicit whole-field omissions; preview reports omission counts plus renderer-known retained/omitted field and record counts for four fixed groups, without scanning content or writing a report. Retained source records may contain arbitrary strings, arguments, or payloads; this is not a secret scan and does not make sharing safe. Incomplete, partial, or unknown source status remains visible and exits with status 2."
         }
@@ -2803,6 +2812,45 @@ fn read_verified_audit_session(
 ) -> Result<sideeffect::audit_session_reader_linux::VerifiedAuditSession, String> {
     sideeffect::audit_session_reader_linux::read_verified_session(path)
         .map_err(|error| format!("could not verify audit session: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+type BaselineVerifiedSession = sideeffect::audit_session_reader_linux::VerifiedAuditSession;
+#[cfg(windows)]
+type BaselineVerifiedSession = sideeffect::audit_session_reader_windows::VerifiedAuditSession;
+
+#[cfg(target_os = "linux")]
+fn read_baseline_session_with_budget(
+    path: &Path,
+    remaining: &mut u64,
+) -> Result<BaselineVerifiedSession, String> {
+    sideeffect::audit_session_reader_linux::read_verified_session_with_budget(path, remaining)
+        .map_err(|error| {
+            format!("could not verify audit session within baseline read budget: {error}")
+        })
+}
+
+#[cfg(windows)]
+fn read_baseline_session_with_budget(
+    path: &Path,
+    remaining: &mut u64,
+) -> Result<BaselineVerifiedSession, String> {
+    sideeffect::audit_session_reader_windows::read_verified_session_with_budget(path, remaining)
+        .map_err(|error| {
+            format!("could not verify audit session within baseline read budget: {error}")
+        })
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn read_baseline_sessions_with_budget(
+    paths: &[&OsString],
+    budget: u64,
+) -> Result<Vec<BaselineVerifiedSession>, String> {
+    let mut remaining = budget;
+    paths
+        .iter()
+        .map(|path| read_baseline_session_with_budget(Path::new(path), &mut remaining))
+        .collect()
 }
 
 #[cfg(windows)]
@@ -6640,6 +6688,350 @@ fn compare_audit_sessions(
     })
 }
 
+#[cfg(any(target_os = "linux", windows))]
+fn baseline_command(operation: &OsString, arguments: &[OsString]) -> Result<ExitCode, String> {
+    match operation.to_str() {
+        Some("preview") => baseline_preview_command(arguments),
+        Some("create") => baseline_create_command(arguments),
+        Some("compare") => baseline_compare_command(arguments),
+        _ => Err("baseline command must be 'preview', 'create', or 'compare'".to_owned()),
+    }
+}
+
+struct BaselineCliArguments<'a> {
+    label: String,
+    profile: Option<&'a OsString>,
+    confirm: Option<&'a OsString>,
+    sessions: Vec<&'a OsString>,
+}
+
+fn parse_baseline_arguments(
+    arguments: &[OsString],
+    allow_confirm: bool,
+) -> Result<BaselineCliArguments<'_>, String> {
+    let mut label: Option<&OsString> = None;
+    let mut profile: Option<&OsString> = None;
+    let mut confirm: Option<&OsString> = None;
+    let mut sessions = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let flag = &arguments[index];
+        let value = arguments.get(index + 1).ok_or_else(|| {
+            format!(
+                "baseline option {} requires a value",
+                terminal_safe_text(&flag.to_string_lossy())
+            )
+        })?;
+        match flag.to_str() {
+            Some("--label") if label.replace(value).is_none() => {}
+            Some("--profile") if allow_confirm && profile.replace(value).is_none() => {}
+            Some("--confirm-sha256") if allow_confirm && confirm.replace(value).is_none() => {}
+            Some("--session") => sessions.push(value),
+            Some("--label") => return Err("duplicate baseline --label option".to_owned()),
+            Some("--profile") if allow_confirm => {
+                return Err("duplicate baseline --profile option".to_owned());
+            }
+            Some("--confirm-sha256") if allow_confirm => {
+                return Err("duplicate baseline --confirm-sha256 option".to_owned());
+            }
+            _ => {
+                return Err(format!(
+                    "unknown baseline option {}",
+                    terminal_safe_text(&flag.to_string_lossy())
+                ));
+            }
+        }
+        index += 2;
+    }
+    let label = label
+        .and_then(|value| value.to_str())
+        .ok_or("baseline requires a UTF-8 --label value")?
+        .to_owned();
+    Ok(BaselineCliArguments {
+        label,
+        profile,
+        confirm,
+        sessions,
+    })
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn baseline_preview_command(arguments: &[OsString]) -> Result<ExitCode, String> {
+    let BaselineCliArguments {
+        label,
+        sessions: session_paths,
+        ..
+    } = parse_baseline_arguments(arguments, false)?;
+    if session_paths.is_empty() || session_paths.len() > sideeffect::baseline::MAX_BASELINE_SESSIONS
+    {
+        return Err(format!(
+            "baseline preview requires 1..={} --session directories",
+            sideeffect::baseline::MAX_BASELINE_SESSIONS
+        ));
+    }
+    let sessions = read_baseline_sessions_with_budget(
+        &session_paths,
+        sideeffect::baseline::MAX_BASELINE_SESSION_READ_BYTES,
+    )?;
+    let digests: Vec<_> = sessions
+        .iter()
+        .map(|session| format!("{:x}", Sha256::digest(session.manifest_bytes())))
+        .collect();
+    let inputs: Vec<_> = sessions
+        .iter()
+        .zip(&digests)
+        .map(
+            |(session, digest)| sideeffect::baseline::BaselineManifestInput {
+                manifest: session.manifest(),
+                manifest_sha256: digest,
+            },
+        )
+        .collect();
+    let preview = sideeffect::baseline::preview_baseline(&label, &inputs)
+        .map_err(|error| error.to_string())?;
+    let encoded = serialize_pretty_bounded(
+        &preview,
+        sideeffect::baseline::MAX_BASELINE_OUTPUT_BYTES,
+        "baseline preview",
+    )?;
+    io::stdout()
+        .lock()
+        .write_all(&encoded)
+        .map_err(|error| format!("could not write baseline preview: {error}"))?;
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn baseline_create_command(arguments: &[OsString]) -> Result<ExitCode, String> {
+    let BaselineCliArguments {
+        label,
+        profile: profile_output,
+        confirm,
+        sessions: session_paths,
+    } = parse_baseline_arguments(arguments, true)?;
+    let profile_output =
+        profile_output.ok_or("baseline create requires --profile NEW_PROFILE.json")?;
+    let confirm = confirm
+        .and_then(|value| value.to_str())
+        .ok_or("baseline create requires a UTF-8 --confirm-sha256 value")?;
+    if session_paths.is_empty() || session_paths.len() > sideeffect::baseline::MAX_BASELINE_SESSIONS
+    {
+        return Err(format!(
+            "baseline create requires 1..={} --session directories",
+            sideeffect::baseline::MAX_BASELINE_SESSIONS
+        ));
+    }
+    let sessions = read_baseline_sessions_with_budget(
+        &session_paths,
+        sideeffect::baseline::MAX_BASELINE_SESSION_READ_BYTES,
+    )?;
+    let digests: Vec<_> = sessions
+        .iter()
+        .map(|session| format!("{:x}", Sha256::digest(session.manifest_bytes())))
+        .collect();
+    let inputs: Vec<_> = sessions
+        .iter()
+        .zip(&digests)
+        .map(
+            |(session, digest)| sideeffect::baseline::BaselineManifestInput {
+                manifest: session.manifest(),
+                manifest_sha256: digest,
+            },
+        )
+        .collect();
+    let preview = sideeffect::baseline::preview_baseline(&label, &inputs)
+        .map_err(|error| error.to_string())?;
+    let reviewed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch".to_owned())?
+        .as_millis();
+    let profile = sideeffect::baseline::create_profile(&preview, confirm, reviewed_at)
+        .map_err(|error| error.to_string())?;
+    let encoded = serialize_pretty_bounded(
+        &profile,
+        sideeffect::baseline::MAX_BASELINE_PROFILE_BYTES,
+        "baseline profile",
+    )?;
+    let published = publish_baseline_profile(Path::new(profile_output), &encoded)?;
+    eprintln!(
+        "Created reviewed baseline profile at {}. It records observations only; no software or signer identity was established.",
+        terminal_safe_path(&published)
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn publish_baseline_profile(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    #[cfg(target_os = "linux")]
+    {
+        publish_private_file(
+            path,
+            bytes,
+            sideeffect::baseline::MAX_BASELINE_PROFILE_BYTES,
+        )
+        .map_err(|error| format!("could not publish private baseline profile: {error}"))
+    }
+    #[cfg(windows)]
+    {
+        publish_private_windows_file(
+            path,
+            bytes,
+            sideeffect::baseline::MAX_BASELINE_PROFILE_BYTES,
+        )
+        .map_err(|error| format!("could not publish private baseline profile: {error}"))
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn baseline_compare_command(arguments: &[OsString]) -> Result<ExitCode, String> {
+    let mut profile_path: Option<&OsString> = None;
+    let mut session_paths = Vec::new();
+    let mut baseline_paths = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let flag = &arguments[index];
+        let value = arguments.get(index + 1).ok_or_else(|| {
+            format!(
+                "baseline compare option {} requires a value",
+                terminal_safe_text(&flag.to_string_lossy())
+            )
+        })?;
+        match flag.to_str() {
+            Some("--profile") if profile_path.replace(value).is_none() => {}
+            Some("--session") => session_paths.push(value),
+            Some("--baseline-session") => baseline_paths.push(value),
+            Some("--profile") => {
+                return Err("duplicate baseline compare --profile option".to_owned());
+            }
+            _ => {
+                return Err(format!(
+                    "unknown baseline compare option {}",
+                    terminal_safe_text(&flag.to_string_lossy())
+                ));
+            }
+        }
+        index += 2;
+    }
+    let profile_path = profile_path.ok_or("baseline compare requires --profile PROFILE.json")?;
+    if session_paths.is_empty()
+        || session_paths.len() > sideeffect::baseline::MAX_BASELINE_SESSIONS
+        || baseline_paths.is_empty()
+        || baseline_paths.len() > sideeffect::baseline::MAX_BASELINE_SESSIONS
+    {
+        return Err(format!(
+            "baseline compare requires 1..={} --session and --baseline-session directories",
+            sideeffect::baseline::MAX_BASELINE_SESSIONS
+        ));
+    }
+    let profile_bytes = read_input_file(
+        Path::new(profile_path),
+        sideeffect::baseline::MAX_BASELINE_PROFILE_BYTES,
+        "baseline profile",
+    )?;
+    let profile = sideeffect::baseline::parse_profile(&profile_bytes)
+        .map_err(|error| format!("invalid baseline profile: {error}"))?;
+    let all_paths: Vec<_> = baseline_paths
+        .iter()
+        .copied()
+        .chain(session_paths.iter().copied())
+        .collect();
+    let all_sessions = read_baseline_sessions_with_budget(
+        &all_paths,
+        sideeffect::baseline::MAX_BASELINE_SESSION_READ_BYTES
+            .min(sideeffect::audit_session_diff::MAX_SESSION_DIFF_PAIR_BYTES as u64),
+    )?;
+    let (baseline_sessions, candidate_sessions) = all_sessions.split_at(baseline_paths.len());
+    let baseline_digests: Vec<_> = baseline_sessions
+        .iter()
+        .map(|session| format!("{:x}", Sha256::digest(session.manifest_bytes())))
+        .collect();
+    let candidate_digests: Vec<_> = candidate_sessions
+        .iter()
+        .map(|session| format!("{:x}", Sha256::digest(session.manifest_bytes())))
+        .collect();
+    let baseline_artifacts: Vec<_> = baseline_sessions
+        .iter()
+        .map(|session| {
+            session
+                .artifacts()
+                .iter()
+                .map(
+                    |artifact| sideeffect::audit_session_diff::VerifiedArtifactBytes {
+                        kind: artifact.kind(),
+                        path: artifact.path(),
+                        bytes: artifact.bytes(),
+                    },
+                )
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let candidate_artifacts: Vec<_> = candidate_sessions
+        .iter()
+        .map(|session| {
+            session
+                .artifacts()
+                .iter()
+                .map(
+                    |artifact| sideeffect::audit_session_diff::VerifiedArtifactBytes {
+                        kind: artifact.kind(),
+                        path: artifact.path(),
+                        bytes: artifact.bytes(),
+                    },
+                )
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let baselines: Vec<_> = baseline_sessions
+        .iter()
+        .zip(&baseline_digests)
+        .zip(&baseline_artifacts)
+        .map(
+            |((session, digest), artifacts)| sideeffect::baseline::BaselineComparisonSession {
+                manifest: session.manifest(),
+                manifest_sha256: digest,
+                artifacts,
+            },
+        )
+        .collect();
+    let candidates: Vec<_> = candidate_sessions
+        .iter()
+        .zip(&candidate_digests)
+        .zip(&candidate_artifacts)
+        .map(
+            |((session, digest), artifacts)| sideeffect::baseline::BaselineComparisonSession {
+                manifest: session.manifest(),
+                manifest_sha256: digest,
+                artifacts,
+            },
+        )
+        .collect();
+    let comparison =
+        sideeffect::baseline::compare_against_baseline(&profile, &baselines, &candidates)
+            .map_err(|error| error.to_string())?;
+    let encoded = serialize_pretty_bounded(
+        &comparison,
+        sideeffect::baseline::MAX_BASELINE_OUTPUT_BYTES,
+        "baseline comparison",
+    )?;
+    io::stdout()
+        .lock()
+        .write_all(&encoded)
+        .map_err(|error| format!("could not write baseline comparison: {error}"))?;
+    Ok(
+        if comparison.status == sideeffect::baseline::BaselineComparisonStatus::Compared {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(2)
+        },
+    )
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn baseline_command(operation: &OsString, arguments: &[OsString]) -> Result<ExitCode, String> {
+    let _ = (operation, arguments);
+    Err("behavioral baselines are not supported on this platform".to_owned())
+}
+
 fn verified_runtime_artifact<'manifest, 'bytes>(
     manifest: &'manifest sideeffect::audit_session::AuditSessionManifest,
     artifacts: &'bytes [sideeffect::audit_session_diff::VerifiedArtifactBytes<'bytes>],
@@ -9982,6 +10374,25 @@ impl CappedBuffer {
     }
 }
 
+fn serialize_pretty_bounded<T: serde::Serialize>(
+    value: &T,
+    limit: usize,
+    description: &str,
+) -> Result<Vec<u8>, String> {
+    let mut output = CappedBuffer::new(limit);
+    serde_json::to_writer_pretty(&mut output, value).map_err(|error| {
+        if output.exceeded {
+            format!("{description} exceeds its {limit} byte output limit")
+        } else {
+            format!("could not serialize {description}: {error}")
+        }
+    })?;
+    output
+        .write_all(b"\n")
+        .map_err(|_| format!("{description} exceeds its {limit} byte output limit"))?;
+    Ok(output.bytes)
+}
+
 impl Write for CappedBuffer {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         let new_len = self.bytes.len().checked_add(buffer.len()).ok_or_else(|| {
@@ -10174,6 +10585,14 @@ mod tests {
         assert!(buffer.write_all(b"d").is_err());
         assert_eq!(buffer.bytes, b"abc");
         assert!(buffer.exceeded);
+    }
+
+    #[test]
+    fn pretty_json_serialization_stops_at_the_output_budget() {
+        let value = serde_json::json!({"large": "x".repeat(4096)});
+        let error =
+            super::serialize_pretty_bounded(&value, 64, "synthetic baseline result").unwrap_err();
+        assert!(error.contains("64 byte output limit"));
     }
 
     #[test]
