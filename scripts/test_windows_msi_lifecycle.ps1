@@ -235,11 +235,179 @@ function Install-Msi {
     Assert-UnderPath -Child $MsiPath -Parent $script:TestRoot -Label 'MSI fixture'
     Assert-UnderPath -Child $InstallRoot -Parent $script:TestRoot -Label 'MSI install root'
     Assert-UnderPath -Child $LogPath -Parent $script:TestRoot -Label 'MSI log'
-    $quotedMsiPath = '"' + [System.IO.Path]::GetFullPath($MsiPath) + '"'
-    $quotedLogPath = '"' + [System.IO.Path]::GetFullPath($LogPath) + '"'
-    $quotedInstallRoot = '"' + [System.IO.Path]::GetFullPath($InstallRoot) + '"'
-    $argumentLine = "/i $quotedMsiPath /qn /norestart /l*v $quotedLogPath INSTALLROOT=$quotedInstallRoot"
+    $argumentLine = Get-MsiInstallArgumentLine -MsiPath $MsiPath -InstallRoot $InstallRoot -LogPath $LogPath
     Invoke-Msi -Description $Description -ArgumentLine $argumentLine -LogPath $LogPath -PackagePath $MsiPath
+}
+
+function Get-MsiInstallArgumentVector {
+    param(
+        [Parameter(Mandatory = $true)][string] $MsiPath,
+        [Parameter(Mandatory = $true)][string] $InstallRoot,
+        [Parameter(Mandatory = $true)][string] $LogPath
+    )
+
+    return ,@(
+        '/i', [System.IO.Path]::GetFullPath($MsiPath),
+        '/qn', '/norestart', '/l*v', [System.IO.Path]::GetFullPath($LogPath),
+        "INSTALLROOT=$([System.IO.Path]::GetFullPath($InstallRoot))"
+    )
+}
+
+function Get-MsiInstallArgumentLine {
+    param(
+        [Parameter(Mandatory = $true)][string] $MsiPath,
+        [Parameter(Mandatory = $true)][string] $InstallRoot,
+        [Parameter(Mandatory = $true)][string] $LogPath
+    )
+
+    $arguments = Get-MsiInstallArgumentVector -MsiPath $MsiPath -InstallRoot $InstallRoot -LogPath $LogPath
+    return "/i `"$($arguments[1])`" /qn /norestart /l*v `"$($arguments[5])`" INSTALLROOT=`"$([System.IO.Path]::GetFullPath($InstallRoot))`""
+}
+
+function Invoke-ObservedMsiInstall {
+    param(
+        [Parameter(Mandatory = $true)][string] $MsiPath,
+        [Parameter(Mandatory = $true)][string] $InstallRoot,
+        [Parameter(Mandatory = $true)][string] $LogPath,
+        [Parameter(Mandatory = $true)][string] $SessionPath
+    )
+
+    Assert-UnderPath -Child $MsiPath -Parent $script:TestRoot -Label 'observed MSI fixture'
+    Assert-UnderPath -Child $InstallRoot -Parent $script:TestRoot -Label 'observed MSI install root'
+    Assert-UnderPath -Child $LogPath -Parent $script:TestRoot -Label 'observed MSI log'
+    Assert-UnderPath -Child $SessionPath -Parent $script:TestRoot -Label 'MSI observation session'
+    $msiArguments = Get-MsiInstallArgumentVector -MsiPath $MsiPath -InstallRoot $InstallRoot -LogPath $LogPath
+    $auditArguments = @(
+        'audit', '--output', $SessionPath,
+        '--observe-root', $InstallRoot, '--hash-regular-files',
+        '--runtime-source', 'windows-etw', '--runtime-duration-seconds', '30',
+        '--', $script:MsiexecPath
+    ) + $msiArguments
+    & $script:SideEffectPath @auditArguments
+    $auditExitCode = $LASTEXITCODE
+    if ($auditExitCode -ne 2) {
+        throw "SideEffect observed MSI install returned exit code $auditExitCode; expected partial exit 2 because ETW completeness is unknown."
+    }
+    $global:LASTEXITCODE = 0
+
+    $comparisonOutput = & $script:SideEffectPath 'compare-observation' $SessionPath | Out-String
+    $comparisonExitCode = $LASTEXITCODE
+    if ($comparisonExitCode -ne 2) {
+        throw "SideEffect observation comparison returned exit code $comparisonExitCode; expected partial exit 2 because runtime completeness is unknown."
+    }
+    $global:LASTEXITCODE = 0
+    $comparison = $comparisonOutput | ConvertFrom-Json
+    if ($comparison.schema -ne 'sideeffect.observation_window_diff' -or
+        $comparison.schema_version -ne 1 -or
+        $comparison.status -ne 'partial' -or
+        $comparison.root_comparison_status -ne 'complete' -or
+        $comparison.root_source_status -ne 'complete' -or
+        $comparison.runtime_source_status -ne 'partial' -or
+        $comparison.runtime_capture_completeness -ne 'unknown') {
+        throw "Observed MSI session did not retain complete root comparison and unknown/partial runtime status: $($comparison | ConvertTo-Json -Compress -Depth 12)"
+    }
+    if ($comparison.root_diff.counts.additions -ne 1 -or $comparison.root_diff.deltas.Count -ne 1) {
+        throw 'Observed MSI session did not report exactly one selected-root addition.'
+    }
+    $delta = $comparison.root_diff.deltas[0]
+    $payloadPath = Join-Path $InstallRoot 'payload.bin'
+    $afterRootPath = Join-Path $SessionPath 'root-snapshot-after.json'
+    $afterRoot = Get-Content -LiteralPath $afterRootPath -Raw | ConvertFrom-Json
+    $afterRows = @($afterRoot.entries | Where-Object { $_.display_name -ceq 'payload.bin' })
+    $payloadHash = (Get-FileHash -LiteralPath $payloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($delta.kind -ne 'added' -or $delta.name -cne 'payload.bin' -or
+        $delta.after.evidence_source -ne 'selected_root_directory_entry' -or
+        $delta.after.entry_ordinal -ne $afterRows[0].ordinal -or $afterRows.Count -ne 1 -or
+        $afterRows[0].content_sha256 -cne $payloadHash -or $afterRows[0].content_hash_status -ne 'observed') {
+        throw 'Observed MSI root addition did not match the installed payload SHA-256 and verified after-snapshot evidence ordinal.'
+    }
+
+    $expectedPath = [System.IO.Path]::GetFullPath($payloadPath)
+    $association = $comparison.root_runtime_association
+    if ($null -eq $association -or $association.claim -ne 'exact_lexical_dos_drive_path_candidate_only_no_success_ownership_or_causation' -or
+        $association.status -ne 'partial' -or $association.capture_completeness -ne 'unknown') {
+        throw "Observation comparison did not retain the bounded claim and unknown ETW completeness: $($association | ConvertTo-Json -Compress -Depth 12)"
+    }
+
+    $runtimeArtifact = @($comparison.runtime_artifacts | Where-Object { $_.path -eq 'runtime.windows.json' })
+    if ($runtimeArtifact.Count -ne 1 -or $runtimeArtifact[0].schema -ne 'sideeffect.windows_runtime_capture' -or $runtimeArtifact[0].schema_version -ne 3) {
+        throw 'Observation comparison did not reference exactly one Windows ETW v3 capture artifact.'
+    }
+    $capturePath = Join-Path $SessionPath 'runtime.windows.json'
+    Assert-UnderPath -Child $capturePath -Parent $SessionPath -Label 'ETW capture artifact'
+    $captureBytes = [System.IO.File]::ReadAllBytes($capturePath)
+    $captureSha256 = [System.Security.Cryptography.SHA256]::HashData($captureBytes)
+    $captureArtifactHash = [System.BitConverter]::ToString($captureSha256).Replace('-', '').ToLowerInvariant()
+    if ($captureArtifactHash -cne $runtimeArtifact[0].sha256) {
+        throw 'ETW capture artifact bytes did not match the verified session artifact digest.'
+    }
+    $capture = [System.Text.Encoding]::UTF8.GetString($captureBytes) | ConvertFrom-Json
+    if ($capture.schema -ne 'sideeffect.windows_runtime_capture' -or $capture.schema_version -ne 3 -or
+        $capture.document_sha256 -cne $association.capture_document_sha256 -or
+        $association.capture_artifact_sha256 -cne $captureArtifactHash) {
+        throw 'ETW capture document digest or distinct capture artifact digest did not match the comparison evidence.'
+    }
+    $targetPid = [uint32]$capture.target.process_id
+    $targetStarts = @($capture.events | Where-Object {
+        $_.event_kind -eq 'process_start' -and $_.payload_decoding.status -eq 'decoded' -and
+        [uint32]$_.payload_decoding.process_id -eq $targetPid -and
+        [System.IO.Path]::GetFileName([string]$_.payload_decoding.image_file_name) -ieq 'msiexec.exe'
+    })
+    if ($targetPid -eq 0 -or $targetStarts.Count -eq 0) {
+        throw 'ETW capture did not contain a decoded process-start row for the actual msiexec target PID.'
+    }
+    $payloadNameEvents = @($capture.events | Where-Object {
+        $_.event_kind -eq 'file_io_observation' -and $_.observation_decoding.status -eq 'decoded' -and
+        $_.observation_decoding.observation.activity.kind -eq 'file' -and
+        [System.IO.Path]::GetFileName([string]$_.observation_decoding.observation.activity.observation.path) -ieq 'payload.bin'
+    })
+    if ($payloadNameEvents.Count -eq 0) {
+        throw 'ETW capture did not contain a decoded file-name observation for the fixture payload basename.'
+    }
+    $rawPayloadHashes = @{}
+    foreach ($event in $payloadNameEvents) {
+        $eventIndex = [Array]::IndexOf($capture.events, $event)
+        $rawPayload = [Convert]::FromHexString([string]$event.raw_payload_hex)
+        $rawPayloadHash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::HashData($rawPayload)).Replace('-', '').ToLowerInvariant()
+        $payloadNameUtf16 = [System.Text.Encoding]::Unicode.GetBytes('payload.bin')
+        $rawHex = [System.BitConverter]::ToString($rawPayload).Replace('-', '').ToLowerInvariant()
+        $payloadNameHex = [System.BitConverter]::ToString($payloadNameUtf16).Replace('-', '').ToLowerInvariant()
+        if (-not $rawHex.Contains($payloadNameHex) -or $eventIndex -lt 0) {
+            throw 'Decoded ETW payload-name row did not retain the expected basename in its raw payload bytes.'
+        }
+        $rawPayloadHashes[[string]$event.record_ordinal] = $rawPayloadHash
+    }
+
+    $candidate = @($association.associations | Where-Object { $_.candidate_path -ceq $expectedPath -and $_.delta_kind -eq 'added' -and $_.etw_operation -eq 'create_name' })
+    if ($candidate.Count -gt 0) {
+        foreach ($evidence in $candidate[0].runtime_evidence) {
+            if ($evidence.capture_document_sha256 -cne $capture.document_sha256 -or $evidence.etw_operation -ne 'create_name' -or
+                $evidence.json_pointer -notmatch '^/events/([0-9]+)$') {
+                throw 'ETW evidence reference did not match the capture document digest, event pointer, and create-name observation.'
+            }
+            $eventIndex = [int]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture)
+            if ($eventIndex -lt 0 -or $eventIndex -ge $capture.events.Count) {
+                throw 'ETW evidence JSON pointer was outside the actual capture events array.'
+            }
+            $event = $capture.events[$eventIndex]
+            if (-not $rawPayloadHashes.ContainsKey([string]$event.record_ordinal) -or
+                $event.record_ordinal -ne $evidence.record_ordinal -or
+                $rawPayloadHashes[[string]$event.record_ordinal] -cne $evidence.raw_payload_sha256 -or
+                $event.observation_decoding.observation.activity.observation.path -cne $expectedPath) {
+                throw "ETW evidence pointer /events/$eventIndex did not resolve to the matching raw-payload-verified exact DOS path observation."
+            }
+        }
+        Write-Output "ETW exact DOS-path candidate linked to the installed payload; $($candidate[0].runtime_evidence.Count) raw evidence reference(s)."
+    }
+    elseif ($association.association_status -eq 'insufficient_evidence' -and
+        $association.summary.candidate_match_count -eq 0 -and
+        @($association.diagnostics | Where-Object { $_ -in @('different_namespaces_remain_unresolved', 'no_same_namespace_exact_path_candidate_was_observed') }).Count -gt 0) {
+        Write-Output "ETW observed the fixture payload basename in decoded file-name rows, but the comparator reported no exact path candidate; root/runtime association remains unresolved."
+    }
+    else {
+        throw "ETW payload-name evidence was not supported by a candidate or an explicit unresolved namespace diagnostic: $($association | ConvertTo-Json -Compress -Depth 12)"
+    }
+    Write-Output "Observed v1 MSI install with one selected-root addition and decoded msiexec target evidence; capture completeness remains unknown."
 }
 
 function Uninstall-Msi {
@@ -837,6 +1005,7 @@ try {
 
     $beforePath = Join-Path $script:TestRoot 'before-install.json'
     $snapshotV1Path = Join-Path $script:TestRoot 'installed-v1.json'
+    $observationV1Path = Join-Path $script:TestRoot 'observed-install-v1'
     $snapshotV2Path = Join-Path $script:TestRoot 'installed-v2.json'
     $snapshotDowngradePath = Join-Path $script:TestRoot 'downgraded-v1.json'
     $snapshotUninstallPath = Join-Path $script:TestRoot 'uninstalled.json'
@@ -857,9 +1026,10 @@ try {
     }
 
     $installationStarted = $true
-    Install-Msi -MsiPath $msiV1 -InstallRoot $script:InstallRoot -LogPath (Join-Path $script:TestRoot 'install-v1.log') -Description 'MSI v1 install'
+    Invoke-ObservedMsiInstall -MsiPath $msiV1 -InstallRoot $script:InstallRoot -LogPath (Join-Path $script:TestRoot 'install-v1.log') -SessionPath $observationV1Path
     Assert-ProductVersion -ProductCode $productCodeV1 -Version '1.0.0' -LogPath (Join-Path $script:TestRoot 'install-v1.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin')
     Assert-InstalledPayload -ProductCode $productCodeV1 -LogPath (Join-Path $script:TestRoot 'install-v1.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin') -ExpectedBytes $payloadV1
+    Get-InventorySnapshot -Path $snapshotV1Path | Out-Null
     $entryV1 = Get-PayloadEntry (Get-InventorySnapshot -Path $snapshotV1Path)
     $softwareV1 = Get-SoftwareSnapshot -Path $softwareV1Path
     $v1FixtureRegistrations = @(Get-FixtureSoftwareRegistrations -Document $softwareV1 -DisplayName 'SideEffect R5 Synthetic MSI Fixture' -Version '1.0.0')
