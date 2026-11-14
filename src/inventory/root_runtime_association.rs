@@ -4,6 +4,7 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use crate::limits::ParseLimits;
 use crate::model::{ParseCompleteness, SyscallOutcome, TraceRecordKind};
@@ -331,7 +332,11 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
         .collect()
 }
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
 }
 
 #[cfg(test)]
