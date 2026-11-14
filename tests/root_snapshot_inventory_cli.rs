@@ -1,5 +1,7 @@
 use serde_json::Value;
 use std::fs;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,6 +16,28 @@ fn fixture_dir(label: &str) -> std::path::PathBuf {
     ));
     fs::create_dir(&path).unwrap();
     path
+}
+
+struct TempFixture(PathBuf);
+
+impl TempFixture {
+    fn new(label: &str) -> Self {
+        Self(fixture_dir(label))
+    }
+}
+
+impl Deref for TempFixture {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for TempFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 #[test]
@@ -89,6 +113,146 @@ fn inventory(root: &std::path::Path, output: &std::path::Path, hash: bool) -> Va
         String::from_utf8_lossy(&result.stderr)
     );
     serde_json::from_slice(&fs::read(output).unwrap()).unwrap()
+}
+
+fn inventory_diff(before: &std::path::Path, after: &std::path::Path) -> Value {
+    let result = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["explain", "--inventory-diff"])
+        .arg(before)
+        .arg(after)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    serde_json::from_slice(&result.stdout).unwrap()
+}
+
+fn fixture_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn assert_snapshot_hash(document: &Value, expected: &str) -> usize {
+    assert_eq!(document["schema"], "sideeffect.selected_root_inventory");
+    assert_eq!(document["schema_version"], 2);
+    assert_eq!(document["status"], "complete");
+    let entries = document["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry["content_hash_status"], "observed");
+    assert_eq!(entry["content_sha256"], expected);
+    assert_eq!(entry["evidence"]["source"], "selected_root_directory_entry");
+    assert_eq!(entry["evidence"]["entry_ordinal"], entry["ordinal"]);
+    entry["ordinal"].as_u64().unwrap() as usize
+}
+
+#[test]
+fn synthetic_selected_root_install_update_rollback_uninstall_tracks_content_and_evidence() {
+    let temp = TempFixture::new("synthetic-lifecycle");
+    let root = temp.join("selected-install-root");
+    fs::create_dir(&root).unwrap();
+    let install_before_path = temp.join("before-install.json");
+    let install_before = inventory(&root, &install_before_path, true);
+    assert_eq!(install_before["schema_version"], 2);
+    assert_eq!(install_before["status"], "complete");
+    assert!(install_before["entries"].as_array().unwrap().is_empty());
+
+    let file = root.join("synthetic-app.bin");
+    let version_one = b"synthetic fixture application version one";
+    let version_two = b"synthetic fixture application version two";
+    fs::write(&file, version_one).unwrap();
+    let installed_path = temp.join("installed.json");
+    let installed = inventory(&root, &installed_path, true);
+    let version_one_hash = fixture_sha256(version_one);
+    let installed_ordinal = assert_snapshot_hash(&installed, &version_one_hash);
+    let install_diff = inventory_diff(&install_before_path, &installed_path);
+    assert_eq!(install_diff["status"], "complete");
+    assert_eq!(install_diff["counts"]["additions"], 1);
+    assert_eq!(install_diff["deltas"][0]["kind"], "added");
+    assert_eq!(
+        install_diff["deltas"][0]["after"]["evidence_source"],
+        "selected_root_directory_entry"
+    );
+    assert_eq!(
+        install_diff["deltas"][0]["after"]["entry_ordinal"],
+        installed_ordinal
+    );
+
+    fs::write(&file, version_two).unwrap();
+    let updated_path = temp.join("updated.json");
+    let updated = inventory(&root, &updated_path, true);
+    let version_two_hash = fixture_sha256(version_two);
+    let updated_ordinal = assert_snapshot_hash(&updated, &version_two_hash);
+    assert_ne!(version_one_hash, version_two_hash);
+    let update_diff = inventory_diff(&installed_path, &updated_path);
+    assert_eq!(update_diff["status"], "complete");
+    assert_eq!(update_diff["counts"]["changes"], 1);
+    assert!(
+        update_diff["deltas"][0]["changed_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "content_sha256")
+    );
+    assert_eq!(
+        update_diff["deltas"][0]["before"]["entry_ordinal"],
+        installed_ordinal
+    );
+    assert_eq!(
+        update_diff["deltas"][0]["after"]["entry_ordinal"],
+        updated_ordinal
+    );
+    for side in ["before", "after"] {
+        assert_eq!(
+            update_diff["deltas"][0][side]["evidence_source"],
+            "selected_root_directory_entry"
+        );
+    }
+
+    fs::write(&file, version_one).unwrap();
+    let rolled_back_path = temp.join("rolled-back.json");
+    let rolled_back = inventory(&root, &rolled_back_path, true);
+    let rolled_back_ordinal = assert_snapshot_hash(&rolled_back, &version_one_hash);
+    let rollback_diff = inventory_diff(&updated_path, &rolled_back_path);
+    assert_eq!(rollback_diff["status"], "complete");
+    assert_eq!(rollback_diff["counts"]["changes"], 1);
+    assert!(
+        rollback_diff["deltas"][0]["changed_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "content_sha256")
+    );
+    assert_eq!(
+        rollback_diff["deltas"][0]["before"]["entry_ordinal"],
+        updated_ordinal
+    );
+    assert_eq!(
+        rollback_diff["deltas"][0]["after"]["entry_ordinal"],
+        rolled_back_ordinal
+    );
+
+    fs::remove_file(&file).unwrap();
+    let uninstalled_path = temp.join("uninstalled.json");
+    let uninstalled = inventory(&root, &uninstalled_path, true);
+    assert_eq!(uninstalled["status"], "complete");
+    assert!(uninstalled["entries"].as_array().unwrap().is_empty());
+    let uninstall_diff = inventory_diff(&rolled_back_path, &uninstalled_path);
+    assert_eq!(uninstall_diff["status"], "complete");
+    assert_eq!(uninstall_diff["counts"]["removals"], 1);
+    assert_eq!(uninstall_diff["deltas"][0]["kind"], "removed");
+    assert_eq!(
+        uninstall_diff["deltas"][0]["before"]["evidence_source"],
+        "selected_root_directory_entry"
+    );
+    assert_eq!(
+        uninstall_diff["deltas"][0]["before"]["entry_ordinal"],
+        rolled_back_ordinal
+    );
+    assert!(uninstall_diff["deltas"][0]["after"].is_null());
 }
 
 #[test]
