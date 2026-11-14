@@ -581,15 +581,6 @@ fn assert_observed_dpkg_install(session_path: &Path, observed_root: &Path) {
     assert_eq!(association["trace_sha256"], trace_ref.sha256);
     let payload_path = observed_root.join(PAYLOAD_NAME);
     let payload_path = payload_path.to_string_lossy();
-    let associations = association["associations"].as_array().unwrap();
-    assert!(
-        associations
-            .iter()
-            .all(|candidate| candidate["candidate_path"] != payload_path.as_ref())
-    );
-    assert_eq!(association["summary"]["delta_count"], 1);
-    assert_eq!(association["summary"]["candidate_match_count"], 0);
-    assert_eq!(association["summary"]["unmatched_delta_count"], 1);
 
     let staged_payload_path = observed_root.join(format!("{PAYLOAD_NAME}.dpkg-new"));
     let staged_payload_path = staged_payload_path.to_string_lossy();
@@ -623,6 +614,37 @@ fn assert_observed_dpkg_install(session_path: &Path, observed_root: &Path) {
         .expect("rename evidence range does not overflow");
     assert_eq!(&trace_bytes[start..end], rename.raw_line.as_bytes());
     assert!(rename.raw_line.ends_with(" = 0"));
+
+    // The successful staging-to-final rename now supplies the added payload's
+    // only lexical candidate, matched at its destination operand. The staging
+    // path never appears in either snapshot, so its name never becomes a delta.
+    assert_eq!(association["summary"]["delta_count"], 1);
+    assert_eq!(association["summary"]["candidate_match_count"], 1);
+    assert_eq!(association["summary"]["unmatched_delta_count"], 0);
+    let associations = association["associations"].as_array().unwrap();
+    assert_eq!(associations.len(), 1);
+    assert_eq!(associations[0]["delta_kind"], "added");
+    assert_eq!(associations[0]["status"], "candidate_match");
+    assert_eq!(associations[0]["candidate_path"], payload_path.as_ref());
+    assert!(
+        !associations[0]["multiple_runtime_observations"]
+            .as_bool()
+            .unwrap()
+    );
+    let evidence = associations[0]["runtime_evidence"].as_array().unwrap();
+    assert_eq!(evidence.len(), 1);
+    assert!(
+        matches!(
+            evidence[0]["syscall"].as_str(),
+            Some("rename" | "renameat" | "renameat2")
+        ),
+        "{}",
+        evidence[0]["syscall"]
+    );
+    assert_eq!(evidence[0]["line_number"], rename.evidence.line_number);
+    assert_eq!(evidence[0]["byte_offset"], rename.evidence.byte_offset);
+    assert_eq!(evidence[0]["byte_length"], rename.evidence.byte_length);
+    assert_eq!(evidence[0]["trace_sha256"], trace_ref.sha256);
 
     let staged_create = trace
         .records

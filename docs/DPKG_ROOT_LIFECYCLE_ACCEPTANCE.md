@@ -44,21 +44,27 @@ fixture dpkg command's fixed `PATH`, `LC_ALL`, and private `TMPDIR` overrides;
 the package command itself still targets only the canonicalized fixture root,
 admin directory, and log under the private temporary parent. The resulting
 session is compared with `compare-observation`: the selected-root diff must
-show the added payload. The runtime association must leave the final payload
-without a candidate link because dpkg commits it from a staging path with
-`rename`. The test verifies each referenced runtime line locator against the
+show the added payload. The runtime association must link the added payload to
+the successful staging-to-final `rename` as a lexical candidate: the
+association interprets a successful rename with strict absolute byte-faithful
+operands as a removal candidate at its source path and an addition/change
+candidate at its destination path. The test verifies each referenced runtime
+line locator against the
 raw `trace.strace` bytes and parsed successful syscall result, plus the
 session-manifest artifact digests. The trace must retain both a successful
 create of `payload.bin.dpkg-new` and a `rename` return value of zero to the final
-payload path. Since the current association adapter does not interpret
-`rename`, it leaves the added root delta unmatched; the test makes no candidate
-link for that final path. The remaining update, downgrade, and purge
+payload path. The staged `payload.bin.dpkg-new` name appears in neither
+snapshot, so only the destination operand produces a candidate; the test
+asserts one `candidate_match` for the added payload and no unmatched delta,
+while the source operand supports nothing because the staging name is not a
+root delta. The remaining update, downgrade, and purge
 transitions use the same direct private-root dpkg helper and are checked with
 package/root snapshots, but are not individually wrapped in `audit`. The
 association remains explicitly
 `lexical_path_candidate_only_no_causation_or_process_identity`, and capture
-completeness remains unknown. This does not prove the package command caused
-the file state or establish broad `strace` coverage.
+completeness remains unknown. A candidate link to the rename destination does
+not prove the package command caused the file state, that the rename and the
+delta describe the same object identity, or establish broad `strace` coverage.
 
 The test requires Linux x86_64, Rust/Cargo, `strace`, `dpkg`, `dpkg-deb`, and
 `dpkg-query`. CI installs `strace` and `dpkg` explicitly. The

@@ -723,8 +723,11 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
     let created_file = observed_root.join("created-by-selected-command.txt");
     let transient_file = observed_root.join("transient-by-selected-command.txt");
     let removed_file = observed_root.join("removed-by-selected-command.txt");
+    let moved_source = observed_root.join("renamed-away-by-selected-command.txt");
+    let moved_destination = observed_root.join("renamed-in-by-selected-command.txt");
     fs::write(&removed_file, "pre-existing fixture").unwrap();
-    let script = "from pathlib import Path\nimport sys\nPath(sys.argv[1]).write_text('fixture')\ntransient = Path(sys.argv[2])\ntransient.write_text('transient fixture')\ntransient.unlink()\nPath(sys.argv[3]).unlink()";
+    fs::write(&moved_source, "fixture that will be renamed").unwrap();
+    let script = "from pathlib import Path\nimport os\nimport sys\nPath(sys.argv[1]).write_text('fixture')\ntransient = Path(sys.argv[2])\ntransient.write_text('transient fixture')\ntransient.unlink()\nPath(sys.argv[3]).unlink()\nos.rename(sys.argv[4], sys.argv[5])";
     let captured = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .arg("audit")
         .arg("--output")
@@ -740,6 +743,8 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
         .arg(&created_file)
         .arg(&transient_file)
         .arg(&removed_file)
+        .arg(&moved_source)
+        .arg(&moved_destination)
         .output()
         .unwrap();
     assert_eq!(
@@ -785,17 +790,23 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
     assert_eq!(compared.status.code(), Some(2));
     let report: serde_json::Value = serde_json::from_slice(&compared.stdout).unwrap();
     assert_eq!(report["root_comparison_status"], "complete");
-    assert_eq!(report["root_diff"]["counts"]["additions"], 1);
-    assert_eq!(report["root_diff"]["counts"]["removals"], 1);
+    assert_eq!(report["root_diff"]["counts"]["additions"], 2);
+    assert_eq!(report["root_diff"]["counts"]["removals"], 2);
     let deltas = report["root_diff"]["deltas"].as_array().unwrap();
-    assert_eq!(deltas.len(), 2);
+    assert_eq!(deltas.len(), 4);
     assert!(deltas.iter().any(
         |delta| delta["kind"] == "added" && delta["name"] == "created-by-selected-command.txt"
     ));
     assert!(
+        deltas.iter().any(|delta| delta["kind"] == "added"
+            && delta["name"] == "renamed-in-by-selected-command.txt")
+    );
+    assert!(
         deltas.iter().any(|delta| delta["kind"] == "removed"
             && delta["name"] == "removed-by-selected-command.txt")
     );
+    assert!(deltas.iter().any(|delta| delta["kind"] == "removed"
+        && delta["name"] == "renamed-away-by-selected-command.txt"));
     let transient_name = transient_file.file_name().unwrap().to_str().unwrap();
     assert!(
         deltas.iter().all(|delta| delta["name"] != transient_name),
@@ -820,10 +831,13 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
     let associations = report["root_runtime_association"]["associations"]
         .as_array()
         .unwrap();
-    assert_eq!(associations.len(), 2);
+    assert_eq!(associations.len(), 4);
     let added_association = associations
         .iter()
-        .find(|association| association["delta_kind"] == "added")
+        .find(|association| {
+            association["delta_kind"] == "added"
+                && association["candidate_path"] == created_file.to_string_lossy().as_ref()
+        })
         .expect("the created file must be a lexical openat candidate");
     assert_eq!(
         added_association["candidate_path"],
@@ -831,7 +845,10 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
     );
     let removed_association = associations
         .iter()
-        .find(|association| association["delta_kind"] == "removed")
+        .find(|association| {
+            association["delta_kind"] == "removed"
+                && association["candidate_path"] == removed_file.to_string_lossy().as_ref()
+        })
         .expect("the deleted file must be a lexical unlink candidate");
     assert_eq!(
         removed_association["candidate_path"],
@@ -849,9 +866,52 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
         64
     );
 
+    // A successful rename supports a removal at its source path and an addition
+    // at its destination path, both as lexical candidates from the same row.
+    let renamed_away_association = associations
+        .iter()
+        .find(|association| {
+            association["delta_kind"] == "removed"
+                && association["candidate_path"] == moved_source.to_string_lossy().as_ref()
+        })
+        .expect("the renamed-away file must be a lexical rename source candidate");
+    let renamed_in_association = associations
+        .iter()
+        .find(|association| {
+            association["delta_kind"] == "added"
+                && association["candidate_path"] == moved_destination.to_string_lossy().as_ref()
+        })
+        .expect("the renamed-in file must be a lexical rename destination candidate");
+    assert!(
+        matches!(
+            renamed_away_association["runtime_evidence"][0]["syscall"].as_str(),
+            Some("rename" | "renameat" | "renameat2")
+        ),
+        "{}",
+        renamed_away_association["runtime_evidence"][0]["syscall"]
+    );
+    assert!(
+        matches!(
+            renamed_in_association["runtime_evidence"][0]["syscall"].as_str(),
+            Some("rename" | "renameat" | "renameat2")
+        ),
+        "{}",
+        renamed_in_association["runtime_evidence"][0]["syscall"]
+    );
+    assert_eq!(
+        renamed_away_association["runtime_evidence"][0]["line_number"],
+        renamed_in_association["runtime_evidence"][0]["line_number"],
+        "both rename candidates must reference the same syscall row"
+    );
+    assert_eq!(
+        renamed_away_association["runtime_evidence"][0]["byte_offset"],
+        renamed_in_association["runtime_evidence"][0]["byte_offset"]
+    );
+
     // The trace remains the raw runtime evidence for the transient lifecycle.
-    // Its openat path hint is source-derived, while the unlink success is read
-    // from the observed syscall result rather than inferred from the absent file.
+    // Its openat path hint is source-derived, while the unlink and rename
+    // successes are read from the observed syscall results rather than inferred
+    // from the absent file.
     let trace_path = output.join("trace.strace");
     let trace = String::from_utf8(fs::read(&trace_path).unwrap()).unwrap();
     let transient_trace_lines = trace
