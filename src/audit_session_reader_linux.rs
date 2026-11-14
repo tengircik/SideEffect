@@ -580,8 +580,8 @@ mod tests {
         read_verified_session_with_budget,
     };
     use crate::audit_session::{
-        AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, AuditSessionSource, IntervalSemantics,
-        SessionStatus, SourceRole, SourceStatus,
+        AUDIT_SESSION_SCHEMA, AUDIT_SESSION_V15_SCHEMA_VERSION, AuditSessionSource,
+        IntervalSemantics, SessionStatus, SourceRole, SourceStatus,
     };
     use crate::fingerprint::sha256_hex;
     use std::fs;
@@ -629,7 +629,7 @@ mod tests {
         fs::set_permissions(&artifact_path, fs::Permissions::from_mode(0o600)).unwrap();
         let manifest = AuditSessionManifest {
             schema: AUDIT_SESSION_SCHEMA.to_owned(),
-            schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+            schema_version: AUDIT_SESSION_V15_SCHEMA_VERSION,
             session_id: "0123456789abcdef0123456789abcdef".to_owned(),
             platform: "linux".to_owned(),
             architecture: "x86_64".to_owned(),

@@ -10982,7 +10982,7 @@ mod tests {
             };
             AuditSessionManifest {
                 schema: sideeffect::audit_session::AUDIT_SESSION_SCHEMA.to_owned(),
-                schema_version: sideeffect::audit_session::AUDIT_SESSION_SCHEMA_VERSION,
+                schema_version: sideeffect::audit_session::AUDIT_SESSION_V15_SCHEMA_VERSION,
                 session_id: id.to_owned(),
                 platform: "windows".to_owned(),
                 architecture: "x86_64".to_owned(),
@@ -11110,7 +11110,7 @@ mod tests {
             ];
             AuditSessionManifest {
                 schema: sideeffect::audit_session::AUDIT_SESSION_SCHEMA.to_owned(),
-                schema_version: sideeffect::audit_session::AUDIT_SESSION_SCHEMA_VERSION,
+                schema_version: sideeffect::audit_session::AUDIT_SESSION_V15_SCHEMA_VERSION,
                 session_id: id.to_owned(),
                 platform: "linux".to_owned(),
                 architecture: "x86_64".to_owned(),
