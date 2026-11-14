@@ -43,6 +43,7 @@ function New-MsiFixture {
         [Parameter(Mandatory = $true)][string] $UpgradeCode,
         [Parameter(Mandatory = $true)][string] $ComponentCode,
         [Parameter(Mandatory = $true)][string] $DefaultDirectoryName,
+        [Parameter(Mandatory = $true)][string] $DefaultInstallRoot,
         [Parameter(Mandatory = $true)][string] $CandlePath,
         [Parameter(Mandatory = $true)][string] $LightPath
     )
@@ -62,11 +63,9 @@ function New-MsiFixture {
              InstallPrivileges="limited" />
     <MajorUpgrade DowngradeErrorMessage="A later synthetic fixture version is already installed." />
     <MediaTemplate />
-    <Property Id="INSTALLROOT" Secure="yes" />
+    <Property Id="INSTALLROOT" Value="$(var.DefaultInstallRoot)" Secure="yes" />
     <Directory Id="TARGETDIR" Name="SourceDir">
-      <Directory Id="TempFolder">
-        <Directory Id="INSTALLROOT" Name="$(var.DefaultDirectoryName)" />
-      </Directory>
+      <Directory Id="INSTALLROOT" Name="$(var.DefaultDirectoryName)" />
     </Directory>
     <Feature Id="FixtureFeature" Title="Synthetic fixture payload" Level="1">
       <ComponentRef Id="FixturePayload" />
@@ -98,6 +97,7 @@ function New-MsiFixture {
         "-dUpgradeCode=$UpgradeCode",
         "-dComponentCode=$ComponentCode",
         "-dDefaultDirectoryName=$DefaultDirectoryName",
+        "-dDefaultInstallRoot=$DefaultInstallRoot",
         "-dPayloadPath=$PayloadPath",
         '-out', $WixObjPath,
         $WxsPath
@@ -210,45 +210,139 @@ function Uninstall-Msi {
     Invoke-Msi -Description $Description -ArgumentLine $argumentLine -LogPath $LogPath -AcceptedExitCodes $acceptedExitCodes
 }
 
+function Get-MsiProductProperty {
+    param(
+        [Parameter(Mandatory = $true)][string] $ProductCode,
+        [Parameter(Mandatory = $true)][uint32] $Context,
+        [Parameter(Mandatory = $true)][string] $Property
+    )
+
+    $value = [System.Text.StringBuilder]::new(512)
+    [uint32] $length = 511
+    $status = [SideEffectMsiNative]::GetProductInfoEx($ProductCode, $null, $Context, $Property, $value, [ref]$length)
+    [pscustomobject]@{
+        Status = $status
+        Value = if ($status -eq 0) { $value.ToString() } else { $null }
+    }
+}
+
 function Get-ProductRegistration {
     param([Parameter(Mandatory = $true)][string] $ProductCode)
 
-    $subKeyPath = "Software\Microsoft\Windows\CurrentVersion\Uninstall\$ProductCode"
-    foreach ($view in @([Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32.RegistryView]::Registry32)) {
-        $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, $view)
-        try {
-            $productKey = $baseKey.OpenSubKey($subKeyPath)
-            if ($null -ne $productKey) {
-                try {
-                    return [pscustomobject]@{
-                        DisplayName = $productKey.GetValue('DisplayName')
-                        DisplayVersion = $productKey.GetValue('DisplayVersion')
-                    }
-                }
-                finally {
-                    $productKey.Dispose()
-                }
+    # The fixture requests per-user limited installation. Query Windows Installer's
+    # own current-user contexts rather than assuming an ARP uninstall-key layout.
+    foreach ($context in @(2, 1)) { # USERUNMANAGED, then USERMANAGED for cleanup diagnostics.
+        $name = Get-MsiProductProperty -ProductCode $ProductCode -Context $context -Property 'InstalledProductName'
+        if ($name.Status -eq 1605) {
+            continue
+        }
+        if ($name.Status -ne 0) {
+            throw "MsiGetProductInfoEx could not query product $ProductCode in context $context (Win32 status $($name.Status))."
+        }
+        $version = Get-MsiProductProperty -ProductCode $ProductCode -Context $context -Property 'VersionString'
+        $state = Get-MsiProductProperty -ProductCode $ProductCode -Context $context -Property 'State'
+        foreach ($propertyResult in @($version, $state)) {
+            if ($propertyResult.Status -ne 0) {
+                throw "MsiGetProductInfoEx could not retrieve a required property for product $ProductCode in context $context (Win32 status $($propertyResult.Status))."
             }
         }
-        finally {
-            $baseKey.Dispose()
+        return [pscustomobject]@{
+            DisplayName = $name.Value
+            DisplayVersion = $version.Value
+            ProductState = $state.Value
+            Context = $context
         }
     }
     return $null
 }
 
+function Get-MsiStageDiagnostics {
+    param(
+        [Parameter(Mandatory = $true)][string] $ProductCode,
+        [Parameter(Mandatory = $true)][string] $LogPath,
+        [Parameter(Mandatory = $true)][string] $PayloadPath,
+        [Parameter(Mandatory = $true)][string] $DefaultPayloadPath
+    )
+
+    $registrationText = 'Windows Installer API query returned no current-user product.'
+    try {
+        $registration = Get-ProductRegistration -ProductCode $ProductCode
+        if ($null -ne $registration) {
+            $registrationText = "Windows Installer API: name='$($registration.DisplayName)', version='$($registration.DisplayVersion)', state='$($registration.ProductState)', context=$($registration.Context)."
+        }
+    }
+    catch {
+        $registrationText = "Windows Installer API query failed: $($_.Exception.Message)"
+    }
+
+    $payloadState = if (Test-Path -LiteralPath $PayloadPath -PathType Leaf) {
+        $file = Get-Item -LiteralPath $PayloadPath
+        "present at '$PayloadPath' ($($file.Length) bytes)"
+    }
+    else {
+        "absent at '$PayloadPath'"
+    }
+    if ($DefaultPayloadPath -ne $PayloadPath -and (Test-Path -LiteralPath $DefaultPayloadPath -PathType Leaf)) {
+        $fallbackFile = Get-Item -LiteralPath $DefaultPayloadPath
+        $payloadState += "; also found at authored fallback '$DefaultPayloadPath' ($($fallbackFile.Length) bytes)"
+    }
+    $logTail = if (Test-Path -LiteralPath $LogPath -PathType Leaf) {
+        (Get-Content -LiteralPath $LogPath -Tail 35 -ErrorAction SilentlyContinue) -join [Environment]::NewLine
+    }
+    else {
+        'MSI verbose log was not created.'
+    }
+    if ($logTail.Length -gt 12000) {
+        $logTail = $logTail.Substring($logTail.Length - 12000)
+    }
+    "`n$registrationText`nPayload: $payloadState`nMSI log tail ($LogPath):`n$logTail"
+}
+
+function Assert-InstalledPayload {
+    param(
+        [Parameter(Mandatory = $true)][string] $ProductCode,
+        [Parameter(Mandatory = $true)][string] $LogPath,
+        [Parameter(Mandatory = $true)][string] $PayloadPath,
+        [Parameter(Mandatory = $true)][byte[]] $ExpectedBytes
+    )
+
+    $expectedHash = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($ExpectedBytes)).ToLowerInvariant()
+    if (-not (Test-Path -LiteralPath $PayloadPath -PathType Leaf)) {
+        throw "MSI stage did not write the expected payload.$(Get-MsiStageDiagnostics -ProductCode $ProductCode -LogPath $LogPath -PayloadPath $PayloadPath -DefaultPayloadPath $script:DefaultInstallRootPayload)"
+    }
+    $actualHash = (Get-FileHash -LiteralPath $PayloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualHash -ne $expectedHash) {
+        throw "MSI stage wrote different payload bytes than expected (expected SHA-256 $expectedHash, observed $actualHash).$(Get-MsiStageDiagnostics -ProductCode $ProductCode -LogPath $LogPath -PayloadPath $PayloadPath -DefaultPayloadPath $script:DefaultInstallRootPayload)"
+    }
+}
+
 function Assert-ProductVersion {
     param(
         [Parameter(Mandatory = $true)][string] $ProductCode,
-        [Parameter(Mandatory = $true)][string] $Version
+        [Parameter(Mandatory = $true)][string] $Version,
+        [Parameter(Mandatory = $true)][string] $LogPath,
+        [Parameter(Mandatory = $true)][string] $PayloadPath
     )
 
-    $registration = Get-ProductRegistration -ProductCode $ProductCode
-    if ($null -eq $registration) {
-        throw "MSI product $ProductCode is not registered for the current user."
+    $registrationQueryFailure = $null
+    try {
+        $registration = Get-ProductRegistration -ProductCode $ProductCode
+    }
+    catch {
+        $registration = $null
+        $registrationQueryFailure = $_.Exception.Message
+    }
+    if ($null -ne $registrationQueryFailure) {
+        throw "Windows Installer registration query failed: $registrationQueryFailure.$(Get-MsiStageDiagnostics -ProductCode $ProductCode -LogPath $LogPath -PayloadPath $PayloadPath -DefaultPayloadPath $script:DefaultInstallRootPayload)"
+    }
+    if ($null -eq $registration -or $registration.ProductState -ne '5') {
+        throw "MSI product $ProductCode was not installed in a current-user Windows Installer context.$(Get-MsiStageDiagnostics -ProductCode $ProductCode -LogPath $LogPath -PayloadPath $PayloadPath -DefaultPayloadPath $script:DefaultInstallRootPayload)"
     }
     if ($registration.DisplayName -ne 'SideEffect R5 Synthetic MSI Fixture' -or $registration.DisplayVersion -ne $Version) {
-        throw "MSI registration did not report expected version $Version."
+        throw "MSI registration did not report expected version $Version.$(Get-MsiStageDiagnostics -ProductCode $ProductCode -LogPath $LogPath -PayloadPath $PayloadPath -DefaultPayloadPath $script:DefaultInstallRootPayload)"
+    }
+    if ($registration.Context -ne 2) {
+        throw "MSI fixture registered in unexpected Windows Installer context $($registration.Context), expected current-user unmanaged context.$(Get-MsiStageDiagnostics -ProductCode $ProductCode -LogPath $LogPath -PayloadPath $PayloadPath -DefaultPayloadPath $script:DefaultInstallRootPayload)"
     }
 }
 
@@ -344,6 +438,23 @@ if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP) -or [string]::IsNullOrWhiteSp
     throw 'RUNNER_TEMP and WIX must be provided by the GitHub-hosted Windows runner.'
 }
 
+Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class SideEffectMsiNative
+{
+    [DllImport("msi.dll", EntryPoint = "MsiGetProductInfoExW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    public static extern uint GetProductInfoEx(
+        string productCode,
+        string userSid,
+        uint installContext,
+        string property,
+        StringBuilder value,
+        ref uint valueLength);
+}
+'@
+
 $script:SideEffectPath = [System.IO.Path]::GetFullPath($SideEffectPath)
 if (-not (Test-Path -LiteralPath $script:SideEffectPath -PathType Leaf)) {
     throw "SideEffect CLI was not found at $script:SideEffectPath."
@@ -364,7 +475,7 @@ $script:TestRoot = Join-Path $runnerTemp "sideeffect-r5-msi-lifecycle-$runId"
 Assert-UnderPath -Child $script:TestRoot -Parent $runnerTemp -Label 'MSI lifecycle fixture'
 $script:InstallRoot = Join-Path $script:TestRoot 'install-root'
 $defaultDirectoryName = "SideEffectR5Msi-$runId"
-$tempFallbackRoot = Join-Path $script:TestRoot $defaultDirectoryName
+$script:DefaultInstallRootPayload = Join-Path $script:InstallRoot 'payload.bin'
 $upgradeCode = ([Guid]::NewGuid()).ToString('B').ToUpperInvariant()
 $productCodeV1 = ([Guid]::NewGuid()).ToString('B').ToUpperInvariant()
 $productCodeV2 = ([Guid]::NewGuid()).ToString('B').ToUpperInvariant()
@@ -379,7 +490,7 @@ try {
     $createdTestRoot = $true
     Assert-UnderPath -Child $script:TestRoot -Parent $runnerTemp -Label 'created MSI lifecycle fixture'
     Assert-UnderPath -Child $script:InstallRoot -Parent $script:TestRoot -Label 'MSI install root'
-    Assert-UnderPath -Child $tempFallbackRoot -Parent $script:TestRoot -Label 'MSI default directory'
+    Assert-UnderPath -Child $script:InstallRoot -Parent $script:TestRoot -Label 'MSI default directory'
     New-Item -ItemType Directory -Path $script:InstallRoot -ErrorAction Stop | Out-Null
 
     $productCodeV1Key = Get-ProductRegistration -ProductCode $productCodeV1
@@ -400,8 +511,8 @@ try {
     $objV2 = Join-Path $script:TestRoot 'fixture-v2.wixobj'
     $msiV1 = Join-Path $script:TestRoot 'fixture-v1.msi'
     $msiV2 = Join-Path $script:TestRoot 'fixture-v2.msi'
-    New-MsiFixture -WxsPath $wxsV1 -WixObjPath $objV1 -MsiPath $msiV1 -PayloadPath $payloadV1Path -Version '1.0.0' -ProductCode $productCodeV1 -UpgradeCode $upgradeCode -ComponentCode $componentCode -DefaultDirectoryName $defaultDirectoryName -CandlePath $candlePath -LightPath $lightPath
-    New-MsiFixture -WxsPath $wxsV2 -WixObjPath $objV2 -MsiPath $msiV2 -PayloadPath $payloadV2Path -Version '2.0.0' -ProductCode $productCodeV2 -UpgradeCode $upgradeCode -ComponentCode $componentCode -DefaultDirectoryName $defaultDirectoryName -CandlePath $candlePath -LightPath $lightPath
+    New-MsiFixture -WxsPath $wxsV1 -WixObjPath $objV1 -MsiPath $msiV1 -PayloadPath $payloadV1Path -Version '1.0.0' -ProductCode $productCodeV1 -UpgradeCode $upgradeCode -ComponentCode $componentCode -DefaultDirectoryName $defaultDirectoryName -DefaultInstallRoot $script:InstallRoot -CandlePath $candlePath -LightPath $lightPath
+    New-MsiFixture -WxsPath $wxsV2 -WixObjPath $objV2 -MsiPath $msiV2 -PayloadPath $payloadV2Path -Version '2.0.0' -ProductCode $productCodeV2 -UpgradeCode $upgradeCode -ComponentCode $componentCode -DefaultDirectoryName $defaultDirectoryName -DefaultInstallRoot $script:InstallRoot -CandlePath $candlePath -LightPath $lightPath
 
     $beforePath = Join-Path $script:TestRoot 'before-install.json'
     $snapshotV1Path = Join-Path $script:TestRoot 'installed-v1.json'
@@ -415,7 +526,8 @@ try {
 
     $installationStarted = $true
     Install-Msi -MsiPath $msiV1 -InstallRoot $script:InstallRoot -LogPath (Join-Path $script:TestRoot 'install-v1.log') -Description 'MSI v1 install'
-    Assert-ProductVersion -ProductCode $productCodeV1 -Version '1.0.0'
+    Assert-ProductVersion -ProductCode $productCodeV1 -Version '1.0.0' -LogPath (Join-Path $script:TestRoot 'install-v1.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin')
+    Assert-InstalledPayload -ProductCode $productCodeV1 -LogPath (Join-Path $script:TestRoot 'install-v1.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin') -ExpectedBytes $payloadV1
     $entryV1 = Get-PayloadEntry (Get-InventorySnapshot -Path $snapshotV1Path)
     if ($entryV1.content_sha256 -ne (Get-FileHash -LiteralPath (Join-Path $script:InstallRoot 'payload.bin') -Algorithm SHA256).Hash.ToLowerInvariant()) {
         throw 'SideEffect v1 hash did not match the installed payload bytes.'
@@ -426,7 +538,8 @@ try {
 
     Install-Msi -MsiPath $msiV2 -InstallRoot $script:InstallRoot -LogPath (Join-Path $script:TestRoot 'update-v2.log') -Description 'MSI v2 major upgrade'
     Assert-ProductAbsent -ProductCode $productCodeV1
-    Assert-ProductVersion -ProductCode $productCodeV2 -Version '2.0.0'
+    Assert-ProductVersion -ProductCode $productCodeV2 -Version '2.0.0' -LogPath (Join-Path $script:TestRoot 'update-v2.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin')
+    Assert-InstalledPayload -ProductCode $productCodeV2 -LogPath (Join-Path $script:TestRoot 'update-v2.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin') -ExpectedBytes $payloadV2
     $entryV2 = Get-PayloadEntry (Get-InventorySnapshot -Path $snapshotV2Path)
     if ($entryV2.content_sha256 -ne (Get-FileHash -LiteralPath (Join-Path $script:InstallRoot 'payload.bin') -Algorithm SHA256).Hash.ToLowerInvariant()) {
         throw 'SideEffect v2 hash did not match the installed payload bytes.'
@@ -441,7 +554,8 @@ try {
     Uninstall-Msi -ProductCode $productCodeV2 -LogPath (Join-Path $script:TestRoot 'uninstall-v2-for-downgrade.log') -Description 'MSI v2 uninstall for downgrade strategy'
     Assert-ProductAbsent -ProductCode $productCodeV2
     Install-Msi -MsiPath $msiV1 -InstallRoot $script:InstallRoot -LogPath (Join-Path $script:TestRoot 'downgrade-reinstall-v1.log') -Description 'MSI v1 reinstall downgrade strategy'
-    Assert-ProductVersion -ProductCode $productCodeV1 -Version '1.0.0'
+    Assert-ProductVersion -ProductCode $productCodeV1 -Version '1.0.0' -LogPath (Join-Path $script:TestRoot 'downgrade-reinstall-v1.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin')
+    Assert-InstalledPayload -ProductCode $productCodeV1 -LogPath (Join-Path $script:TestRoot 'downgrade-reinstall-v1.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin') -ExpectedBytes $payloadV1
     $entryDowngrade = Get-PayloadEntry (Get-InventorySnapshot -Path $snapshotDowngradePath)
     if ($entryDowngrade.content_sha256 -ne $entryV1.content_sha256) {
         throw 'Downgrade reinstall did not restore the v1 payload fingerprint.'
@@ -468,10 +582,7 @@ finally {
         if ($installationStarted) {
             foreach ($productCode in @($productCodeV2, $productCodeV1)) {
                 try {
-                    if ($null -eq (Get-ProductRegistration -ProductCode $productCode)) {
-                        continue
-                    }
-                    Uninstall-Msi -ProductCode $productCode -LogPath (Join-Path $script:TestRoot "cleanup-$($productCode.Trim('{}')).log") -Description 'MSI lifecycle failure cleanup'
+                    Uninstall-Msi -ProductCode $productCode -LogPath (Join-Path $script:TestRoot "cleanup-$($productCode.Trim('{}')).log") -Description 'MSI lifecycle cleanup' -AllowMissing
                 }
                 catch {
                     Write-Warning "Could not clean up fixture MSI ${productCode}: $_"
