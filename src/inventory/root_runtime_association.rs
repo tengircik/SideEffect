@@ -43,6 +43,7 @@ pub struct RootRuntimeAssociationSummary {
     pub eligible_runtime_observation_count: usize,
     pub runtime_observation_rows_omitted_to_limit: usize,
     pub failed_or_unknown_write_intent_count: usize,
+    pub failed_or_unknown_removal_intent_count: usize,
     pub candidate_match_count: usize,
     pub ambiguous_candidate_count: usize,
     pub unmatched_delta_count: usize,
@@ -71,8 +72,9 @@ pub struct RootRuntimeEvidence {
 }
 
 /// Compare an already validated selected-root delta with a bounded strace trace.
-/// Only successful openat create/truncate operations with
-/// parser-derived absolute lexical hints are eligible.
+/// Only successful openat create/truncate operations are eligible for additions
+/// and changes, and only successful unlink/unlinkat operations for removals.
+/// Both directions require a plain absolute lexical operand.
 pub fn associate_root_runtime_diff(
     diff: &super::root_snapshot_diff::RootSnapshotDiff,
     trace_bytes: &[u8],
@@ -86,62 +88,92 @@ pub fn associate_root_runtime_diff(
     let trace = parse_trace_bytes(trace_bytes, ParseLimits::default())
         .map_err(|error| format!("trace parse failed: {error}"))?;
     let trace_hash = format!("{:x}", Sha256::digest(trace_bytes));
-    let mut observed = BTreeMap::<Vec<u8>, Vec<RootRuntimeEvidence>>::new();
+    let mut observed_writes = BTreeMap::<Vec<u8>, Vec<RootRuntimeEvidence>>::new();
+    let mut observed_removals = BTreeMap::<Vec<u8>, Vec<RootRuntimeEvidence>>::new();
     let mut failed_or_unknown_write_intent_count = 0;
+    let mut failed_or_unknown_removal_intent_count = 0;
     let mut eligible_runtime_observation_count = 0usize;
     let mut runtime_observation_rows_omitted_to_limit = 0usize;
     for record in &trace.records {
         if record.kind != TraceRecordKind::Syscall {
             continue;
         }
-        let syscall = match record.syscall.as_deref() {
-            Some("openat") => "openat",
-            _ => continue,
-        };
-        let Some(hint) = &record.lexical_path_hint else {
-            continue;
-        };
         let Some(args) = record.raw_arguments.as_deref().and_then(split_args) else {
             continue;
         };
-        let Some(flags) = args.get(2) else { continue };
-        let flag_tokens = flags.split('|').map(str::trim).collect::<Vec<_>>();
-        if flag_tokens.contains(&"O_TMPFILE")
-            || !flag_tokens
-                .iter()
-                .any(|flag| matches!(*flag, "O_CREAT" | "O_TRUNC"))
-        {
-            continue;
-        }
-        if record.outcome != Some(SyscallOutcome::Success) {
-            failed_or_unknown_write_intent_count += 1;
-            continue;
-        }
-        // The parser hint is usable here only when the source operand is an exact,
-        // plain absolute spelling without path aliases or escapes.
-        let Some(operand) = args.get(1) else {
+        // Direction is strict: an openat write intent can only support additions
+        // or changes, and an unlink can only support a removal.
+        let candidate = match record.syscall.as_deref() {
+            Some("openat") => {
+                // The parser hint is usable here only when the source operand is an
+                // exact, plain absolute spelling without path aliases or escapes.
+                let Some(hint) = &record.lexical_path_hint else {
+                    continue;
+                };
+                let Some(flags) = args.get(2) else { continue };
+                let flag_tokens = flags.split('|').map(str::trim).collect::<Vec<_>>();
+                if flag_tokens.contains(&"O_TMPFILE")
+                    || !flag_tokens
+                        .iter()
+                        .any(|flag| matches!(*flag, "O_CREAT" | "O_TRUNC"))
+                {
+                    continue;
+                }
+                if record.outcome != Some(SyscallOutcome::Success) {
+                    failed_or_unknown_write_intent_count += 1;
+                    continue;
+                }
+                let Some(operand) = args.get(1) else {
+                    continue;
+                };
+                let Some(path) = plain_absolute_operand(operand) else {
+                    continue;
+                };
+                if path != hint.path {
+                    continue;
+                }
+                Some(("openat", path, &mut observed_writes))
+            }
+            Some("unlink") => {
+                if args.len() != 1 {
+                    continue;
+                }
+                if !removal_succeeded(record) {
+                    failed_or_unknown_removal_intent_count += 1;
+                    continue;
+                }
+                let Some(path) = plain_absolute_operand(args[0]) else {
+                    continue;
+                };
+                Some(("unlink", path, &mut observed_removals))
+            }
+            Some("unlinkat") => {
+                // Directory-fd-relative and `AT_REMOVEDIR` forms are excluded; only
+                // the absolute-path, file-removal spelling is eligible.
+                if args.len() != 3 || args[0] != "AT_FDCWD" || args[2] != "0" {
+                    continue;
+                }
+                if !removal_succeeded(record) {
+                    failed_or_unknown_removal_intent_count += 1;
+                    continue;
+                }
+                let Some(path) = plain_absolute_operand(args[1]) else {
+                    continue;
+                };
+                Some(("unlinkat", path, &mut observed_removals))
+            }
+            _ => continue,
+        };
+        let Some((syscall, path, observed)) = candidate else {
             continue;
         };
-        let Some(path) = operand.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
-            continue;
-        };
-        if path != hint.path
-            || !path.starts_with('/')
-            || path.len() > 4095
-            || path.contains('\\')
-            || path.bytes().any(|b| !(0x20..=0x7e).contains(&b))
-            || path.split('/').any(|part| part == "." || part == "..")
-            || path.contains("//")
-        {
-            continue;
-        }
         if eligible_runtime_observation_count >= MAX_EVIDENCE_REFS {
             runtime_observation_rows_omitted_to_limit += 1;
             continue;
         }
         eligible_runtime_observation_count += 1;
         observed
-            .entry(hint.path.as_bytes().to_vec())
+            .entry(path.as_bytes().to_vec())
             .or_default()
             .push(RootRuntimeEvidence {
                 trace_sha256: trace_hash.clone(),
@@ -158,9 +190,11 @@ pub fn associate_root_runtime_diff(
     let mut ambiguous = 0;
     let mut total_evidence_refs = 0usize;
     for delta in &diff.deltas {
-        if !matches!(delta.kind, "added" | "changed") {
-            continue;
-        }
+        let observed = match delta.kind {
+            "added" | "changed" => &observed_writes,
+            "removed" => &observed_removals,
+            _ => continue,
+        };
         delta_count += 1;
         let Some(name_bytes) = decode_hex(&delta.name_identity_hex) else {
             unmatched += 1;
@@ -217,6 +251,7 @@ pub fn associate_root_runtime_diff(
             eligible_runtime_observation_count,
             runtime_observation_rows_omitted_to_limit,
             failed_or_unknown_write_intent_count,
+            failed_or_unknown_removal_intent_count,
             candidate_match_count: associations.len(),
             ambiguous_candidate_count: ambiguous,
             unmatched_delta_count: unmatched,
@@ -235,9 +270,10 @@ pub fn associate_root_runtime_diff(
             diagnostics
         },
         limitations: vec![
-            "Only exact absolute lexical paths in successful openat O_CREAT or O_TRUNC calls are considered; successful O_CREAT may open an existing file and does not prove a change.",
-            "Failed or unknown write-intent outcomes are counted but never treated as mutations.",
-            "Successful open calls are associated only with selected-root additions or changed rows; removals and unlink/rename operations are not supported.",
+            "Only exact absolute lexical paths in successful openat O_CREAT or O_TRUNC calls are considered for additions and changes; successful O_CREAT may open an existing file and does not prove a change.",
+            "Only exact absolute lexical paths in successful unlink calls, and in successful unlinkat calls with AT_FDCWD and flags 0, are considered for removals; unlinkat AT_REMOVEDIR, directory-fd-relative, relative, and malformed calls are excluded.",
+            "Failed or unknown write-intent or removal-intent outcomes are counted but never treated as mutations.",
+            "Successful open calls are associated only with selected-root additions or changed rows, and successful unlink calls only with removed rows; remove, rename, and directory-removal operations other than those forms remain unsupported.",
             "The strace task ID is not a stable process identity and does not establish which process caused a delta.",
             "A lexical candidate does not prove the filesystem operation changed the selected-root entry.",
             "Missing candidates do not establish absence; unsupported, failed, ambiguous, or non-comparable observations remain unknown.",
@@ -281,6 +317,31 @@ pub fn associate_root_runtime_diff(
         report.diagnostics.push("association_output_limit_reached");
     }
     Ok(report)
+}
+
+/// Strict plain absolute operand spelling shared by the open and unlink directions.
+/// It rejects aliases, escapes, non-ASCII bytes, and non-quoted operands.
+fn plain_absolute_operand(operand: &str) -> Option<&str> {
+    let path = operand
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))?;
+    if !path.starts_with('/')
+        || path.len() > 4095
+        || path.contains('\\')
+        || path.bytes().any(|b| !(0x20..=0x7e).contains(&b))
+        || path.split('/').any(|part| part == "." || part == "..")
+        || path.contains("//")
+    {
+        return None;
+    }
+    Some(path)
+}
+
+/// A removal counts only when the observed result is exactly the integer `0`.
+/// The parser derives outcomes for a selected syscall set that does not include
+/// unlink, so this reads the raw result strictly instead of guessing a success.
+fn removal_succeeded(record: &crate::model::TraceRecord) -> bool {
+    record.raw_result.as_deref().map(str::trim) == Some("0")
 }
 
 fn split_args(input: &str) -> Option<Vec<&str>> {
@@ -390,20 +451,113 @@ mod tests {
         assert_eq!(report.summary.failed_or_unknown_write_intent_count, 1);
     }
 
+    fn removed() -> super::super::root_snapshot_diff::RootSnapshotDiff {
+        super::super::root_snapshot_diff::compare_selected_root_inventory_json(
+            &snapshot(json!([row(4)])),
+            &snapshot(json!([])),
+        )
+        .unwrap()
+    }
+
+    fn added() -> super::super::root_snapshot_diff::RootSnapshotDiff {
+        super::super::root_snapshot_diff::compare_selected_root_inventory_json(
+            &snapshot(json!([])),
+            &snapshot(json!([row(4)])),
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn ignores_removals_and_tmpfile_paths() {
-        let before = snapshot(json!([row(4)]));
-        let after = snapshot(json!([]));
-        let diff =
-            super::super::root_snapshot_diff::compare_selected_root_inventory_json(&before, &after)
-                .unwrap();
+    fn associates_successful_unlink_only_with_removed_delta_and_raw_locator() {
+        let diff = removed();
+        let trace = b"123.000001 unlink(\"/tmp/r5-root/item\") = 0\n";
+        let report = associate_root_runtime_diff(&diff, trace).unwrap();
+        assert_eq!(report.associations.len(), 1);
+        assert_eq!(report.associations[0].status, "candidate_match");
+        assert_eq!(report.associations[0].delta_kind, "removed");
+        assert_eq!(
+            report.associations[0].candidate_path_bytes_hex,
+            "2f746d702f72352d726f6f742f6974656d"
+        );
+        assert_eq!(report.associations[0].runtime_evidence[0].syscall, "unlink");
+        assert_eq!(report.associations[0].runtime_evidence[0].line_number, 1);
+        assert_eq!(report.associations[0].runtime_evidence[0].byte_offset, 0);
+        assert_eq!(report.summary.delta_count, 1);
+        assert_eq!(report.summary.unmatched_delta_count, 0);
+        assert_eq!(report.summary.failed_or_unknown_removal_intent_count, 0);
+
+        let report = associate_root_runtime_diff(
+            &diff,
+            b"unlinkat(AT_FDCWD, \"/tmp/r5-root/item\", 0) = 0\n",
+        )
+        .unwrap();
+        assert_eq!(report.associations.len(), 1);
+        assert_eq!(
+            report.associations[0].runtime_evidence[0].syscall,
+            "unlinkat"
+        );
+    }
+
+    #[test]
+    fn removal_mutation_direction_is_strict() {
+        // A successful removal never supports an addition or a changed row.
+        let report =
+            associate_root_runtime_diff(&added(), b"unlink(\"/tmp/r5-root/item\") = 0\n").unwrap();
+        assert!(report.associations.is_empty());
+        assert_eq!(report.summary.unmatched_delta_count, 1);
+
+        let changed = super::super::root_snapshot_diff::compare_selected_root_inventory_json(
+            &snapshot(json!([row(4)])),
+            &snapshot(json!([row(5)])),
+        )
+        .unwrap();
+        let report =
+            associate_root_runtime_diff(&changed, b"unlink(\"/tmp/r5-root/item\") = 0\n").unwrap();
+        assert!(report.associations.is_empty());
+        assert_eq!(report.summary.unmatched_delta_count, 1);
+    }
+
+    #[test]
+    fn failed_removedir_relative_suffix_and_malformed_removals_do_not_match() {
+        let diff = removed();
+        let trace = b"unlink(\"/tmp/r5-root/item\") = -1 EACCES (Permission denied)\n\
+unlinkat(AT_FDCWD, \"/tmp/r5-root/item\", AT_REMOVEDIR) = 0\n\
+unlinkat(3</tmp/r5-root>, \"item\", 0) = 0\n\
+unlink(\"item\") = 0\n\
+unlink(\"/tmp/r5-root/item.bak\") = 0\n\
+unlink(\"/tmp/r5-root/item\", 0) = 0\n\
+unlinkat(AT_FDCWD, \"/tmp/r5-root/item\") = 0\n\
+unlink(\"/tmp/r5-root/item, 0) = 0\n\
+unlink(AT_FDCWD, \"/tmp/r5-root/item\") = 0\n";
+        let report = associate_root_runtime_diff(&diff, trace).unwrap();
+        assert!(report.associations.is_empty());
+        assert_eq!(report.summary.delta_count, 1);
+        assert_eq!(report.summary.unmatched_delta_count, 1);
+        assert_eq!(report.summary.failed_or_unknown_removal_intent_count, 1);
+    }
+
+    #[test]
+    fn repeated_successful_removals_remain_ambiguous() {
+        let diff = removed();
+        let trace = b"unlink(\"/tmp/r5-root/item\") = 0\nunlinkat(AT_FDCWD, \"/tmp/r5-root/item\", 0) = 0\n";
+        let report = associate_root_runtime_diff(&diff, trace).unwrap();
+        assert_eq!(report.associations.len(), 1);
+        assert_eq!(report.associations[0].status, "ambiguous_candidate_match");
+        assert!(report.associations[0].multiple_runtime_observations);
+        assert_eq!(report.summary.ambiguous_candidate_count, 1);
+    }
+
+    #[test]
+    fn openat_write_intent_does_not_match_a_removed_delta_and_tmpfile_is_ignored() {
+        let diff = removed();
         let report = associate_root_runtime_diff(
             &diff,
             b"openat(AT_FDCWD, \"/tmp/r5-root/item\", O_WRONLY|O_CREAT, 0600) = 3\n",
         )
         .unwrap();
         assert!(report.associations.is_empty());
-        assert_eq!(report.summary.delta_count, 0);
+        assert_eq!(report.summary.delta_count, 1);
+        assert_eq!(report.summary.unmatched_delta_count, 1);
 
         let before = snapshot(json!([]));
         let after = snapshot(json!([row(4)]));
