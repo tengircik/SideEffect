@@ -471,6 +471,8 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
         "runtime.windows.json"
     );
     fs::remove_dir_all(observation_session).unwrap();
+    fs::remove_file(observation_file).unwrap();
+    fs::remove_dir(observation_root).unwrap();
 
     if std::env::var("SIDEEFFECT_ETW_DIAGNOSTIC_SAMPLE")
         .is_ok_and(|value| value == "windows_server_hosted_ci")
