@@ -131,7 +131,7 @@ function Get-MsiCabinetIdentifiers {
         $installer = New-Object -ComObject WindowsInstaller.Installer
         $database = $installer.OpenDatabase([System.IO.Path]::GetFullPath($MsiPath), 0) # MSIDBOPEN_READONLY
         $view = $database.OpenView('SELECT `Cabinet` FROM `Media`')
-        $view.Execute($null)
+        [void]$view.Execute($null)
         while ($true) {
             $record = $view.Fetch()
             if ($null -eq $record) {
@@ -144,11 +144,11 @@ function Get-MsiCabinetIdentifiers {
                 [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($record)
             }
         }
-        return $identifiers.ToArray()
+        return @($identifiers.ToArray() | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     }
     finally {
         if ($null -ne $view) {
-            try { $view.Close() } catch { }
+            try { [void]$view.Close() } catch { }
             [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($view)
         }
         if ($null -ne $database) {
