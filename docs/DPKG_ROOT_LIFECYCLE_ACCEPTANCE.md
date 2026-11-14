@@ -35,7 +35,33 @@ snapshot rows. A fixture-owned anchor file keeps the selected directory
 present throughout the lifecycle, so the final snapshot can directly confirm
 that the package payload is absent after purge while the anchor remains.
 
-The test requires Linux, Rust/Cargo, `dpkg`, `dpkg-deb`, and `dpkg-query`. The
+The v1 install phase is also launched through the real
+`audit --observe-root --hash-regular-files` CLI. The test builds that CLI's
+argument vector from the same fixed `/usr/bin/dpkg` command and private-root
+arguments used by the unobserved lifecycle phases, preserving argument
+boundaries. It clears the audit process environment and copies only the
+fixture dpkg command's fixed `PATH`, `LC_ALL`, and private `TMPDIR` overrides;
+the package command itself still targets only the canonicalized fixture root,
+admin directory, and log under the private temporary parent. The resulting
+session is compared with `compare-observation`: the selected-root diff must
+show the added payload. The runtime association must leave the final payload
+without a candidate link because dpkg commits it from a staging path with
+`rename`. The test verifies each referenced runtime line locator against the
+raw `trace.strace` bytes and parsed successful syscall result, plus the
+session-manifest artifact digests. The trace must retain both a successful
+create of `payload.bin.dpkg-new` and a `rename` return value of zero to the final
+payload path. Since the current association adapter does not interpret
+`rename`, it leaves the added root delta unmatched; the test makes no candidate
+link for that final path. The remaining update, downgrade, and purge
+transitions use the same direct private-root dpkg helper and are checked with
+package/root snapshots, but are not individually wrapped in `audit`. The
+association remains explicitly
+`lexical_path_candidate_only_no_causation_or_process_identity`, and capture
+completeness remains unknown. This does not prove the package command caused
+the file state or establish broad `strace` coverage.
+
+The test requires Linux x86_64, Rust/Cargo, `strace`, `dpkg`, `dpkg-deb`, and
+`dpkg-query`. CI installs `strace` and `dpkg` explicitly. The
 normal Linux `cargo test --locked --all-targets` job runs it; no package
 installation or elevation is required on the CI host. All package trees,
 archives, dpkg state/logs, installed files, and snapshots are created in the

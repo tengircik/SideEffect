@@ -1,7 +1,12 @@
 #![cfg(target_os = "linux")]
 
 use serde_json::Value;
+use sideeffect::audit_session::{ArtifactKind, SourceRole, SourceStatus, parse_manifest};
 use sideeffect::inventory::parse_dpkg_query_output;
+use sideeffect::limits::ParseLimits;
+use sideeffect::model::{SyscallOutcome, TraceRecordKind};
+use sideeffect::trace::strace::parse_trace_bytes;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -154,15 +159,123 @@ fn isolated_dpkg_command(root: &Path, private_parent: &Path) -> Command {
     command
 }
 
-fn dpkg_install(root: &Path, private_parent: &Path, deb: &Path, downgrade: bool) {
+fn dpkg_install_command(
+    root: &Path,
+    private_parent: &Path,
+    deb: &Path,
+    downgrade: bool,
+) -> Command {
     let mut command = isolated_dpkg_command(root, private_parent);
     if downgrade {
         command.arg("--force-downgrade");
     }
-    let output = command.arg("--install").arg(deb).output().unwrap();
+    command.arg("--install").arg(deb);
+    command
+}
+
+fn dpkg_install(root: &Path, private_parent: &Path, deb: &Path, downgrade: bool) {
+    let output = dpkg_install_command(root, private_parent, deb, downgrade)
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "isolated dpkg install failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn audit_dpkg_install(
+    root: &Path,
+    private_parent: &Path,
+    observed_root: &Path,
+    deb: &Path,
+    session_path: &Path,
+) {
+    let dpkg = dpkg_install_command(root, private_parent, deb, false);
+    let program = dpkg.get_program().to_owned();
+    let arguments = dpkg.get_args().map(OsString::from).collect::<Vec<_>>();
+    let expected_arguments = [
+        format!("--root={}", root.canonicalize().unwrap().display()),
+        format!(
+            "--admindir={}",
+            root.canonicalize().unwrap().join("var/lib/dpkg").display()
+        ),
+        format!("--instdir={}", root.canonicalize().unwrap().display()),
+        format!(
+            "--log={}",
+            private_parent
+                .canonicalize()
+                .unwrap()
+                .join("dpkg.log")
+                .display()
+        ),
+        "--force-not-root".to_owned(),
+        "--no-triggers".to_owned(),
+        "--install".to_owned(),
+        deb.to_string_lossy().into_owned(),
+    ];
+    assert_eq!(
+        arguments
+            .iter()
+            .map(|argument| argument.to_str().expect("fixture argv is UTF-8"))
+            .collect::<Vec<_>>(),
+        expected_arguments
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        "the observed child must preserve the isolated dpkg argument vector exactly"
+    );
+    let environment = dpkg
+        .get_envs()
+        .map(|(key, value)| (OsString::from(key), value.map(OsString::from)))
+        .collect::<Vec<_>>();
+    assert_eq!(program, DPKG);
+    assert_eq!(
+        environment.len(),
+        3,
+        "isolated dpkg must retain only its fixed PATH, locale, and private TMPDIR overrides"
+    );
+    assert!(
+        environment
+            .iter()
+            .any(|(key, value)| { key == "PATH" && value.as_deref() == Some(SAFE_PATH.as_ref()) })
+    );
+    assert!(
+        environment
+            .iter()
+            .any(|(key, value)| { key == "LC_ALL" && value.as_deref() == Some(OsStr::new("C")) })
+    );
+    assert!(environment.iter().any(|(key, value)| {
+        key == "TMPDIR" && value.as_deref() == Some(private_parent.as_os_str())
+    }));
+
+    let mut audit = Command::new(env!("CARGO_BIN_EXE_sideeffect"));
+    audit
+        .env_clear()
+        .arg("audit")
+        .arg("--output")
+        .arg(session_path)
+        .arg("--observe-root")
+        .arg(observed_root)
+        .arg("--hash-regular-files")
+        .arg("--runtime-duration-seconds")
+        .arg("30")
+        .arg("--")
+        .arg(program)
+        .args(arguments);
+    for (key, value) in environment {
+        audit.env(
+            key,
+            value.expect("the fixture dpkg environment contains only fixed values"),
+        );
+    }
+    let output = audit
+        .output()
+        .expect("launch observed isolated dpkg install");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "runtime-containing audit sessions are partial by contract: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -354,6 +467,186 @@ fn snapshot_diff(before: &Path, after: &Path) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn assert_observed_dpkg_install(session_path: &Path, observed_root: &Path) {
+    let manifest_path = session_path.join("session.json");
+    let manifest_bytes = fs::read(&manifest_path).unwrap();
+    let manifest = parse_manifest(&manifest_bytes).expect("validate observation session manifest");
+    assert_eq!(
+        manifest.schema_version,
+        sideeffect::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION
+    );
+    assert_eq!(
+        manifest.status,
+        sideeffect::audit_session::SessionStatus::Partial,
+        "runtime completeness remains unknown by contract"
+    );
+    let root_source = manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::SelectedRoot)
+        .expect("selected-root source");
+    assert_eq!(root_source.status, SourceStatus::Complete);
+    assert_eq!(root_source.artifacts.len(), 2);
+    assert!(
+        root_source
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == ArtifactKind::SelectedRoot)
+    );
+    assert!(
+        root_source
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == ArtifactKind::SelectedRootAfter)
+    );
+
+    let runtime = manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::Runtime)
+        .expect("runtime source");
+    assert_eq!(runtime.status, SourceStatus::Partial);
+    assert_eq!(
+        runtime.scope,
+        "selected command and traced descendants; command arguments are not copied into the session manifest"
+    );
+    assert_eq!(runtime.artifacts.len(), 2);
+    let run_ref = runtime
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == ArtifactKind::RuntimeManifest)
+        .unwrap();
+    let trace_ref = runtime
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == ArtifactKind::RuntimeTrace)
+        .unwrap();
+    assert_eq!(run_ref.path, "run.json");
+    assert_eq!(trace_ref.path, "trace.strace");
+
+    for artifact in root_source.artifacts.iter().chain(&runtime.artifacts) {
+        let path = session_path.join(&artifact.path);
+        let metadata = fs::symlink_metadata(&path).expect("session artifact exists");
+        assert!(metadata.is_file());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let bytes = fs::read(path).unwrap();
+        assert_eq!(artifact.byte_length, bytes.len() as u64);
+        assert_eq!(artifact.sha256, sha256_hex(&bytes));
+    }
+
+    let run: Value = serde_json::from_slice(&fs::read(session_path.join("run.json")).unwrap())
+        .expect("runtime bundle manifest JSON");
+    assert_eq!(run["schema"], "sideeffect.run");
+    assert_eq!(run["schema_version"], 2);
+    assert_eq!(run["capture"]["completeness"], "unknown");
+    assert_eq!(run["capture"]["stop_reason"], "tracer_exited");
+    assert_eq!(
+        run["capture"]["strace_reported_status"]["kind"],
+        "exit_code"
+    );
+    assert_eq!(run["capture"]["strace_reported_status"]["value"], 0);
+
+    let trace_bytes = fs::read(session_path.join("trace.strace")).unwrap();
+    let trace = parse_trace_bytes(&trace_bytes, ParseLimits::default()).unwrap();
+    assert_eq!(
+        trace.parse_status,
+        sideeffect::model::ParseCompleteness::Complete
+    );
+    let compared = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("compare-observation")
+        .arg(session_path)
+        .output()
+        .expect("launch SideEffect observation comparison");
+    assert_eq!(
+        compared.status.code(),
+        Some(2),
+        "runtime-containing comparison remains partial by contract: {}",
+        String::from_utf8_lossy(&compared.stderr)
+    );
+    let report: Value = serde_json::from_slice(&compared.stdout).unwrap();
+    assert_eq!(report["root_comparison_status"], "complete");
+    assert_eq!(report["root_diff"]["counts"]["additions"], 1);
+    assert_eq!(report["root_diff"]["counts"]["removals"], 0);
+    assert_eq!(report["runtime_source_status"], "partial");
+    assert_eq!(report["runtime_capture_completeness"], "unknown");
+
+    let association = &report["root_runtime_association"];
+    assert_eq!(
+        association["claim"],
+        "lexical_path_candidate_only_no_causation_or_process_identity"
+    );
+    assert_eq!(association["status"], "partial");
+    assert_eq!(association["capture_completeness"], "unknown");
+    assert_eq!(association["trace_sha256"], trace_ref.sha256);
+    let payload_path = observed_root.join(PAYLOAD_NAME);
+    let payload_path = payload_path.to_string_lossy();
+    let associations = association["associations"].as_array().unwrap();
+    assert!(
+        associations
+            .iter()
+            .all(|candidate| candidate["candidate_path"] != payload_path.as_ref())
+    );
+    assert_eq!(association["summary"]["delta_count"], 1);
+    assert_eq!(association["summary"]["candidate_match_count"], 0);
+    assert_eq!(association["summary"]["unmatched_delta_count"], 1);
+
+    let staged_payload_path = observed_root.join(format!("{PAYLOAD_NAME}.dpkg-new"));
+    let staged_payload_path = staged_payload_path.to_string_lossy();
+    let rename = trace
+        .records
+        .iter()
+        .find(|record| {
+            matches!(
+                record.syscall.as_deref(),
+                Some("rename" | "renameat" | "renameat2")
+            ) && record.raw_result.as_deref() == Some("0")
+                && record.raw_arguments.as_ref().is_some_and(|arguments| {
+                    arguments.contains(staged_payload_path.as_ref())
+                        && arguments.contains(payload_path.as_ref())
+                })
+        })
+        .expect("raw trace must record dpkg's successful staging-to-final rename");
+    assert_eq!(rename.kind, TraceRecordKind::Syscall);
+    assert_eq!(
+        rename.outcome, None,
+        "rename is not interpreted by the typed outcome adapter"
+    );
+    assert_eq!(
+        trace.source_sha256,
+        sha256_hex(&trace_bytes),
+        "parsed runtime rows must retain the exact trace fingerprint"
+    );
+    let start = rename.evidence.byte_offset as usize;
+    let end = start
+        .checked_add(rename.evidence.byte_length as usize)
+        .expect("rename evidence range does not overflow");
+    assert_eq!(&trace_bytes[start..end], rename.raw_line.as_bytes());
+    assert!(rename.raw_line.ends_with(" = 0"));
+
+    let staged_create = trace
+        .records
+        .iter()
+        .find(|record| {
+            matches!(record.syscall.as_deref(), Some("openat" | "openat2"))
+                && record.outcome == Some(SyscallOutcome::Success)
+                && record
+                    .raw_arguments
+                    .as_ref()
+                    .is_some_and(|arguments| arguments.contains("O_CREAT"))
+                && record
+                    .lexical_path_hint
+                    .as_ref()
+                    .is_some_and(|hint| hint.path == staged_payload_path.as_ref())
+        })
+        .expect("raw trace must retain a successful create of the dpkg staging path");
+    let start = staged_create.evidence.byte_offset as usize;
+    let end = start
+        .checked_add(staged_create.evidence.byte_length as usize)
+        .expect("staging create evidence range does not overflow");
+    assert_eq!(&trace_bytes[start..end], staged_create.raw_line.as_bytes());
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(bytes))
@@ -396,7 +689,15 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
         sha256_hex(ANCHOR_CONTENT)
     );
 
-    dpkg_install(&private_root, private_parent, &deb_v1, false);
+    let observed_v1_session = private_parent.join("observed-install-v1.session");
+    audit_dpkg_install(
+        &private_root,
+        private_parent,
+        &install_root,
+        &deb_v1,
+        &observed_v1_session,
+    );
+    assert_observed_dpkg_install(&observed_v1_session, &install_root);
     let packages_v1_path = private_parent.join("packages-installed-v1.json");
     let packages_v1 = dpkg_query_inventory(&private_root, private_parent, &packages_v1_path);
     assert_package_version(&packages_v1, Some("1.0-1"));

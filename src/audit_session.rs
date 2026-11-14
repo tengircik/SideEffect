@@ -1041,8 +1041,10 @@ fn artifact_version_supported(
     }
     observed == current
         || (kind == ArtifactKind::Startup && matches!(observed, 2 | 3))
-        || (kind == ArtifactKind::SelectedRoot
-            && session_version >= AUDIT_SESSION_V8_SCHEMA_VERSION
+        || (matches!(
+            kind,
+            ArtifactKind::SelectedRoot | ArtifactKind::SelectedRootAfter
+        ) && session_version >= AUDIT_SESSION_V8_SCHEMA_VERSION
             && observed == 2)
         || (matches!(observed, 1..=4)
             && matches!(
@@ -1466,7 +1468,7 @@ mod tests {
                 kind: ArtifactKind::SelectedRoot,
                 path: "root-snapshot.json".to_owned(),
                 schema: "sideeffect.selected_root_inventory".to_owned(),
-                schema_version: 1,
+                schema_version: 2,
                 byte_length: 1,
                 sha256: "0".repeat(64),
             },
@@ -1474,7 +1476,7 @@ mod tests {
                 kind: ArtifactKind::SelectedRootAfter,
                 path: "root-snapshot-after.json".to_owned(),
                 schema: "sideeffect.selected_root_inventory".to_owned(),
-                schema_version: 1,
+                schema_version: 2,
                 byte_length: 1,
                 sha256: "0".repeat(64),
             },
