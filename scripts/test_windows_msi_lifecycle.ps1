@@ -104,18 +104,76 @@ function New-MsiFixture {
     )
     Invoke-WixTool -Tool $CandlePath -Arguments $compileArguments
     Invoke-WixTool -Tool $LightPath -Arguments @('-nologo', '-out', $MsiPath, $WixObjPath)
+
+    if (-not (Test-Path -LiteralPath $MsiPath -PathType Leaf)) {
+        throw "WiX completed without creating the expected MSI package: $MsiPath"
+    }
+    if ((Get-Item -LiteralPath $MsiPath).Length -le 0) {
+        throw "WiX created an empty MSI package: $MsiPath"
+    }
 }
 
 function Invoke-Msi {
     param(
-        [Parameter(Mandatory = $true)][string[]] $Arguments,
-        [Parameter(Mandatory = $true)][string] $Description
+        [Parameter(Mandatory = $true)][string] $ArgumentLine,
+        [Parameter(Mandatory = $true)][string] $Description,
+        [Parameter(Mandatory = $true)][string] $LogPath,
+        [Parameter()][string] $PackagePath,
+        [Parameter()][int[]] $AcceptedExitCodes = @()
     )
 
-    & $script:MsiexecPath @Arguments
-    $exitCode = $LASTEXITCODE
+    $LogPath = [System.IO.Path]::GetFullPath($LogPath)
+    Assert-UnderPath -Child $LogPath -Parent $script:TestRoot -Label 'MSI log'
+    if (-not [string]::IsNullOrWhiteSpace($PackagePath)) {
+        $PackagePath = [System.IO.Path]::GetFullPath($PackagePath)
+        Assert-UnderPath -Child $PackagePath -Parent $script:TestRoot -Label 'MSI package'
+        if (-not (Test-Path -LiteralPath $PackagePath -PathType Leaf)) {
+            throw "$Description cannot start because the MSI package does not exist: $PackagePath"
+        }
+        if ((Get-Item -LiteralPath $PackagePath).Length -le 0) {
+            throw "$Description cannot start because the MSI package is empty: $PackagePath"
+        }
+    }
+
+    # Start-Process receives one explicit Windows command line. Quote package and log
+    # paths literally because Windows Installer parses its own command-line grammar.
+    $processId = [Guid]::NewGuid().ToString('N')
+    $stdoutPath = Join-Path $script:TestRoot "msiexec-$processId.stdout.txt"
+    $stderrPath = Join-Path $script:TestRoot "msiexec-$processId.stderr.txt"
+    Assert-UnderPath -Child $stdoutPath -Parent $script:TestRoot -Label 'MSI stdout'
+    Assert-UnderPath -Child $stderrPath -Parent $script:TestRoot -Label 'MSI stderr'
+    $process = Start-Process -FilePath $script:MsiexecPath -ArgumentList $ArgumentLine `
+        -WorkingDirectory $script:TestRoot -RedirectStandardOutput $stdoutPath `
+        -RedirectStandardError $stderrPath -Wait -PassThru -NoNewWindow
+    $exitCode = $process.ExitCode
+    if ($exitCode -eq 0 -or $AcceptedExitCodes -contains $exitCode) {
+        return
+    }
     if ($exitCode -ne 0) {
-        throw "$Description failed with msiexec exit code $exitCode."
+        $hint = switch ($exitCode) {
+            1619 { 'Windows Installer could not open the package; check the package path, access, and MSI validity.' }
+            1618 { 'Another Windows Installer operation is in progress on this runner.' }
+            1603 { 'Windows Installer reported a fatal installation error; inspect the verbose log.' }
+            default { 'Inspect the verbose log for the Windows Installer diagnostic.' }
+        }
+        $packageDetail = if (-not [string]::IsNullOrWhiteSpace($PackagePath)) { "`nMSI package: $PackagePath" } else { '' }
+        $logDetail = ''
+        if (Test-Path -LiteralPath $LogPath -PathType Leaf) {
+            $tail = @(Get-Content -LiteralPath $LogPath -Tail 30 -ErrorAction SilentlyContinue) -join [Environment]::NewLine
+            $logDetail = "`nVerbose log: $LogPath`nLast log lines:`n$tail"
+        }
+        else {
+            $logDetail = "`nVerbose log was not created at: $LogPath"
+        }
+        foreach ($streamPath in @($stdoutPath, $stderrPath)) {
+            if (Test-Path -LiteralPath $streamPath -PathType Leaf) {
+                $streamTail = @(Get-Content -LiteralPath $streamPath -Tail 20 -ErrorAction SilentlyContinue) -join [Environment]::NewLine
+                if (-not [string]::IsNullOrWhiteSpace($streamTail)) {
+                    $logDetail += "`nProcess output ($streamPath):`n$streamTail"
+                }
+            }
+        }
+        throw "$Description failed with msiexec exit code $exitCode. $hint`nCommand line: $ArgumentLine$packageDetail$logDetail"
     }
 }
 
@@ -130,10 +188,11 @@ function Install-Msi {
     Assert-UnderPath -Child $MsiPath -Parent $script:TestRoot -Label 'MSI fixture'
     Assert-UnderPath -Child $InstallRoot -Parent $script:TestRoot -Label 'MSI install root'
     Assert-UnderPath -Child $LogPath -Parent $script:TestRoot -Label 'MSI log'
-    Invoke-Msi -Description $Description -Arguments @(
-        '/i', $MsiPath, '/qn', '/norestart', '/l*v', $LogPath,
-        "INSTALLROOT=$InstallRoot"
-    )
+    $quotedMsiPath = '"' + [System.IO.Path]::GetFullPath($MsiPath) + '"'
+    $quotedLogPath = '"' + [System.IO.Path]::GetFullPath($LogPath) + '"'
+    $quotedInstallRoot = '"' + [System.IO.Path]::GetFullPath($InstallRoot) + '"'
+    $argumentLine = "/i $quotedMsiPath /qn /norestart /l*v $quotedLogPath INSTALLROOT=$quotedInstallRoot"
+    Invoke-Msi -Description $Description -ArgumentLine $argumentLine -LogPath $LogPath -PackagePath $MsiPath
 }
 
 function Uninstall-Msi {
@@ -145,14 +204,10 @@ function Uninstall-Msi {
     )
 
     Assert-UnderPath -Child $LogPath -Parent $script:TestRoot -Label 'MSI log'
-    & $script:MsiexecPath '/x' $ProductCode '/qn' '/norestart' '/l*v' $LogPath
-    $exitCode = $LASTEXITCODE
-    if ($AllowMissing -and $exitCode -eq 1605) {
-        return
-    }
-    if ($exitCode -ne 0) {
-        throw "$Description failed with msiexec exit code $exitCode."
-    }
+    $quotedLogPath = '"' + [System.IO.Path]::GetFullPath($LogPath) + '"'
+    $argumentLine = "/x $ProductCode /qn /norestart /l*v $quotedLogPath"
+    $acceptedExitCodes = if ($AllowMissing) { @(1605) } else { @() }
+    Invoke-Msi -Description $Description -ArgumentLine $argumentLine -LogPath $LogPath -AcceptedExitCodes $acceptedExitCodes
 }
 
 function Get-ProductRegistration {
@@ -314,10 +369,10 @@ $upgradeCode = ([Guid]::NewGuid()).ToString('B').ToUpperInvariant()
 $productCodeV1 = ([Guid]::NewGuid()).ToString('B').ToUpperInvariant()
 $productCodeV2 = ([Guid]::NewGuid()).ToString('B').ToUpperInvariant()
 $componentCode = ([Guid]::NewGuid()).ToString('B').ToUpperInvariant()
-$previousTemp = $env:TEMP
-$previousTmp = $env:TMP
 $createdTestRoot = $false
 $installationStarted = $false
+$testFailure = $null
+$cleanupErrors = [System.Collections.Generic.List[string]]::new()
 
 try {
     New-Item -ItemType Directory -Path $script:TestRoot -ErrorAction Stop | Out-Null
@@ -358,8 +413,6 @@ try {
         throw 'Fresh MSI install root was not empty before installation.'
     }
 
-    $env:TEMP = $script:TestRoot
-    $env:TMP = $script:TestRoot
     $installationStarted = $true
     Install-Msi -MsiPath $msiV1 -InstallRoot $script:InstallRoot -LogPath (Join-Path $script:TestRoot 'install-v1.log') -Description 'MSI v1 install'
     Assert-ProductVersion -ProductCode $productCodeV1 -Version '1.0.0'
@@ -407,23 +460,52 @@ try {
     Assert-DiffEvidence -Diff $uninstallDiff -Kind 'removed' -CountField 'removals' -Count 1 -BeforeEntry $entryDowngrade
     Write-Output 'MSI v1 uninstall removed the observed selected-root payload.'
 }
+catch {
+    $testFailure = $_
+}
 finally {
-    $env:TEMP = $previousTemp
-    $env:TMP = $previousTmp
-    if ($installationStarted) {
-        foreach ($productCode in @($productCodeV2, $productCodeV1)) {
-            if ($null -ne (Get-ProductRegistration -ProductCode $productCode)) {
+    try {
+        if ($installationStarted) {
+            foreach ($productCode in @($productCodeV2, $productCodeV1)) {
                 try {
+                    if ($null -eq (Get-ProductRegistration -ProductCode $productCode)) {
+                        continue
+                    }
                     Uninstall-Msi -ProductCode $productCode -LogPath (Join-Path $script:TestRoot "cleanup-$($productCode.Trim('{}')).log") -Description 'MSI lifecycle failure cleanup'
                 }
                 catch {
                     Write-Warning "Could not clean up fixture MSI ${productCode}: $_"
+                    $cleanupErrors.Add("Could not uninstall fixture MSI ${productCode}: $($_.Exception.Message)")
                 }
             }
         }
+        $registeredFixtureRemains = $false
+        foreach ($productCode in @($productCodeV2, $productCodeV1)) {
+            if ($null -ne (Get-ProductRegistration -ProductCode $productCode)) {
+                $registeredFixtureRemains = $true
+            }
+        }
+        if ($createdTestRoot -and (Test-Path -LiteralPath $script:TestRoot)) {
+            if ($registeredFixtureRemains) {
+                Write-Warning "Fixture files were retained because an MSI product remains registered: $script:TestRoot"
+                $cleanupErrors.Add("Fixture MSI registration remains; retained fixture files at $script:TestRoot")
+            }
+            else {
+                Assert-UnderPath -Child $script:TestRoot -Parent $runnerTemp -Label 'MSI cleanup target'
+                Remove-Item -LiteralPath $script:TestRoot -Recurse -Force -ErrorAction Stop
+            }
+        }
     }
-    if ($createdTestRoot -and (Test-Path -LiteralPath $script:TestRoot)) {
-        Assert-UnderPath -Child $script:TestRoot -Parent $runnerTemp -Label 'MSI cleanup target'
-        Remove-Item -LiteralPath $script:TestRoot -Recurse -Force
+    catch {
+        Write-Warning "Fixture cleanup failed without replacing the test result: $_"
+        Write-Warning "Fixture files and installer logs remain under: $script:TestRoot"
+        $cleanupErrors.Add("Fixture cleanup failed; retained files at ${script:TestRoot}: $($_.Exception.Message)")
     }
+}
+
+if ($null -ne $testFailure) {
+    throw $testFailure
+}
+if ($cleanupErrors.Count -gt 0) {
+    throw "MSI lifecycle passed, but fixture cleanup failed: $($cleanupErrors -join '; ')"
 }
