@@ -317,7 +317,7 @@ function Invoke-ObservedMsiInstall {
     $payloadHash = (Get-FileHash -LiteralPath $payloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($delta.kind -ne 'added' -or $delta.name -cne 'payload.bin' -or
         $delta.after.evidence_source -ne 'selected_root_directory_entry' -or
-        $delta.after.entry_ordinal -ne $afterRows[0].ordinal -or $afterRows.Count -ne 1 -or
+        $afterRows.Count -ne 1 -or $delta.after.entry_ordinal -ne $afterRows[0].ordinal -or
         $afterRows[0].content_sha256 -cne $payloadHash -or $afterRows[0].content_hash_status -ne 'observed') {
         throw 'Observed MSI root addition did not match the installed payload SHA-256 and verified after-snapshot evidence ordinal.'
     }
@@ -356,26 +356,33 @@ function Invoke-ObservedMsiInstall {
     if ($targetPid -eq 0 -or $targetStarts.Count -eq 0) {
         throw 'ETW capture did not contain a decoded process-start row for the actual msiexec target PID.'
     }
-    $payloadNameEvents = @($capture.events | Where-Object {
-        $_.event_kind -eq 'file_io_observation' -and $_.observation_decoding.status -eq 'decoded' -and
-        $_.observation_decoding.observation.activity.kind -eq 'file' -and
-        [System.IO.Path]::GetFileName([string]$_.observation_decoding.observation.activity.observation.path) -ieq 'payload.bin'
-    })
-    if ($payloadNameEvents.Count -eq 0) {
-        throw 'ETW capture did not contain a decoded file-name observation for the fixture payload basename.'
-    }
     $rawPayloadHashes = @{}
-    foreach ($event in $payloadNameEvents) {
-        $eventIndex = [Array]::IndexOf($capture.events, $event)
+    $payloadNameEvidence = [System.Collections.Generic.List[object]]::new()
+    for ($eventIndex = 0; $eventIndex -lt $capture.events.Count; $eventIndex++) {
+        $event = $capture.events[$eventIndex]
+        if ($event.event_kind -ne 'file_io_observation' -or $event.observation_decoding.status -ne 'decoded' -or
+            $event.observation_decoding.observation.activity.kind -ne 'file' -or
+            [System.IO.Path]::GetFileName([string]$event.observation_decoding.observation.activity.observation.path) -ine 'payload.bin') {
+            continue
+        }
         $rawPayload = [Convert]::FromHexString([string]$event.raw_payload_hex)
         $rawPayloadHash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::HashData($rawPayload)).Replace('-', '').ToLowerInvariant()
         $payloadNameUtf16 = [System.Text.Encoding]::Unicode.GetBytes('payload.bin')
         $rawHex = [System.BitConverter]::ToString($rawPayload).Replace('-', '').ToLowerInvariant()
         $payloadNameHex = [System.BitConverter]::ToString($payloadNameUtf16).Replace('-', '').ToLowerInvariant()
-        if (-not $rawHex.Contains($payloadNameHex) -or $eventIndex -lt 0) {
+        if (-not $rawHex.Contains($payloadNameHex)) {
             throw 'Decoded ETW payload-name row did not retain the expected basename in its raw payload bytes.'
         }
         $rawPayloadHashes[[string]$event.record_ordinal] = $rawPayloadHash
+        $payloadNameEvidence.Add([pscustomobject]@{
+            capture_document_sha256 = $capture.document_sha256
+            json_pointer = "/events/$eventIndex"
+            record_ordinal = $event.record_ordinal
+            raw_payload_sha256 = $rawPayloadHash
+        })
+    }
+    if ($payloadNameEvidence.Count -eq 0) {
+        throw 'ETW capture did not contain a decoded file-name observation for the fixture payload basename.'
     }
 
     $candidate = @($association.associations | Where-Object { $_.candidate_path -ceq $expectedPath -and $_.delta_kind -eq 'added' -and $_.etw_operation -eq 'create_name' })
@@ -402,7 +409,7 @@ function Invoke-ObservedMsiInstall {
     elseif ($association.association_status -eq 'insufficient_evidence' -and
         $association.summary.candidate_match_count -eq 0 -and
         @($association.diagnostics | Where-Object { $_ -in @('different_namespaces_remain_unresolved', 'no_same_namespace_exact_path_candidate_was_observed') }).Count -gt 0) {
-        Write-Output "ETW observed the fixture payload basename in decoded file-name rows, but the comparator reported no exact path candidate; root/runtime association remains unresolved."
+        Write-Output "ETW observed the fixture payload basename in decoded file-name rows, but the comparator reported no exact path candidate; root/runtime association remains unresolved. Evidence references (capped at 8): $(@($payloadNameEvidence | Select-Object -First 8) | ConvertTo-Json -Compress -Depth 4)"
     }
     else {
         throw "ETW payload-name evidence was not supported by a candidate or an explicit unresolved namespace diagnostic: $($association | ConvertTo-Json -Compress -Depth 12)"
@@ -1029,8 +1036,8 @@ try {
     Invoke-ObservedMsiInstall -MsiPath $msiV1 -InstallRoot $script:InstallRoot -LogPath (Join-Path $script:TestRoot 'install-v1.log') -SessionPath $observationV1Path
     Assert-ProductVersion -ProductCode $productCodeV1 -Version '1.0.0' -LogPath (Join-Path $script:TestRoot 'install-v1.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin')
     Assert-InstalledPayload -ProductCode $productCodeV1 -LogPath (Join-Path $script:TestRoot 'install-v1.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin') -ExpectedBytes $payloadV1
-    Get-InventorySnapshot -Path $snapshotV1Path | Out-Null
-    $entryV1 = Get-PayloadEntry (Get-InventorySnapshot -Path $snapshotV1Path)
+    $snapshotV1 = Get-InventorySnapshot -Path $snapshotV1Path
+    $entryV1 = Get-PayloadEntry $snapshotV1
     $softwareV1 = Get-SoftwareSnapshot -Path $softwareV1Path
     $v1FixtureRegistrations = @(Get-FixtureSoftwareRegistrations -Document $softwareV1 -DisplayName 'SideEffect R5 Synthetic MSI Fixture' -Version '1.0.0')
     if ($v1FixtureRegistrations.Count -gt 0) {
