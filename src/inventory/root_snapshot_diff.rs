@@ -379,9 +379,56 @@ pub fn compare_selected_root_inventory_json(
     if left.platform != right.platform || !matches!(left.platform.as_str(), "linux" | "windows") {
         return Err(RootSnapshotDiffError::PlatformMismatch);
     }
-    validate(&left)?;
-    validate(&right)?;
+    validate(&left, false)?;
+    validate(&right, false)?;
     compare(&left, &right)
+}
+
+/// Observation-window variant: a strictly validated partial snapshot with no
+/// opened root yields no diff, because unmatched rows cannot support presence claims.
+pub fn compare_observation_root_inventory_json(
+    before: &[u8],
+    after: &[u8],
+    expected_platform: &str,
+) -> Result<Option<RootSnapshotDiff>, RootSnapshotDiffError> {
+    if before.len().saturating_add(after.len()) > MAX_INPUT_BYTES {
+        return Err(RootSnapshotDiffError::InputTooLarge);
+    }
+    let left = parse_document(before)?;
+    let right = parse_document(after)?;
+    if left.schema != INPUT_SCHEMA
+        || right.schema != INPUT_SCHEMA
+        || !matches!(left.schema_version, 1 | 2)
+        || !matches!(right.schema_version, 1 | 2)
+    {
+        return Err(RootSnapshotDiffError::UnsupportedSchema);
+    }
+    if left.platform != right.platform
+        || left.platform != expected_platform
+        || !matches!(left.platform.as_str(), "linux" | "windows")
+    {
+        return Err(RootSnapshotDiffError::PlatformMismatch);
+    }
+    validate(&left, true)?;
+    validate(&right, true)?;
+    if left.scope != right.scope {
+        return Err(RootSnapshotDiffError::ScopeMismatch);
+    }
+    if left.root.is_none() || right.root.is_none() {
+        if (left.root.is_none()
+            && (left.status != "partial"
+                || !left.entries.is_empty()
+                || left.diagnostics.is_empty()))
+            || (right.root.is_none()
+                && (right.status != "partial"
+                    || !right.entries.is_empty()
+                    || right.diagnostics.is_empty()))
+        {
+            return Err(RootSnapshotDiffError::MalformedInput);
+        }
+        return Ok(None);
+    }
+    compare(&left, &right).map(Some)
 }
 
 fn parse_document(bytes: &[u8]) -> Result<Document, RootSnapshotDiffError> {
@@ -389,7 +436,10 @@ fn parse_document(bytes: &[u8]) -> Result<Document, RootSnapshotDiffError> {
     serde_json::from_value(value).map_err(|_| RootSnapshotDiffError::MalformedInput)
 }
 
-fn validate(document: &Document) -> Result<(), RootSnapshotDiffError> {
+fn validate(
+    document: &Document,
+    allow_unavailable_root: bool,
+) -> Result<(), RootSnapshotDiffError> {
     let expected_scope = match document.schema_version {
         1 => SCOPE_V1,
         2 => SCOPE_V2,
@@ -433,10 +483,13 @@ fn validate(document: &Document) -> Result<(), RootSnapshotDiffError> {
                 && h.deadline_seconds == 5 => {}
         _ => return Err(RootSnapshotDiffError::MalformedInput),
     }
-    let root = document
-        .root
-        .as_ref()
-        .ok_or(RootSnapshotDiffError::MalformedInput)?;
+    let root = match document.root.as_ref() {
+        Some(root) => root,
+        None if allow_unavailable_root && document.status == "partial" => {
+            return validate_entries(document);
+        }
+        None => return Err(RootSnapshotDiffError::MalformedInput),
+    };
     if root.object_type != "directory"
         || root.display_path.is_empty()
         || root.display_path.len() > MAX_STRING_BYTES
@@ -445,6 +498,10 @@ fn validate(document: &Document) -> Result<(), RootSnapshotDiffError> {
     }
     root_identity(root, &document.platform)?;
 
+    validate_entries(document)
+}
+
+fn validate_entries(document: &Document) -> Result<(), RootSnapshotDiffError> {
     let mut ordinals = BTreeSet::new();
     let mut aggregate_name_bytes = 0usize;
     for entry in &document.entries {
@@ -949,7 +1006,10 @@ fn side(reference: &EntryRef<'_>) -> RootSnapshotSide {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_INPUT_BYTES, RootSnapshotDiffError, compare_selected_root_inventory_json};
+    use super::{
+        MAX_INPUT_BYTES, RootSnapshotDiffError, compare_observation_root_inventory_json,
+        compare_selected_root_inventory_json,
+    };
     use serde_json::{Value, json};
 
     fn document(
@@ -1007,6 +1067,50 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn observation_unavailable_root_requires_valid_partial_snapshot_pair() {
+        let before = document("linux", "2f746d70", "complete", &[]);
+        let mut unavailable: Value = serde_json::from_slice(&before).unwrap();
+        unavailable["status"] = json!("partial");
+        unavailable["root"] = Value::Null;
+        unavailable["diagnostics"] =
+            json!([{"code":"root_open_failed","entry_ordinal":null,"native_error":2}]);
+        let unavailable = serde_json::to_vec(&unavailable).unwrap();
+        assert!(
+            compare_observation_root_inventory_json(&before, &unavailable, "linux")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            compare_selected_root_inventory_json(&before, &unavailable).unwrap_err(),
+            RootSnapshotDiffError::MalformedInput
+        );
+
+        let mut invalid: Value = serde_json::from_slice(&unavailable).unwrap();
+        invalid["status"] = json!("complete");
+        assert_eq!(
+            compare_observation_root_inventory_json(
+                &before,
+                &serde_json::to_vec(&invalid).unwrap(),
+                "linux"
+            )
+            .unwrap_err(),
+            RootSnapshotDiffError::LimitExceeded
+        );
+
+        let mut platform_mismatch: Value = serde_json::from_slice(&unavailable).unwrap();
+        platform_mismatch["platform"] = json!("windows");
+        assert_eq!(
+            compare_observation_root_inventory_json(
+                &before,
+                &serde_json::to_vec(&platform_mismatch).unwrap(),
+                "linux"
+            )
+            .unwrap_err(),
+            RootSnapshotDiffError::PlatformMismatch
+        );
     }
 
     fn row<'a>(

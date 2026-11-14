@@ -194,6 +194,10 @@ fn observation_files() -> Vec<(&'static str, Vec<u8>)> {
 }
 
 fn publish_observation_session() -> std::path::PathBuf {
+    publish_observation_files(observation_files())
+}
+
+fn publish_observation_files(files: Vec<(&'static str, Vec<u8>)>) -> std::path::PathBuf {
     let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
     let base = std::env::temp_dir().join(format!(
         "sideeffect-observation-cli-{}-{id}",
@@ -201,7 +205,6 @@ fn publish_observation_session() -> std::path::PathBuf {
     ));
     let session = base.join("session");
     fs::create_dir_all(&base).unwrap();
-    let files = observation_files();
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -256,6 +259,71 @@ fn compare_observation_verifies_artifacts_and_keeps_partial_runtime_separate() {
     assert_eq!(report["after_artifact"]["path"], "root-snapshot-after.json");
     assert_eq!(report["runtime_artifacts"].as_array().unwrap().len(), 0);
     fs::remove_dir_all(session.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn compare_observation_reports_unavailable_selected_root_without_presence_claims() {
+    let mut files = observation_files();
+    let after_index = files
+        .iter()
+        .position(|(name, _)| *name == "root-snapshot-after.json")
+        .unwrap();
+    let mut after: Value = serde_json::from_slice(&files[after_index].1).unwrap();
+    after["status"] = json!("partial");
+    after["root"] = Value::Null;
+    after["entries"] = json!([]);
+    after["diagnostics"] =
+        json!([{"code":"root_open_failed","entry_ordinal":null,"native_error":2}]);
+    files[after_index].1 = serde_json::to_vec(&after).unwrap();
+    let manifest_index = files
+        .iter()
+        .position(|(name, _)| *name == "session.json")
+        .unwrap();
+    let mut manifest: Value = serde_json::from_slice(&files[manifest_index].1).unwrap();
+    let root_source = manifest["sources"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|source| source["role"] == "selected_root")
+        .unwrap();
+    root_source["status"] = json!("partial");
+    root_source["diagnostic_codes"] = json!(["root_open_failed"]);
+    let artifact = root_source["artifacts"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|artifact| artifact["path"] == "root-snapshot-after.json")
+        .unwrap();
+    artifact["byte_length"] = json!(files[after_index].1.len());
+    artifact["sha256"] = json!(digest(&files[after_index].1));
+    let sources: Vec<AuditSessionSource> =
+        serde_json::from_value(manifest["sources"].clone()).unwrap();
+    manifest["coverage_manifest"] =
+        serde_json::to_value(CoverageManifest::from_sources(&sources)).unwrap();
+    files[manifest_index].1 = serde_json::to_vec(&manifest).unwrap();
+    let session = publish_observation_files(files);
+    let base = session.parent().unwrap().to_path_buf();
+    let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("compare-observation")
+        .arg(&session)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["root_comparison_status"], "partial");
+    assert_eq!(
+        report["root_comparison_diagnostic"],
+        "selected_root_unavailable"
+    );
+    assert!(report["root_diff"].is_null());
+    assert_eq!(report["before_artifact"]["path"], "root-snapshot.json");
+    assert_eq!(report["after_artifact"]["path"], "root-snapshot-after.json");
+    fs::remove_dir_all(base).unwrap();
 }
 
 #[test]
