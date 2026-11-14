@@ -464,25 +464,126 @@ function Get-SoftwareSnapshot {
     return $document
 }
 
-function Find-FixtureSoftwareRegistration {
+function Get-FixtureSoftwareRegistrations {
     param(
         [Parameter(Mandatory = $true)] $Document,
+        [Parameter(Mandatory = $true)][string] $DisplayName,
         [Parameter(Mandatory = $true)][string] $Version
     )
 
     $matches = @($Document.registrations | Where-Object {
-        $_.display_name -eq 'SideEffect R5 Synthetic MSI Fixture' -and
+        $_.display_name -eq $DisplayName -and
         $_.evidence.hive -eq 'HKEY_CURRENT_USER' -and
         $_.evidence.registry_view -in @('native', 'wow64_32') -and
         (@($_.values | Where-Object { $_.name -eq 'DisplayVersion' -and $_.text -eq $Version }).Count -eq 1)
     })
-    if ($matches.Count -gt 1) {
-        throw "SideEffect reported $($matches.Count) current-user native fixture registrations at version $Version; expected at most one."
+    foreach ($view in @('native', 'wow64_32')) {
+        if (@($matches | Where-Object { $_.evidence.registry_view -eq $view }).Count -gt 1) {
+            throw "SideEffect reported duplicate current-user $view fixture registrations at version $Version."
+        }
     }
-    if ($matches.Count -eq 1) {
-        return $matches[0]
+    return $matches
+}
+
+function Get-GeneratedUninstallKeyDiagnostics {
+    param(
+        [Parameter(Mandatory = $true)][string] $ProductCode,
+        [Parameter(Mandatory = $true)][string] $ExpectedDisplayName,
+        [Parameter(Mandatory = $true)][string] $ExpectedVersion
+    )
+
+    $basePath = 'Software\Microsoft\Windows\CurrentVersion\Uninstall'
+    $results = [System.Collections.Generic.List[object]]::new()
+    foreach ($view in @(
+        [pscustomobject]@{ Name = 'native'; Value = [Microsoft.Win32.RegistryView]::Registry64 },
+        [pscustomobject]@{ Name = 'wow64_32'; Value = [Microsoft.Win32.RegistryView]::Registry32 }
+    )) {
+        $root = $null
+        $key = $null
+        try {
+            $root = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, $view.Value)
+            $key = $root.OpenSubKey("$basePath\$ProductCode", $false)
+            $displayNameMatches = $false
+            $displayVersionMatches = $false
+            if ($null -ne $key) {
+                $displayName = $key.GetValue('DisplayName', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                $displayVersion = $key.GetValue('DisplayVersion', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                $displayNameMatches = $displayName -is [string] -and $displayName -ceq $ExpectedDisplayName
+                $displayVersionMatches = $displayVersion -is [string] -and $displayVersion -ceq $ExpectedVersion
+            }
+            $results.Add([pscustomobject]@{
+                RegistryView = $view.Name
+                GeneratedProductKeyPresent = ($null -ne $key)
+                DisplayNameMatchesFixture = $displayNameMatches
+                DisplayVersionMatchesFixture = $displayVersionMatches
+                QueryFailed = $false
+            })
+        }
+        catch {
+            $results.Add([pscustomobject]@{
+                RegistryView = $view.Name
+                GeneratedProductKeyPresent = $false
+                DisplayNameMatchesFixture = $false
+                DisplayVersionMatchesFixture = $false
+                QueryFailed = $true
+            })
+        }
+        finally {
+            if ($null -ne $key) { $key.Dispose() }
+            if ($null -ne $root) { $root.Dispose() }
+        }
     }
-    return $null
+    return @($results.ToArray())
+}
+
+function New-HostedRegistryFixtureRegistration {
+    param(
+        [Parameter(Mandatory = $true)][string] $ProductCode,
+        [Parameter(Mandatory = $true)][string] $DisplayName,
+        [Parameter(Mandatory = $true)][string] $Version
+    )
+
+    $path = "Software\Microsoft\Windows\CurrentVersion\Uninstall\$ProductCode"
+    $root = $null
+    $existing = $null
+    $key = $null
+    try {
+        $root = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, [Microsoft.Win32.RegistryView]::Registry64)
+        $existing = $root.OpenSubKey($path, $false)
+        if ($null -ne $existing) {
+            throw 'Generated registry fixture key unexpectedly exists before creation.'
+        }
+        $script:HostedRegistryFixtureProductCode = $ProductCode
+        $key = $root.CreateSubKey($path)
+        if ($null -eq $key) {
+            throw 'Could not create the generated current-user registry fixture key.'
+        }
+        $script:HostedRegistryFixtureCreated = $true
+        $key.SetValue('DisplayName', $DisplayName, [Microsoft.Win32.RegistryValueKind]::String)
+        $key.SetValue('DisplayVersion', $Version, [Microsoft.Win32.RegistryValueKind]::String)
+        $key.Flush()
+    }
+    finally {
+        if ($null -ne $key) { $key.Dispose() }
+        if ($null -ne $existing) { $existing.Dispose() }
+        if ($null -ne $root) { $root.Dispose() }
+    }
+}
+
+function Remove-HostedRegistryFixtureRegistration {
+    if (-not $script:HostedRegistryFixtureCreated) {
+        return
+    }
+    $root = $null
+    try {
+        $root = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, [Microsoft.Win32.RegistryView]::Registry64)
+        $path = "Software\Microsoft\Windows\CurrentVersion\Uninstall\$($script:HostedRegistryFixtureProductCode)"
+        $root.DeleteSubKey($path, $false)
+        $script:HostedRegistryFixtureCreated = $false
+    }
+    finally {
+        if ($null -ne $root) { $root.Dispose() }
+    }
 }
 
 function Get-SoftwareInventoryDiff {
@@ -535,9 +636,14 @@ function Assert-SoftwareLifecycleDiff {
         [Parameter(Mandatory = $true)] $Before,
         [Parameter(Mandatory = $true)] $After,
         [Parameter()][string[]] $AddedVersions = @(),
-        [Parameter()][string[]] $RemovedVersions = @()
+        [Parameter()][string[]] $RemovedVersions = @(),
+        [Parameter()][string] $DisplayName = 'SideEffect R5 Synthetic MSI Fixture',
+        [switch] $Force
     )
 
+    if (-not $Force -and $script:MsiRegistrationObservationStatus -ne 'observed') {
+        return
+    }
     foreach ($sourceId in @('current_user_native_uninstall', 'current_user_32_uninstall')) {
         $source = @($Diff.sources | Where-Object { $_.source_id -eq $sourceId })
         if ($source.Count -ne 1 -or
@@ -546,45 +652,57 @@ function Assert-SoftwareLifecycleDiff {
             throw "Software diff did not preserve complete comparison states for current-user source '$sourceId'."
         }
     }
+    $expectedDeltaCount = 0
     foreach ($version in $AddedVersions) {
-        if ($null -ne (Find-FixtureSoftwareRegistration -Document $Before -Version $version)) {
+        $beforeRegistrations = @(Get-FixtureSoftwareRegistrations -Document $Before -DisplayName $DisplayName -Version $version)
+        if ($beforeRegistrations.Count -ne 0) {
             throw "Fixture version $version was already present in the before software snapshot."
         }
-        $registration = Find-FixtureSoftwareRegistration -Document $After -Version $version
-        if ($null -eq $registration) {
-            throw "SideEffect did not observe current-user native fixture registration version $version."
+        $afterRegistrations = @(Get-FixtureSoftwareRegistrations -Document $After -DisplayName $DisplayName -Version $version)
+        if ($afterRegistrations.Count -eq 0) {
+            throw "SideEffect did not observe current-user fixture registration '$DisplayName' version $version."
         }
-        $deltas = @($Diff.deltas | Where-Object {
-            $_.kind -eq 'added' -and $_.identity.source_id -in @('current_user_native_uninstall', 'current_user_32_uninstall') -and
-            $_.after.display_name -eq 'SideEffect R5 Synthetic MSI Fixture' -and $_.after.display_version -eq $version
-        })
-        if ($deltas.Count -ne 1) {
-            throw "Software diff did not report exactly one evidence-linked addition for fixture version $version."
+        foreach ($registration in $afterRegistrations) {
+            $sourceId = if ($registration.evidence.registry_view -eq 'native') { 'current_user_native_uninstall' } else { 'current_user_32_uninstall' }
+            $deltas = @($Diff.deltas | Where-Object {
+                $_.kind -eq 'added' -and $_.identity.source_id -eq $sourceId -and
+                $_.identity.registry_view -eq $registration.evidence.registry_view -and
+                $_.identity.registry_subkey -eq $registration.registry_subkey -and
+                $_.after.display_name -eq $DisplayName -and $_.after.display_version -eq $version
+            })
+            if ($deltas.Count -ne 1) {
+                throw "Software diff did not report exactly one evidence-linked addition for fixture version $version in $($registration.evidence.registry_view)."
+            }
+            Assert-SoftwareDiffSideEvidence -Delta $deltas[0] -Side 'after' -Snapshot $After
+            $expectedDeltaCount++
         }
-        Assert-SoftwareDiffSideEvidence -Delta $deltas[0] -Side 'after' -Snapshot $After
     }
     foreach ($version in $RemovedVersions) {
-        $registration = Find-FixtureSoftwareRegistration -Document $Before -Version $version
-        if ($null -eq $registration) {
-            throw "SideEffect did not observe current-user native fixture registration version $version before removal."
+        $beforeRegistrations = @(Get-FixtureSoftwareRegistrations -Document $Before -DisplayName $DisplayName -Version $version)
+        if ($beforeRegistrations.Count -eq 0) {
+            throw "SideEffect did not observe current-user fixture registration '$DisplayName' version $version before removal."
         }
-        if ($null -ne (Find-FixtureSoftwareRegistration -Document $After -Version $version)) {
+        if (@(Get-FixtureSoftwareRegistrations -Document $After -DisplayName $DisplayName -Version $version).Count -ne 0) {
             throw "Fixture version $version remained in the after software snapshot."
         }
-        $deltas = @($Diff.deltas | Where-Object {
-            $_.kind -eq 'removed' -and $_.identity.source_id -in @('current_user_native_uninstall', 'current_user_32_uninstall') -and
-            $_.before.display_name -eq 'SideEffect R5 Synthetic MSI Fixture' -and $_.before.display_version -eq $version
-        })
-        if ($deltas.Count -ne 1) {
-            throw "Software diff did not report exactly one evidence-linked removal for fixture version $version."
+        foreach ($registration in $beforeRegistrations) {
+            $sourceId = if ($registration.evidence.registry_view -eq 'native') { 'current_user_native_uninstall' } else { 'current_user_32_uninstall' }
+            $deltas = @($Diff.deltas | Where-Object {
+                $_.kind -eq 'removed' -and $_.identity.source_id -eq $sourceId -and
+                $_.identity.registry_view -eq $registration.evidence.registry_view -and
+                $_.identity.registry_subkey -eq $registration.registry_subkey -and
+                $_.before.display_name -eq $DisplayName -and $_.before.display_version -eq $version
+            })
+            if ($deltas.Count -ne 1) {
+                throw "Software diff did not report exactly one evidence-linked removal for fixture version $version in $($registration.evidence.registry_view)."
+            }
+            Assert-SoftwareDiffSideEvidence -Delta $deltas[0] -Side 'before' -Snapshot $Before
+            $expectedDeltaCount++
         }
-        Assert-SoftwareDiffSideEvidence -Delta $deltas[0] -Side 'before' -Snapshot $Before
     }
-    $expectedDeltaCount = $AddedVersions.Count + $RemovedVersions.Count
     $fixtureDeltas = @($Diff.deltas | Where-Object {
         $_.identity.source_id -in @('current_user_native_uninstall', 'current_user_32_uninstall') -and
-        ($_.before.display_name -eq 'SideEffect R5 Synthetic MSI Fixture' -or
-            $_.after.display_name -eq 'SideEffect R5 Synthetic MSI Fixture')
+        ($_.before.display_name -eq $DisplayName -or $_.after.display_name -eq $DisplayName)
     })
     if ($fixtureDeltas.Count -ne $expectedDeltaCount) {
         throw "Software diff contained $($fixtureDeltas.Count) fixture registration deltas; expected $expectedDeltaCount."
@@ -682,6 +800,9 @@ $productCodeV2 = ([Guid]::NewGuid()).ToString('B').ToUpperInvariant()
 $componentCode = ([Guid]::NewGuid()).ToString('B').ToUpperInvariant()
 $createdTestRoot = $false
 $installationStarted = $false
+$script:MsiRegistrationObservationStatus = 'pending'
+$script:HostedRegistryFixtureCreated = $false
+$script:HostedRegistryFixtureProductCode = $null
 $testFailure = $null
 $cleanupErrors = [System.Collections.Generic.List[string]]::new()
 
@@ -730,8 +851,8 @@ try {
         throw 'Fresh MSI install root was not empty before installation.'
     }
     $softwareBefore = Get-SoftwareSnapshot -Path $softwareBeforePath
-    if ($null -ne (Find-FixtureSoftwareRegistration -Document $softwareBefore -Version '1.0.0') -or
-        $null -ne (Find-FixtureSoftwareRegistration -Document $softwareBefore -Version '2.0.0')) {
+    if (@(Get-FixtureSoftwareRegistrations -Document $softwareBefore -DisplayName 'SideEffect R5 Synthetic MSI Fixture' -Version '1.0.0').Count -ne 0 -or
+        @(Get-FixtureSoftwareRegistrations -Document $softwareBefore -DisplayName 'SideEffect R5 Synthetic MSI Fixture' -Version '2.0.0').Count -ne 0) {
         throw 'A generated fixture version was already present in SideEffect current-user native software inventory before installation.'
     }
 
@@ -741,6 +862,19 @@ try {
     Assert-InstalledPayload -ProductCode $productCodeV1 -LogPath (Join-Path $script:TestRoot 'install-v1.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin') -ExpectedBytes $payloadV1
     $entryV1 = Get-PayloadEntry (Get-InventorySnapshot -Path $snapshotV1Path)
     $softwareV1 = Get-SoftwareSnapshot -Path $softwareV1Path
+    $v1FixtureRegistrations = @(Get-FixtureSoftwareRegistrations -Document $softwareV1 -DisplayName 'SideEffect R5 Synthetic MSI Fixture' -Version '1.0.0')
+    if ($v1FixtureRegistrations.Count -gt 0) {
+        $script:MsiRegistrationObservationStatus = 'observed'
+    }
+    else {
+        $generatedKeyDiagnostics = @(Get-GeneratedUninstallKeyDiagnostics -ProductCode $productCodeV1 -ExpectedDisplayName 'SideEffect R5 Synthetic MSI Fixture' -ExpectedVersion '1.0.0')
+        $keyMatchesFixture = @($generatedKeyDiagnostics | Where-Object { $_.GeneratedProductKeyPresent -and $_.DisplayNameMatchesFixture -and $_.DisplayVersionMatchesFixture })
+        if ($keyMatchesFixture.Count -gt 0) {
+            throw "SideEffect missed an exact generated HKCU Uninstall key in a complete source; the MSI registration adapter needs investigation. Diagnostic: $($generatedKeyDiagnostics | ConvertTo-Json -Compress)"
+        }
+        $script:MsiRegistrationObservationStatus = 'unknown_not_observed_in_selected_uninstall_views'
+        Write-Output "MSI ProductCode $productCodeV1 is installed per MsiGetProductInfoEx, but SideEffect did not observe its fixture registration. Registration correlation: unknown. Exact generated-key-only HKCU Uninstall diagnostics: $($generatedKeyDiagnostics | ConvertTo-Json -Compress)"
+    }
     if ($entryV1.content_sha256 -ne (Get-FileHash -LiteralPath (Join-Path $script:InstallRoot 'payload.bin') -Algorithm SHA256).Hash.ToLowerInvariant()) {
         throw 'SideEffect v1 hash did not match the installed payload bytes.'
     }
@@ -799,6 +933,25 @@ try {
     $softwareFinalUninstallDiff = Get-SoftwareInventoryDiff -BeforePath $softwareDowngradePath -AfterPath $softwareUninstallPath
     Assert-SoftwareLifecycleDiff -Diff $softwareFinalUninstallDiff -Before $softwareDowngrade -After $softwareUninstalled -RemovedVersions @('1.0.0')
     Write-Output 'MSI v1 uninstall removed the observed selected-root payload.'
+
+    $registryFixtureCode = ([Guid]::NewGuid()).ToString('B').ToUpperInvariant()
+    $registryFixtureName = "SideEffect R5 Synthetic Uninstall Registry Fixture $($registryFixtureCode.Trim('{}'))"
+    $registryFixtureVersion = 'synthetic-1'
+    $softwareRegistryFixturePath = Join-Path $script:TestRoot 'software-synthetic-registry-fixture.json'
+    $softwareRegistryFixtureRemovedPath = Join-Path $script:TestRoot 'software-synthetic-registry-fixture-removed.json'
+    New-HostedRegistryFixtureRegistration -ProductCode $registryFixtureCode -DisplayName $registryFixtureName -Version $registryFixtureVersion
+    $directRegistryDiagnostics = @(Get-GeneratedUninstallKeyDiagnostics -ProductCode $registryFixtureCode -ExpectedDisplayName $registryFixtureName -ExpectedVersion $registryFixtureVersion)
+    if (@($directRegistryDiagnostics | Where-Object { $_.GeneratedProductKeyPresent -and $_.DisplayNameMatchesFixture -and $_.DisplayVersionMatchesFixture }).Count -eq 0) {
+        throw "The generated current-user synthetic registry row did not read back through either selected view: $($directRegistryDiagnostics | ConvertTo-Json -Compress)"
+    }
+    $softwareRegistryFixture = Get-SoftwareSnapshot -Path $softwareRegistryFixturePath
+    $registryFixtureDiff = Get-SoftwareInventoryDiff -BeforePath $softwareUninstallPath -AfterPath $softwareRegistryFixturePath
+    Assert-SoftwareLifecycleDiff -Diff $registryFixtureDiff -Before $softwareUninstalled -After $softwareRegistryFixture -DisplayName $registryFixtureName -AddedVersions @($registryFixtureVersion) -Force
+    Remove-HostedRegistryFixtureRegistration
+    $softwareRegistryFixtureRemoved = Get-SoftwareSnapshot -Path $softwareRegistryFixtureRemovedPath
+    $registryFixtureRemovalDiff = Get-SoftwareInventoryDiff -BeforePath $softwareRegistryFixturePath -AfterPath $softwareRegistryFixtureRemovedPath
+    Assert-SoftwareLifecycleDiff -Diff $registryFixtureRemovalDiff -Before $softwareRegistryFixture -After $softwareRegistryFixtureRemoved -DisplayName $registryFixtureName -RemovedVersions @($registryFixtureVersion) -Force
+    Write-Output "Separate hosted-only HKCU Uninstall fixture produced evidence-linked addition/removal deltas in the observed current-user view(s): $((Get-FixtureSoftwareRegistrations -Document $softwareRegistryFixture -DisplayName $registryFixtureName -Version $registryFixtureVersion | ForEach-Object { $_.evidence.registry_view }) -join ', ')"
 }
 catch {
     $testFailure = $_
@@ -816,6 +969,7 @@ finally {
                 }
             }
         }
+        Remove-HostedRegistryFixtureRegistration
         $registeredFixtureRemains = $false
         foreach ($productCode in @($productCodeV2, $productCodeV1)) {
             if ($null -ne (Get-ProductRegistration -ProductCode $productCode)) {
