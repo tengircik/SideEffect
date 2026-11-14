@@ -17,10 +17,18 @@ the exact generated service in both normal and failure cleanup. Inventory JSON
 is bounded, kept in the fixture directory, and removed during cleanup.
 
 For the baseline, added, changed, and removed states, the script runs the real
-`inventory startup` CLI and requires complete source status before comparing.
-The real `explain --inventory-diff` CLI must report the fixture service's
-addition, display-name change, and removal, each linked to the exact
-`service_entries` evidence row. The observed SCM row must retain its native
+`inventory startup` CLI. Each snapshot must have a complete
+`service_start_configuration` source; unrelated startup sources may make the
+aggregate inventory partial. The real `explain --inventory-diff` CLI reports
+the display-name change for the matched fixture service, linked to the exact
+before and after `service_entries` evidence rows. When aggregate inputs are
+complete it must also report add/remove deltas. If either aggregate input is
+partial, the comparison must remain partial and suppress the unmatched
+add/remove presence claim; the test then verifies the service's source rows
+directly in each inventory and does not promote that snapshot difference into
+a comparative presence result. If the SCM source itself is incomplete, the
+test reports only its bounded status and diagnostic codes and fails the
+lifecycle claim as unknown. The observed SCM row must retain its native
 `EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W`
 evidence and report `configured=present`, `effective=unknown`, and
 `observed=unknown`.

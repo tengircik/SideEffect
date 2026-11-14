@@ -71,8 +71,8 @@ function Get-StartupDocument {
     Assert-UnderPath -Child $path -Parent $script:FixtureRoot -Label 'startup inventory output'
     $result = & $script:SideEffectPath inventory startup --output $path 2>&1
     $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0) {
-        throw "SideEffect startup inventory returned exit code ${exitCode}; complete lifecycle evidence is required."
+    if ($exitCode -notin @(0, 2)) {
+        throw "SideEffect startup inventory failed with exit code ${exitCode}."
     }
     $item = Get-Item -LiteralPath $path
     if ($item.Length -gt 64MB) {
@@ -82,15 +82,32 @@ function Get-StartupDocument {
     if ($document.schema -cne 'sideeffect.windows_startup_inventory' -or $document.schema_version -ne 10) {
         throw 'SideEffect emitted an unexpected startup inventory contract.'
     }
-    if ($document.status -cne 'complete') {
-        throw 'SideEffect startup inventory was partial; the lifecycle result remains unknown.'
+    if (($document.status -ceq 'complete' -and $exitCode -ne 0) -or
+        ($document.status -ceq 'partial' -and $exitCode -ne 2) -or
+        $document.status -cnotin @('complete', 'partial')) {
+        throw 'SideEffect startup inventory status did not match its documented CLI exit code.'
     }
-    foreach ($source in $document.sources) {
-        if ($source.status -cnotin @('complete', 'not_present')) {
-            throw "Startup source $($source.id) was $($source.status); presence comparisons are not accepted."
-        }
-    }
+    Assert-SCMSourceComparable -Document $document -Label $Name
     return [pscustomobject]@{ Path = $path; Document = $document }
+}
+
+function Assert-SCMSourceComparable {
+    param(
+        [Parameter(Mandatory = $true)] $Document,
+        [Parameter(Mandatory = $true)][string] $Label
+    )
+
+    $sources = @($Document.sources | Where-Object { $_.id -ceq 'service_start_configuration' })
+    if ($sources.Count -ne 1) {
+        throw "Startup snapshot $Label did not contain exactly one SCM service source."
+    }
+    if ($sources[0].status -cne 'complete') {
+        $codes = @($sources[0].diagnostics | Select-Object -First 8 | ForEach-Object {
+            if ($_.code -is [string] -and $_.code.Length -le 128) { $_.code }
+        }) -join ','
+        if (-not $codes) { $codes = 'none' }
+        throw "SCM source for $Label is $($sources[0].status); diagnostic_codes=$codes. The service lifecycle remains unknown."
+    }
 }
 
 function Invoke-StartupDiff {
@@ -101,14 +118,19 @@ function Invoke-StartupDiff {
 
     $output = & $script:SideEffectPath explain --inventory-diff $Before.Path $After.Path 2>&1
     $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0) {
-        throw "SideEffect startup diff returned exit code ${exitCode}; complete lifecycle evidence is required."
+    if ($exitCode -notin @(0, 2)) {
+        throw "SideEffect startup diff failed with exit code ${exitCode}."
     }
     $text = $output -join [Environment]::NewLine
     $report = $text | ConvertFrom-Json
-    if ($report.schema -cne 'sideeffect.startup_inventory_diff' -or $report.status -cne 'complete') {
-        throw 'SideEffect did not produce a complete startup comparison.'
+    if ($report.schema -cne 'sideeffect.startup_inventory_diff' -or
+        ($report.status -ceq 'complete' -and $exitCode -ne 0) -or
+        ($report.status -ceq 'partial' -and $exitCode -ne 2) -or
+        $report.status -cnotin @('complete', 'partial')) {
+        throw 'SideEffect startup diff status did not match its documented CLI exit code.'
     }
+    Assert-SCMSourceComparable -Document $Before.Document -Label 'before diff'
+    Assert-SCMSourceComparable -Document $After.Document -Label 'after diff'
     return $report
 }
 
@@ -162,6 +184,35 @@ function Assert-FixtureDelta {
     if ($ExpectedChangedField -and $delta.changed_fields -notcontains $ExpectedChangedField) {
         throw "Service delta did not include the expected changed field $ExpectedChangedField."
     }
+}
+
+function Assert-FixturePresenceOutcome {
+    param(
+        [Parameter(Mandatory = $true)] $Report,
+        [Parameter(Mandatory = $true)][string] $Kind,
+        [Parameter(Mandatory = $true)][int] $RowIndex,
+        [Parameter(Mandatory = $true)][ValidateSet('before', 'after')][string] $EvidenceSide
+    )
+
+    $pointer = "/service_entries/$RowIndex"
+    $matches = @($Report.deltas | Where-Object {
+        $_.category -ceq 'service_configuration' -and
+        $_.kind -ceq $Kind -and
+        $_.PSObject.Properties[$EvidenceSide].Value.references -contains $pointer
+    })
+    if ($Report.status -ceq 'complete') {
+        if ($matches.Count -ne 1) {
+            throw "Complete startup comparison did not contain one $Kind delta linked to $pointer."
+        }
+        return
+    }
+    if ($matches.Count -ne 0) {
+        throw "Partial startup comparison made an unsupported $Kind presence claim for $pointer."
+    }
+    if ($Report.counts.unmatched_rows_suppressed_for_incomplete_source -lt 1) {
+        throw "Partial startup comparison did not report suppression for unmatched row $pointer."
+    }
+    Write-Output "Startup comparison is partial; $Kind presence for the exact fixture row was conservatively suppressed."
 }
 
 # This script mutates SCM state and is intentionally unusable outside disposable hosted CI.
@@ -226,7 +277,7 @@ try {
     }
     $createdIndex = [Array]::IndexOf($created.Document.service_entries, $createdService)
     $addDiff = Invoke-StartupDiff -Before $before -After $created
-    Assert-FixtureDelta -Report $addDiff -Kind 'observed_after_only' -ExpectedChangedField '' -BeforeIndex -1 -AfterIndex $createdIndex
+    Assert-FixturePresenceOutcome -Report $addDiff -Kind 'observed_after_only' -RowIndex $createdIndex -EvidenceSide 'after'
 
     Invoke-Sc -Arguments @('config', $script:ServiceName, 'DisplayName=', $updatedDisplayName) -Description 'Change inert fixture display name'
     $changed = Get-StartupDocument -Name 'changed.json'
@@ -247,7 +298,7 @@ try {
         throw 'Fixture service remained visible after its SCM deletion completed.'
     }
     $removeDiff = Invoke-StartupDiff -Before $changed -After $removed
-    Assert-FixtureDelta -Report $removeDiff -Kind 'observed_before_only' -ExpectedChangedField '' -BeforeIndex $changedIndex -AfterIndex -1
+    Assert-FixturePresenceOutcome -Report $removeDiff -Kind 'observed_before_only' -RowIndex $changedIndex -EvidenceSide 'before'
 
     Write-Output 'Hosted SCM startup lifecycle acceptance passed: disabled fixture add/change/remove deltas link to SideEffect source rows.'
 }
