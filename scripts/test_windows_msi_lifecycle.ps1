@@ -219,7 +219,7 @@ function Get-MsiProductProperty {
 
     $value = [System.Text.StringBuilder]::new(512)
     [uint32] $length = 511
-    $status = [SideEffectMsiNative]::GetProductInfoEx($ProductCode, $null, $Context, $Property, $value, [ref]$length)
+    $status = [SideEffectMsiNative]::GetProductInfoEx($ProductCode, $script:CurrentUserSid, $Context, $Property, $value, [ref]$length)
     [pscustomobject]@{
         Status = $status
         Value = if ($status -eq 0) { $value.ToString() } else { $null }
@@ -454,6 +454,10 @@ public static class SideEffectMsiNative
         ref uint valueLength);
 }
 '@
+$script:CurrentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+if ([string]::IsNullOrWhiteSpace($script:CurrentUserSid)) {
+    throw 'Could not resolve the current Windows user SID for the per-user MSI registration check.'
+}
 
 $script:SideEffectPath = [System.IO.Path]::GetFullPath($SideEffectPath)
 if (-not (Test-Path -LiteralPath $script:SideEffectPath -PathType Leaf)) {
