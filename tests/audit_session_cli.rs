@@ -789,6 +789,35 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
     );
     assert_eq!(report["runtime_artifacts"].as_array().unwrap().len(), 2);
     assert_eq!(report["runtime_source_status"], "partial");
+    assert_eq!(report["runtime_capture_completeness"], "unknown");
+    assert_eq!(
+        report["root_runtime_association"]["claim"],
+        "lexical_path_candidate_only_no_causation_or_process_identity"
+    );
+    assert_eq!(report["root_runtime_association"]["status"], "partial");
+    assert_eq!(
+        report["root_runtime_association"]["parse_comparison_status"],
+        "complete"
+    );
+    assert_eq!(
+        report["root_runtime_association"]["capture_completeness"],
+        "unknown"
+    );
+    let associations = report["root_runtime_association"]["associations"]
+        .as_array()
+        .unwrap();
+    assert_eq!(associations.len(), 1);
+    assert_eq!(
+        associations[0]["candidate_path"],
+        created_file.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        associations[0]["runtime_evidence"][0]["trace_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
 
     // The trace remains the raw runtime evidence for the transient lifecycle.
     // Its openat path hint is source-derived, while the unlink success is read
