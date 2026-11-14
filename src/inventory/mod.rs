@@ -23,6 +23,7 @@ pub(crate) mod process_diff;
 mod processes;
 #[cfg(windows)]
 mod processes_windows;
+mod root_runtime_association;
 mod root_snapshot;
 mod root_snapshot_diff;
 #[cfg(target_os = "linux")]
@@ -80,6 +81,9 @@ pub use permission_diff::{
 pub use process_diff::{
     ProcessDelta, ProcessDiff, ProcessDiffCounts, ProcessDiffError, ProcessDiffStatus,
     ProcessEvidenceRef, ProcessSide, compare_process_inventory_json, is_process_inventory_json,
+};
+pub use root_runtime_association::{
+    RootRuntimeAssociation, RootRuntimeAssociationReport, associate_root_runtime_diff,
 };
 pub use startup_diff::{
     StartupDelta, StartupDiffCounts, StartupDiffError, StartupDiffStatus, StartupEvidenceSide,

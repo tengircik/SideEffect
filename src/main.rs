@@ -2064,7 +2064,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect compare-sessions BEFORE_SESSION_DIR AFTER_SESSION_DIR\nVerifies both local audit sessions, reports metadata comparability, and compares bounded item-level inventory and runtime evidence from verified artifacts. Per-source status and evidence references remain visible; missing, partial, unsupported, or incompatible sources do not become empty results. This is not an exhaustive history or coverage claim, and it does not establish causation or event absence. Incomparable or partial results exit with status 2 and include stable reason codes."
         }
         "compare-observation" => {
-            "Usage: sideeffect compare-observation VERIFIED_OBSERVATION_SESSION_DIR\nVerifies one v16 observation session and compares its selected-root snapshots with the bounded root comparator. The result cites both verified artifacts by path, schema, and SHA-256. Partial snapshots retain uncertainty and suppress unsupported presence claims; temporal differences do not establish causation. Runtime capture completeness remains unknown."
+            "Usage: sideeffect compare-observation VERIFIED_OBSERVATION_SESSION_DIR\nVerifies one v16 observation session, compares selected-root snapshots, and adds Linux exact-path candidates from the session's manifest-verified strace trace. The result cites input artifacts by path, schema, and SHA-256. Runtime candidate locators bind to trace digest and raw row offsets. Failed/unknown write-intent outcomes remain separate; successful opens and path matches do not prove a mutation, process identity, or cause, and do not establish causation. Runtime source and capture completeness remain distinct. Windows selected-root/runtime path namespaces are unsupported by this association adapter."
         }
         "baseline" => {
             "Usage: sideeffect baseline preview --label LABEL --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect baseline create --profile NEW_PROFILE.json --label LABEL --confirm-sha256 PREVIEW_SHA256 --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect baseline compare --profile PROFILE.json --baseline-session SESSION_DIR [--baseline-session SESSION_DIR...] --session CANDIDATE_SESSION_DIR [--session CANDIDATE_SESSION_DIR...]\nPreviews a bounded set of 1..=16 verified audit sessions and prints a deterministic preview digest. Creating a profile requires the exact digest and writes a new current-user-private file without replacing an existing file. Partial, incomplete, or loss-affected inputs are shown with their unknown coverage but cannot be promoted into a profile. A profile records only reviewed observations: software and signer identity are not recorded. Comparison requires the exact approved baseline sessions and matching manifest digests; a missing, replaced, or additional session prevents item comparison and exits with status 2. Candidate item differences are reported against the existing evidence-linked session diff, but the candidate is never absorbed automatically. Removal and absence claims are withheld when either side declares incomplete or unknown coverage. Differences do not establish unsafe behavior, causation, or complete system coverage."
@@ -6722,11 +6722,14 @@ struct ObservationWindowReport<'a> {
     scope: &'static str,
     root_source_status: sideeffect::audit_session::SourceStatus,
     runtime_source_status: sideeffect::audit_session::SourceStatus,
+    runtime_capture_completeness: Option<String>,
     before_artifact: &'a sideeffect::audit_session::SessionArtifactRef,
     after_artifact: &'a sideeffect::audit_session::SessionArtifactRef,
     runtime_artifacts: Vec<&'a sideeffect::audit_session::SessionArtifactRef>,
     root_comparison_diagnostic: Option<&'static str>,
     root_diff: Option<sideeffect::inventory::RootSnapshotDiff>,
+    root_runtime_association: Option<sideeffect::inventory::RootRuntimeAssociationReport>,
+    root_runtime_association_diagnostic: Option<&'static str>,
 }
 
 fn compare_observation(session_path: &OsString) -> Result<ExitCode, String> {
@@ -6805,7 +6808,69 @@ fn compare_observation(session_path: &OsString) -> Result<ExitCode, String> {
             (None, Some(diagnostic))
         }
     };
-    let complete = root.status == sideeffect::audit_session::SourceStatus::Complete
+    #[cfg(target_os = "linux")]
+    let (
+        root_runtime_association,
+        root_runtime_association_diagnostic,
+        runtime_capture_completeness,
+    ) = {
+        let result = (|| -> Result<(sideeffect::inventory::RootRuntimeAssociationReport, String), &'static str> {
+            let artifacts = verified.artifacts();
+            use sideeffect::audit_session::ArtifactKind;
+            let run_ref = runtime.artifacts.iter().find(|artifact| artifact.kind == ArtifactKind::RuntimeManifest)
+                .ok_or("runtime_artifact_missing")?;
+            let trace_ref = runtime.artifacts.iter().find(|artifact| artifact.kind == ArtifactKind::RuntimeTrace)
+                .ok_or("runtime_artifact_missing")?;
+            if run_ref.path != "run.json" || run_ref.schema != "sideeffect.run" || run_ref.schema_version != 2
+                || trace_ref.path != "trace.strace" || trace_ref.schema != "strace_text" || trace_ref.schema_version != 1 {
+                return Err("runtime_artifact_contract_mismatch");
+            }
+            let run_artifact = artifacts.iter().find(|artifact| artifact.kind() == ArtifactKind::RuntimeManifest && artifact.path() == run_ref.path)
+                .ok_or("runtime_artifact_reference_mismatch")?;
+            let trace_artifact = artifacts.iter().find(|artifact| artifact.kind() == ArtifactKind::RuntimeTrace && artifact.path() == trace_ref.path)
+                .ok_or("runtime_artifact_reference_mismatch")?;
+            let run_bytes = run_artifact.bytes();
+            let trace_bytes = trace_artifact.bytes();
+            if run_bytes.len() > sideeffect::limits::MAX_BUNDLE_MANIFEST_BYTES
+                || trace_bytes.len() > sideeffect::limits::MAX_TRACE_BYTES {
+                return Err("runtime_artifact_input_limit_exceeded");
+            }
+            let run_manifest: RunManifest = serde_json::from_slice(run_bytes)
+                .map_err(|_| "runtime_manifest_invalid")?;
+            validate_bundle_manifest(&run_manifest).map_err(|_| "runtime_manifest_invalid")?;
+            if run_manifest.schema_version != run_ref.schema_version
+                || run_manifest.trace.name != trace_ref.path
+                || run_manifest.trace.format != trace_ref.schema
+                || run_manifest.trace.byte_length != trace_ref.byte_length
+                || run_manifest.trace.byte_length != trace_bytes.len() as u64
+                || run_manifest.trace.sha256 != trace_ref.sha256
+                || format!("{:x}", Sha256::digest(trace_bytes)) != run_manifest.trace.sha256 {
+                return Err("runtime_manifest_trace_contract_mismatch");
+            }
+            let verified_diff = root_diff.as_ref().ok_or("selected_root_unavailable")?;
+            let association = sideeffect::inventory::associate_root_runtime_diff(
+                verified_diff,
+                trace_bytes,
+            ).map_err(|_| "root_runtime_association_unavailable")?;
+            Ok((association, run_manifest.capture.completeness.clone()))
+        })();
+        match result {
+            Ok((association, completeness)) => (Some(association), None, Some(completeness)),
+            Err(diagnostic) => (None, Some(diagnostic), None),
+        }
+    };
+    #[cfg(windows)]
+    let (
+        root_runtime_association,
+        root_runtime_association_diagnostic,
+        runtime_capture_completeness,
+    ) = (
+        None,
+        Some("linux_root_runtime_association_unsupported"),
+        None,
+    );
+    let complete = root_runtime_association_diagnostic.is_none()
+        && root.status == sideeffect::audit_session::SourceStatus::Complete
         && runtime.status == sideeffect::audit_session::SourceStatus::Complete
         && root_diff
             .as_ref()
@@ -6820,11 +6885,14 @@ fn compare_observation(session_path: &OsString) -> Result<ExitCode, String> {
         scope: "verified_before_after_selected_root_comparison_during_bounded_runtime_capture; temporal differences do not establish causation",
         root_source_status: root.status,
         runtime_source_status: runtime.status,
+        runtime_capture_completeness,
         before_artifact: before_ref,
         after_artifact: after_ref,
         runtime_artifacts: runtime.artifacts.iter().collect(),
         root_comparison_diagnostic,
         root_diff,
+        root_runtime_association,
+        root_runtime_association_diagnostic,
     };
     let mut output = CappedBuffer::new(MAX_REPORT_BYTES);
     serde_json::to_writer(&mut output, &report)
