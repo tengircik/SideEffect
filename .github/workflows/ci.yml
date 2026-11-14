@@ -101,7 +101,7 @@ jobs:
       - name: Install strace
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y strace python3
+          sudo apt-get install --no-install-recommends -y strace python3 dpkg
 
       - name: Validate portable agent skill
         run: python3 scripts/validate_agent_skill.py
@@ -256,7 +256,7 @@ jobs:
       - name: Install strace
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y strace python3
+          sudo apt-get install --no-install-recommends -y strace python3 dpkg
 
       - name: Check formatting with Rust 1.85
         run: cargo +1.85.0 fmt --all --check
