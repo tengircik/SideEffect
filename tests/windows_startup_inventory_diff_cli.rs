@@ -209,7 +209,7 @@ fn windows_v10_service_and_task_lifecycle_diffs_keep_configuration_evidence() {
     assert!(added["deltas"].as_array().unwrap().iter().all(|delta| {
         delta["after"]["references"]
             .as_array()
-            .is_some_and(|refs| refs.len() > 0)
+            .is_some_and(|refs| !refs.is_empty())
     }));
 
     let (updated, code) = compare(&installed_path, &changed_path);
@@ -251,7 +251,7 @@ fn windows_v10_service_and_task_lifecycle_diffs_keep_configuration_evidence() {
     assert!(removed["deltas"].as_array().unwrap().iter().all(|delta| {
         delta["before"]["references"]
             .as_array()
-            .is_some_and(|refs| refs.len() > 0)
+            .is_some_and(|refs| !refs.is_empty())
             && delta["after"].is_null()
     }));
 }
