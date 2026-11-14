@@ -722,7 +722,9 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
     let output = directory.0.join("observation.session");
     let created_file = observed_root.join("created-by-selected-command.txt");
     let transient_file = observed_root.join("transient-by-selected-command.txt");
-    let script = "from pathlib import Path\nimport sys\nPath(sys.argv[1]).write_text('fixture')\ntransient = Path(sys.argv[2])\ntransient.write_text('transient fixture')\ntransient.unlink()";
+    let removed_file = observed_root.join("removed-by-selected-command.txt");
+    fs::write(&removed_file, "pre-existing fixture").unwrap();
+    let script = "from pathlib import Path\nimport sys\nPath(sys.argv[1]).write_text('fixture')\ntransient = Path(sys.argv[2])\ntransient.write_text('transient fixture')\ntransient.unlink()\nPath(sys.argv[3]).unlink()";
     let captured = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .arg("audit")
         .arg("--output")
@@ -737,6 +739,7 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
         .arg(script)
         .arg(&created_file)
         .arg(&transient_file)
+        .arg(&removed_file)
         .output()
         .unwrap();
     assert_eq!(
@@ -749,6 +752,10 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
     assert!(
         !transient_file.exists(),
         "the selected fixture command must remove its transient file"
+    );
+    assert!(
+        !removed_file.exists(),
+        "the selected fixture command must remove its pre-existing file"
     );
     let manifest = parse_manifest(&fs::read(output.join("session.json")).unwrap()).unwrap();
     assert_eq!(
@@ -779,9 +786,16 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
     let report: serde_json::Value = serde_json::from_slice(&compared.stdout).unwrap();
     assert_eq!(report["root_comparison_status"], "complete");
     assert_eq!(report["root_diff"]["counts"]["additions"], 1);
+    assert_eq!(report["root_diff"]["counts"]["removals"], 1);
     let deltas = report["root_diff"]["deltas"].as_array().unwrap();
-    assert_eq!(deltas.len(), 1);
-    assert_eq!(deltas[0]["name"], "created-by-selected-command.txt");
+    assert_eq!(deltas.len(), 2);
+    assert!(deltas.iter().any(
+        |delta| delta["kind"] == "added" && delta["name"] == "created-by-selected-command.txt"
+    ));
+    assert!(
+        deltas.iter().any(|delta| delta["kind"] == "removed"
+            && delta["name"] == "removed-by-selected-command.txt")
+    );
     let transient_name = transient_file.file_name().unwrap().to_str().unwrap();
     assert!(
         deltas.iter().all(|delta| delta["name"] != transient_name),
@@ -806,13 +820,29 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
     let associations = report["root_runtime_association"]["associations"]
         .as_array()
         .unwrap();
-    assert_eq!(associations.len(), 1);
+    assert_eq!(associations.len(), 2);
+    let added_association = associations
+        .iter()
+        .find(|association| association["delta_kind"] == "added")
+        .expect("the created file must be a lexical openat candidate");
     assert_eq!(
-        associations[0]["candidate_path"],
+        added_association["candidate_path"],
         created_file.to_string_lossy().as_ref()
     );
+    let removed_association = associations
+        .iter()
+        .find(|association| association["delta_kind"] == "removed")
+        .expect("the deleted file must be a lexical unlink candidate");
     assert_eq!(
-        associations[0]["runtime_evidence"][0]["trace_sha256"]
+        removed_association["candidate_path"],
+        removed_file.to_string_lossy().as_ref()
+    );
+    assert!(
+        removed_association["runtime_evidence"][0]["syscall"] == "unlink"
+            || removed_association["runtime_evidence"][0]["syscall"] == "unlinkat"
+    );
+    assert_eq!(
+        removed_association["runtime_evidence"][0]["trace_sha256"]
             .as_str()
             .unwrap()
             .len(),
