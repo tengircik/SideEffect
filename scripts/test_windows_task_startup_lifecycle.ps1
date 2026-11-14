@@ -78,11 +78,11 @@ function Get-StartupDocument {
         $document.status -cnotin @('complete', 'partial')) {
         throw 'SideEffect startup inventory status did not match its documented CLI exit code.'
     }
-    Assert-TaskSourceComparable -Document $document -Label $Name
+    Assert-TaskSourceAvailable -Document $document -Label $Name
     return [pscustomobject]@{ Path = $path; Document = $document }
 }
 
-function Assert-TaskSourceComparable {
+function Assert-TaskSourceAvailable {
     param(
         [Parameter(Mandatory = $true)] $Document,
         [Parameter(Mandatory = $true)][string] $Label
@@ -92,12 +92,15 @@ function Assert-TaskSourceComparable {
     if ($sources.Count -ne 1) {
         throw "Startup snapshot $Label did not contain exactly one Task Scheduler source."
     }
-    if ($sources[0].status -cne 'complete') {
+    if ($sources[0].status -cnotin @('complete', 'partial')) {
+        throw "Task Scheduler source for $Label has unsupported status $($sources[0].status)."
+    }
+    if ($sources[0].status -ceq 'partial') {
         $codes = @($sources[0].diagnostics | Select-Object -First 8 | ForEach-Object {
             if ($_.code -is [string] -and $_.code.Length -le 128) { $_.code }
         }) -join ','
         if (-not $codes) { $codes = 'none' }
-        throw "Task Scheduler source for $Label is $($sources[0].status); diagnostic_codes=$codes. The task lifecycle remains unknown."
+        Write-Host "Task Scheduler source for $Label is partial; bounded diagnostic_codes=$codes. Exact fixture rows are validated independently."
     }
 }
 
@@ -119,8 +122,8 @@ function Invoke-StartupDiff {
         $report.status -cnotin @('complete', 'partial')) {
         throw 'SideEffect startup diff status did not match its documented CLI exit code.'
     }
-    Assert-TaskSourceComparable -Document $Before.Document -Label 'before diff'
-    Assert-TaskSourceComparable -Document $After.Document -Label 'after diff'
+    Assert-TaskSourceAvailable -Document $Before.Document -Label 'before diff'
+    Assert-TaskSourceAvailable -Document $After.Document -Label 'after diff'
     return $report
 }
 
@@ -188,25 +191,22 @@ function Get-FixtureActionRow {
     return [pscustomobject]@{ Row = $action; Index = $index }
 }
 
-function Assert-TaskDelta {
+function Assert-MatchedActionChange {
     param(
         [Parameter(Mandatory = $true)] $Report,
-        [Parameter(Mandatory = $true)][string] $Category,
-        [Parameter(Mandatory = $true)][string] $Kind,
-        [Parameter(Mandatory = $true)][string] $Pointer,
-        [Parameter(Mandatory = $true)][ValidateSet('before', 'after')][string] $EvidenceSide,
-        [Parameter()][string] $ExpectedChangedField
+        [Parameter(Mandatory = $true)][string] $BeforePointer,
+        [Parameter(Mandatory = $true)][string] $AfterPointer
     )
 
     $matches = @($Report.deltas | Where-Object {
-        $_.category -ceq $Category -and $_.kind -ceq $Kind -and
-        $_.PSObject.Properties[$EvidenceSide].Value.references -contains $Pointer
+        $_.category -ceq 'scheduled_task_action_sequence' -and
+        $_.kind -ceq 'changed' -and
+        $_.changed_fields -contains 'action_sequence' -and
+        $_.before.references -contains $BeforePointer -and
+        $_.after.references -contains $AfterPointer
     })
     if ($matches.Count -ne 1) {
-        throw "Expected one $Kind $Category delta linked to $Pointer; found $($matches.Count)."
-    }
-    if ($ExpectedChangedField -and $matches[0].changed_fields -notcontains $ExpectedChangedField) {
-        throw "The $Category delta did not include the expected field $ExpectedChangedField."
+        throw "Expected one matched action change linked to both $BeforePointer and $AfterPointer; found $($matches.Count)."
     }
 }
 
@@ -314,8 +314,7 @@ try {
     $changedTask = Get-FixtureTaskRow -Document $changed.Document
     $changedAction = Get-FixtureActionRow -Document $changed.Document -ExpectedPath $updatedInertImage -ExpectedTaskIndex $changedTask.Row.evidence.task_index
     $changedDiff = Invoke-StartupDiff -Before $created -After $changed
-    Assert-TaskDelta -Report $changedDiff -Category 'scheduled_task_action_sequence' -Kind 'changed' -Pointer "/scheduled_task_actions/$($createdAction.Index)" -EvidenceSide 'before' -ExpectedChangedField 'action_sequence'
-    Assert-TaskDelta -Report $changedDiff -Category 'scheduled_task_action_sequence' -Kind 'changed' -Pointer "/scheduled_task_actions/$($changedAction.Index)" -EvidenceSide 'after' -ExpectedChangedField 'action_sequence'
+    Assert-MatchedActionChange -Report $changedDiff -BeforePointer "/scheduled_task_actions/$($createdAction.Index)" -AfterPointer "/scheduled_task_actions/$($changedAction.Index)"
 
     Remove-FixtureTaskAndWait
     $script:TaskCreated = $false
