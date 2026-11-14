@@ -442,6 +442,155 @@ function Get-InventoryDiff {
     return $output | ConvertFrom-Json
 }
 
+function Get-SoftwareSnapshot {
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    Assert-UnderPath -Child $Path -Parent $script:TestRoot -Label 'SideEffect software snapshot'
+    & $script:SideEffectPath 'inventory' 'packages' '--output' $Path
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0 -and $exitCode -ne 2) {
+        throw "SideEffect software snapshot failed with exit code $exitCode."
+    }
+    $document = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    if ($document.schema -ne 'sideeffect.windows_software_inventory' -or $document.schema_version -ne 1 -or $document.platform -ne 'windows') {
+        throw 'SideEffect software snapshot did not report the Windows software-registration v1 contract.'
+    }
+    foreach ($sourceId in @('current_user_native_uninstall', 'current_user_32_uninstall')) {
+        $source = @($document.sources | Where-Object { $_.id -eq $sourceId })
+        if ($source.Count -ne 1 -or $source[0].status -notin @('complete', 'not_present')) {
+            throw "SideEffect current-user Uninstall source '$sourceId' was not complete: $($source | ConvertTo-Json -Compress -Depth 8)"
+        }
+    }
+    return $document
+}
+
+function Find-FixtureSoftwareRegistration {
+    param(
+        [Parameter(Mandatory = $true)] $Document,
+        [Parameter(Mandatory = $true)][string] $Version
+    )
+
+    $matches = @($Document.registrations | Where-Object {
+        $_.display_name -eq 'SideEffect R5 Synthetic MSI Fixture' -and
+        $_.evidence.hive -eq 'HKEY_CURRENT_USER' -and
+        $_.evidence.registry_view -in @('native', 'wow64_32') -and
+        (@($_.values | Where-Object { $_.name -eq 'DisplayVersion' -and $_.text -eq $Version }).Count -eq 1)
+    })
+    if ($matches.Count -gt 1) {
+        throw "SideEffect reported $($matches.Count) current-user native fixture registrations at version $Version; expected at most one."
+    }
+    if ($matches.Count -eq 1) {
+        return $matches[0]
+    }
+    return $null
+}
+
+function Get-SoftwareInventoryDiff {
+    param(
+        [Parameter(Mandatory = $true)][string] $BeforePath,
+        [Parameter(Mandatory = $true)][string] $AfterPath
+    )
+
+    $output = & $script:SideEffectPath 'explain' '--inventory-diff' $BeforePath $AfterPath | Out-String
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0 -and $exitCode -ne 2) {
+        throw "SideEffect software inventory diff failed with exit code $exitCode."
+    }
+    $diff = $output | ConvertFrom-Json
+    if ($diff.schema -ne 'sideeffect.windows_software_inventory_diff' -or $diff.schema_version -ne 1) {
+        throw 'SideEffect did not return the Windows software-registration diff v1 contract.'
+    }
+    return $diff
+}
+
+function Assert-SoftwareDiffSideEvidence {
+    param(
+        [Parameter(Mandatory = $true)] $Delta,
+        [Parameter(Mandatory = $true)][string] $Side,
+        [Parameter(Mandatory = $true)] $Snapshot
+    )
+
+    $facts = $Delta.$Side
+    if ($null -eq $facts) {
+        throw "Software diff $Side side did not contain registration facts."
+    }
+    $evidence = $facts.evidence
+    if ($evidence.source_id -notin @('current_user_native_uninstall', 'current_user_32_uninstall') -or $Delta.identity.source_id -ne $evidence.source_id) {
+        throw "Software diff $Side side did not retain a current-user source identity."
+    }
+    $rows = @($Snapshot.registrations | Where-Object {
+        $_.evidence.registration_index -eq $evidence.registration_index -and
+        $_.evidence.hive -eq 'HKEY_CURRENT_USER' -and
+        $_.evidence.registry_view -eq $Delta.identity.registry_view -and
+        $_.registry_subkey -eq $Delta.identity.registry_subkey
+    })
+    if ($rows.Count -ne 1 -or $rows[0].evidence.registration_index -ne $evidence.registration_index) {
+        throw "Software diff $Side evidence did not resolve to exactly one source registration row."
+    }
+}
+
+function Assert-SoftwareLifecycleDiff {
+    param(
+        [Parameter(Mandatory = $true)] $Diff,
+        [Parameter(Mandatory = $true)] $Before,
+        [Parameter(Mandatory = $true)] $After,
+        [Parameter()][string[]] $AddedVersions = @(),
+        [Parameter()][string[]] $RemovedVersions = @()
+    )
+
+    foreach ($sourceId in @('current_user_native_uninstall', 'current_user_32_uninstall')) {
+        $source = @($Diff.sources | Where-Object { $_.source_id -eq $sourceId })
+        if ($source.Count -ne 1 -or
+            $source[0].before_status -notin @('complete', 'not_present') -or
+            $source[0].after_status -notin @('complete', 'not_present')) {
+            throw "Software diff did not preserve complete comparison states for current-user source '$sourceId'."
+        }
+    }
+    foreach ($version in $AddedVersions) {
+        if ($null -ne (Find-FixtureSoftwareRegistration -Document $Before -Version $version)) {
+            throw "Fixture version $version was already present in the before software snapshot."
+        }
+        $registration = Find-FixtureSoftwareRegistration -Document $After -Version $version
+        if ($null -eq $registration) {
+            throw "SideEffect did not observe current-user native fixture registration version $version."
+        }
+        $deltas = @($Diff.deltas | Where-Object {
+            $_.kind -eq 'added' -and $_.identity.source_id -in @('current_user_native_uninstall', 'current_user_32_uninstall') -and
+            $_.after.display_name -eq 'SideEffect R5 Synthetic MSI Fixture' -and $_.after.display_version -eq $version
+        })
+        if ($deltas.Count -ne 1) {
+            throw "Software diff did not report exactly one evidence-linked addition for fixture version $version."
+        }
+        Assert-SoftwareDiffSideEvidence -Delta $deltas[0] -Side 'after' -Snapshot $After
+    }
+    foreach ($version in $RemovedVersions) {
+        $registration = Find-FixtureSoftwareRegistration -Document $Before -Version $version
+        if ($null -eq $registration) {
+            throw "SideEffect did not observe current-user native fixture registration version $version before removal."
+        }
+        if ($null -ne (Find-FixtureSoftwareRegistration -Document $After -Version $version)) {
+            throw "Fixture version $version remained in the after software snapshot."
+        }
+        $deltas = @($Diff.deltas | Where-Object {
+            $_.kind -eq 'removed' -and $_.identity.source_id -in @('current_user_native_uninstall', 'current_user_32_uninstall') -and
+            $_.before.display_name -eq 'SideEffect R5 Synthetic MSI Fixture' -and $_.before.display_version -eq $version
+        })
+        if ($deltas.Count -ne 1) {
+            throw "Software diff did not report exactly one evidence-linked removal for fixture version $version."
+        }
+        Assert-SoftwareDiffSideEvidence -Delta $deltas[0] -Side 'before' -Snapshot $Before
+    }
+    $expectedDeltaCount = $AddedVersions.Count + $RemovedVersions.Count
+    $fixtureDeltas = @($Diff.deltas | Where-Object {
+        $_.identity.source_id -in @('current_user_native_uninstall', 'current_user_32_uninstall') -and
+        ($_.before.display_name -eq 'SideEffect R5 Synthetic MSI Fixture' -or
+            $_.after.display_name -eq 'SideEffect R5 Synthetic MSI Fixture')
+    })
+    if ($fixtureDeltas.Count -ne $expectedDeltaCount) {
+        throw "Software diff contained $($fixtureDeltas.Count) fixture registration deltas; expected $expectedDeltaCount."
+    }
+}
+
 function Assert-DiffEvidence {
     param(
         [Parameter(Mandatory = $true)] $Diff,
@@ -570,9 +719,20 @@ try {
     $snapshotV2Path = Join-Path $script:TestRoot 'installed-v2.json'
     $snapshotDowngradePath = Join-Path $script:TestRoot 'downgraded-v1.json'
     $snapshotUninstallPath = Join-Path $script:TestRoot 'uninstalled.json'
+    $softwareBeforePath = Join-Path $script:TestRoot 'software-before-install.json'
+    $softwareV1Path = Join-Path $script:TestRoot 'software-installed-v1.json'
+    $softwareV2Path = Join-Path $script:TestRoot 'software-installed-v2.json'
+    $softwareV2UninstallPath = Join-Path $script:TestRoot 'software-uninstalled-v2-for-downgrade.json'
+    $softwareDowngradePath = Join-Path $script:TestRoot 'software-downgraded-v1.json'
+    $softwareUninstallPath = Join-Path $script:TestRoot 'software-uninstalled-v1.json'
     $before = Get-InventorySnapshot -Path $beforePath
     if (@($before.entries).Count -ne 0) {
         throw 'Fresh MSI install root was not empty before installation.'
+    }
+    $softwareBefore = Get-SoftwareSnapshot -Path $softwareBeforePath
+    if ($null -ne (Find-FixtureSoftwareRegistration -Document $softwareBefore -Version '1.0.0') -or
+        $null -ne (Find-FixtureSoftwareRegistration -Document $softwareBefore -Version '2.0.0')) {
+        throw 'A generated fixture version was already present in SideEffect current-user native software inventory before installation.'
     }
 
     $installationStarted = $true
@@ -580,11 +740,14 @@ try {
     Assert-ProductVersion -ProductCode $productCodeV1 -Version '1.0.0' -LogPath (Join-Path $script:TestRoot 'install-v1.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin')
     Assert-InstalledPayload -ProductCode $productCodeV1 -LogPath (Join-Path $script:TestRoot 'install-v1.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin') -ExpectedBytes $payloadV1
     $entryV1 = Get-PayloadEntry (Get-InventorySnapshot -Path $snapshotV1Path)
+    $softwareV1 = Get-SoftwareSnapshot -Path $softwareV1Path
     if ($entryV1.content_sha256 -ne (Get-FileHash -LiteralPath (Join-Path $script:InstallRoot 'payload.bin') -Algorithm SHA256).Hash.ToLowerInvariant()) {
         throw 'SideEffect v1 hash did not match the installed payload bytes.'
     }
     $installDiff = Get-InventoryDiff -BeforePath $beforePath -AfterPath $snapshotV1Path
     Assert-DiffEvidence -Diff $installDiff -Kind 'added' -CountField 'additions' -Count 1 -AfterEntry $entryV1
+    $softwareInstallDiff = Get-SoftwareInventoryDiff -BeforePath $softwareBeforePath -AfterPath $softwareV1Path
+    Assert-SoftwareLifecycleDiff -Diff $softwareInstallDiff -Before $softwareBefore -After $softwareV1 -AddedVersions @('1.0.0')
     Write-Output "MSI v1 installed; observed selected-root SHA-256: $($entryV1.content_sha256)"
 
     Install-Msi -MsiPath $msiV2 -InstallRoot $script:InstallRoot -LogPath (Join-Path $script:TestRoot 'update-v2.log') -Description 'MSI v2 major upgrade'
@@ -592,6 +755,7 @@ try {
     Assert-ProductVersion -ProductCode $productCodeV2 -Version '2.0.0' -LogPath (Join-Path $script:TestRoot 'update-v2.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin')
     Assert-InstalledPayload -ProductCode $productCodeV2 -LogPath (Join-Path $script:TestRoot 'update-v2.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin') -ExpectedBytes $payloadV2
     $entryV2 = Get-PayloadEntry (Get-InventorySnapshot -Path $snapshotV2Path)
+    $softwareV2 = Get-SoftwareSnapshot -Path $softwareV2Path
     if ($entryV2.content_sha256 -ne (Get-FileHash -LiteralPath (Join-Path $script:InstallRoot 'payload.bin') -Algorithm SHA256).Hash.ToLowerInvariant()) {
         throw 'SideEffect v2 hash did not match the installed payload bytes.'
     }
@@ -600,29 +764,40 @@ try {
     }
     $updateDiff = Get-InventoryDiff -BeforePath $snapshotV1Path -AfterPath $snapshotV2Path
     Assert-DiffEvidence -Diff $updateDiff -Kind 'changed' -CountField 'changes' -Count 1 -BeforeEntry $entryV1 -AfterEntry $entryV2 -RequireContentChange
+    $softwareUpdateDiff = Get-SoftwareInventoryDiff -BeforePath $softwareV1Path -AfterPath $softwareV2Path
+    Assert-SoftwareLifecycleDiff -Diff $softwareUpdateDiff -Before $softwareV1 -After $softwareV2 -AddedVersions @('2.0.0') -RemovedVersions @('1.0.0')
     Write-Output "MSI v2 major upgrade completed; observed selected-root SHA-256: $($entryV2.content_sha256)"
 
     Uninstall-Msi -ProductCode $productCodeV2 -LogPath (Join-Path $script:TestRoot 'uninstall-v2-for-downgrade.log') -Description 'MSI v2 uninstall for downgrade strategy'
     Assert-ProductAbsent -ProductCode $productCodeV2
+    $softwareV2Uninstalled = Get-SoftwareSnapshot -Path $softwareV2UninstallPath
+    $softwareV2UninstallDiff = Get-SoftwareInventoryDiff -BeforePath $softwareV2Path -AfterPath $softwareV2UninstallPath
+    Assert-SoftwareLifecycleDiff -Diff $softwareV2UninstallDiff -Before $softwareV2 -After $softwareV2Uninstalled -RemovedVersions @('2.0.0')
     Install-Msi -MsiPath $msiV1 -InstallRoot $script:InstallRoot -LogPath (Join-Path $script:TestRoot 'downgrade-reinstall-v1.log') -Description 'MSI v1 reinstall downgrade strategy'
     Assert-ProductVersion -ProductCode $productCodeV1 -Version '1.0.0' -LogPath (Join-Path $script:TestRoot 'downgrade-reinstall-v1.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin')
     Assert-InstalledPayload -ProductCode $productCodeV1 -LogPath (Join-Path $script:TestRoot 'downgrade-reinstall-v1.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin') -ExpectedBytes $payloadV1
     $entryDowngrade = Get-PayloadEntry (Get-InventorySnapshot -Path $snapshotDowngradePath)
+    $softwareDowngrade = Get-SoftwareSnapshot -Path $softwareDowngradePath
     if ($entryDowngrade.content_sha256 -ne $entryV1.content_sha256) {
         throw 'Downgrade reinstall did not restore the v1 payload fingerprint.'
     }
     $downgradeDiff = Get-InventoryDiff -BeforePath $snapshotV2Path -AfterPath $snapshotDowngradePath
     Assert-DiffEvidence -Diff $downgradeDiff -Kind 'changed' -CountField 'changes' -Count 1 -BeforeEntry $entryV2 -AfterEntry $entryDowngrade -RequireContentChange
+    $softwareDowngradeDiff = Get-SoftwareInventoryDiff -BeforePath $softwareV2UninstallPath -AfterPath $softwareDowngradePath
+    Assert-SoftwareLifecycleDiff -Diff $softwareDowngradeDiff -Before $softwareV2Uninstalled -After $softwareDowngrade -AddedVersions @('1.0.0')
     Write-Output "Downgrade strategy restored MSI v1; observed selected-root SHA-256: $($entryDowngrade.content_sha256)"
 
     Uninstall-Msi -ProductCode $productCodeV1 -LogPath (Join-Path $script:TestRoot 'uninstall-v1.log') -Description 'MSI v1 final uninstall'
     Assert-ProductAbsent -ProductCode $productCodeV1
     $uninstalled = Get-InventorySnapshot -Path $snapshotUninstallPath
+    $softwareUninstalled = Get-SoftwareSnapshot -Path $softwareUninstallPath
     if (@($uninstalled.entries).Count -ne 0 -or (Test-Path -LiteralPath (Join-Path $script:InstallRoot 'payload.bin'))) {
         throw 'Final MSI uninstall left the synthetic payload in the selected root.'
     }
     $uninstallDiff = Get-InventoryDiff -BeforePath $snapshotDowngradePath -AfterPath $snapshotUninstallPath
     Assert-DiffEvidence -Diff $uninstallDiff -Kind 'removed' -CountField 'removals' -Count 1 -BeforeEntry $entryDowngrade
+    $softwareFinalUninstallDiff = Get-SoftwareInventoryDiff -BeforePath $softwareDowngradePath -AfterPath $softwareUninstallPath
+    Assert-SoftwareLifecycleDiff -Diff $softwareFinalUninstallDiff -Before $softwareDowngrade -After $softwareUninstalled -RemovedVersions @('1.0.0')
     Write-Output 'MSI v1 uninstall removed the observed selected-root payload.'
 }
 catch {
