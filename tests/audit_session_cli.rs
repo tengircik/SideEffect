@@ -721,7 +721,8 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
     fs::create_dir(&observed_root).unwrap();
     let output = directory.0.join("observation.session");
     let created_file = observed_root.join("created-by-selected-command.txt");
-    let script = "from pathlib import Path; Path(__import__('sys').argv[1]).write_text('fixture')";
+    let transient_file = observed_root.join("transient-by-selected-command.txt");
+    let script = "from pathlib import Path\nimport sys\nPath(sys.argv[1]).write_text('fixture')\ntransient = Path(sys.argv[2])\ntransient.write_text('transient fixture')\ntransient.unlink()";
     let captured = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .arg("audit")
         .arg("--output")
@@ -735,6 +736,7 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
         .arg("-c")
         .arg(script)
         .arg(&created_file)
+        .arg(&transient_file)
         .output()
         .unwrap();
     assert_eq!(
@@ -744,6 +746,10 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
         String::from_utf8_lossy(&captured.stderr)
     );
     assert!(created_file.exists());
+    assert!(
+        !transient_file.exists(),
+        "the selected fixture command must remove its transient file"
+    );
     let manifest = parse_manifest(&fs::read(output.join("session.json")).unwrap()).unwrap();
     assert_eq!(
         manifest.schema_version,
@@ -773,8 +779,62 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
     let report: serde_json::Value = serde_json::from_slice(&compared.stdout).unwrap();
     assert_eq!(report["root_comparison_status"], "complete");
     assert_eq!(report["root_diff"]["counts"]["additions"], 1);
+    let deltas = report["root_diff"]["deltas"].as_array().unwrap();
+    assert_eq!(deltas.len(), 1);
+    assert_eq!(deltas[0]["name"], "created-by-selected-command.txt");
+    let transient_name = transient_file.file_name().unwrap().to_str().unwrap();
+    assert!(
+        deltas.iter().all(|delta| delta["name"] != transient_name),
+        "a file created and removed inside the observation window must not appear in the before/after diff"
+    );
     assert_eq!(report["runtime_artifacts"].as_array().unwrap().len(), 2);
     assert_eq!(report["runtime_source_status"], "partial");
+
+    // The trace remains the raw runtime evidence for the transient lifecycle.
+    // Its openat path hint is source-derived, while the unlink success is read
+    // from the observed syscall result rather than inferred from the absent file.
+    let trace_path = output.join("trace.strace");
+    let trace = String::from_utf8(fs::read(&trace_path).unwrap()).unwrap();
+    let transient_trace_lines = trace
+        .lines()
+        .filter(|line| line.contains(transient_name))
+        .collect::<Vec<_>>();
+    assert!(
+        !transient_trace_lines.is_empty(),
+        "runtime trace must retain rows for the transient fixture file: {trace}"
+    );
+    assert!(
+        transient_trace_lines.iter().any(|line| {
+            let line = line.trim_end();
+            (line.contains("unlink(") || line.contains("unlinkat("))
+                && line
+                    .rsplit_once(" = ")
+                    .is_some_and(|(_, result)| result == "0")
+        }),
+        "runtime trace must retain the observed successful removal syscall: {transient_trace_lines:?}"
+    );
+    let events = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["events", "--trace"])
+        .arg(&trace_path)
+        .output()
+        .unwrap();
+    assert!(
+        events.status.success(),
+        "{}",
+        String::from_utf8_lossy(&events.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&events.stdout).unwrap();
+    assert!(
+        envelope["events"].as_array().unwrap().iter().any(|event| {
+            matches!(event["event_kind"].as_str(), Some("openat" | "openat2"))
+                && event["path_observation"]["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with(transient_name))
+                && event["operation"]["source_kind"] == "syscall_attempt"
+                && event["operation"]["result"] == "success"
+        }),
+        "runtime evidence must retain the observed successful open of the transient file"
+    );
 }
 
 #[test]

@@ -419,6 +419,7 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
     let observation_root = directory.join("observation-root");
     fs::create_dir(&observation_root).unwrap();
     let observation_file = observation_root.join("created-by-etw-fixture.txt");
+    let observation_transient = observation_root.join("removed-by-etw-fixture.txt");
     let observation_session = directory.join("observation-session");
     let observation_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let observation_port = observation_listener.local_addr().unwrap().port();
@@ -437,6 +438,10 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
         .arg(&fixture_executable)
         .args(["--ignored", "--exact", "etw_fixture_child", "--nocapture"])
         .env("SIDEEFFECT_ETW_FIXTURE_FILE", &observation_file)
+        .env(
+            "SIDEEFFECT_ETW_FIXTURE_TRANSIENT_FILE",
+            &observation_transient,
+        )
         .env("SIDEEFFECT_ETW_FIXTURE_PORT", observation_port.to_string())
         .output()
         .unwrap();
@@ -448,6 +453,10 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
         String::from_utf8_lossy(&observation.stderr)
     );
     assert!(observation_file.exists());
+    assert!(
+        !observation_transient.exists(),
+        "the selected ETW fixture command must remove its transient file"
+    );
     let observation_manifest: Value =
         serde_json::from_slice(&fs::read(observation_session.join("session.json")).unwrap())
             .unwrap();
@@ -465,10 +474,47 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
         observation_comparison["root_diff"]["counts"]["additions"],
         1
     );
+    let observation_deltas = observation_comparison["root_diff"]["deltas"]
+        .as_array()
+        .unwrap();
+    assert_eq!(observation_deltas.len(), 1);
+    assert_eq!(observation_deltas[0]["name"], "created-by-etw-fixture.txt");
+    let observation_transient_name = observation_transient.file_name().unwrap().to_str().unwrap();
+    assert!(
+        observation_deltas
+            .iter()
+            .all(|delta| delta["name"] != observation_transient_name),
+        "a file created and removed inside the observation window must not appear in the before/after diff"
+    );
     assert_eq!(observation_comparison["runtime_source_status"], "partial");
     assert_eq!(
         observation_comparison["runtime_artifacts"][0]["path"],
         "runtime.windows.json"
+    );
+    // Classic FileIo records retain create/write/delete-name observations but
+    // no per-operation completion status. The capture therefore cannot prove
+    // that the deletion succeeded; it only shows the transient name was
+    // observed during the bounded window, while the before/after snapshots
+    // independently show that no transient file remained.
+    let observation_runtime: Value = serde_json::from_slice(
+        &fs::read(observation_session.join("runtime.windows.json")).unwrap(),
+    )
+    .unwrap();
+    let transient_file_observations = observation_runtime["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| {
+            event["observation_decoding"]["status"] == "decoded"
+                && event["observation_decoding"]["observation"]["activity"]["kind"] == "file"
+                && event["observation_decoding"]["observation"]["activity"]["observation"]["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with(observation_transient_name))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !transient_file_observations.is_empty(),
+        "runtime capture must retain at least one observed event for the transient fixture file"
     );
     fs::remove_dir_all(observation_session).unwrap();
     fs::remove_file(observation_file).unwrap();
@@ -532,6 +578,11 @@ fn etw_fixture_child() {
         fs::read(&path).expect("ETW fixture should read its temporary file"),
         b"fixture"
     );
+    if let Some(transient) = std::env::var_os("SIDEEFFECT_ETW_FIXTURE_TRANSIENT_FILE") {
+        fs::write(&transient, b"transient fixture")
+            .expect("ETW fixture should write its transient file");
+        fs::remove_file(&transient).expect("ETW fixture should remove its transient file");
+    }
     let mut connection = TcpStream::connect(("127.0.0.1", port))
         .expect("ETW fixture should connect to its local listener");
     connection
