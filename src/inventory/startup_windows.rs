@@ -1190,18 +1190,17 @@ fn query_service_triggers(
     *aggregate_config_bytes += required_bytes;
     let word_count = required_bytes.div_ceil(std::mem::size_of::<u64>());
     let mut buffer = vec![0u64; word_count];
-    let mut actual_bytes = 0u32;
+    // QueryServiceConfig2W documents `pcbBytesNeeded` only for the
+    // ERROR_INSUFFICIENT_BUFFER case; it is undefined after a successful call.
+    // The first call supplied the bounded required size, so parse only that span.
+    let mut bytes_needed = 0u32;
     query(
         buffer.as_mut_ptr().cast(),
         required_bytes as u32,
-        &mut actual_bytes,
+        &mut bytes_needed,
     )
     .map_err(ServiceTriggerQueryError::Api)?;
-    let actual_bytes = actual_bytes as usize;
-    if actual_bytes < std::mem::size_of::<ServiceTriggerInfo>() || actual_bytes > required_bytes {
-        return Err(ServiceTriggerQueryError::InvalidResponse);
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), actual_bytes) };
+    let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), required_bytes) };
     parse_service_triggers(bytes, aggregate_data_bytes, aggregate_trigger_count).map_err(|error| {
         match error {
             ServiceTriggerParseError::InvalidResponse => ServiceTriggerQueryError::InvalidResponse,
@@ -1435,16 +1434,15 @@ fn query_delayed_auto_start_config(
     *aggregate_config_bytes += required_bytes;
     let word_count = required_bytes.div_ceil(std::mem::size_of::<u64>());
     let mut buffer = vec![0u64; word_count];
-    let mut actual_bytes = 0u32;
+    // QueryServiceConfig2W documents `pcbBytesNeeded` only for the
+    // ERROR_INSUFFICIENT_BUFFER case; it is undefined after a successful call.
+    let mut bytes_needed = 0u32;
     query(
         buffer.as_mut_ptr().cast(),
         required_bytes as u32,
-        &mut actual_bytes,
+        &mut bytes_needed,
     )
     .map_err(DelayedAutoStartQueryError::Api)?;
-    if actual_bytes as usize != expected_bytes {
-        return Err(DelayedAutoStartQueryError::InvalidResponse);
-    }
     let raw =
         unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<ServiceDelayedAutoStartInfo>()) };
     Ok(raw.delayed_auto_start != 0)
@@ -4418,6 +4416,49 @@ mod tests {
     }
 
     #[test]
+    fn service_trigger_query_uses_bounded_required_size_when_success_length_is_undefined() {
+        let required = std::mem::size_of::<ServiceTriggerInfo>();
+        let mut calls = 0;
+        let mut aggregate_config = 0;
+        let mut aggregate_data = 0;
+        let mut aggregate_triggers = 0;
+        let observed = query_service_triggers(
+            |buffer, size, bytes_needed| {
+                calls += 1;
+                if buffer.is_null() {
+                    assert_eq!(size, 0);
+                    unsafe { *bytes_needed = required as u32 };
+                    Err(ERROR_INSUFFICIENT_BUFFER)
+                } else {
+                    assert_eq!(size as usize, required);
+                    unsafe {
+                        std::ptr::write_unaligned(
+                            buffer.cast::<ServiceTriggerInfo>(),
+                            ServiceTriggerInfo {
+                                trigger_count: 0,
+                                triggers: std::ptr::null_mut(),
+                                reserved: std::ptr::null_mut(),
+                            },
+                        );
+                        // The API contract does not define this out value on success.
+                        *bytes_needed = 0;
+                    }
+                    Ok(())
+                }
+            },
+            &mut aggregate_config,
+            &mut aggregate_data,
+            &mut aggregate_triggers,
+        )
+        .expect("bounded empty trigger configuration should be observed");
+        assert!(observed.is_empty());
+        assert_eq!(calls, 2);
+        assert_eq!(aggregate_config, required);
+        assert_eq!(aggregate_data, 0);
+        assert_eq!(aggregate_triggers, 0);
+    }
+
+    #[test]
     fn service_trigger_parser_preserves_unknown_codes_guid_and_raw_data() {
         let (mut storage, length) = fixture_span();
         let base = storage.as_mut_ptr().cast::<u8>();
@@ -4639,7 +4680,8 @@ mod tests {
                         assert_eq!(size as usize, encoded.len());
                         unsafe {
                             std::ptr::copy_nonoverlapping(encoded.as_ptr(), buffer, encoded.len());
-                            *needed = encoded.len() as u32;
+                            // The success-case value is undefined by QueryServiceConfig2W.
+                            *needed = 0;
                         }
                         Ok(())
                     }
@@ -4738,7 +4780,7 @@ mod tests {
             Err(DelayedAutoStartQueryError::Api(ERROR_ACCESS_DENIED))
         );
 
-        let actual_size_mismatch = query_delayed_auto_start_config(
+        let undefined_success_size_is_ignored = query_delayed_auto_start_config(
             |_buffer, size, needed| {
                 if size == 0 {
                     unsafe { *needed = std::mem::size_of::<ServiceDelayedAutoStartInfo>() as u32 };
@@ -4750,10 +4792,7 @@ mod tests {
             },
             &mut aggregate,
         );
-        assert_eq!(
-            actual_size_mismatch,
-            Err(DelayedAutoStartQueryError::InvalidResponse)
-        );
+        assert_eq!(undefined_success_size_is_ignored, Ok(false));
     }
 
     #[test]

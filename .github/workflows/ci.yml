@@ -349,6 +349,10 @@ jobs:
       - name: Build CLI
         run: cargo build --locked --bin sideeffect
 
+      - name: Run hosted disabled SCM startup lifecycle acceptance
+        shell: pwsh
+        run: ./scripts/test_windows_service_startup_lifecycle.ps1 -SideEffectPath (Join-Path $PWD 'target\debug\sideeffect.exe')
+
       - name: Run synthetic Windows MSI lifecycle acceptance
         shell: pwsh
         run: ./scripts/test_windows_msi_lifecycle.ps1 -SideEffectPath (Join-Path $PWD 'target\debug\sideeffect.exe')
