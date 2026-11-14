@@ -924,7 +924,7 @@ mod tests {
         (
             AuditSessionManifest {
                 schema: "sideeffect.audit_session".into(),
-                schema_version: crate::audit_session::AUDIT_SESSION_SCHEMA_VERSION,
+                schema_version: crate::audit_session::AUDIT_SESSION_V15_SCHEMA_VERSION,
                 session_id: id.into(),
                 platform: spec.platform.into(),
                 architecture: "x86_64".into(),

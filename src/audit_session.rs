@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
 pub const AUDIT_SESSION_SCHEMA: &str = "sideeffect.audit_session";
-pub const AUDIT_SESSION_SCHEMA_VERSION: u32 = 15;
+pub const AUDIT_SESSION_SCHEMA_VERSION: u32 = 16;
 pub const AUDIT_SESSION_V1_SCHEMA_VERSION: u32 = 1;
 pub const AUDIT_SESSION_V2_SCHEMA_VERSION: u32 = 2;
 pub const AUDIT_SESSION_V3_SCHEMA_VERSION: u32 = 3;
@@ -24,6 +24,7 @@ pub const AUDIT_SESSION_V12_SCHEMA_VERSION: u32 = 12;
 pub const AUDIT_SESSION_V13_SCHEMA_VERSION: u32 = 13;
 pub const AUDIT_SESSION_V14_SCHEMA_VERSION: u32 = 14;
 pub const AUDIT_SESSION_V15_SCHEMA_VERSION: u32 = 15;
+pub const AUDIT_SESSION_V16_SCHEMA_VERSION: u32 = 16;
 pub const COVERAGE_MANIFEST_V1_VERSION: u32 = 1;
 pub const COVERAGE_MANIFEST_VERSION: u32 = 2;
 pub const MAX_AUDIT_SESSION_MANIFEST_BYTES: usize = 512 * 1024;
@@ -389,6 +390,7 @@ pub enum ArtifactKind {
     WindowsRuntimeCapture,
     PathExecutables,
     SelectedRoot,
+    SelectedRootAfter,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -450,7 +452,8 @@ impl AuditSessionManifest {
                 | AUDIT_SESSION_V12_SCHEMA_VERSION
                 | AUDIT_SESSION_V13_SCHEMA_VERSION
                 | AUDIT_SESSION_V14_SCHEMA_VERSION
-                | AUDIT_SESSION_V15_SCHEMA_VERSION,
+                | AUDIT_SESSION_V15_SCHEMA_VERSION
+                | AUDIT_SESSION_V16_SCHEMA_VERSION,
             ) => {
                 for fact in [&context.os_name, &context.os_version] {
                     match (fact.status, &fact.value) {
@@ -485,7 +488,8 @@ impl AuditSessionManifest {
                 | AUDIT_SESSION_V12_SCHEMA_VERSION
                 | AUDIT_SESSION_V13_SCHEMA_VERSION
                 | AUDIT_SESSION_V14_SCHEMA_VERSION
-                | AUDIT_SESSION_V15_SCHEMA_VERSION,
+                | AUDIT_SESSION_V15_SCHEMA_VERSION
+                | AUDIT_SESSION_V16_SCHEMA_VERSION,
             ) => {
                 if !matches!(
                     coverage.version,
@@ -574,7 +578,8 @@ impl AuditSessionManifest {
                     | AUDIT_SESSION_V12_SCHEMA_VERSION
                     | AUDIT_SESSION_V13_SCHEMA_VERSION
                     | AUDIT_SESSION_V14_SCHEMA_VERSION
-                    | AUDIT_SESSION_V15_SCHEMA_VERSION,
+                    | AUDIT_SESSION_V15_SCHEMA_VERSION
+                    | AUDIT_SESSION_V16_SCHEMA_VERSION,
                 ) => {
                     validate_collector_identity(identity, &source.platform, source.role)?;
                 }
@@ -655,7 +660,8 @@ impl AuditSessionManifest {
                 return Err(ValidationError::RuntimeCompletenessNotEstablished);
             }
 
-            let expected = expected_artifacts(source.role, &source.platform)?;
+            let observation_window = self.schema_version >= AUDIT_SESSION_V16_SCHEMA_VERSION;
+            let expected = expected_artifacts(source.role, &source.platform, observation_window)?;
             if source.artifacts.len() > expected.len()
                 || (source.status == SourceStatus::Complete
                     && source.artifacts.len() != expected.len())
@@ -698,6 +704,17 @@ impl AuditSessionManifest {
             if source.status != SourceStatus::Complete {
                 all_complete = false;
             }
+            if observation_window
+                && source.role == SourceRole::SelectedRoot
+                && source.artifacts.len() != expected.len()
+            {
+                return Err(ValidationError::ArtifactSetMismatch);
+            }
+        }
+        if self.schema_version >= AUDIT_SESSION_V16_SCHEMA_VERSION
+            && (!roles.contains(&SourceRole::SelectedRoot) || !roles.contains(&SourceRole::Runtime))
+        {
+            return Err(ValidationError::InvalidSchema);
         }
         if (self.status == SessionStatus::Complete) != all_complete {
             return Err(ValidationError::SessionStatusHidesIncompleteSource);
@@ -1018,7 +1035,7 @@ fn artifact_version_supported(
             AUDIT_SESSION_V12_SCHEMA_VERSION => observed == 7,
             AUDIT_SESSION_V13_SCHEMA_VERSION => observed == 8,
             AUDIT_SESSION_V14_SCHEMA_VERSION => observed == 9,
-            AUDIT_SESSION_V15_SCHEMA_VERSION => observed == 10,
+            AUDIT_SESSION_V15_SCHEMA_VERSION | AUDIT_SESSION_V16_SCHEMA_VERSION => observed == 10,
             _ => false,
         };
     }
@@ -1037,6 +1054,7 @@ fn artifact_version_supported(
 fn expected_artifacts(
     role: SourceRole,
     platform: &str,
+    observation_window: bool,
 ) -> Result<Vec<ArtifactKind>, ValidationError> {
     match platform {
         "linux" if matches!(role, SourceRole::Msix | SourceRole::AppPaths) => {
@@ -1048,7 +1066,13 @@ fn expected_artifacts(
             SourceRole::Permissions => vec![ArtifactKind::Permissions],
             SourceRole::Startup => vec![ArtifactKind::Startup],
             SourceRole::PathExecutables => vec![ArtifactKind::PathExecutables],
-            SourceRole::SelectedRoot => vec![ArtifactKind::SelectedRoot],
+            SourceRole::SelectedRoot => {
+                if observation_window {
+                    vec![ArtifactKind::SelectedRoot, ArtifactKind::SelectedRootAfter]
+                } else {
+                    vec![ArtifactKind::SelectedRoot]
+                }
+            }
             SourceRole::Runtime => vec![ArtifactKind::RuntimeManifest, ArtifactKind::RuntimeTrace],
             SourceRole::Msix => return Err(ValidationError::UnsupportedArtifactPlatform),
             SourceRole::AppPaths => return Err(ValidationError::UnsupportedArtifactPlatform),
@@ -1059,7 +1083,13 @@ fn expected_artifacts(
             SourceRole::Permissions => vec![ArtifactKind::WindowsPermissions],
             SourceRole::Startup => vec![ArtifactKind::WindowsStartup],
             SourceRole::PathExecutables => vec![ArtifactKind::PathExecutables],
-            SourceRole::SelectedRoot => vec![ArtifactKind::SelectedRoot],
+            SourceRole::SelectedRoot => {
+                if observation_window {
+                    vec![ArtifactKind::SelectedRoot, ArtifactKind::SelectedRootAfter]
+                } else {
+                    vec![ArtifactKind::SelectedRoot]
+                }
+            }
             SourceRole::Runtime => vec![ArtifactKind::WindowsRuntimeCapture],
             SourceRole::Msix => vec![ArtifactKind::WindowsMsix],
             SourceRole::AppPaths => vec![ArtifactKind::WindowsAppPaths],
@@ -1083,6 +1113,11 @@ fn artifact_contract(
         ),
         ArtifactKind::SelectedRoot => (
             "root-snapshot.json",
+            "sideeffect.selected_root_inventory",
+            1,
+        ),
+        ArtifactKind::SelectedRootAfter => (
+            "root-snapshot-after.json",
             "sideeffect.selected_root_inventory",
             1,
         ),
@@ -1334,16 +1369,17 @@ pub enum ValidationError {
 mod tests {
     use super::{
         AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, AUDIT_SESSION_V1_SCHEMA_VERSION,
-        AUDIT_SESSION_V2_SCHEMA_VERSION, AUDIT_SESSION_V3_SCHEMA_VERSION, AppliedLimit,
-        ArtifactKind, AuditSessionManifest, AuditSessionSource, CoverageManifest, CoverageStatus,
-        IntervalSemantics, SessionArtifactRef, SessionStatus, SourceRole, SourceStatus,
-        ValidationError, compare_sessions, parse_manifest,
+        AUDIT_SESSION_V2_SCHEMA_VERSION, AUDIT_SESSION_V3_SCHEMA_VERSION,
+        AUDIT_SESSION_V15_SCHEMA_VERSION, AppliedLimit, ArtifactKind, AuditSessionManifest,
+        AuditSessionSource, CoverageManifest, CoverageStatus, IntervalSemantics,
+        SessionArtifactRef, SessionStatus, SourceRole, SourceStatus, ValidationError,
+        compare_sessions, parse_manifest,
     };
 
     fn valid_manifest() -> AuditSessionManifest {
         AuditSessionManifest {
             schema: AUDIT_SESSION_SCHEMA.to_owned(),
-            schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+            schema_version: AUDIT_SESSION_V15_SCHEMA_VERSION,
             session_id: "0123456789abcdef0123456789abcdef".to_owned(),
             platform: "linux".to_owned(),
             architecture: "x86_64".to_owned(),
@@ -1409,6 +1445,85 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    fn valid_observation_manifest() -> AuditSessionManifest {
+        let mut manifest = valid_manifest();
+        manifest.schema_version = super::AUDIT_SESSION_V16_SCHEMA_VERSION;
+        manifest.status = SessionStatus::Partial;
+        let root = &mut manifest.sources[0];
+        root.role = SourceRole::SelectedRoot;
+        root.collector = Some(crate::audit_session::collector_identity(
+            "linux",
+            SourceRole::SelectedRoot,
+        ));
+        root.scope = "one explicitly selected directory before and after runtime".to_owned();
+        root.status = SourceStatus::Partial;
+        root.applied_limits.clear();
+        root.diagnostic_codes = vec!["snapshot_partial".to_owned()];
+        root.artifacts = vec![
+            SessionArtifactRef {
+                kind: ArtifactKind::SelectedRoot,
+                path: "root-snapshot.json".to_owned(),
+                schema: "sideeffect.selected_root_inventory".to_owned(),
+                schema_version: 1,
+                byte_length: 1,
+                sha256: "0".repeat(64),
+            },
+            SessionArtifactRef {
+                kind: ArtifactKind::SelectedRootAfter,
+                path: "root-snapshot-after.json".to_owned(),
+                schema: "sideeffect.selected_root_inventory".to_owned(),
+                schema_version: 1,
+                byte_length: 1,
+                sha256: "0".repeat(64),
+            },
+        ];
+        let runtime = AuditSessionSource {
+            role: SourceRole::Runtime,
+            collector: Some(crate::audit_session::collector_identity(
+                "linux",
+                SourceRole::Runtime,
+            )),
+            platform: "linux".to_owned(),
+            scope: "selected command and traced descendants".to_owned(),
+            started_at_unix_ms: 1001,
+            ended_at_unix_ms: 1002,
+            status: SourceStatus::Partial,
+            applied_limits: vec![],
+            requested_settings: vec![],
+            effective_settings: vec![],
+            loss: Some(super::LossMetadata::unknown()),
+            diagnostic_codes: vec!["runtime_capture_unavailable".to_owned()],
+            artifacts: vec![],
+        };
+        manifest.sources.push(runtime);
+        manifest.coverage_manifest = Some(CoverageManifest::from_sources(&manifest.sources));
+        manifest
+    }
+
+    #[test]
+    fn v16_requires_a_runtime_bracket_and_both_root_snapshots_even_when_partial() {
+        let valid = valid_observation_manifest();
+        assert!(valid.validate().is_ok());
+
+        let mut missing_after = valid.clone();
+        missing_after.sources[0].artifacts.pop();
+        missing_after.coverage_manifest =
+            Some(CoverageManifest::from_sources(&missing_after.sources));
+        assert_eq!(
+            missing_after.validate(),
+            Err(ValidationError::ArtifactSetMismatch)
+        );
+
+        let mut missing_runtime = valid;
+        missing_runtime.sources.pop();
+        missing_runtime.coverage_manifest =
+            Some(CoverageManifest::from_sources(&missing_runtime.sources));
+        assert_eq!(
+            missing_runtime.validate(),
+            Err(ValidationError::InvalidSchema)
+        );
     }
 
     #[test]
@@ -1584,16 +1699,16 @@ mod tests {
             "v8 must retain its selected-root v2 contract"
         );
         assert!(
-            root_manifest(super::AUDIT_SESSION_SCHEMA_VERSION, 1)
+            root_manifest(super::AUDIT_SESSION_V15_SCHEMA_VERSION, 1)
                 .validate()
                 .is_ok()
         );
         assert!(
-            root_manifest(super::AUDIT_SESSION_SCHEMA_VERSION, 2)
+            root_manifest(super::AUDIT_SESSION_V15_SCHEMA_VERSION, 2)
                 .validate()
                 .is_ok()
         );
-        let mut unsupported_root = root_manifest(super::AUDIT_SESSION_SCHEMA_VERSION, 2);
+        let mut unsupported_root = root_manifest(super::AUDIT_SESSION_V15_SCHEMA_VERSION, 2);
         unsupported_root.sources[0].artifacts[0].schema_version = 3;
         assert_eq!(
             unsupported_root.validate(),

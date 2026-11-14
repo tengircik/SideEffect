@@ -13,16 +13,18 @@ const BUNDLE_TRACE_NAME: &[u8] = b"trace.strace";
 const MANIFEST_NAME: &[u8] = b"run.json";
 const REPORT_NAME: &[u8] = b"report.html";
 const PRIVATE_FILE_NAME: &[u8] = b"private-output";
-const SESSION_ARTIFACT_NAMES: [&[u8]; 8] = [
+const SESSION_ARTIFACT_NAMES: [&[u8]; 9] = [
     b"packages.json",
     b"processes.json",
     b"startup.json",
     b"path-executables.json",
     b"root-snapshot.json",
+    b"root-snapshot-after.json",
     b"permissions.json",
     b"run.json",
     b"trace.strace",
 ];
+const SESSION_ARTIFACT_COUNT: usize = SESSION_ARTIFACT_NAMES.len();
 const SESSION_MANIFEST_NAME: &[u8] = b"session.json";
 const SESSION_MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 const SESSION_MAX_MANIFEST_BYTES: usize = 512 * 1024;
@@ -67,7 +69,7 @@ pub struct SessionOutput {
     stage_name: OsString,
     stage_device: libc::dev_t,
     stage_inode: libc::ino_t,
-    artifact_identities: [Option<(libc::dev_t, libc::ino_t)>; 8],
+    artifact_identities: [Option<(libc::dev_t, libc::ino_t)>; SESSION_ARTIFACT_COUNT],
     manifest_identity: Option<(libc::dev_t, libc::ino_t)>,
     total_bytes: usize,
     file_limit: usize,
@@ -125,7 +127,7 @@ impl SessionOutput {
             stage_name,
             stage_device: stage_stat.st_dev,
             stage_inode: stage_stat.st_ino,
-            artifact_identities: [None; 8],
+            artifact_identities: [None; SESSION_ARTIFACT_COUNT],
             manifest_identity: None,
             total_bytes: 0,
             file_limit,
@@ -827,7 +829,7 @@ fn publish_private_session(
         ));
     }
     let mut total = manifest.len();
-    let mut seen = [false; 8];
+    let mut seen = [false; SESSION_ARTIFACT_COUNT];
     for (name, bytes) in artifacts {
         if bytes.len() > max_file_bytes {
             return Err(io::Error::new(
@@ -1374,7 +1376,7 @@ fn unlink_entry_if_same(dir_fd: i32, name: &[u8], device: libc::dev_t, inode: li
 
 fn has_exact_session_entries(
     directory_fd: i32,
-    artifacts: &[Option<(libc::dev_t, libc::ino_t)>; 8],
+    artifacts: &[Option<(libc::dev_t, libc::ino_t)>; SESSION_ARTIFACT_COUNT],
 ) -> bool {
     let duplicate = unsafe { libc::fcntl(directory_fd, libc::F_DUPFD_CLOEXEC, 0) };
     if duplicate < 0 {
@@ -1390,7 +1392,7 @@ fn has_exact_session_entries(
         .filter(|identity| identity.is_some())
         .count()
         + 1;
-    let mut seen_artifacts = [false; 8];
+    let mut seen_artifacts = [false; SESSION_ARTIFACT_COUNT];
     let mut saw_manifest = false;
     let mut count = 0usize;
     loop {
@@ -2061,6 +2063,33 @@ mod tests {
     }
 
     #[test]
+    fn session_publishes_every_allowlisted_artifact_without_truncating_layout() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("full-session");
+        let artifacts: Vec<_> = super::SESSION_ARTIFACT_NAMES
+            .iter()
+            .map(|name| (std::str::from_utf8(name).unwrap(), b"artifact".as_slice()))
+            .collect();
+
+        let (published, parent_sync) =
+            publish_private_session(&destination, &artifacts, b"manifest", 1024, 4096).unwrap();
+
+        assert!(parent_sync);
+        assert_eq!(
+            fs::read_dir(&published).unwrap().count(),
+            super::SESSION_ARTIFACT_COUNT + 1
+        );
+        assert_eq!(
+            fs::read(published.join("root-snapshot-after.json")).unwrap(),
+            b"artifact"
+        );
+        assert_eq!(
+            fs::read(published.join("trace.strace")).unwrap(),
+            b"artifact"
+        );
+    }
+
+    #[test]
     fn session_rejects_names_limits_and_destination_collisions() {
         let directory = TestDirectory::new();
         let destination = directory.0.join("session");
@@ -2152,7 +2181,7 @@ mod tests {
         let directory = TestDirectory::new();
         let destination = directory.0.join("session");
         let mut output = SessionOutput::prepare(&destination).unwrap();
-        output.write_artifact("startup.json", b"startup").unwrap();
+        output.write_artifact("trace.strace", b"trace").unwrap();
         output.write_manifest(b"manifest").unwrap();
         let stage = output.stage_path_for_test();
         let marker = stage.join("unowned-marker");
@@ -2169,5 +2198,25 @@ mod tests {
         assert!(!destination.exists());
         fs::remove_file(marker).unwrap();
         fs::remove_dir(stage).unwrap();
+    }
+
+    #[test]
+    fn session_stages_and_publishes_after_root_snapshot_artifact() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("observation-session");
+        let mut output = SessionOutput::prepare(&destination).unwrap();
+        output
+            .write_artifact("root-snapshot.json", b"before")
+            .unwrap();
+        output
+            .write_artifact("root-snapshot-after.json", b"after")
+            .unwrap();
+        output.write_manifest(b"manifest").unwrap();
+        let (published, _) = output.publish().unwrap();
+        assert_eq!(
+            fs::read(published.join("root-snapshot-after.json")).unwrap(),
+            b"after"
+        );
+        assert_eq!(fs::read_dir(&published).unwrap().count(), 3);
     }
 }

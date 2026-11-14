@@ -3,7 +3,7 @@
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sideeffect::audit_session::{
-    AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, ArtifactKind, AuditSessionManifest,
+    AUDIT_SESSION_SCHEMA, AUDIT_SESSION_V15_SCHEMA_VERSION, ArtifactKind, AuditSessionManifest,
     AuditSessionSource, CoverageManifest, IntervalSemantics, LossMetadata, SessionArtifactRef,
     SessionStatus, SourceRole, SourceStatus, collector_identity,
 };
@@ -158,7 +158,7 @@ fn write_session_with_id(
     };
     let manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
-        schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+        schema_version: AUDIT_SESSION_V15_SCHEMA_VERSION,
         session_id: session_id.to_owned(),
         platform: "linux".to_owned(),
         architecture: "x86_64".to_owned(),
@@ -232,7 +232,7 @@ fn write_startup_session(path: &Path, id: &str, status: SourceStatus) {
     };
     let mut manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.into(),
-        schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+        schema_version: AUDIT_SESSION_V15_SCHEMA_VERSION,
         session_id: id.into(),
         platform: "linux".into(),
         architecture: "x86_64".into(),
@@ -488,7 +488,7 @@ fn write_selected_root_session(
     };
     let mut manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
-        schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+        schema_version: AUDIT_SESSION_V15_SCHEMA_VERSION,
         session_id: session_id.to_owned(),
         platform: "linux".to_owned(),
         architecture: "x86_64".to_owned(),
@@ -564,7 +564,7 @@ fn write_package_session(path: &Path, session_id: &str, status: SourceStatus) {
     };
     let mut manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.into(),
-        schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+        schema_version: AUDIT_SESSION_V15_SCHEMA_VERSION,
         session_id: session_id.into(),
         platform: "linux".into(),
         architecture: "x86_64".into(),

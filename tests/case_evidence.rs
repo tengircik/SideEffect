@@ -3,7 +3,7 @@
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sideeffect::audit_session::{
-    AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, ArtifactKind, AuditSessionManifest,
+    AUDIT_SESSION_SCHEMA, AUDIT_SESSION_V15_SCHEMA_VERSION, ArtifactKind, AuditSessionManifest,
     AuditSessionSource, ContextFact, ContextFactStatus, CoverageManifest, HostContext,
     IntervalSemantics, LossMetadata, PrivilegeContext, SessionArtifactRef, SessionStatus,
     SourceRole, SourceStatus,
@@ -64,7 +64,7 @@ fn manifest(
 ) -> (AuditSessionManifest, Vec<u8>) {
     let mut manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
-        schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+        schema_version: AUDIT_SESSION_V15_SCHEMA_VERSION,
         session_id: session_id.to_owned(),
         platform: platform.to_owned(),
         architecture: "synthetic".to_owned(),
@@ -124,7 +124,7 @@ fn make_case(
         "sessions": [{
             "session_id": session_id,
             "platform": platform,
-            "manifest_schema_version": AUDIT_SESSION_SCHEMA_VERSION,
+            "manifest_schema_version": AUDIT_SESSION_V15_SCHEMA_VERSION,
             "manifest_sha256": sha256(manifest_bytes)
         }],
         "entries": [{
@@ -681,7 +681,7 @@ fn resolves_synthetic_selected_root_entries_above_general_query_limit() {
         "sessions":[{
             "session_id":LINUX_ID,
             "platform":platform,
-            "manifest_schema_version":AUDIT_SESSION_SCHEMA_VERSION,
+            "manifest_schema_version":AUDIT_SESSION_V15_SCHEMA_VERSION,
             "manifest_sha256":sha256(&manifest_bytes)
         }],
         "entries":[{

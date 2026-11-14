@@ -3,7 +3,7 @@
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sideeffect::audit_session::{
-    AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, ArtifactKind, AuditSessionManifest,
+    AUDIT_SESSION_SCHEMA, AUDIT_SESSION_V15_SCHEMA_VERSION, ArtifactKind, AuditSessionManifest,
     AuditSessionSource, CoverageManifest, IntervalSemantics, LossMetadata, SessionArtifactRef,
     SessionStatus, SourceRole, SourceStatus, collector_identity,
 };
@@ -214,7 +214,7 @@ fn session_manifest_with_id(runtime: Option<&[u8]>, session_id: &str) -> Vec<u8>
     };
     let mut manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
-        schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+        schema_version: AUDIT_SESSION_V15_SCHEMA_VERSION,
         session_id: session_id.to_owned(),
         platform: "windows".to_owned(),
         architecture: "x86_64".to_owned(),
@@ -294,7 +294,7 @@ fn publish_startup_session(directory: &std::path::Path, session_id: &str) {
     };
     let mut manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.into(),
-        schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+        schema_version: AUDIT_SESSION_V15_SCHEMA_VERSION,
         session_id: session_id.into(),
         platform: "windows".into(),
         architecture: "x86_64".into(),
@@ -481,7 +481,7 @@ fn write_selected_root_session(
     };
     let mut manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
-        schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+        schema_version: AUDIT_SESSION_V15_SCHEMA_VERSION,
         session_id: session_id.to_owned(),
         platform: "windows".to_owned(),
         architecture: "x86_64".to_owned(),
@@ -567,7 +567,7 @@ fn write_package_session(directory: &Path, session_id: &str, source_status: Sour
     };
     let mut manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
-        schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+        schema_version: AUDIT_SESSION_V15_SCHEMA_VERSION,
         session_id: session_id.to_owned(),
         platform: "windows".to_owned(),
         architecture: "x86_64".to_owned(),
