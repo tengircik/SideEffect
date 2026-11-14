@@ -158,7 +158,8 @@ pub use root_snapshot::{
 };
 pub use root_snapshot_diff::{
     RootSnapshotDelta, RootSnapshotDiff, RootSnapshotDiffCounts, RootSnapshotDiffError,
-    RootSnapshotSide, compare_selected_root_inventory_json, is_selected_root_inventory_json,
+    RootSnapshotSide, compare_observation_root_inventory_json,
+    compare_selected_root_inventory_json, is_selected_root_inventory_json,
 };
 #[cfg(target_os = "linux")]
 pub use startup::{

@@ -6745,6 +6745,11 @@ fn compare_observation(session_path: &OsString) -> Result<ExitCode, String> {
         .iter()
         .find(|source| source.role == sideeffect::audit_session::SourceRole::Runtime)
         .ok_or_else(|| "observation session has no runtime source".to_owned())?;
+    if root.platform != manifest.platform {
+        return Err(
+            "observation selected-root platform does not match the verified session".to_owned(),
+        );
+    }
     let before_ref = root
         .artifacts
         .iter()
@@ -6765,12 +6770,16 @@ fn compare_observation(session_path: &OsString) -> Result<ExitCode, String> {
             .map(|artifact| artifact.bytes())
             .ok_or_else(|| format!("verified observation artifact {path} is missing"))
     };
-    let comparison = sideeffect::inventory::compare_selected_root_inventory_json(
-        artifact_bytes(&before_ref.path)?,
-        artifact_bytes(&after_ref.path)?,
+    let before_bytes = artifact_bytes(&before_ref.path)?;
+    let after_bytes = artifact_bytes(&after_ref.path)?;
+    let comparison = sideeffect::inventory::compare_observation_root_inventory_json(
+        before_bytes,
+        after_bytes,
+        &root.platform,
     );
     let (root_diff, root_comparison_diagnostic) = match comparison {
-        Ok(diff) => (Some(diff), None),
+        Ok(Some(diff)) => (Some(diff), None),
+        Ok(None) => (None, Some("selected_root_unavailable")),
         Err(error) => {
             let diagnostic = match error {
                 sideeffect::inventory::RootSnapshotDiffError::MalformedInput => {
