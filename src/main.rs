@@ -125,7 +125,8 @@ const USAGE: &str = "Usage: sideeffect inspect [--format json|text] <strace-trac
        sideeffect inventory permissions --output <new-inventory.json> <path>...\n\
        sideeffect inventory access-check --operation read|write|execute --output <new-result.json> <absolute-path> (Linux; current credentials)\n\
        sideeffect inventory access-check --pid <pid> --creation-time-filetime <100ns-value> --operation read|write|execute --output <new-result.json> <absolute-path> (Windows)\n\
-       sideeffect audit --output <new-session-directory> [--packages] [--msix (native Windows)] [--app-paths (native Windows)] [--processes] [--startup] [--path-executables] [--root <directory> [--hash-regular-files]] [--permission <path>]... [--runtime-duration-seconds <1..3600> -- <program> [args...]]\n\
+       sideeffect audit --output <new-session-directory> [--packages] [--msix (native Windows)] [--app-paths (native Windows)] [--processes] [--startup] [--path-executables] [--root <directory> [--hash-regular-files]] [--observe-root <directory> [--hash-regular-files] --runtime-duration-seconds <1..3600> -- <program> [args...]] [--permission <path>]...\n\
+       sideeffect compare-observation <verified-observation-session-directory>\n\
        sideeffect record --trace <new-trace-file> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> -- <program> [args...]\n       sideeffect record --trace <new-trace-file> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect record --bundle <new-bundle-directory> --duration-seconds <1..3600> -- <program> [args...]\n       sideeffect help [command [subcommand]]\n       sideeffect version\n       sideeffect --help\n       sideeffect --version\n\nInspect reads one bounded strace text file or a validated local run bundle and writes JSON evidence by default, or terminal-safe text with --format text. Evidence verifies the supplied SHA-256 fingerprint, then checks an exact line/byte/length tuple against one parsed row. The fingerprint identifies bytes but does not authenticate them or prove capture completeness. Diff compares two complete parsed traces, or validates two local run bundles with --bundles, and writes observed syscall-row differences to stdout (JSON by default), or a local offline HTML report on Linux. Diff-summary creates a separate aggregate-only export and omits event strings, hashes, and evidence references; counts/category patterns can still be sensitive, and this is not a safe-to-share verdict. On Linux, inventory packages reads available local dpkg, RPM, pacman, and APK databases plus optional fixed-path Flatpak installed references; on Windows, it reads selected current-user and machine-wide Uninstall registry entries. Both are bounded source snapshots and can miss unregistered software. Windows does not use Win32_Product or launch uninstall commands. Windows `inventory app-paths` separately reads selected App Paths registry registrations; it does not expand, parse, execute, or validate their referenced paths. Windows `inventory msix` separately reads current-user package registrations and does not activate packages or inspect package files. On Linux, inventory processes reads bounded numeric /proc status entries and executable-link identities; on Windows, it reads a Tool Help snapshot and queries accessible image paths. Neither adapter reads command lines or promises atomic or exhaustive coverage. On Linux, inventory startup discovers curated sources; on Windows, it inventories selected Run/RunOnce values, Startup folders, and visible service configuration and boot/logon triggers in tasks visible to the current token. For tasks, bounded Exec-action executable paths, arguments, and working directories are recorded as inert text; other action types remain unsupported with unknown action-specific fields. Neither platform establishes that a configured entry ran. Inventory permissions inspects only explicit Linux paths and records ownership/type/mode, supported POSIX ACLs, and Linux file-capability xattrs; it never follows the final path symlink or calculates effective access. Record follows a selected command's traced descendants and may enforce a requested wall-clock limit; this is observation, not isolation or a safety check.";
 
 fn main() -> ExitCode {
@@ -855,6 +856,7 @@ fn run(arguments: Vec<OsString>) -> Result<ExitCode, String> {
             evidence(path, digest, line, byte_offset, byte_length)
         }
         [command, left, right] if command == "diff" => diff(left, right),
+        [command, session] if command == "compare-observation" => compare_observation(session),
         [command, runtime_flag, before, after]
             if command == "diff" && runtime_flag == "--windows-runtime" =>
         {
@@ -1133,6 +1135,15 @@ fn audit_command(arguments: &[OsString]) -> Result<ExitCode, String> {
                 index += 2;
                 continue;
             }
+            if argument == "--observe-root" {
+                if !selected.insert("root") || index + 1 >= arguments.len() {
+                    return Err("audit requires exactly one --observe-root DIRECTORY".to_owned());
+                }
+                options.root_path = Some(Path::new(&arguments[index + 1]).to_path_buf());
+                options.observation_window = true;
+                index += 2;
+                continue;
+            }
             if argument == "--hash-regular-files" {
                 if !selected.insert("hash-regular-files") {
                     return Err(
@@ -1244,6 +1255,16 @@ fn audit_command(arguments: &[OsString]) -> Result<ExitCode, String> {
                 }
                 Some("--root") => {
                     return Err("audit requires exactly one --root DIRECTORY".to_owned());
+                }
+                Some("--observe-root")
+                    if selected.insert("root") && index + 1 < arguments.len() =>
+                {
+                    options.root_path = Some(Path::new(&arguments[index + 1]).to_path_buf());
+                    options.observation_window = true;
+                    index += 2;
+                }
+                Some("--observe-root") => {
+                    return Err("audit requires exactly one --observe-root DIRECTORY".to_owned());
                 }
                 Some("--hash-regular-files") if selected.insert("hash-regular-files") => {
                     options.hash_root_regular_files = true;
@@ -1995,11 +2016,11 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         "audit" => {
             #[cfg(target_os = "linux")]
             {
-                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages] [--processes] [--startup] [--path-executables] [--root DIRECTORY [--hash-regular-files]] [--permission PATH]... [--runtime-duration-seconds 1..3600 -- PROGRAM [ARGS...]]\nCollects explicitly selected Linux inventory sources and an optional bounded command capture into one local, private session directory. --root snapshots one selected directory and its direct children; it reads metadata only by default. --hash-regular-files opts into bounded SHA-256 reads of direct-child regular files and requires --root. Hashes are sensitive equality fingerprints, not authenticity evidence. Collection does not recurse. Review root paths and names before sharing a session. --path-executables snapshots current-process PATH metadata heuristically and never runs files or resolves commands through a shell. Linux runtime uses external strace. Runtime command arguments stay separate and are passed without a shell. The session stores the native run manifest and raw trace, which may contain sensitive arguments and paths. Each source has its own interval; the session is not an atomic snapshot. Runtime completeness remains unknown, so runtime sources and sessions containing runtime are partial. Partial and unavailable selected sources are preserved and cause exit status 2."
+                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages] [--processes] [--startup] [--path-executables] [--root DIRECTORY [--hash-regular-files]] [--observe-root DIRECTORY [--hash-regular-files] --runtime-duration-seconds 1..3600 -- PROGRAM [ARGS...]] [--permission PATH]...\nCollects explicitly selected Linux inventory sources and an optional bounded command capture into one local, private session directory. --root snapshots one selected directory and its direct children; it reads metadata only by default. --observe-root requires a selected root and bounded runtime command and records before/after direct-child snapshots alongside runtime evidence. The output directory must not overlap the observed root. Use compare-observation SESSION_DIR for a verified evidence-linked temporal diff; changes do not establish causation. --hash-regular-files opts into bounded SHA-256 reads of direct-child regular files and requires --root or --observe-root. Hashes are sensitive equality fingerprints, not authenticity evidence. Collection does not recurse. Review root paths and names before sharing a session. --path-executables snapshots current-process PATH metadata heuristically and never runs files or resolves commands through a shell. Linux runtime uses external strace. Runtime command arguments stay separate and are passed without a shell. The session stores the native run manifest and raw trace, which may contain sensitive arguments and paths. Each source has its own interval; the session is not an atomic snapshot. Runtime completeness remains unknown, so runtime sources and sessions containing runtime are partial. Partial and unavailable selected sources are preserved and cause exit status 2."
             }
             #[cfg(windows)]
             {
-                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages] [--msix] [--app-paths] [--processes] [--startup] [--path-executables] [--root DIRECTORY [--hash-regular-files]] [--permission PATH]... [--runtime-source windows-etw --runtime-duration-seconds 1..60 -- PROGRAM [ARGS...]]\nCollects selected bounded native Windows inventories and optional system-wide ETW observations into one current-user-private session directory. --packages reads bounded Uninstall registry registrations; --msix separately reads bounded current-user MSIX package registrations and does not activate packages or inspect package files. --app-paths adds selected current-user and accessible machine App Paths registrations without checking or launching registered paths; App-Paths-only sessions emit envelope v11. --startup includes bounded local ROOT\\subscription WMI rows and emits envelope v15 with startup artifact v10, including read-only service delayed-auto-start, dependency, load-order group, and trigger configuration; selecting --app-paths as well retains the App Paths source in v15. Dependencies and group membership are configured SCM values only: they do not establish effective startup order, activation, or runtime behavior. The delayed bit is ignored unless the service is configured for automatic start and does not state an exact start time or prove execution. WMI query, command, script, and service-trigger data are inert evidence. Session v10/v11 startup artifacts remain v6; v12 remains readable with startup v7; v13 remains readable with startup v8. --root snapshots one selected directory and its direct children; it reads metadata only by default. --hash-regular-files opts into bounded SHA-256 reads of direct-child regular files and requires --root. Hashes are sensitive equality fingerprints, not authenticity evidence. Collection does not recurse. Review root paths and names before sharing a session. --path-executables snapshots current-process PATH metadata heuristically and never runs files or resolves commands through a shell. --permission inspects explicitly selected paths only. ETW requires permission to control the shared NT Kernel Logger; SideEffect never elevates. The command is passed as separate arguments and is not started unless ETW setup succeeds. Capture completeness is unknown, so runtime-containing sessions are partial."
+                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages] [--msix] [--app-paths] [--processes] [--startup] [--path-executables] [--root DIRECTORY [--hash-regular-files]] [--observe-root DIRECTORY [--hash-regular-files] --runtime-source windows-etw --runtime-duration-seconds 1..60 -- PROGRAM [ARGS...]] [--permission PATH]...\nCollects selected bounded native Windows inventories and optional system-wide ETW observations into one current-user-private session directory. --observe-root requires a selected root and bounded ETW command, records before/after direct-child snapshots alongside runtime evidence, and requires the output directory to be outside the observed root. Use compare-observation SESSION_DIR for a verified evidence-linked temporal diff; changes do not establish causation. --packages reads bounded Uninstall registry registrations; --msix separately reads bounded current-user MSIX package registrations and does not activate packages or inspect package files. --app-paths adds selected current-user and accessible machine App Paths registrations without checking or launching registered paths; App-Paths-only sessions emit envelope v11. --startup includes bounded local ROOT\\subscription WMI rows and emits envelope v15 with startup artifact v10, including read-only service delayed-auto-start, dependency, load-order group, and trigger configuration; selecting --app-paths as well retains the App Paths source in v15. Dependencies and group membership are configured SCM values only: they do not establish effective startup order, activation, or runtime behavior. The delayed bit is ignored unless the service is configured for automatic start and does not state an exact start time or prove execution. WMI query, command, script, and service-trigger data are inert evidence. Session v10/v11 startup artifacts remain v6; v12 remains readable with startup v7; v13 remains readable with startup v8. --root snapshots one selected directory and its direct children; it reads metadata only by default. --hash-regular-files opts into bounded SHA-256 reads of direct-child regular files and requires --root or --observe-root. Hashes are sensitive equality fingerprints, not authenticity evidence. Collection does not recurse. Review root paths and names before sharing a session. --path-executables snapshots current-process PATH metadata heuristically and never runs files or resolves commands through a shell. --permission inspects explicitly selected paths only. ETW requires permission to control the shared NT Kernel Logger; SideEffect never elevates. The command is passed as separate arguments and is not started unless ETW setup succeeds. Capture completeness is unknown, so runtime-containing sessions are partial."
             }
             #[cfg(not(any(target_os = "linux", windows)))]
             {
@@ -2041,6 +2062,9 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         }
         "compare-sessions" => {
             "Usage: sideeffect compare-sessions BEFORE_SESSION_DIR AFTER_SESSION_DIR\nVerifies both local audit sessions, reports metadata comparability, and compares bounded item-level inventory and runtime evidence from verified artifacts. Per-source status and evidence references remain visible; missing, partial, unsupported, or incompatible sources do not become empty results. This is not an exhaustive history or coverage claim, and it does not establish causation or event absence. Incomparable or partial results exit with status 2 and include stable reason codes."
+        }
+        "compare-observation" => {
+            "Usage: sideeffect compare-observation VERIFIED_OBSERVATION_SESSION_DIR\nVerifies one v16 observation session and compares its selected-root snapshots with the bounded root comparator. The result cites both verified artifacts by path, schema, and SHA-256. Partial snapshots retain uncertainty and suppress unsupported presence claims; temporal differences do not establish causation. Runtime capture completeness remains unknown."
         }
         "baseline" => {
             "Usage: sideeffect baseline preview --label LABEL --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect baseline create --profile NEW_PROFILE.json --label LABEL --confirm-sha256 PREVIEW_SHA256 --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect baseline compare --profile PROFILE.json --baseline-session SESSION_DIR [--baseline-session SESSION_DIR...] --session CANDIDATE_SESSION_DIR [--session CANDIDATE_SESSION_DIR...]\nPreviews a bounded set of 1..=16 verified audit sessions and prints a deterministic preview digest. Creating a profile requires the exact digest and writes a new current-user-private file without replacing an existing file. Partial, incomplete, or loss-affected inputs are shown with their unknown coverage but cannot be promoted into a profile. A profile records only reviewed observations: software and signer identity are not recorded. Comparison requires the exact approved baseline sessions and matching manifest digests; a missing, replaced, or additional session prevents item comparison and exits with status 2. Candidate item differences are reported against the existing evidence-linked session diff, but the candidate is never absorbed automatically. Removal and absence claims are withheld when either side declares incomplete or unknown coverage. Differences do not establish unsafe behavior, causation, or complete system coverage."
@@ -6682,6 +6706,125 @@ fn compare_audit_sessions(
     let comparable = report.comparable;
     write_json(&report, "audit-session diff report")?;
     Ok(if comparable {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
+#[derive(serde::Serialize)]
+struct ObservationWindowReport<'a> {
+    schema: &'static str,
+    schema_version: u32,
+    session_id: &'a str,
+    status: &'static str,
+    root_comparison_status: &'static str,
+    scope: &'static str,
+    root_source_status: sideeffect::audit_session::SourceStatus,
+    runtime_source_status: sideeffect::audit_session::SourceStatus,
+    before_artifact: &'a sideeffect::audit_session::SessionArtifactRef,
+    after_artifact: &'a sideeffect::audit_session::SessionArtifactRef,
+    runtime_artifacts: Vec<&'a sideeffect::audit_session::SessionArtifactRef>,
+    root_comparison_diagnostic: Option<&'static str>,
+    root_diff: Option<sideeffect::inventory::RootSnapshotDiff>,
+}
+
+fn compare_observation(session_path: &OsString) -> Result<ExitCode, String> {
+    let verified = read_verified_audit_session(Path::new(session_path))?;
+    let manifest = verified.manifest();
+    if manifest.schema_version < sideeffect::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION {
+        return Err("compare-observation requires a v16 bounded observation session".to_owned());
+    }
+    let root = manifest
+        .sources
+        .iter()
+        .find(|source| source.role == sideeffect::audit_session::SourceRole::SelectedRoot)
+        .ok_or_else(|| "observation session has no selected-root source".to_owned())?;
+    let runtime = manifest
+        .sources
+        .iter()
+        .find(|source| source.role == sideeffect::audit_session::SourceRole::Runtime)
+        .ok_or_else(|| "observation session has no runtime source".to_owned())?;
+    let before_ref = root
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == sideeffect::audit_session::ArtifactKind::SelectedRoot)
+        .ok_or_else(|| "observation session has no verified before snapshot".to_owned())?;
+    let after_ref = root
+        .artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.kind == sideeffect::audit_session::ArtifactKind::SelectedRootAfter
+        })
+        .ok_or_else(|| "observation session has no verified after snapshot".to_owned())?;
+    let artifact_bytes = |path: &str| {
+        verified
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.path() == path)
+            .map(|artifact| artifact.bytes())
+            .ok_or_else(|| format!("verified observation artifact {path} is missing"))
+    };
+    let comparison = sideeffect::inventory::compare_selected_root_inventory_json(
+        artifact_bytes(&before_ref.path)?,
+        artifact_bytes(&after_ref.path)?,
+    );
+    let (root_diff, root_comparison_diagnostic) = match comparison {
+        Ok(diff) => (Some(diff), None),
+        Err(error) => {
+            let diagnostic = match error {
+                sideeffect::inventory::RootSnapshotDiffError::MalformedInput => {
+                    "root_snapshot_invalid"
+                }
+                sideeffect::inventory::RootSnapshotDiffError::InputTooLarge
+                | sideeffect::inventory::RootSnapshotDiffError::LimitExceeded => {
+                    "root_comparison_limit_exceeded"
+                }
+                sideeffect::inventory::RootSnapshotDiffError::UnsupportedSchema => {
+                    "root_snapshot_schema_unsupported"
+                }
+                sideeffect::inventory::RootSnapshotDiffError::PlatformMismatch => {
+                    "root_snapshot_platform_mismatch"
+                }
+                sideeffect::inventory::RootSnapshotDiffError::ScopeMismatch => {
+                    "root_snapshot_scope_mismatch"
+                }
+                sideeffect::inventory::RootSnapshotDiffError::RootMismatch => {
+                    "selected_root_mismatch"
+                }
+            };
+            (None, Some(diagnostic))
+        }
+    };
+    let complete = root.status == sideeffect::audit_session::SourceStatus::Complete
+        && runtime.status == sideeffect::audit_session::SourceStatus::Complete
+        && root_diff
+            .as_ref()
+            .is_some_and(|diff| diff.status == "complete");
+    let root_comparison_status = root_diff.as_ref().map_or("partial", |diff| diff.status);
+    let report = ObservationWindowReport {
+        schema: "sideeffect.observation_window_diff",
+        schema_version: 1,
+        session_id: &manifest.session_id,
+        status: if complete { "complete" } else { "partial" },
+        root_comparison_status,
+        scope: "verified_before_after_selected_root_comparison_during_bounded_runtime_capture; temporal differences do not establish causation",
+        root_source_status: root.status,
+        runtime_source_status: runtime.status,
+        before_artifact: before_ref,
+        after_artifact: after_ref,
+        runtime_artifacts: runtime.artifacts.iter().collect(),
+        root_comparison_diagnostic,
+        root_diff,
+    };
+    let mut output = CappedBuffer::new(MAX_REPORT_BYTES);
+    serde_json::to_writer(&mut output, &report)
+        .map_err(|error| format!("could not serialize observation comparison: {error}"))?;
+    std::io::stdout()
+        .write_all(&output.bytes)
+        .map_err(|error| format!("could not write observation comparison: {error}"))?;
+    println!();
+    Ok(if complete {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(2)

@@ -32,7 +32,7 @@ type Handle = *mut c_void;
 const TOKEN_QUERY: u32 = 0x0008;
 const TOKEN_USER_CLASS: u32 = 1;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
-const MAX_PRIVATE_DIRECTORY_FILES: usize = 8;
+const MAX_PRIVATE_DIRECTORY_FILES: usize = 11;
 static NEXT_STAGE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[repr(C)]
@@ -644,6 +644,38 @@ mod tests {
         assert!(!destination.exists());
         let entries = fs::read_dir(&parent).unwrap().count();
         assert_eq!(entries, 0);
+        fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn private_directory_accepts_the_v16_maximum_of_ten_artifacts_and_manifest() {
+        let parent = temp_dir();
+        let destination = parent.join("maximum-session");
+        let mut owned_files = (0..10)
+            .map(|index| (format!("artifact-{index}.json"), vec![b'x']))
+            .collect::<Vec<_>>();
+        owned_files.push(("session.json".to_owned(), b"{}".to_vec()));
+        let files = owned_files
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect::<Vec<_>>();
+        let published = publish_private_directory(&destination, &files, 1024).unwrap();
+        assert_eq!(fs::read_dir(&published).unwrap().count(), 11);
+
+        let too_many = (0..12)
+            .map(|index| (format!("extra-{index}.json"), b"x".as_slice()))
+            .collect::<Vec<_>>();
+        let too_many = too_many
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), *bytes))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            publish_private_directory(&parent.join("too-many"), &too_many, 1024)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        fs::remove_dir_all(published).unwrap();
         fs::remove_dir(parent).unwrap();
     }
 

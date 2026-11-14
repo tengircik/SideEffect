@@ -2,9 +2,9 @@
 
 use crate::audit_session::{
     AUDIT_SESSION_SCHEMA, ArtifactKind, AuditSessionManifest, AuditSessionSource, ContextFact,
-    ContextFactStatus, CoverageManifest, HostContext, IntervalSemantics, PrivilegeContext,
-    RuntimeCoverageDetail, SessionArtifactRef, SessionStatus, SourceRole, SourceStatus,
-    UnsupportedRuntimeCategoryCode,
+    ContextFactStatus, CoverageManifest, HostContext, IntervalSemantics,
+    MAX_SESSION_ARTIFACT_BYTES, PrivilegeContext, RuntimeCoverageDetail, SessionArtifactRef,
+    SessionStatus, SourceRole, SourceStatus, UnsupportedRuntimeCategoryCode,
 };
 use crate::fingerprint::sha256_hex;
 use crate::inventory::{
@@ -33,6 +33,7 @@ pub struct WindowsAuditOptions {
     pub path_executables: bool,
     pub root_path: Option<PathBuf>,
     pub hash_root_regular_files: bool,
+    pub observation_window: bool,
     pub permission_paths: Vec<PathBuf>,
     pub include_runtime: bool,
     pub runtime_duration: Option<Duration>,
@@ -65,6 +66,7 @@ pub fn collect_and_publish(
         && !options.startup
         && !options.path_executables
         && options.root_path.is_none()
+        && !options.observation_window
         && !options.hash_root_regular_files
         && options.permission_paths.is_empty()
         && !options.include_runtime
@@ -73,6 +75,9 @@ pub fn collect_and_publish(
     }
     if options.hash_root_regular_files && options.root_path.is_none() {
         return Err("audit --hash-regular-files requires --root DIRECTORY".to_owned());
+    }
+    if options.observation_window && (options.root_path.is_none() || !options.include_runtime) {
+        return Err("audit --observe-root requires --root DIRECTORY and a bounded Windows ETW runtime command".to_owned());
     }
     if options.permission_paths.len() > 256 {
         return Err("permission path count exceeds the 256 path limit".to_owned());
@@ -89,6 +94,12 @@ pub fn collect_and_publish(
         );
     }
     if options.include_runtime {
+        if options.observation_window {
+            reject_overlapping_observation_output(
+                options.root_path.as_deref().expect("validated root path"),
+                destination,
+            )?;
+        }
         match std::fs::symlink_metadata(destination) {
             Ok(_) => {
                 return Err(
@@ -249,9 +260,7 @@ pub fn collect_and_publish(
         ));
     }
     if options.startup {
-        let doc = collect_windows_startup_for_session(
-            crate::audit_session::AUDIT_SESSION_SCHEMA_VERSION,
-        )?;
+        let doc = collect_windows_startup_for_session(session_schema_version(options))?;
         let (status, diagnostics) = status_from_serialized(&doc, "status");
         let value = serde_json::to_vec(&doc)
             .map_err(|e| format!("could not serialize startup inventory: {e}"))?;
@@ -513,6 +522,61 @@ pub fn collect_and_publish(
         ));
     }
 
+    if options.observation_window {
+        let root = options.root_path.as_deref().expect("validated root path");
+        let doc = crate::inventory::collect_root_snapshot_with_hash(
+            root,
+            options.hash_root_regular_files,
+        );
+        let (status, diagnostics) = status_from_serialized(&doc, "status");
+        if let Some(root_source) = sources
+            .iter_mut()
+            .find(|source| source.role == SourceRole::SelectedRoot)
+        {
+            root_source.ended_at_unix_ms = doc.captured_ended_at_unix_ms;
+            if status != SourceStatus::Complete {
+                root_source.status = SourceStatus::Partial;
+            }
+            root_source
+                .diagnostic_codes
+                .extend(diagnostics.into_iter().map(str::to_owned));
+            root_source.diagnostic_codes.sort();
+            root_source.diagnostic_codes.dedup();
+            if root_source.diagnostic_codes.len()
+                > crate::audit_session::MAX_DIAGNOSTIC_CODES_PER_SOURCE
+            {
+                root_source
+                    .diagnostic_codes
+                    .truncate(crate::audit_session::MAX_DIAGNOSTIC_CODES_PER_SOURCE);
+                root_source.status = SourceStatus::Partial;
+            }
+            root_source.scope = if options.hash_root_regular_files {
+                "same explicitly selected directory and direct-child metadata before and after the bounded runtime capture; optional regular-file content fingerprints"
+            } else {
+                "same explicitly selected directory and direct-child metadata before and after the bounded runtime capture"
+            }.to_owned();
+        }
+        let bytes = serde_json::to_vec(&doc)
+            .map_err(|e| format!("could not serialize after selected-root inventory: {e}"))?;
+        let existing_bytes = artifacts.iter().try_fold(0usize, |total, artifact| {
+            total.checked_add(artifact.bytes.len())
+        });
+        let fits = bytes.len() as u64 <= MAX_SESSION_ARTIFACT_BYTES
+            && existing_bytes
+                .and_then(|total| total.checked_add(bytes.len()))
+                .is_some_and(|total| total <= MAX_WINDOWS_SESSION_BYTES.saturating_sub(512 * 1024));
+        if !fits {
+            return Err("after selected-root inventory exceeds the audit-session artifact or aggregate byte limit".to_owned());
+        }
+        artifacts.push(artifact(
+            ArtifactKind::SelectedRootAfter,
+            "root-snapshot-after.json",
+            "sideeffect.selected_root_inventory",
+            doc.schema_version,
+            bytes,
+        ));
+    }
+
     let context = host_context();
     let ended = now_ms()?;
     let mut files: Vec<(&str, &[u8])> = artifacts
@@ -634,7 +698,11 @@ fn build_manifest(
     for source in &mut sources {
         source.artifacts = artifacts
             .iter()
-            .filter(|artifact| role_kind(source.role) == Some(artifact.kind))
+            .filter(|artifact| {
+                role_kind(source.role) == Some(artifact.kind)
+                    || (source.role == SourceRole::SelectedRoot
+                        && artifact.kind == ArtifactKind::SelectedRootAfter)
+            })
             .map(|artifact| SessionArtifactRef {
                 kind: artifact.kind,
                 path: artifact.file_name.to_owned(),
@@ -853,7 +921,8 @@ fn collect_windows_startup_for_session(
         crate::audit_session::AUDIT_SESSION_V12_SCHEMA_VERSION => Ok(collect_windows_startup_v7()),
         crate::audit_session::AUDIT_SESSION_V13_SCHEMA_VERSION => Ok(collect_windows_startup_v8()),
         crate::audit_session::AUDIT_SESSION_V14_SCHEMA_VERSION => Ok(collect_windows_startup_v9()),
-        crate::audit_session::AUDIT_SESSION_V15_SCHEMA_VERSION => {
+        crate::audit_session::AUDIT_SESSION_V15_SCHEMA_VERSION
+        | crate::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION => {
             Ok(crate::inventory::collect_windows_startup())
         }
         _ => Err("unsupported Windows audit-session schema version".to_owned()),
@@ -861,13 +930,36 @@ fn collect_windows_startup_for_session(
 }
 
 fn session_schema_version(options: &WindowsAuditOptions) -> u32 {
-    if options.startup {
-        crate::audit_session::AUDIT_SESSION_SCHEMA_VERSION
+    if options.observation_window {
+        crate::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION
+    } else if options.startup {
+        crate::audit_session::AUDIT_SESSION_V15_SCHEMA_VERSION
     } else if options.app_paths {
         crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION
     } else {
         crate::audit_session::AUDIT_SESSION_V9_SCHEMA_VERSION
     }
+}
+
+fn reject_overlapping_observation_output(root: &Path, destination: &Path) -> Result<(), String> {
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|error| format!("could not resolve --observe-root before launch: {error}"))?;
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let canonical_parent = std::fs::canonicalize(parent)
+        .map_err(|error| format!("could not resolve audit output parent before launch: {error}"))?;
+    let name = destination
+        .file_name()
+        .ok_or_else(|| "audit output must name a new session directory".to_owned())?;
+    let resolved_destination = canonical_parent.join(name);
+    if resolved_destination.starts_with(&canonical_root)
+        || canonical_root.starts_with(&resolved_destination)
+    {
+        return Err("audit output overlaps --observe-root; choose a session directory outside the observed root before launching the command".to_owned());
+    }
+    Ok(())
 }
 
 fn now_ms() -> Result<u128, String> {
@@ -905,6 +997,38 @@ mod tests {
             session_schema_version(&app_paths_only),
             crate::audit_session::AUDIT_SESSION_V11_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn observation_session_uses_v16_and_rejects_output_under_the_root() {
+        let observation = WindowsAuditOptions {
+            observation_window: true,
+            root_path: Some(std::path::PathBuf::from("C:\\scope")),
+            include_runtime: true,
+            startup: true,
+            ..WindowsAuditOptions::default()
+        };
+        assert_eq!(
+            session_schema_version(&observation),
+            crate::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION
+        );
+
+        let base = std::env::temp_dir().join(format!(
+            "sideeffect-observation-overlap-{}-{}",
+            std::process::id(),
+            super::NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        assert!(
+            super::reject_overlapping_observation_output(&root, &root.join("session")).is_err()
+        );
+        assert!(
+            super::reject_overlapping_observation_output(&root, &outside.join("session")).is_ok()
+        );
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

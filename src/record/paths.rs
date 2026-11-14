@@ -13,12 +13,13 @@ const BUNDLE_TRACE_NAME: &[u8] = b"trace.strace";
 const MANIFEST_NAME: &[u8] = b"run.json";
 const REPORT_NAME: &[u8] = b"report.html";
 const PRIVATE_FILE_NAME: &[u8] = b"private-output";
-const SESSION_ARTIFACT_NAMES: [&[u8]; 8] = [
+const SESSION_ARTIFACT_NAMES: [&[u8]; 9] = [
     b"packages.json",
     b"processes.json",
     b"startup.json",
     b"path-executables.json",
     b"root-snapshot.json",
+    b"root-snapshot-after.json",
     b"permissions.json",
     b"run.json",
     b"trace.strace",
@@ -2169,5 +2170,25 @@ mod tests {
         assert!(!destination.exists());
         fs::remove_file(marker).unwrap();
         fs::remove_dir(stage).unwrap();
+    }
+
+    #[test]
+    fn session_stages_and_publishes_after_root_snapshot_artifact() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("observation-session");
+        let mut output = SessionOutput::prepare(&destination).unwrap();
+        output
+            .write_artifact("root-snapshot.json", b"before")
+            .unwrap();
+        output
+            .write_artifact("root-snapshot-after.json", b"after")
+            .unwrap();
+        output.write_manifest(b"manifest").unwrap();
+        let (published, _) = output.publish().unwrap();
+        assert_eq!(
+            fs::read(published.join("root-snapshot-after.json")).unwrap(),
+            b"after"
+        );
+        assert_eq!(fs::read_dir(&published).unwrap().count(), 3);
     }
 }

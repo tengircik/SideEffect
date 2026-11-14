@@ -715,6 +715,69 @@ fn audit_cli_includes_bounded_runtime_bundle_and_preserves_argument_boundaries()
 }
 
 #[test]
+fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
+    let directory = TestDirectory::new();
+    let observed_root = directory.0.join("observed");
+    fs::create_dir(&observed_root).unwrap();
+    let output = directory.0.join("observation.session");
+    let created_file = observed_root.join("created-by-selected-command.txt");
+    let script = "from pathlib import Path; Path(__import__('sys').argv[1]).write_text('fixture')";
+    let captured = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&output)
+        .arg("--observe-root")
+        .arg(&observed_root)
+        .arg("--runtime-duration-seconds")
+        .arg("10")
+        .arg("--")
+        .arg("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(&created_file)
+        .output()
+        .unwrap();
+    assert_eq!(
+        captured.status.code(),
+        Some(2),
+        "runtime capture is partial by contract: {}",
+        String::from_utf8_lossy(&captured.stderr)
+    );
+    assert!(created_file.exists());
+    let manifest = parse_manifest(&fs::read(output.join("session.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest.schema_version,
+        sideeffect::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION
+    );
+    let root_source = manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::SelectedRoot)
+        .unwrap();
+    assert_eq!(root_source.artifacts.len(), 2);
+    assert!(root_source.started_at_unix_ms < root_source.ended_at_unix_ms);
+    let runtime = manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::Runtime)
+        .unwrap();
+    assert_eq!(runtime.status, SourceStatus::Partial);
+    assert_eq!(runtime.artifacts.len(), 2);
+
+    let compared = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("compare-observation")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_eq!(compared.status.code(), Some(2));
+    let report: serde_json::Value = serde_json::from_slice(&compared.stdout).unwrap();
+    assert_eq!(report["root_comparison_status"], "complete");
+    assert_eq!(report["root_diff"]["counts"]["additions"], 1);
+    assert_eq!(report["runtime_artifacts"].as_array().unwrap().len(), 2);
+    assert_eq!(report["runtime_source_status"], "partial");
+}
+
+#[test]
 fn audit_cli_preserves_unavailable_runtime_source_alongside_other_sources() {
     let directory = TestDirectory::new();
     let output = directory.0.join("partial.session");

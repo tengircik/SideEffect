@@ -33,6 +33,7 @@ pub struct AuditOptions {
     pub path_executables: bool,
     pub root_path: Option<PathBuf>,
     pub hash_root_regular_files: bool,
+    pub observation_window: bool,
     pub permission_paths: Vec<PathBuf>,
     pub runtime_program: Option<OsString>,
     pub runtime_arguments: Vec<OsString>,
@@ -61,6 +62,7 @@ pub fn collect_and_publish(
         && !options.startup
         && !options.path_executables
         && options.root_path.is_none()
+        && !options.observation_window
         && !options.hash_root_regular_files
         && options.permission_paths.is_empty()
         && options.runtime_program.is_none()
@@ -93,6 +95,14 @@ pub fn collect_and_publish(
             "runtime audit duration must be a whole number of seconds from 1 to 3600".to_owned(),
         );
     }
+    if options.observation_window
+        && (options.root_path.is_none() || options.runtime_program.is_none())
+    {
+        return Err(
+            "audit --observe-root requires --root DIRECTORY and a bounded runtime command"
+                .to_owned(),
+        );
+    }
 
     let session_start = now_unix_ms()?;
     // Capture the selected root before creating the sibling staging directory. If the
@@ -100,6 +110,12 @@ pub fn collect_and_publish(
     // appear as an observed child in its own snapshot.
     if options.hash_root_regular_files && options.root_path.is_none() {
         return Err("audit --hash-regular-files requires --root DIRECTORY".to_owned());
+    }
+    if options.observation_window {
+        reject_overlapping_observation_output(
+            options.root_path.as_deref().expect("validated root path"),
+            destination,
+        )?;
     }
     let root_snapshot = options.root_path.as_deref().map(|path| {
         crate::inventory::collect_root_snapshot_with_hash(path, options.hash_root_regular_files)
@@ -428,6 +444,60 @@ pub fn collect_and_publish(
         }
     }
 
+    if options.observation_window {
+        let root = options.root_path.as_deref().expect("validated root path");
+        let after = crate::inventory::collect_root_snapshot_with_hash(
+            root,
+            options.hash_root_regular_files,
+        );
+        let after_bytes = serde_json::to_vec(&after).map_err(|error| {
+            format!("could not serialize after selected-root inventory: {error}")
+        })?;
+        if let Some(source) = sources
+            .iter_mut()
+            .find(|source| source.role == SourceRole::SelectedRoot)
+        {
+            source.ended_at_unix_ms = after.captured_ended_at_unix_ms;
+            if after.status != "complete" {
+                source.status = SourceStatus::Partial;
+            }
+            source
+                .diagnostic_codes
+                .extend(after.diagnostics.iter().map(|item| item.code.to_owned()));
+            source.diagnostic_codes.sort();
+            source.diagnostic_codes.dedup();
+            if source.diagnostic_codes.len() > MAX_DIAGNOSTICS {
+                source.diagnostic_codes.truncate(MAX_DIAGNOSTICS);
+                source.status = SourceStatus::Partial;
+            }
+            source.scope = if options.hash_root_regular_files {
+                "same explicitly selected directory and direct-child metadata before and after the bounded runtime capture; optional regular-file content fingerprints"
+            } else {
+                "same explicitly selected directory and direct-child metadata before and after the bounded runtime capture"
+            }
+            .to_owned();
+        }
+        let existing_bytes = artifacts.iter().try_fold(0_u64, |total, artifact| {
+            total.checked_add(artifact.bytes.len() as u64)
+        });
+        let reserve_manifest = 512 * 1024;
+        let fits = after_bytes.len() as u64 <= crate::audit_session::MAX_SESSION_ARTIFACT_BYTES
+            && existing_bytes
+                .and_then(|total| total.checked_add(after_bytes.len() as u64))
+                .is_some_and(|total| {
+                    total
+                        <= crate::audit_session::MAX_SESSION_TOTAL_ARTIFACT_BYTES
+                            .saturating_sub(reserve_manifest)
+                });
+        if !fits {
+            return Err("after selected-root inventory exceeds the audit-session artifact or aggregate byte limit".to_owned());
+        }
+        artifacts.push(Artifact {
+            file_name: "root-snapshot-after.json",
+            bytes: after_bytes,
+        });
+    }
+
     let host_context = host_context();
     let session_end = now_unix_ms()?;
     if sources.is_empty() || sources.len() > MAX_SESSION_SOURCES {
@@ -454,7 +524,9 @@ pub fn collect_and_publish(
             ArtifactKind::Permissions => SourceRole::Permissions,
             ArtifactKind::Startup => SourceRole::Startup,
             ArtifactKind::PathExecutables => SourceRole::PathExecutables,
-            ArtifactKind::SelectedRoot => SourceRole::SelectedRoot,
+            ArtifactKind::SelectedRoot | ArtifactKind::SelectedRootAfter => {
+                SourceRole::SelectedRoot
+            }
             ArtifactKind::WindowsSoftware
             | ArtifactKind::WindowsMsix
             | ArtifactKind::WindowsAppPaths
@@ -488,7 +560,11 @@ pub fn collect_and_publish(
     ));
     let manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
-        schema_version: AUDIT_SESSION_V9_SCHEMA_VERSION,
+        schema_version: if options.observation_window {
+            crate::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION
+        } else {
+            AUDIT_SESSION_V9_SCHEMA_VERSION
+        },
         session_id,
         platform: "linux".to_owned(),
         architecture: std::env::consts::ARCH.to_owned(),
@@ -720,6 +796,7 @@ fn artifact_kind(file_name: &str) -> Result<ArtifactKind, String> {
         "permissions.json" => Ok(ArtifactKind::Permissions),
         "path-executables.json" => Ok(ArtifactKind::PathExecutables),
         "root-snapshot.json" => Ok(ArtifactKind::SelectedRoot),
+        "root-snapshot-after.json" => Ok(ArtifactKind::SelectedRootAfter),
         "run.json" => Ok(ArtifactKind::RuntimeManifest),
         "trace.strace" => Ok(ArtifactKind::RuntimeTrace),
         "software.windows.json" => Ok(ArtifactKind::WindowsSoftware),
@@ -728,6 +805,27 @@ fn artifact_kind(file_name: &str) -> Result<ArtifactKind, String> {
         "startup.windows.json" => Ok(ArtifactKind::WindowsStartup),
         _ => Err("unknown audit artifact name".to_owned()),
     }
+}
+
+fn reject_overlapping_observation_output(root: &Path, destination: &Path) -> Result<(), String> {
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|error| format!("could not resolve --observe-root before launch: {error}"))?;
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let canonical_parent = std::fs::canonicalize(parent)
+        .map_err(|error| format!("could not resolve audit output parent before launch: {error}"))?;
+    let name = destination
+        .file_name()
+        .ok_or_else(|| "audit output must name a new session directory".to_owned())?;
+    let resolved_destination = canonical_parent.join(name);
+    if resolved_destination.starts_with(&canonical_root)
+        || canonical_root.starts_with(&resolved_destination)
+    {
+        return Err("audit output overlaps --observe-root; choose a session directory outside the observed root before launching the command".to_owned());
+    }
+    Ok(())
 }
 
 fn limit(code: &str, value: u64) -> AppliedLimit {
@@ -794,6 +892,26 @@ impl Write for CappedWriter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn observation_output_overlap_is_rejected_before_capture() {
+        let base = std::env::temp_dir().join(format!(
+            "sideeffect-observation-overlap-{}-{}",
+            std::process::id(),
+            super::NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        assert!(
+            super::reject_overlapping_observation_output(&root, &root.join("session")).is_err()
+        );
+        assert!(
+            super::reject_overlapping_observation_output(&root, &outside.join("session")).is_ok()
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn linux_runtime_coverage_counts_only_fixed_parser_diagnostic_categories() {
         let detail = super::runtime_coverage_detail_from_trace(

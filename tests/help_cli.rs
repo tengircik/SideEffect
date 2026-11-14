@@ -20,12 +20,23 @@ fn help_command_and_flag_show_command_list() {
         ));
         assert!(text.contains("sideeffect attribute --windows-runtime <capture.json>"));
         assert!(text.contains("sideeffect events --trace <strace-trace-file>"));
+        assert!(text.contains("sideeffect compare-observation"));
         assert!(text.contains("--session <audit-session-directory>"));
     }
 }
 
 #[test]
 fn focused_help_covers_command_and_nested_inventory_topics() {
+    let observation = run(&["help", "compare-observation"]);
+    assert!(observation.status.success());
+    let observation_help = String::from_utf8_lossy(&observation.stdout);
+    assert!(observation_help.contains("Verifies one v16 observation session"));
+    assert!(observation_help.contains("do not establish causation"));
+
+    let audit = run(&["help", "audit"]);
+    assert!(audit.status.success());
+    assert!(String::from_utf8_lossy(&audit.stdout).contains("--observe-root"));
+
     let model_explain = run(&["help", "model-explain"]);
     assert!(model_explain.status.success());
     let model_explain_help = String::from_utf8_lossy(&model_explain.stdout);

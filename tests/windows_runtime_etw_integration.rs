@@ -415,6 +415,63 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
                 && edge["evidence"][0] == link["event"]
         }));
     }
+
+    let observation_root = directory.join("observation-root");
+    fs::create_dir(&observation_root).unwrap();
+    let observation_file = observation_root.join("created-by-etw-fixture.txt");
+    let observation_session = directory.join("observation-session");
+    let observation_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let observation_port = observation_listener.local_addr().unwrap().port();
+    let observation = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .args(["audit", "--output"])
+        .arg(&observation_session)
+        .args(["--observe-root"])
+        .arg(&observation_root)
+        .args([
+            "--runtime-source",
+            "windows-etw",
+            "--runtime-duration-seconds",
+            "10",
+            "--",
+        ])
+        .arg(&fixture_executable)
+        .args(["--ignored", "--exact", "etw_fixture_child", "--nocapture"])
+        .env("SIDEEFFECT_ETW_FIXTURE_FILE", &observation_file)
+        .env("SIDEEFFECT_ETW_FIXTURE_PORT", observation_port.to_string())
+        .output()
+        .unwrap();
+    drop(observation_listener);
+    assert_eq!(
+        observation.status.code(),
+        Some(2),
+        "ETW completeness remains unknown: {}",
+        String::from_utf8_lossy(&observation.stderr)
+    );
+    assert!(observation_file.exists());
+    let observation_manifest: Value =
+        serde_json::from_slice(&fs::read(observation_session.join("session.json")).unwrap())
+            .unwrap();
+    assert_eq!(observation_manifest["schema_version"], 16);
+    let observation_comparison = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("compare-observation")
+        .arg(&observation_session)
+        .output()
+        .unwrap();
+    assert_eq!(observation_comparison.status.code(), Some(2));
+    let observation_comparison: Value =
+        serde_json::from_slice(&observation_comparison.stdout).unwrap();
+    assert_eq!(observation_comparison["root_comparison_status"], "complete");
+    assert_eq!(
+        observation_comparison["root_diff"]["counts"]["additions"],
+        1
+    );
+    assert_eq!(observation_comparison["runtime_source_status"], "partial");
+    assert_eq!(
+        observation_comparison["runtime_artifacts"][0]["path"],
+        "runtime.windows.json"
+    );
+    fs::remove_dir_all(observation_session).unwrap();
+
     if std::env::var("SIDEEFFECT_ETW_DIAGNOSTIC_SAMPLE")
         .is_ok_and(|value| value == "windows_server_hosted_ci")
     {

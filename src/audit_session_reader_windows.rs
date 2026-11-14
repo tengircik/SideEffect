@@ -17,7 +17,7 @@ use std::path::Path;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-const MAX_ENTRIES: usize = 10;
+const MAX_ENTRIES: usize = 11;
 
 #[derive(Debug)]
 pub struct VerifiedAuditSession {
@@ -378,6 +378,7 @@ fn label(path: &str) -> &'static str {
         "startup.json" => "startup.json",
         "path-executables.json" => "path-executables.json",
         "root-snapshot.json" => "root-snapshot.json",
+        "root-snapshot-after.json" => "root-snapshot-after.json",
         "software.windows.json" => "software.windows.json",
         "msix.windows.json" => "msix.windows.json",
         "processes.windows.json" => "processes.windows.json",
@@ -598,7 +599,7 @@ mod tests {
         verify_schema,
     };
     use crate::audit_session::{
-        AUDIT_SESSION_SCHEMA, AUDIT_SESSION_SCHEMA_VERSION, ArtifactKind, AuditSessionManifest,
+        AUDIT_SESSION_SCHEMA, AUDIT_SESSION_V15_SCHEMA_VERSION, ArtifactKind, AuditSessionManifest,
         AuditSessionSource, IntervalSemantics, SessionArtifactRef, SessionStatus, SourceRole,
         SourceStatus,
     };
@@ -849,7 +850,7 @@ mod tests {
         let runtime = valid_runtime_bytes();
         let manifest = AuditSessionManifest {
             schema: AUDIT_SESSION_SCHEMA.to_owned(),
-            schema_version: AUDIT_SESSION_SCHEMA_VERSION,
+            schema_version: AUDIT_SESSION_V15_SCHEMA_VERSION,
             session_id: "0123456789abcdef0123456789abcdef".to_owned(),
             platform: "windows".to_owned(),
             architecture: "x86_64".to_owned(),
