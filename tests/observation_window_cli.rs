@@ -287,13 +287,17 @@ fn observation_files() -> Vec<(&'static str, Vec<u8>)> {
     };
     manifest.validate().unwrap();
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let mut files = vec![
+    let files = vec![
         ("root-snapshot.json", before),
         ("root-snapshot-after.json", after),
         ("session.json", manifest_bytes),
     ];
     #[cfg(windows)]
-    files.push(("runtime.windows.json", capture_bytes));
+    let files = {
+        let mut files = files;
+        files.push(("runtime.windows.json", capture_bytes));
+        files
+    };
     files
 }
 
