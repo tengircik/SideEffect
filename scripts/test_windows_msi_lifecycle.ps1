@@ -44,7 +44,7 @@ function New-MsiFixture {
         [Parameter(Mandatory = $true)][string] $ComponentCode,
         [Parameter(Mandatory = $true)][string] $DefaultDirectoryName,
         [Parameter(Mandatory = $true)][string] $DefaultInstallRoot,
-        [Parameter(Mandatory = $true)][string] $CabinetTemplate,
+        [Parameter(Mandatory = $true)][string] $CabinetName,
         [Parameter(Mandatory = $true)][string] $ExpectedCabinet,
         [Parameter(Mandatory = $true)][string] $CandlePath,
         [Parameter(Mandatory = $true)][string] $LightPath
@@ -64,7 +64,7 @@ function New-MsiFixture {
              InstallScope="perUser"
              InstallPrivileges="limited" />
     <MajorUpgrade DowngradeErrorMessage="A later synthetic fixture version is already installed." />
-    <MediaTemplate EmbedCab="yes" CabinetTemplate="$(var.CabinetTemplate)" />
+    <Media Id="1" Cabinet="$(var.CabinetName)" EmbedCab="yes" />
     <Property Id="INSTALLROOT" Value="$(var.DefaultInstallRoot)" Secure="yes" />
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="INSTALLROOT" Name="$(var.DefaultDirectoryName)" />
@@ -100,7 +100,7 @@ function New-MsiFixture {
         "-dComponentCode=$ComponentCode",
         "-dDefaultDirectoryName=$DefaultDirectoryName",
         "-dDefaultInstallRoot=$DefaultInstallRoot",
-        "-dCabinetTemplate=$CabinetTemplate",
+        "-dCabinetName=$CabinetName",
         "-dPayloadPath=$PayloadPath",
         '-out', $WixObjPath,
         $WxsPath
@@ -562,10 +562,8 @@ try {
     $objV2 = Join-Path $script:TestRoot 'fixture-v2.wixobj'
     $msiV1 = Join-Path $script:TestRoot 'fixture-v1.msi'
     $msiV2 = Join-Path $script:TestRoot 'fixture-v2.msi'
-    $cabinetTemplateV1 = 'sideeffect-r5-v1-{0}.cab'
-    $cabinetTemplateV2 = 'sideeffect-r5-v2-{0}.cab'
-    New-MsiFixture -WxsPath $wxsV1 -WixObjPath $objV1 -MsiPath $msiV1 -PayloadPath $payloadV1Path -Version '1.0.0' -ProductCode $productCodeV1 -UpgradeCode $upgradeCode -ComponentCode $componentCode -DefaultDirectoryName $defaultDirectoryName -DefaultInstallRoot $script:InstallRoot -CabinetTemplate $cabinetTemplateV1 -ExpectedCabinet '#sideeffect-r5-v1-1.cab' -CandlePath $candlePath -LightPath $lightPath
-    New-MsiFixture -WxsPath $wxsV2 -WixObjPath $objV2 -MsiPath $msiV2 -PayloadPath $payloadV2Path -Version '2.0.0' -ProductCode $productCodeV2 -UpgradeCode $upgradeCode -ComponentCode $componentCode -DefaultDirectoryName $defaultDirectoryName -DefaultInstallRoot $script:InstallRoot -CabinetTemplate $cabinetTemplateV2 -ExpectedCabinet '#sideeffect-r5-v2-1.cab' -CandlePath $candlePath -LightPath $lightPath
+    New-MsiFixture -WxsPath $wxsV1 -WixObjPath $objV1 -MsiPath $msiV1 -PayloadPath $payloadV1Path -Version '1.0.0' -ProductCode $productCodeV1 -UpgradeCode $upgradeCode -ComponentCode $componentCode -DefaultDirectoryName $defaultDirectoryName -DefaultInstallRoot $script:InstallRoot -CabinetName 'r5v1.cab' -ExpectedCabinet '#r5v1.cab' -CandlePath $candlePath -LightPath $lightPath
+    New-MsiFixture -WxsPath $wxsV2 -WixObjPath $objV2 -MsiPath $msiV2 -PayloadPath $payloadV2Path -Version '2.0.0' -ProductCode $productCodeV2 -UpgradeCode $upgradeCode -ComponentCode $componentCode -DefaultDirectoryName $defaultDirectoryName -DefaultInstallRoot $script:InstallRoot -CabinetName 'r5v2.cab' -ExpectedCabinet '#r5v2.cab' -CandlePath $candlePath -LightPath $lightPath
 
     $beforePath = Join-Path $script:TestRoot 'before-install.json'
     $snapshotV1Path = Join-Path $script:TestRoot 'installed-v1.json'
