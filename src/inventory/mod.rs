@@ -44,6 +44,8 @@ mod windows_app_paths_diff;
 #[cfg(windows)]
 mod windows_msix;
 mod windows_msix_diff;
+#[cfg(windows)]
+mod windows_root_runtime_association;
 mod windows_software_diff;
 
 #[cfg(target_os = "linux")]
@@ -101,6 +103,12 @@ pub use windows_msix_diff::{
     WindowsMsixComparisonStatus, WindowsMsixCounts, WindowsMsixDelta, WindowsMsixEvidenceReference,
     WindowsMsixFacts, WindowsMsixIdentity, WindowsMsixInventoryComparison,
     compare_windows_msix_inventory_json,
+};
+#[cfg(windows)]
+pub use windows_root_runtime_association::{
+    WindowsRootRuntimeAssociation, WindowsRootRuntimeAssociationReport,
+    WindowsRootRuntimeAssociationSummary, WindowsRootRuntimeEvidence,
+    associate_windows_root_runtime_diff,
 };
 pub use windows_software_diff::{
     WindowsSoftwareChangeKind, WindowsSoftwareComparisonCounts,

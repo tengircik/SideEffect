@@ -4,6 +4,12 @@ use sideeffect::audit_session::{
     ArtifactKind, AuditSessionManifest, AuditSessionSource, CoverageManifest, HostContext,
     IntervalSemantics, LossMetadata, SessionArtifactRef, SessionStatus, SourceRole, SourceStatus,
 };
+#[cfg(windows)]
+use sideeffect::windows_runtime::{
+    AppliedLimits, CollectionStatus, EventLoss, NativeRuntimeEvent, SessionMetadata, StopReason,
+    TargetOutcome, WINDOWS_RUNTIME_CAPTURE_SCHEMA, WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION,
+    WindowsRuntimeCapture,
+};
 use std::fs;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -101,10 +107,105 @@ fn entry() -> Value {
     .unwrap()
 }
 
+#[cfg(windows)]
+fn windows_capture() -> Vec<u8> {
+    let path = r"C:\Synthetic\ObservationRoot\new";
+    let mut payload = vec![0; 8];
+    for unit in path.encode_utf16().chain(std::iter::once(0)) {
+        payload.extend_from_slice(&unit.to_le_bytes());
+    }
+    let raw_payload_hex: String = payload.iter().map(|byte| format!("{byte:02x}")).collect();
+    let mut capture = WindowsRuntimeCapture {
+        schema: WINDOWS_RUNTIME_CAPTURE_SCHEMA.to_owned(),
+        schema_version: WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION,
+        platform: "windows".to_owned(),
+        capture_profile: "synthetic_observation_fixture".to_owned(),
+        collection_status: CollectionStatus::Partial,
+        capture_completeness: "unknown".to_owned(),
+        started_at_unix_ms: 1001,
+        ended_at_unix_ms: 1002,
+        requested_duration_seconds: 1,
+        stop_reason: StopReason::DurationLimitReached,
+        target: TargetOutcome {
+            process_id: 7,
+            exit_code: None,
+            status_available: false,
+        },
+        session: SessionMetadata {
+            name: "synthetic fixture".to_owned(),
+            provider: "synthetic fixture".to_owned(),
+            scope: "synthetic fixture only; no live capture".to_owned(),
+            buffer_size_kb_requested: 16,
+            minimum_buffers_requested: 1,
+            maximum_buffers_requested: 1,
+            buffer_count_reported: 0,
+            provider_process_id_header_semantics: "context only".to_owned(),
+        },
+        limits: AppliedLimits {
+            maximum_duration_seconds: 60,
+            maximum_events: 50_000,
+            maximum_total_payload_bytes: 8 * 1024 * 1024,
+            maximum_payload_bytes_per_event: 64 * 1024,
+            maximum_document_bytes: 32 * 1024 * 1024,
+        },
+        event_loss: EventLoss {
+            events_lost: 0,
+            log_buffers_lost: 0,
+            real_time_buffers_lost: 0,
+            loss_statistics_available: true,
+            observation: "zero_reported".to_owned(),
+            final_snapshot_available: true,
+        },
+        document_sha256: String::new(),
+        events: vec![NativeRuntimeEvent {
+            record_ordinal: 1,
+            provider_guid: "90cbdc39-4a3e-11d1-84f4-0000f80464e3".to_owned(),
+            event_id: 0,
+            event_version: 2,
+            opcode: 32,
+            event_kind: "file_io_observation".to_owned(),
+            header_process_id: 7,
+            header_thread_id: 9,
+            header_flags: 0x0040,
+            timestamp_qpc: 12,
+            raw_payload_hex,
+            payload_decoding: None,
+            observation_decoding: Some(json!({
+                "status":"decoded", "diagnostic":null,
+                "observation":{"schema":"windows.kernel_file_io","schema_version":2,
+                    "activity":{"kind":"file","observation":{
+                        "operation":"create_name","thread_id":null,"file_object":0,
+                        "file_key":null,"path":path,"requested_bytes":null,
+                        "file_offset":null,"create_options":null,"file_attributes":null,
+                        "share_access":null,"information_class":null,"extra_info":null
+                    }}
+                }
+            })),
+        }],
+        diagnostics: vec!["synthetic fixture; not a real capture".to_owned()],
+    };
+    capture.document_sha256.clear();
+    capture.document_sha256 = digest(&serde_json::to_vec(&capture).unwrap());
+    serde_json::to_vec(&capture).unwrap()
+}
+
 fn observation_files() -> Vec<(&'static str, Vec<u8>)> {
     let before = root_snapshot(json!([]), 1000, 1001);
     let after = root_snapshot(json!([entry()]), 1002, 1003);
     let platform = if cfg!(windows) { "windows" } else { "linux" };
+    #[cfg(windows)]
+    let capture_bytes = windows_capture();
+    #[cfg(windows)]
+    let runtime_artifacts = vec![SessionArtifactRef {
+        kind: ArtifactKind::WindowsRuntimeCapture,
+        path: "runtime.windows.json".to_owned(),
+        schema: "sideeffect.windows_runtime_capture".to_owned(),
+        schema_version: 3,
+        byte_length: capture_bytes.len() as u64,
+        sha256: digest(&capture_bytes),
+    }];
+    #[cfg(not(windows))]
+    let runtime_artifacts: Vec<SessionArtifactRef> = vec![];
     let root_source = AuditSessionSource {
         role: SourceRole::SelectedRoot,
         collector: Some(sideeffect::audit_session::collector_identity(
@@ -157,7 +258,7 @@ fn observation_files() -> Vec<(&'static str, Vec<u8>)> {
         effective_settings: vec![],
         loss: Some(LossMetadata::unknown()),
         diagnostic_codes: vec!["synthetic_fixture_not_a_live_capture".to_owned()],
-        artifacts: vec![],
+        artifacts: runtime_artifacts,
     };
     let sources = vec![root_source, runtime_source];
     let manifest = AuditSessionManifest {
@@ -186,11 +287,14 @@ fn observation_files() -> Vec<(&'static str, Vec<u8>)> {
     };
     manifest.validate().unwrap();
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    vec![
+    let mut files = vec![
         ("root-snapshot.json", before),
         ("root-snapshot-after.json", after),
         ("session.json", manifest_bytes),
-    ]
+    ];
+    #[cfg(windows)]
+    files.push(("runtime.windows.json", capture_bytes));
+    files
 }
 
 fn publish_observation_session() -> std::path::PathBuf {
@@ -257,7 +361,34 @@ fn compare_observation_verifies_artifacts_and_keeps_partial_runtime_separate() {
         64
     );
     assert_eq!(report["after_artifact"]["path"], "root-snapshot-after.json");
+    #[cfg(target_os = "linux")]
     assert_eq!(report["runtime_artifacts"].as_array().unwrap().len(), 0);
+    #[cfg(windows)]
+    {
+        assert_eq!(report["runtime_artifacts"].as_array().unwrap().len(), 1);
+        let association = &report["root_runtime_association"];
+        assert_eq!(association["status"], "partial");
+        assert_eq!(
+            association["summary"]["candidate_match_count"], 1,
+            "{association}"
+        );
+        assert_eq!(
+            association["associations"][0]["candidate_path"],
+            r"C:\Synthetic\ObservationRoot\new"
+        );
+        assert_eq!(
+            association["associations"][0]["runtime_evidence"][0]["json_pointer"],
+            "/events/0"
+        );
+        assert_eq!(
+            association["associations"][0]["runtime_evidence"][0]["record_ordinal"],
+            1
+        );
+        assert_eq!(
+            association["capture_artifact_sha256"],
+            report["runtime_artifacts"][0]["sha256"]
+        );
+    }
     fs::remove_dir_all(session.parent().unwrap()).unwrap();
 }
 

@@ -2064,7 +2064,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect compare-sessions BEFORE_SESSION_DIR AFTER_SESSION_DIR\nVerifies both local audit sessions, reports metadata comparability, and compares bounded item-level inventory and runtime evidence from verified artifacts. Per-source status and evidence references remain visible; missing, partial, unsupported, or incompatible sources do not become empty results. This is not an exhaustive history or coverage claim, and it does not establish causation or event absence. Incomparable or partial results exit with status 2 and include stable reason codes."
         }
         "compare-observation" => {
-            "Usage: sideeffect compare-observation VERIFIED_OBSERVATION_SESSION_DIR\nVerifies one v16 observation session, compares selected-root snapshots, and adds Linux exact-path candidates from the session's manifest-verified strace trace. The result cites input artifacts by path, schema, and SHA-256. Runtime candidate locators bind to trace digest and raw row offsets. Failed/unknown write-intent outcomes remain separate; successful opens and path matches do not prove a mutation, process identity, or cause, and do not establish causation. Runtime source and capture completeness remain distinct. Windows selected-root/runtime path namespaces are unsupported by this association adapter."
+            "Usage: sideeffect compare-observation VERIFIED_OBSERVATION_SESSION_DIR\nVerifies one v16 observation session and compares selected-root snapshots. Linux adds exact-path candidates from the manifest-verified strace trace; Windows adds exact lexical candidates only for same-spelling absolute DOS drive paths in raw-cross-checked ETW FileIo name observations. Results cite input artifacts and raw rows. Linux locators bind to trace digest and raw row offsets; Windows locators bind to capture document digest, event-array row, and raw-payload digest. ETW file-name records do not report operation success. Path matches do not prove mutation, process identity, or cause, and do not establish causation. Runtime source and capture completeness remain distinct. Unsupported path namespaces remain unresolved."
         }
         "baseline" => {
             "Usage: sideeffect baseline preview --label LABEL --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect baseline create --profile NEW_PROFILE.json --label LABEL --confirm-sha256 PREVIEW_SHA256 --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect baseline compare --profile PROFILE.json --baseline-session SESSION_DIR [--baseline-session SESSION_DIR...] --session CANDIDATE_SESSION_DIR [--session CANDIDATE_SESSION_DIR...]\nPreviews a bounded set of 1..=16 verified audit sessions and prints a deterministic preview digest. Creating a profile requires the exact digest and writes a new current-user-private file without replacing an existing file. Partial, incomplete, or loss-affected inputs are shown with their unknown coverage but cannot be promoted into a profile. A profile records only reviewed observations: software and signer identity are not recorded. Comparison requires the exact approved baseline sessions and matching manifest digests; a missing, replaced, or additional session prevents item comparison and exits with status 2. Candidate item differences are reported against the existing evidence-linked session diff, but the candidate is never absorbed automatically. Removal and absence claims are withheld when either side declares incomplete or unknown coverage. Differences do not establish unsafe behavior, causation, or complete system coverage."
@@ -6728,7 +6728,10 @@ struct ObservationWindowReport<'a> {
     runtime_artifacts: Vec<&'a sideeffect::audit_session::SessionArtifactRef>,
     root_comparison_diagnostic: Option<&'static str>,
     root_diff: Option<sideeffect::inventory::RootSnapshotDiff>,
+    #[cfg(target_os = "linux")]
     root_runtime_association: Option<sideeffect::inventory::RootRuntimeAssociationReport>,
+    #[cfg(windows)]
+    root_runtime_association: Option<sideeffect::inventory::WindowsRootRuntimeAssociationReport>,
     root_runtime_association_diagnostic: Option<&'static str>,
 }
 
@@ -6864,11 +6867,48 @@ fn compare_observation(session_path: &OsString) -> Result<ExitCode, String> {
         root_runtime_association,
         root_runtime_association_diagnostic,
         runtime_capture_completeness,
-    ) = (
-        None,
-        Some("linux_root_runtime_association_unsupported"),
-        None,
-    );
+    ) = {
+        let result = (|| {
+            use sideeffect::audit_session::ArtifactKind;
+            let capture_ref = runtime
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.kind == ArtifactKind::WindowsRuntimeCapture)
+                .ok_or("runtime_artifact_missing")?;
+            if capture_ref.path != "runtime.windows.json"
+                || capture_ref.schema != "sideeffect.windows_runtime_capture"
+                || capture_ref.schema_version != 3
+            {
+                return Err("runtime_artifact_contract_mismatch");
+            }
+            let capture_artifact = verified
+                .artifacts()
+                .iter()
+                .find(|artifact| {
+                    artifact.kind() == ArtifactKind::WindowsRuntimeCapture
+                        && artifact.path() == capture_ref.path
+                })
+                .ok_or("runtime_artifact_reference_mismatch")?;
+            let capture_bytes = capture_artifact.bytes();
+            if capture_ref.byte_length != capture_bytes.len() as u64
+                || capture_ref.sha256 != format!("{:x}", Sha256::digest(capture_bytes))
+            {
+                return Err("runtime_artifact_reference_mismatch");
+            }
+            let verified_diff = root_diff.as_ref().ok_or("selected_root_unavailable")?;
+            let association = sideeffect::inventory::associate_windows_root_runtime_diff(
+                verified_diff,
+                capture_bytes,
+            )
+            .map_err(|_| "root_runtime_association_unavailable")?;
+            let completeness = association.capture_completeness.to_owned();
+            Ok((association, completeness))
+        })();
+        match result {
+            Ok((association, completeness)) => (Some(association), None, Some(completeness)),
+            Err(diagnostic) => (None, Some(diagnostic), None),
+        }
+    };
     let complete = root_runtime_association_diagnostic.is_none()
         && root.status == sideeffect::audit_session::SourceStatus::Complete
         && runtime.status == sideeffect::audit_session::SourceStatus::Complete
@@ -6891,6 +6931,9 @@ fn compare_observation(session_path: &OsString) -> Result<ExitCode, String> {
         runtime_artifacts: runtime.artifacts.iter().collect(),
         root_comparison_diagnostic,
         root_diff,
+        #[cfg(target_os = "linux")]
+        root_runtime_association,
+        #[cfg(windows)]
         root_runtime_association,
         root_runtime_association_diagnostic,
     };
