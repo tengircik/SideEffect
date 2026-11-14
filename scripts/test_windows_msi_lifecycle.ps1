@@ -44,6 +44,8 @@ function New-MsiFixture {
         [Parameter(Mandatory = $true)][string] $ComponentCode,
         [Parameter(Mandatory = $true)][string] $DefaultDirectoryName,
         [Parameter(Mandatory = $true)][string] $DefaultInstallRoot,
+        [Parameter(Mandatory = $true)][string] $CabinetTemplate,
+        [Parameter(Mandatory = $true)][string] $ExpectedCabinet,
         [Parameter(Mandatory = $true)][string] $CandlePath,
         [Parameter(Mandatory = $true)][string] $LightPath
     )
@@ -62,7 +64,7 @@ function New-MsiFixture {
              InstallScope="perUser"
              InstallPrivileges="limited" />
     <MajorUpgrade DowngradeErrorMessage="A later synthetic fixture version is already installed." />
-    <MediaTemplate />
+    <MediaTemplate EmbedCab="yes" CabinetTemplate="$(var.CabinetTemplate)" />
     <Property Id="INSTALLROOT" Value="$(var.DefaultInstallRoot)" Secure="yes" />
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="INSTALLROOT" Name="$(var.DefaultDirectoryName)" />
@@ -98,6 +100,7 @@ function New-MsiFixture {
         "-dComponentCode=$ComponentCode",
         "-dDefaultDirectoryName=$DefaultDirectoryName",
         "-dDefaultInstallRoot=$DefaultInstallRoot",
+        "-dCabinetTemplate=$CabinetTemplate",
         "-dPayloadPath=$PayloadPath",
         '-out', $WixObjPath,
         $WxsPath
@@ -110,6 +113,50 @@ function New-MsiFixture {
     }
     if ((Get-Item -LiteralPath $MsiPath).Length -le 0) {
         throw "WiX created an empty MSI package: $MsiPath"
+    }
+    $cabinets = @(Get-MsiCabinetIdentifiers -MsiPath $MsiPath)
+    if ($cabinets.Count -ne 1 -or $cabinets[0] -ne $ExpectedCabinet -or -not $cabinets[0].StartsWith('#', [System.StringComparison]::Ordinal)) {
+        throw "MSI Media table did not contain the expected independently embedded cabinet '$ExpectedCabinet'; observed: $($cabinets -join ', ')."
+    }
+}
+
+function Get-MsiCabinetIdentifiers {
+    param([Parameter(Mandatory = $true)][string] $MsiPath)
+
+    $installer = $null
+    $database = $null
+    $view = $null
+    $identifiers = [System.Collections.Generic.List[string]]::new()
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        $database = $installer.OpenDatabase([System.IO.Path]::GetFullPath($MsiPath), 0) # MSIDBOPEN_READONLY
+        $view = $database.OpenView('SELECT `Cabinet` FROM `Media`')
+        $view.Execute($null)
+        while ($true) {
+            $record = $view.Fetch()
+            if ($null -eq $record) {
+                break
+            }
+            try {
+                $identifiers.Add([string]$record.StringData(1))
+            }
+            finally {
+                [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($record)
+            }
+        }
+        return $identifiers.ToArray()
+    }
+    finally {
+        if ($null -ne $view) {
+            try { $view.Close() } catch { }
+            [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($view)
+        }
+        if ($null -ne $database) {
+            [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($database)
+        }
+        if ($null -ne $installer) {
+            [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($installer)
+        }
     }
 }
 
@@ -515,8 +562,10 @@ try {
     $objV2 = Join-Path $script:TestRoot 'fixture-v2.wixobj'
     $msiV1 = Join-Path $script:TestRoot 'fixture-v1.msi'
     $msiV2 = Join-Path $script:TestRoot 'fixture-v2.msi'
-    New-MsiFixture -WxsPath $wxsV1 -WixObjPath $objV1 -MsiPath $msiV1 -PayloadPath $payloadV1Path -Version '1.0.0' -ProductCode $productCodeV1 -UpgradeCode $upgradeCode -ComponentCode $componentCode -DefaultDirectoryName $defaultDirectoryName -DefaultInstallRoot $script:InstallRoot -CandlePath $candlePath -LightPath $lightPath
-    New-MsiFixture -WxsPath $wxsV2 -WixObjPath $objV2 -MsiPath $msiV2 -PayloadPath $payloadV2Path -Version '2.0.0' -ProductCode $productCodeV2 -UpgradeCode $upgradeCode -ComponentCode $componentCode -DefaultDirectoryName $defaultDirectoryName -DefaultInstallRoot $script:InstallRoot -CandlePath $candlePath -LightPath $lightPath
+    $cabinetTemplateV1 = 'sideeffect-r5-v1-{0}.cab'
+    $cabinetTemplateV2 = 'sideeffect-r5-v2-{0}.cab'
+    New-MsiFixture -WxsPath $wxsV1 -WixObjPath $objV1 -MsiPath $msiV1 -PayloadPath $payloadV1Path -Version '1.0.0' -ProductCode $productCodeV1 -UpgradeCode $upgradeCode -ComponentCode $componentCode -DefaultDirectoryName $defaultDirectoryName -DefaultInstallRoot $script:InstallRoot -CabinetTemplate $cabinetTemplateV1 -ExpectedCabinet '#sideeffect-r5-v1-1.cab' -CandlePath $candlePath -LightPath $lightPath
+    New-MsiFixture -WxsPath $wxsV2 -WixObjPath $objV2 -MsiPath $msiV2 -PayloadPath $payloadV2Path -Version '2.0.0' -ProductCode $productCodeV2 -UpgradeCode $upgradeCode -ComponentCode $componentCode -DefaultDirectoryName $defaultDirectoryName -DefaultInstallRoot $script:InstallRoot -CabinetTemplate $cabinetTemplateV2 -ExpectedCabinet '#sideeffect-r5-v2-1.cab' -CandlePath $candlePath -LightPath $lightPath
 
     $beforePath = Join-Path $script:TestRoot 'before-install.json'
     $snapshotV1Path = Join-Path $script:TestRoot 'installed-v1.json'
