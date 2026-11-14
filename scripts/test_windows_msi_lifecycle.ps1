@@ -1000,3 +1000,4 @@ if ($null -ne $testFailure) {
 if ($cleanupErrors.Count -gt 0) {
     throw "MSI lifecycle passed, but fixture cleanup failed: $($cleanupErrors -join '; ')"
 }
+exit 0
