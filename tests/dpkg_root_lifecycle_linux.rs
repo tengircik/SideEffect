@@ -242,6 +242,15 @@ fn snapshot_payload_hash(document: &Value, expected_payload: &[u8]) -> usize {
     entry["ordinal"].as_u64().unwrap() as usize
 }
 
+fn snapshot_entry<'a>(document: &'a Value, name: &str) -> &'a Value {
+    document["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["display_name"] == name)
+        .unwrap_or_else(|| panic!("snapshot is missing expected entry {name}"))
+}
+
 fn snapshot_diff(before: &Path, after: &Path) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .args(["explain", "--inventory-diff"])
@@ -317,8 +326,8 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
     let v2_snapshot = snapshot(&install_root, &v2_snapshot_path);
     let v2_ordinal = snapshot_payload_hash(&v2_snapshot, payload_v2);
     assert_ne!(
-        v1_snapshot["entries"][0]["content_sha256"],
-        v2_snapshot["entries"][0]["content_sha256"]
+        snapshot_entry(&v1_snapshot, PAYLOAD_NAME)["content_sha256"],
+        snapshot_entry(&v2_snapshot, PAYLOAD_NAME)["content_sha256"]
     );
     let update_diff = snapshot_diff(&v1_snapshot_path, &v2_snapshot_path);
     assert_eq!(update_diff["counts"]["changes"], 1);
@@ -344,8 +353,8 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
     let downgraded_snapshot = snapshot(&install_root, &downgraded_snapshot_path);
     let downgraded_ordinal = snapshot_payload_hash(&downgraded_snapshot, payload_v1);
     assert_eq!(
-        downgraded_snapshot["entries"][0]["content_sha256"],
-        v1_snapshot["entries"][0]["content_sha256"]
+        snapshot_entry(&downgraded_snapshot, PAYLOAD_NAME)["content_sha256"],
+        snapshot_entry(&v1_snapshot, PAYLOAD_NAME)["content_sha256"]
     );
     let downgrade_diff = snapshot_diff(&v2_snapshot_path, &downgraded_snapshot_path);
     assert_eq!(downgrade_diff["counts"]["changes"], 1);
