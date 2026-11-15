@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+#[cfg(windows)]
 use sha2::{Digest, Sha256};
 #[cfg(windows)]
 use sideeffect::audit_session::{
