@@ -18,6 +18,10 @@ Fixtures are short hand-authored synthetic strace-like text files, never capture
 
 The corpus is bounded to 512 KiB. Each fixture is capped at 128 KiB, 64 KiB per physical record, and 1,000 records. Questions are capped at 2,048 UTF-8 bytes. These are development-corpus validation limits, not new product limits.
 
+## Label-review handoff
+
+`scripts/prepare_local_query_plan_v3_review.py --reviewer-packet PACKET --private-map MAP` creates a randomized question-only packet and a separate ID-to-case map. Keep the map private and do not commit either generated file. Each reviewer should independently fill every plan and rationale, identify themselves pseudonymously, and declare independence only if accurate. `scripts/validate_local_query_plan_v3_reviews.py` accepts two through eight returned packet/map pairs and emits only aggregate agreement diagnostics. It validates the plan schema and packet/map bindings, but cannot prove reviewer identity, independence, actual blinding, or whether labels are semantically correct. Since this development corpus and its oracle labels are public, the workflow does not create a hidden holdout or qualify a model. No completed review has been recorded.
+
 At generation time, `corpus.json` is 145,092 bytes with SHA-256 `93a70b85150d81c52586670600e36c472dbd0f2c40ec74f6b8065944eea0aec7`. Per-fixture SHA-256 values are pinned in the corpus document and verified by the validator.
 
 ## Reproduction

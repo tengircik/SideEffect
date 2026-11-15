@@ -24,6 +24,9 @@ import run_local_model_explain_corpus as process_helpers
 
 MAX_TIMEOUT_SECONDS = 120
 MAX_RESULTS_BYTES = 128 * 1024
+MAX_CLI_BYTES = 512 * 1024 * 1024
+MAX_SOURCE_BYTES = 2 * 1024 * 1024
+MAX_OUTPUT_SCHEMA_BYTES = 16 * 1024
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 ALLOWED_ENVIRONMENT = {
@@ -52,6 +55,69 @@ def _require(condition: bool, message: str) -> None:
         raise RunnerError(message)
 
 
+def _sha256_file(path: Path, limit: int, label: str) -> str:
+    """Hash a bounded regular file without exposing its local path in reports."""
+    try:
+        resolved = path.resolve(strict=True)
+        info = resolved.stat()
+        _require(resolved.is_file(), f"{label} must be a regular file")
+        _require(info.st_size > 0, f"{label} must not be empty")
+        _require(info.st_size <= limit, f"{label} exceeds its byte limit")
+        hasher = hashlib.sha256()
+        size = 0
+        with resolved.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                size += len(chunk)
+                _require(size <= limit, f"{label} exceeds its byte limit")
+                hasher.update(chunk)
+        final_info = resolved.stat()
+        _require(size == info.st_size and final_info.st_size == info.st_size
+                 and final_info.st_mtime_ns == info.st_mtime_ns,
+                 f"{label} changed size while it was being hashed")
+        return hasher.hexdigest()
+    except (OSError, RuntimeError, ValueError) as error:
+        if isinstance(error, RunnerError):
+            raise
+        raise RunnerError(f"cannot identify {label} ({type(error).__name__})") from None
+
+
+def _sha256_json(value: Any, label: str, limit: int = MAX_OUTPUT_SCHEMA_BYTES) -> str:
+    try:
+        encoded = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+                             allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError):
+        raise RunnerError(f"{label} is not canonical JSON") from None
+    _require(len(encoded) <= limit, f"{label} exceeds its byte limit")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _implementation_provenance(sideeffect_executable: Path) -> dict[str, str]:
+    """Return path-free identities for the exact CLI and evaluator contracts."""
+    return {
+        "sideeffect_binary_sha256": _sha256_file(sideeffect_executable, MAX_CLI_BYTES, "SideEffect executable"),
+        "runner_source_sha256": _sha256_file(Path(__file__), MAX_SOURCE_BYTES, "ETW query runner source"),
+        "evaluator_source_sha256": _sha256_file(Path(evaluator.__file__), MAX_SOURCE_BYTES, "ETW query evaluator source"),
+        "capture_contract_source_sha256": _sha256_file(
+            Path(evaluator.capture_contract.__file__), MAX_SOURCE_BYTES, "ETW capture contract source"),
+        "subprocess_helper_source_sha256": _sha256_file(
+            Path(process_helpers.__file__), MAX_SOURCE_BYTES, "subprocess helper source"),
+        "system_prompt_sha256": hashlib.sha256(EXPECTED_SYSTEM_PROMPT.encode("utf-8")).hexdigest(),
+        "query_scope_sha256": _sha256_json(QUERY_SCOPE, "query scope"),
+    }
+
+
+def _runtime_provenance(runtime: str | None) -> dict[str, str | None]:
+    if runtime is None:
+        return {
+            "binary_sha256": None,
+            "identity_status": "unavailable_for_implicitly_configured_runtime",
+        }
+    return {
+        "binary_sha256": _sha256_file(Path(runtime), MAX_CLI_BYTES, "explicit inference runtime"),
+        "identity_status": "sha256_of_explicit_runtime_file",
+    }
+
+
 def _decode_output(raw: bytes, label: str) -> dict[str, Any]:
     try:
         value = evaluator.capture_contract.decode_json(raw, label)
@@ -76,6 +142,34 @@ def _identity(preview: dict[str, Any], backend: str) -> dict[str, str]:
     _require(preview.get("backend_preference") == backend, "preview backend differs from requested backend")
     return {"model_id": model_id, "model_sha256": model_sha256,
             "runtime_source_revision": runtime_revision, "backend_preference": backend}
+
+
+def _validated_backend_used(preference: str, used: Any, status: Any) -> str:
+    _require(preference in {"auto", "cpu", "cuda"}, "backend preference is invalid")
+    _require(isinstance(used, str) and used in {"cpu", "cuda"}
+             and (preference == "auto" or used == preference),
+             "analysis backend does not match the reviewed backend preference")
+    expected_status = {
+        ("cpu", "cpu"): "cpu_explicitly_selected",
+        ("cuda", "cuda"): "cuda_requested_device_available",
+        ("auto", "cpu"): "cpu_used_no_cuda_device_available",
+        ("auto", "cuda"): "cuda_preferred_device_available",
+    }[(preference, used)]
+    _require(status == expected_status, "analysis backend status contradicts requested and effective backends")
+    return used
+
+
+def _effective_backend_summary(backends: list[str]) -> dict[str, Any]:
+    _require(all(backend in {"cpu", "cuda"} for backend in backends),
+             "effective backend list contains an unsupported value")
+    unique = sorted(set(backends))
+    return {
+        "effective_backend_counts": {"cpu": backends.count("cpu"), "cuda": backends.count("cuda")},
+        "effective_backends": unique,
+        "backend_consistency": (
+            "not_observed" if not unique else "single_backend" if len(unique) == 1 else "mixed_backends"
+        ),
+    }
 
 
 def _expected_queryable_rows(capture: dict[str, Any]) -> list[dict[str, Any]]:
@@ -131,6 +225,7 @@ def _validate_preview(preview: dict[str, Any], case: dict[str, Any], capture: di
              and prompt["supported_query_scope"] == QUERY_SCOPE,
              "model prompt contains evidence or differs from the bounded query scope")
     _require(isinstance(preview.get("output_schema"), dict), "preview output schema is missing")
+    output_schema_sha256 = _sha256_json(preview["output_schema"], "preview output schema")
     _require(isinstance(preview.get("model_revision"), str) and 0 < len(preview["model_revision"]) <= 128,
              "preview model revision is invalid")
     coverage = preview.get("coverage")
@@ -147,7 +242,9 @@ def _validate_preview(preview: dict[str, Any], case: dict[str, Any], capture: di
              "preview queryable facts do not exactly match the pinned decoded fixture")
     _require((coverage["query_status"] == "partial_or_unknown") == (omitted > 0
              or capture["capture_completeness"] != "complete"), "preview query status hides capture uncertainty")
-    return _identity(preview, backend)
+    identity = _identity(preview, backend)
+    identity["output_schema_sha256"] = output_schema_sha256
+    return identity
 
 
 def _matched_rows(rows: list[dict[str, Any]], plan: dict[str, Any]) -> list[dict[str, Any]]:
@@ -176,10 +273,8 @@ def _validate_result(result: dict[str, Any], preview: dict[str, Any], case: dict
         _require(result.get(key) == preview.get(key), f"analysis {key} differs from preview")
     _require(result.get("backend_preference") == identity["backend_preference"],
              "analysis backend preference differs from preview")
-    _require(isinstance(result.get("backend_used"), str) and result["backend_used"] in {"cpu", "cuda"}
-             and (identity["backend_preference"] == "auto"
-                  or result["backend_used"] == identity["backend_preference"]),
-             "analysis backend does not match the reviewed backend preference")
+    _validated_backend_used(identity["backend_preference"], result.get("backend_used"),
+                            result.get("backend_status"))
     _require(result.get("evaluation_status") == preview.get("evaluation_status"),
              "analysis changed the model evaluation status")
     plan = evaluator._validate_plan(result.get("plan"), case["id"])
@@ -213,15 +308,34 @@ def _safe_environment() -> dict[str, str]:
 
 def run_corpus(*, sideeffect_command: Sequence[str], backend: str, runtime: str | None,
                timeout_seconds: int = 120, environment: dict[str, str] | None = None,
-               invoke=process_helpers._invoke) -> dict[str, Any]:
+               invoke=process_helpers._invoke,
+               implementation: dict[str, str] | None = None) -> dict[str, Any]:
     _require(backend in {"auto", "cpu", "cuda"}, "backend must be auto, cpu, or cuda")
     _require(type(timeout_seconds) is int and 1 <= timeout_seconds <= MAX_TIMEOUT_SECONDS,
              "timeout must be between 1 and 120 seconds")
+    _require(bool(sideeffect_command) and all(isinstance(part, str) and part for part in sideeffect_command),
+             "SideEffect command must contain non-empty string arguments")
     if environment is None:
         environment = _safe_environment()
     _require(isinstance(environment, dict) and all(
         isinstance(key, str) and key.upper() in ALLOWED_ENVIRONMENT and isinstance(value, str)
         for key, value in environment.items()), "subprocess environment contains an unapproved value")
+    verify_implementation_files = implementation is None
+    if implementation is None:
+        _require(bool(sideeffect_command) and isinstance(sideeffect_command[0], str),
+                 "SideEffect command must begin with its executable path")
+        implementation = _implementation_provenance(Path(sideeffect_command[0]))
+    else:
+        required_implementation = {
+            "sideeffect_binary_sha256", "runner_source_sha256", "evaluator_source_sha256",
+            "capture_contract_source_sha256", "subprocess_helper_source_sha256",
+            "system_prompt_sha256", "query_scope_sha256",
+        }
+        _require(set(implementation) == required_implementation
+                 and all(isinstance(value, str) and SHA256_PATTERN.fullmatch(value)
+                         for value in implementation.values()),
+                 "implementation provenance is invalid")
+    runtime_identity = _runtime_provenance(runtime)
     corpus, corpus_sha256, corpus_summary = evaluator.load_corpus()
     fixtures: dict[str, tuple[bytes, dict[str, Any]]] = {}
     for manifest in corpus["fixtures"]:
@@ -232,6 +346,7 @@ def run_corpus(*, sideeffect_command: Sequence[str], backend: str, runtime: str 
     outcomes: list[dict[str, Any]] = []
     failures: dict[str, int] = {}
     latencies: list[int] = []
+    effective_backends: list[str] = []
     identity: dict[str, str] | None = None
     for case in corpus["cases"]:
         raw, capture = fixtures[case["fixture"]]
@@ -291,6 +406,7 @@ def run_corpus(*, sideeffect_command: Sequence[str], backend: str, runtime: str 
             if (result_code == 2) != partial:
                 raise RunnerError("result_exit_status_mismatch")
             latencies.append(latency)
+            effective_backends.append(result["backend_used"])
             outcomes.append({"case_id": case["id"], "behavior": case["behavior"],
                              "plan_exact": plan == case["expected_plan"],
                              "result_exact": matched_ordinals == case["expected_record_ordinals"],
@@ -314,9 +430,16 @@ def run_corpus(*, sideeffect_command: Sequence[str], backend: str, runtime: str 
             and outcomes_by_id[member]["result_exact"] for member in group["case_ids"])
         for group in corpus["permutation_groups"]
     )
+    if verify_implementation_files:
+        current_implementation = _implementation_provenance(Path(sideeffect_command[0]))
+        _require(current_implementation == implementation,
+                 "SideEffect executable or evaluation source changed during inference")
+    if runtime is not None:
+        _require(_runtime_provenance(runtime) == runtime_identity,
+                 "explicit inference runtime changed during inference")
     report = {
         "schema": "sideeffect.local_model_windows_etw_query_development_results",
-        "schema_version": 1,
+        "schema_version": 2,
         "qualification_result": "not_assessed",
         "semantic_quality_assessed": False,
         "independent_label_review": "not_verified",
@@ -324,6 +447,9 @@ def run_corpus(*, sideeffect_command: Sequence[str], backend: str, runtime: str 
         "inference_performed": True,
         "corpus_sha256": corpus_sha256,
         "label_review_status": corpus["label_review_status"],
+        "implementation": implementation,
+        "runtime_binary": runtime_identity,
+        "requested_backend": backend,
         "run": identity,
         "counts": {"cases": len(corpus["cases"]), "completed": len(outcomes),
                    "failed": len(corpus["cases"]) - len(outcomes)},
@@ -336,6 +462,7 @@ def run_corpus(*, sideeffect_command: Sequence[str], backend: str, runtime: str 
                                            "total": expected_answerable},
             "must_abstain_accuracy": {"correct": abstain_correct, "total": expected_abstain},
             "false_filters_on_must_abstain": false_filters,
+            **_effective_backend_summary(effective_backends),
             "p95_latency_ms": _percentile95(latencies),
             "p95_latency_scope": "successful_analysis_cases_only",
             "permutation_groups": {"passed": passing_groups, "total": len(corpus["permutation_groups"])},
