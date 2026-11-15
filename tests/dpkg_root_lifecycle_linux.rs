@@ -194,9 +194,40 @@ fn audit_dpkg_install(
     session_path: &Path,
 ) {
     let dpkg = dpkg_install_command(root, private_parent, deb, false);
+    audit_dpkg_command(
+        root,
+        private_parent,
+        observed_root,
+        session_path,
+        dpkg,
+        &["--install".to_owned(), deb.to_string_lossy().into_owned()],
+    );
+}
+
+fn audit_dpkg_purge(root: &Path, private_parent: &Path, observed_root: &Path, session_path: &Path) {
+    let mut dpkg = isolated_dpkg_command(root, private_parent);
+    dpkg.args(["--purge", PACKAGE_NAME]);
+    audit_dpkg_command(
+        root,
+        private_parent,
+        observed_root,
+        session_path,
+        dpkg,
+        &["--purge".to_owned(), PACKAGE_NAME.to_owned()],
+    );
+}
+
+fn audit_dpkg_command(
+    root: &Path,
+    private_parent: &Path,
+    observed_root: &Path,
+    session_path: &Path,
+    dpkg: Command,
+    operation_arguments: &[String],
+) {
     let program = dpkg.get_program().to_owned();
     let arguments = dpkg.get_args().map(OsString::from).collect::<Vec<_>>();
-    let expected_arguments = [
+    let mut expected_arguments = vec![
         format!("--root={}", root.canonicalize().unwrap().display()),
         format!(
             "--admindir={}",
@@ -213,9 +244,8 @@ fn audit_dpkg_install(
         ),
         "--force-not-root".to_owned(),
         "--no-triggers".to_owned(),
-        "--install".to_owned(),
-        deb.to_string_lossy().into_owned(),
     ];
+    expected_arguments.extend_from_slice(operation_arguments);
     assert_eq!(
         arguments
             .iter()
@@ -273,23 +303,11 @@ fn audit_dpkg_install(
     }
     let output = audit
         .output()
-        .expect("launch observed isolated dpkg install");
+        .expect("launch observed isolated dpkg transaction");
     assert_eq!(
         output.status.code(),
         Some(2),
         "runtime-containing audit sessions are partial by contract: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn dpkg_purge(root: &Path, private_parent: &Path) {
-    let output = isolated_dpkg_command(root, private_parent)
-        .args(["--purge", PACKAGE_NAME])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "isolated dpkg purge failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -473,7 +491,7 @@ fn assert_observed_dpkg_transition(
     session_path: &Path,
     observed_root: &Path,
     payload_before: Option<&[u8]>,
-    payload_after: &[u8],
+    payload_after: Option<&[u8]>,
 ) {
     let manifest_path = session_path.join("session.json");
     let manifest_bytes = fs::read(&manifest_path).unwrap();
@@ -565,7 +583,10 @@ fn assert_observed_dpkg_transition(
         before_entries.len(),
         1 + usize::from(payload_before.is_some())
     );
-    assert_eq!(after_snapshot["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        after_snapshot["entries"].as_array().unwrap().len(),
+        1 + usize::from(payload_after.is_some())
+    );
     let before_payload = before_entries
         .iter()
         .find(|entry| entry["display_name"] == PAYLOAD_NAME);
@@ -579,24 +600,33 @@ fn assert_observed_dpkg_transition(
         (None, None) => assert_eq!(before_entries.len(), 1),
         _ => panic!("before snapshot payload presence did not match the expected transition"),
     }
-    let after_payload = snapshot_entry(&after_snapshot, PAYLOAD_NAME);
-    assert_eq!(after_payload["content_hash_status"], "observed");
-    assert_eq!(after_payload["content_sha256"], sha256_hex(payload_after));
-    assert_eq!(
-        after_payload["evidence"]["source"],
-        "selected_root_directory_entry"
-    );
-    assert_eq!(
-        after_payload["evidence"]["entry_ordinal"],
-        after_payload["ordinal"]
-    );
-    if let Some(expected_before) = payload_before {
-        assert_ne!(
-            snapshot_entry(&before_snapshot, PAYLOAD_NAME)["content_sha256"],
-            after_payload["content_sha256"],
-            "the verified session snapshots must show the observed fixture content change"
-        );
-        assert_ne!(expected_before, payload_after);
+    let after_entries = after_snapshot["entries"].as_array().unwrap();
+    let after_payload = after_entries
+        .iter()
+        .find(|entry| entry["display_name"] == PAYLOAD_NAME);
+    match (payload_after, after_payload) {
+        (Some(expected), Some(entry)) => {
+            assert_eq!(entry["content_hash_status"], "observed");
+            assert_eq!(entry["content_sha256"], sha256_hex(expected));
+            assert_eq!(entry["evidence"]["source"], "selected_root_directory_entry");
+            assert_eq!(entry["evidence"]["entry_ordinal"], entry["ordinal"]);
+        }
+        (None, None) => assert_eq!(after_entries.len(), 1),
+        _ => panic!("after snapshot payload presence did not match the expected transition"),
+    }
+    match (payload_before, payload_after) {
+        (Some(before), Some(after)) => {
+            assert_ne!(before, after);
+            assert_ne!(
+                snapshot_entry(&before_snapshot, PAYLOAD_NAME)["content_sha256"],
+                snapshot_entry(&after_snapshot, PAYLOAD_NAME)["content_sha256"],
+                "the verified session snapshots must show the observed fixture content change"
+            );
+        }
+        (Some(_), None) | (None, Some(_)) => {}
+        (None, None) => {
+            panic!("an observed lifecycle transition must change payload presence or content")
+        }
     }
 
     let run: Value = serde_json::from_slice(&fs::read(session_path.join("run.json")).unwrap())
@@ -630,20 +660,27 @@ fn assert_observed_dpkg_transition(
     );
     let report: Value = serde_json::from_slice(&compared.stdout).unwrap();
     assert_eq!(report["root_comparison_status"], "complete");
-    let expected_delta_kind = if payload_before.is_some() {
-        "changed"
-    } else {
-        "added"
+    let expected_delta_kind = match (payload_before.is_some(), payload_after.is_some()) {
+        (false, true) => "added",
+        (true, true) => "changed",
+        (true, false) => "removed",
+        (false, false) => unreachable!("validated above"),
     };
     assert_eq!(
         report["root_diff"]["counts"]["additions"],
-        usize::from(payload_before.is_none())
+        usize::from(expected_delta_kind == "added")
     );
-    assert_eq!(report["root_diff"]["counts"]["removals"], 0);
+    assert_eq!(
+        report["root_diff"]["counts"]["removals"],
+        usize::from(expected_delta_kind == "removed")
+    );
     assert_eq!(
         report["root_diff"]["counts"]["changes"],
-        usize::from(payload_before.is_some())
+        usize::from(expected_delta_kind == "changed")
     );
+    let delta = &report["root_diff"]["deltas"][0];
+    assert_eq!(delta["kind"], expected_delta_kind);
+    assert_eq!(delta["name"], PAYLOAD_NAME);
     assert_eq!(report["runtime_source_status"], "partial");
     assert_eq!(report["runtime_capture_completeness"], "unknown");
 
@@ -657,43 +694,17 @@ fn assert_observed_dpkg_transition(
     assert_eq!(association["trace_sha256"], trace_ref.sha256);
     let payload_path = observed_root.join(PAYLOAD_NAME);
     let payload_path = payload_path.to_string_lossy();
-
     let staged_payload_path = observed_root.join(format!("{PAYLOAD_NAME}.dpkg-new"));
     let staged_payload_path = staged_payload_path.to_string_lossy();
-    let rename = trace
-        .records
-        .iter()
-        .find(|record| {
-            matches!(
-                record.syscall.as_deref(),
-                Some("rename" | "renameat" | "renameat2")
-            ) && record.raw_result.as_deref() == Some("0")
-                && record.raw_arguments.as_ref().is_some_and(|arguments| {
-                    arguments.contains(staged_payload_path.as_ref())
-                        && arguments.contains(payload_path.as_ref())
-                })
-        })
-        .expect("raw trace must record dpkg's successful staging-to-final rename");
-    assert_eq!(rename.kind, TraceRecordKind::Syscall);
-    assert_eq!(
-        rename.outcome, None,
-        "rename is not interpreted by the typed outcome adapter"
-    );
     assert_eq!(
         trace.source_sha256,
         sha256_hex(&trace_bytes),
         "parsed runtime rows must retain the exact trace fingerprint"
     );
-    let start = rename.evidence.byte_offset as usize;
-    let end = start
-        .checked_add(rename.evidence.byte_length as usize)
-        .expect("rename evidence range does not overflow");
-    assert_eq!(&trace_bytes[start..end], rename.raw_line.as_bytes());
-    assert!(rename.raw_line.ends_with(" = 0"));
 
-    // The successful staging-to-final rename now supplies the added payload's
-    // only lexical candidate, matched at its destination operand. The staging
-    // path never appears in either snapshot, so its name never becomes a delta.
+    // The observed successful mutation supplies a candidate only on the delta's
+    // supported side: rename destination for add/change, unlink or rename source
+    // for removal. The staging path is not a snapshot delta.
     assert_eq!(association["summary"]["delta_count"], 1);
     assert_eq!(association["summary"]["candidate_match_count"], 1);
     assert_eq!(association["summary"]["unmatched_delta_count"], 0);
@@ -702,10 +713,7 @@ fn assert_observed_dpkg_transition(
     assert_eq!(associations[0]["delta_kind"], expected_delta_kind);
     assert_eq!(associations[0]["status"], "candidate_match");
     assert_eq!(associations[0]["candidate_path"], payload_path.as_ref());
-    if payload_before.is_some() {
-        let delta = &report["root_diff"]["deltas"][0];
-        assert_eq!(delta["kind"], "changed");
-        assert_eq!(delta["name"], PAYLOAD_NAME);
+    if expected_delta_kind == "changed" {
         assert!(
             delta["changed_fields"]
                 .as_array()
@@ -721,6 +729,12 @@ fn assert_observed_dpkg_transition(
             delta["after"]["entry_ordinal"],
             snapshot_entry(&after_snapshot, PAYLOAD_NAME)["ordinal"]
         );
+    } else if expected_delta_kind == "removed" {
+        assert_eq!(
+            delta["before"]["entry_ordinal"],
+            snapshot_entry(&before_snapshot, PAYLOAD_NAME)["ordinal"]
+        );
+        assert!(delta["after"].is_null());
     }
     assert!(
         !associations[0]["multiple_runtime_observations"]
@@ -729,40 +743,87 @@ fn assert_observed_dpkg_transition(
     );
     let evidence = associations[0]["runtime_evidence"].as_array().unwrap();
     assert_eq!(evidence.len(), 1);
-    assert!(
-        matches!(
-            evidence[0]["syscall"].as_str(),
-            Some("rename" | "renameat" | "renameat2")
-        ),
-        "{}",
-        evidence[0]["syscall"]
-    );
-    assert_eq!(evidence[0]["line_number"], rename.evidence.line_number);
-    assert_eq!(evidence[0]["byte_offset"], rename.evidence.byte_offset);
-    assert_eq!(evidence[0]["byte_length"], rename.evidence.byte_length);
-    assert_eq!(evidence[0]["trace_sha256"], trace_ref.sha256);
-
-    let staged_create = trace
+    let runtime_mutation = trace
         .records
         .iter()
         .find(|record| {
-            matches!(record.syscall.as_deref(), Some("openat" | "openat2"))
-                && record.outcome == Some(SyscallOutcome::Success)
-                && record
-                    .raw_arguments
-                    .as_ref()
-                    .is_some_and(|arguments| arguments.contains("O_CREAT"))
-                && record
-                    .lexical_path_hint
-                    .as_ref()
-                    .is_some_and(|hint| hint.path == staged_payload_path.as_ref())
+            record.evidence.line_number == evidence[0]["line_number"]
+                && record.evidence.byte_offset == evidence[0]["byte_offset"]
+                && record.evidence.byte_length == evidence[0]["byte_length"]
         })
-        .expect("raw trace must retain a successful create of the dpkg staging path");
-    let start = staged_create.evidence.byte_offset as usize;
+        .expect("association locator must resolve to one parsed raw trace row");
+    assert_eq!(
+        evidence[0]["syscall"],
+        runtime_mutation.syscall.as_deref().unwrap()
+    );
+    assert_eq!(evidence[0]["trace_sha256"], trace_ref.sha256);
+    assert_eq!(runtime_mutation.kind, TraceRecordKind::Syscall);
+    assert_eq!(runtime_mutation.raw_result.as_deref(), Some("0"));
+    match expected_delta_kind {
+        "added" | "changed" => {
+            assert!(matches!(
+                runtime_mutation.syscall.as_deref(),
+                Some("rename" | "renameat" | "renameat2")
+            ));
+            let arguments = runtime_mutation.raw_arguments.as_deref().unwrap();
+            assert!(arguments.contains(staged_payload_path.as_ref()));
+            assert!(arguments.contains(payload_path.as_ref()));
+            assert_eq!(runtime_mutation.outcome, None);
+        }
+        "removed" => match runtime_mutation.syscall.as_deref() {
+            Some("unlink") => assert_eq!(
+                runtime_mutation.raw_arguments.as_deref(),
+                Some(format!("\"{payload_path}\"").as_str())
+            ),
+            Some("unlinkat") => {
+                let arguments = runtime_mutation.raw_arguments.as_deref().unwrap();
+                let parts = arguments.split(',').map(str::trim).collect::<Vec<_>>();
+                assert_eq!(parts.len(), 3);
+                assert!(parts[0].starts_with("AT_FDCWD"));
+                assert_eq!(parts[1], format!("\"{payload_path}\""));
+                assert_eq!(parts[2], "0");
+            }
+            Some("rename" | "renameat" | "renameat2") => {
+                let arguments = runtime_mutation.raw_arguments.as_deref().unwrap();
+                assert!(arguments.starts_with(&format!("\"{payload_path}\",")));
+            }
+            other => panic!("unexpected syscall for a removal association: {other:?}"),
+        },
+        _ => unreachable!("transition kind was established above"),
+    }
+    let start = runtime_mutation.evidence.byte_offset as usize;
     let end = start
-        .checked_add(staged_create.evidence.byte_length as usize)
-        .expect("staging create evidence range does not overflow");
-    assert_eq!(&trace_bytes[start..end], staged_create.raw_line.as_bytes());
+        .checked_add(runtime_mutation.evidence.byte_length as usize)
+        .expect("runtime mutation evidence range does not overflow");
+    assert_eq!(
+        &trace_bytes[start..end],
+        runtime_mutation.raw_line.as_bytes()
+    );
+    assert!(runtime_mutation.raw_line.ends_with(" = 0"));
+
+    if payload_after.is_some() {
+        let staged_create = trace
+            .records
+            .iter()
+            .find(|record| {
+                matches!(record.syscall.as_deref(), Some("openat" | "openat2"))
+                    && record.outcome == Some(SyscallOutcome::Success)
+                    && record
+                        .raw_arguments
+                        .as_ref()
+                        .is_some_and(|arguments| arguments.contains("O_CREAT"))
+                    && record
+                        .lexical_path_hint
+                        .as_ref()
+                        .is_some_and(|hint| hint.path == staged_payload_path.as_ref())
+            })
+            .expect("raw trace must retain a successful create of the dpkg staging path");
+        let start = staged_create.evidence.byte_offset as usize;
+        let end = start
+            .checked_add(staged_create.evidence.byte_length as usize)
+            .expect("staging create evidence range does not overflow");
+        assert_eq!(&trace_bytes[start..end], staged_create.raw_line.as_bytes());
+    }
 }
 
 fn assert_session_artifacts_verified<'a>(
@@ -831,7 +892,7 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
         &deb_v1,
         &observed_v1_session,
     );
-    assert_observed_dpkg_transition(&observed_v1_session, &install_root, None, payload_v1);
+    assert_observed_dpkg_transition(&observed_v1_session, &install_root, None, Some(payload_v1));
     let packages_v1_path = private_parent.join("packages-installed-v1.json");
     let packages_v1 = dpkg_query_inventory(&private_root, private_parent, &packages_v1_path);
     assert_package_version(&packages_v1, Some("1.0-1"));
@@ -865,7 +926,7 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
         &observed_v2_session,
         &install_root,
         Some(payload_v1),
-        payload_v2,
+        Some(payload_v2),
     );
     let packages_v2_path = private_parent.join("packages-installed-v2.json");
     let packages_v2 = dpkg_query_inventory(&private_root, private_parent, &packages_v2_path);
@@ -931,7 +992,19 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
         downgraded_ordinal
     );
 
-    dpkg_purge(&private_root, private_parent);
+    let observed_purge_session = private_parent.join("observed-purge-v1.session");
+    audit_dpkg_purge(
+        &private_root,
+        private_parent,
+        &install_root,
+        &observed_purge_session,
+    );
+    assert_observed_dpkg_transition(
+        &observed_purge_session,
+        &install_root,
+        Some(payload_v1),
+        None,
+    );
     let packages_purged_path = private_parent.join("packages-purged.json");
     let packages_purged =
         dpkg_query_inventory(&private_root, private_parent, &packages_purged_path);
