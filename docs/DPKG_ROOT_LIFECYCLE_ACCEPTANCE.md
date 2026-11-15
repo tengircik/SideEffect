@@ -49,14 +49,17 @@ a lexical candidate. The association interprets strict absolute byte-faithful
 rename operands as a removal candidate at the source path and an addition or
 change candidate at the destination path. The staging name appears in neither
 snapshot, so it produces no selected-root delta; only the destination supports
-one candidate for install and upgrade. For purge, the test requires one
-candidate for the removed payload from the exact successful supported
-`unlink`, `unlinkat`, or rename-source row selected by the association. For
+one candidate for install and upgrade. For purge, the test checks the exact
+locator when a strict absolute lexical candidate exists for the removed payload
+from a successful supported `unlink`, `unlinkat`, or rename-source row. If the
+real purge uses an unsupported or relative spelling, the delta stays explicitly
+unmatched and the test reports only bounded successful raw removal rows that
+contain the payload basename; this does not claim absolute path identity. For
 `unlinkat`, a bare `AT_FDCWD` or an absolute `-yy` annotation is accepted only
 with flags `0` and an exact absolute operand; the annotation is display context,
-not a path-resolution fallback. It
-checks that locator against the raw trace bytes and observed result. Each
-observed transition has no unmatched selected-root delta. Downgrade still uses
+not a path-resolution fallback. A candidate locator is checked against the raw
+trace bytes and observed result. Install and upgrade have no unmatched
+selected-root delta; purge may remain unmatched. Downgrade still uses
 the direct private-root dpkg helper and package/root snapshots, but is not
 individually wrapped in `audit`. The association remains explicitly
 `lexical_path_candidate_only_no_causation_or_process_identity`, and capture

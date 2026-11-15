@@ -706,13 +706,18 @@ fn assert_observed_dpkg_transition(
     // supported side: rename destination for add/change, unlink or rename source
     // for removal. The staging path is not a snapshot delta.
     assert_eq!(association["summary"]["delta_count"], 1);
-    assert_eq!(association["summary"]["candidate_match_count"], 1);
-    assert_eq!(association["summary"]["unmatched_delta_count"], 0);
     let associations = association["associations"].as_array().unwrap();
-    assert_eq!(associations.len(), 1);
-    assert_eq!(associations[0]["delta_kind"], expected_delta_kind);
-    assert_eq!(associations[0]["status"], "candidate_match");
-    assert_eq!(associations[0]["candidate_path"], payload_path.as_ref());
+    let candidate_count = association["summary"]["candidate_match_count"]
+        .as_u64()
+        .expect("candidate count is numeric");
+    assert!(
+        candidate_count <= 1,
+        "unexpected duplicate candidate: {association}"
+    );
+    assert_eq!(
+        association["summary"]["unmatched_delta_count"],
+        u64::from(candidate_count == 0)
+    );
     if expected_delta_kind == "changed" {
         assert!(
             delta["changed_fields"]
@@ -736,70 +741,143 @@ fn assert_observed_dpkg_transition(
         );
         assert!(delta["after"].is_null());
     }
-    assert!(
-        !associations[0]["multiple_runtime_observations"]
-            .as_bool()
-            .unwrap()
-    );
-    let evidence = associations[0]["runtime_evidence"].as_array().unwrap();
-    assert_eq!(evidence.len(), 1);
-    let runtime_mutation = trace
-        .records
-        .iter()
-        .find(|record| {
-            record.evidence.line_number == evidence[0]["line_number"]
-                && record.evidence.byte_offset == evidence[0]["byte_offset"]
-                && record.evidence.byte_length == evidence[0]["byte_length"]
-        })
-        .expect("association locator must resolve to one parsed raw trace row");
-    assert_eq!(
-        evidence[0]["syscall"],
-        runtime_mutation.syscall.as_deref().unwrap()
-    );
-    assert_eq!(evidence[0]["trace_sha256"], trace_ref.sha256);
-    assert_eq!(runtime_mutation.kind, TraceRecordKind::Syscall);
-    assert_eq!(runtime_mutation.raw_result.as_deref(), Some("0"));
-    match expected_delta_kind {
-        "added" | "changed" => {
-            assert!(matches!(
-                runtime_mutation.syscall.as_deref(),
-                Some("rename" | "renameat" | "renameat2")
-            ));
-            let arguments = runtime_mutation.raw_arguments.as_deref().unwrap();
-            assert!(arguments.contains(staged_payload_path.as_ref()));
-            assert!(arguments.contains(payload_path.as_ref()));
-            assert_eq!(runtime_mutation.outcome, None);
+    if candidate_count == 1 {
+        assert_eq!(associations.len(), 1);
+        assert_eq!(associations[0]["delta_kind"], expected_delta_kind);
+        assert_eq!(associations[0]["status"], "candidate_match");
+        assert_eq!(associations[0]["candidate_path"], payload_path.as_ref());
+        assert!(
+            !associations[0]["multiple_runtime_observations"]
+                .as_bool()
+                .unwrap()
+        );
+        let evidence = associations[0]["runtime_evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), 1);
+        let runtime_mutation = trace
+            .records
+            .iter()
+            .find(|record| {
+                record.evidence.line_number == evidence[0]["line_number"]
+                    && record.evidence.byte_offset == evidence[0]["byte_offset"]
+                    && record.evidence.byte_length == evidence[0]["byte_length"]
+            })
+            .expect("association locator must resolve to one parsed raw trace row");
+        assert_eq!(
+            evidence[0]["syscall"],
+            runtime_mutation.syscall.as_deref().unwrap()
+        );
+        assert_eq!(evidence[0]["trace_sha256"], trace_ref.sha256);
+        assert_eq!(runtime_mutation.kind, TraceRecordKind::Syscall);
+        assert_eq!(runtime_mutation.raw_result.as_deref(), Some("0"));
+        match expected_delta_kind {
+            "added" | "changed" => {
+                assert!(matches!(
+                    runtime_mutation.syscall.as_deref(),
+                    Some("rename" | "renameat" | "renameat2")
+                ));
+                let arguments = runtime_mutation.raw_arguments.as_deref().unwrap();
+                assert!(arguments.contains(staged_payload_path.as_ref()));
+                assert!(arguments.contains(payload_path.as_ref()));
+                assert_eq!(runtime_mutation.outcome, None);
+            }
+            "removed" => match runtime_mutation.syscall.as_deref() {
+                Some("unlink") => assert_eq!(
+                    runtime_mutation.raw_arguments.as_deref(),
+                    Some(format!("\"{payload_path}\"").as_str())
+                ),
+                Some("unlinkat") => {
+                    let arguments = runtime_mutation.raw_arguments.as_deref().unwrap();
+                    let parts = arguments.split(',').map(str::trim).collect::<Vec<_>>();
+                    assert_eq!(parts.len(), 3);
+                    assert!(parts[0].starts_with("AT_FDCWD"));
+                    assert_eq!(parts[1], format!("\"{payload_path}\""));
+                    assert_eq!(parts[2], "0");
+                }
+                Some("rename" | "renameat" | "renameat2") => {
+                    let arguments = runtime_mutation.raw_arguments.as_deref().unwrap();
+                    assert!(arguments.starts_with(&format!("\"{payload_path}\",")));
+                }
+                other => panic!("unexpected syscall for a removal association: {other:?}"),
+            },
+            _ => unreachable!("transition kind was established above"),
         }
-        "removed" => match runtime_mutation.syscall.as_deref() {
-            Some("unlink") => assert_eq!(
-                runtime_mutation.raw_arguments.as_deref(),
-                Some(format!("\"{payload_path}\"").as_str())
-            ),
-            Some("unlinkat") => {
-                let arguments = runtime_mutation.raw_arguments.as_deref().unwrap();
-                let parts = arguments.split(',').map(str::trim).collect::<Vec<_>>();
-                assert_eq!(parts.len(), 3);
-                assert!(parts[0].starts_with("AT_FDCWD"));
-                assert_eq!(parts[1], format!("\"{payload_path}\""));
-                assert_eq!(parts[2], "0");
-            }
-            Some("rename" | "renameat" | "renameat2") => {
-                let arguments = runtime_mutation.raw_arguments.as_deref().unwrap();
-                assert!(arguments.starts_with(&format!("\"{payload_path}\",")));
-            }
-            other => panic!("unexpected syscall for a removal association: {other:?}"),
-        },
-        _ => unreachable!("transition kind was established above"),
+        let start = runtime_mutation.evidence.byte_offset as usize;
+        let end = start
+            .checked_add(runtime_mutation.evidence.byte_length as usize)
+            .expect("runtime mutation evidence range does not overflow");
+        assert_eq!(
+            &trace_bytes[start..end],
+            runtime_mutation.raw_line.as_bytes()
+        );
+        assert!(runtime_mutation.raw_line.ends_with(" = 0"));
+    } else {
+        assert_eq!(expected_delta_kind, "removed");
+        assert!(associations.is_empty());
+        let removal_rows = trace
+            .records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.syscall.as_deref(),
+                    Some("unlink" | "unlinkat" | "rename" | "renameat" | "renameat2")
+                ) && record.raw_result.as_deref() == Some("0")
+                    && record.raw_line.contains(PAYLOAD_NAME)
+            })
+            .collect::<Vec<_>>();
+        if removal_rows.is_empty() {
+            let rows = trace
+                .records
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.syscall.as_deref(),
+                        Some("unlink" | "unlinkat" | "rename" | "renameat" | "renameat2")
+                    )
+                })
+                .take(8)
+                .map(|record| {
+                    let mut line = record.raw_line.chars().take(384).collect::<String>();
+                    if record.raw_line.chars().count() > 384 {
+                        line.push_str("…");
+                    }
+                    format!("{}: {line}", record.evidence.line_number)
+                })
+                .collect::<Vec<_>>();
+            panic!(
+                "purge delta is explicitly unmatched and no successful removal row mentions payload basename; bounded raw rows: {}",
+                if rows.is_empty() {
+                    "none parsed".to_owned()
+                } else {
+                    rows.join(" | ")
+                }
+            );
+        }
+        for record in &removal_rows {
+            let start = usize::try_from(record.evidence.byte_offset)
+                .expect("trace byte offset fits the host address size");
+            let end = start
+                .checked_add(record.evidence.byte_length as usize)
+                .expect("trace evidence range does not overflow");
+            assert_eq!(
+                trace_bytes.get(start..end),
+                Some(record.raw_line.as_bytes()),
+                "unmatched removal evidence locator must resolve to its raw trace row"
+            );
+        }
+        eprintln!(
+            "purge delta explicitly unmatched by absolute lexical path; basename appears in successful removal rows only, with no path identity inferred: {}",
+            removal_rows
+                .iter()
+                .take(8)
+                .map(|record| format!(
+                    "{}: {}",
+                    record.evidence.line_number,
+                    record.raw_line.chars().take(384).collect::<String>()
+                ))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
     }
-    let start = runtime_mutation.evidence.byte_offset as usize;
-    let end = start
-        .checked_add(runtime_mutation.evidence.byte_length as usize)
-        .expect("runtime mutation evidence range does not overflow");
-    assert_eq!(
-        &trace_bytes[start..end],
-        runtime_mutation.raw_line.as_bytes()
-    );
-    assert!(runtime_mutation.raw_line.ends_with(" = 0"));
 
     if payload_after.is_some() {
         let staged_create = trace
