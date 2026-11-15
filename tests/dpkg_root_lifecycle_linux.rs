@@ -838,7 +838,7 @@ fn assert_observed_dpkg_transition(
                 .map(|record| {
                     let mut line = record.raw_line.chars().take(384).collect::<String>();
                     if record.raw_line.chars().count() > 384 {
-                        line.push_str("…");
+                        line.push('…');
                     }
                     format!("{}: {line}", record.evidence.line_number)
                 })
