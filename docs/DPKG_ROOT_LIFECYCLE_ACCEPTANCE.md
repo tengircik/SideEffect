@@ -35,32 +35,24 @@ snapshot rows. A fixture-owned anchor file keeps the selected directory
 present throughout the lifecycle, so the final snapshot can directly confirm
 that the package payload is absent after purge while the anchor remains.
 
-The v1 install phase is also launched through the real
-`audit --observe-root --hash-regular-files` CLI. The test builds that CLI's
-argument vector from the same fixed `/usr/bin/dpkg` command and private-root
-arguments used by the unobserved lifecycle phases, preserving argument
-boundaries. It clears the audit process environment and copies only the
-fixture dpkg command's fixed `PATH`, `LC_ALL`, and private `TMPDIR` overrides;
-the package command itself still targets only the canonicalized fixture root,
-admin directory, and log under the private temporary parent. The resulting
-session is compared with `compare-observation`: the selected-root diff must
-show the added payload. The runtime association must link the added payload to
-the successful staging-to-final `rename` as a lexical candidate: the
-association interprets a successful rename with strict absolute byte-faithful
-operands as a removal candidate at its source path and an addition/change
-candidate at its destination path. The test verifies each referenced runtime
-line locator against the
-raw `trace.strace` bytes and parsed successful syscall result, plus the
-session-manifest artifact digests. The trace must retain both a successful
-create of `payload.bin.dpkg-new` and a `rename` return value of zero to the final
-payload path. The staged `payload.bin.dpkg-new` name appears in neither
-snapshot, so only the destination operand produces a candidate; the test
-asserts one `candidate_match` for the added payload and no unmatched delta,
-while the source operand supports nothing because the staging name is not a
-root delta. The remaining update, downgrade, and purge
-transitions use the same direct private-root dpkg helper and are checked with
-package/root snapshots, but are not individually wrapped in `audit`. The
-association remains explicitly
+The v1 install and v2 upgrade phases are also launched through the real
+`audit --observe-root --hash-regular-files` CLI. Both use the same assertion
+helper: it verifies the session-manifest artifact digests, before/after
+selected-root snapshot content hashes, and exact raw `trace.strace` evidence
+locators. For installation, the selected-root diff shows one added payload;
+for upgrade, it shows one changed payload with different before/after content
+hashes. In each capture the trace must retain a successful create of
+`payload.bin.dpkg-new` and a `rename` return value of zero to the final payload
+path. The runtime association links the final path to that exact successful
+rename as a lexical candidate. The association interprets strict absolute
+byte-faithful rename operands as a removal candidate at the source path and an
+addition/change candidate at the destination path. The staging name appears in
+neither snapshot, so it produces no selected-root delta; the destination
+supports one candidate for the added payload on install and the changed
+payload on upgrade. Both reports have no unmatched delta. The remaining
+downgrade and purge transitions use the same direct private-root dpkg helper
+and are checked with package/root snapshots, but are not individually wrapped
+in `audit`. The association remains explicitly
 `lexical_path_candidate_only_no_causation_or_process_identity`, and capture
 completeness remains unknown. A candidate link to the rename destination does
 not prove the package command caused the file state, that the rename and the

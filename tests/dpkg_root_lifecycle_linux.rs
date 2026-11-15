@@ -1,7 +1,9 @@
 #![cfg(target_os = "linux")]
 
 use serde_json::Value;
-use sideeffect::audit_session::{ArtifactKind, SourceRole, SourceStatus, parse_manifest};
+use sideeffect::audit_session::{
+    ArtifactKind, SessionArtifactRef, SourceRole, SourceStatus, parse_manifest,
+};
 use sideeffect::inventory::parse_dpkg_query_output;
 use sideeffect::limits::ParseLimits;
 use sideeffect::model::{SyscallOutcome, TraceRecordKind};
@@ -467,7 +469,12 @@ fn snapshot_diff(before: &Path, after: &Path) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-fn assert_observed_dpkg_install(session_path: &Path, observed_root: &Path) {
+fn assert_observed_dpkg_transition(
+    session_path: &Path,
+    observed_root: &Path,
+    payload_before: Option<&[u8]>,
+    payload_after: &[u8],
+) {
     let manifest_path = session_path.join("session.json");
     let manifest_bytes = fs::read(&manifest_path).unwrap();
     let manifest = parse_manifest(&manifest_bytes).expect("validate observation session manifest");
@@ -524,15 +531,72 @@ fn assert_observed_dpkg_install(session_path: &Path, observed_root: &Path) {
     assert_eq!(run_ref.path, "run.json");
     assert_eq!(trace_ref.path, "trace.strace");
 
-    for artifact in root_source.artifacts.iter().chain(&runtime.artifacts) {
-        let path = session_path.join(&artifact.path);
-        let metadata = fs::symlink_metadata(&path).expect("session artifact exists");
-        assert!(metadata.is_file());
-        assert!(!metadata.file_type().is_symlink());
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-        let bytes = fs::read(path).unwrap();
-        assert_eq!(artifact.byte_length, bytes.len() as u64);
-        assert_eq!(artifact.sha256, sha256_hex(&bytes));
+    assert_session_artifacts_verified(
+        session_path,
+        root_source.artifacts.iter().chain(&runtime.artifacts),
+    );
+
+    let before_ref = root_source
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == ArtifactKind::SelectedRoot)
+        .unwrap();
+    let after_ref = root_source
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == ArtifactKind::SelectedRootAfter)
+        .unwrap();
+    let before_snapshot: Value =
+        serde_json::from_slice(&fs::read(session_path.join(before_ref.path.as_str())).unwrap())
+            .expect("transition before snapshot JSON");
+    let after_snapshot: Value =
+        serde_json::from_slice(&fs::read(session_path.join(after_ref.path.as_str())).unwrap())
+            .expect("transition after snapshot JSON");
+    for snapshot in [&before_snapshot, &after_snapshot] {
+        assert_eq!(snapshot["schema"], "sideeffect.selected_root_inventory");
+        assert_eq!(snapshot["schema_version"], 2);
+        assert_eq!(snapshot["status"], "complete");
+        let anchor = snapshot_entry(snapshot, ANCHOR_NAME);
+        assert_eq!(anchor["content_hash_status"], "observed");
+        assert_eq!(anchor["content_sha256"], sha256_hex(ANCHOR_CONTENT));
+    }
+    let before_entries = before_snapshot["entries"].as_array().unwrap();
+    assert_eq!(
+        before_entries.len(),
+        1 + usize::from(payload_before.is_some())
+    );
+    assert_eq!(after_snapshot["entries"].as_array().unwrap().len(), 2);
+    let before_payload = before_entries
+        .iter()
+        .find(|entry| entry["display_name"] == PAYLOAD_NAME);
+    match (payload_before, before_payload) {
+        (Some(expected), Some(entry)) => {
+            assert_eq!(entry["content_hash_status"], "observed");
+            assert_eq!(entry["content_sha256"], sha256_hex(expected));
+            assert_eq!(entry["evidence"]["source"], "selected_root_directory_entry");
+            assert_eq!(entry["evidence"]["entry_ordinal"], entry["ordinal"]);
+        }
+        (None, None) => assert_eq!(before_entries.len(), 1),
+        _ => panic!("before snapshot payload presence did not match the expected transition"),
+    }
+    let after_payload = snapshot_entry(&after_snapshot, PAYLOAD_NAME);
+    assert_eq!(after_payload["content_hash_status"], "observed");
+    assert_eq!(after_payload["content_sha256"], sha256_hex(payload_after));
+    assert_eq!(
+        after_payload["evidence"]["source"],
+        "selected_root_directory_entry"
+    );
+    assert_eq!(
+        after_payload["evidence"]["entry_ordinal"],
+        after_payload["ordinal"]
+    );
+    if let Some(expected_before) = payload_before {
+        assert_ne!(
+            snapshot_entry(&before_snapshot, PAYLOAD_NAME)["content_sha256"],
+            after_payload["content_sha256"],
+            "the verified session snapshots must show the observed fixture content change"
+        );
+        assert_ne!(expected_before, payload_after);
     }
 
     let run: Value = serde_json::from_slice(&fs::read(session_path.join("run.json")).unwrap())
@@ -566,8 +630,20 @@ fn assert_observed_dpkg_install(session_path: &Path, observed_root: &Path) {
     );
     let report: Value = serde_json::from_slice(&compared.stdout).unwrap();
     assert_eq!(report["root_comparison_status"], "complete");
-    assert_eq!(report["root_diff"]["counts"]["additions"], 1);
+    let expected_delta_kind = if payload_before.is_some() {
+        "changed"
+    } else {
+        "added"
+    };
+    assert_eq!(
+        report["root_diff"]["counts"]["additions"],
+        usize::from(payload_before.is_none())
+    );
     assert_eq!(report["root_diff"]["counts"]["removals"], 0);
+    assert_eq!(
+        report["root_diff"]["counts"]["changes"],
+        usize::from(payload_before.is_some())
+    );
     assert_eq!(report["runtime_source_status"], "partial");
     assert_eq!(report["runtime_capture_completeness"], "unknown");
 
@@ -623,9 +699,29 @@ fn assert_observed_dpkg_install(session_path: &Path, observed_root: &Path) {
     assert_eq!(association["summary"]["unmatched_delta_count"], 0);
     let associations = association["associations"].as_array().unwrap();
     assert_eq!(associations.len(), 1);
-    assert_eq!(associations[0]["delta_kind"], "added");
+    assert_eq!(associations[0]["delta_kind"], expected_delta_kind);
     assert_eq!(associations[0]["status"], "candidate_match");
     assert_eq!(associations[0]["candidate_path"], payload_path.as_ref());
+    if payload_before.is_some() {
+        let delta = &report["root_diff"]["deltas"][0];
+        assert_eq!(delta["kind"], "changed");
+        assert_eq!(delta["name"], PAYLOAD_NAME);
+        assert!(
+            delta["changed_fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| { field == "content_sha256" })
+        );
+        assert_eq!(
+            delta["before"]["entry_ordinal"],
+            snapshot_entry(&before_snapshot, PAYLOAD_NAME)["ordinal"]
+        );
+        assert_eq!(
+            delta["after"]["entry_ordinal"],
+            snapshot_entry(&after_snapshot, PAYLOAD_NAME)["ordinal"]
+        );
+    }
     assert!(
         !associations[0]["multiple_runtime_observations"]
             .as_bool()
@@ -667,6 +763,22 @@ fn assert_observed_dpkg_install(session_path: &Path, observed_root: &Path) {
         .checked_add(staged_create.evidence.byte_length as usize)
         .expect("staging create evidence range does not overflow");
     assert_eq!(&trace_bytes[start..end], staged_create.raw_line.as_bytes());
+}
+
+fn assert_session_artifacts_verified<'a>(
+    session_path: &Path,
+    artifacts: impl Iterator<Item = &'a SessionArtifactRef>,
+) {
+    for artifact in artifacts {
+        let path = session_path.join(&artifact.path);
+        let metadata = fs::symlink_metadata(&path).expect("session artifact exists");
+        assert!(metadata.is_file());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let bytes = fs::read(path).unwrap();
+        assert_eq!(artifact.byte_length, bytes.len() as u64);
+        assert_eq!(artifact.sha256, sha256_hex(&bytes));
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -719,7 +831,7 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
         &deb_v1,
         &observed_v1_session,
     );
-    assert_observed_dpkg_install(&observed_v1_session, &install_root);
+    assert_observed_dpkg_transition(&observed_v1_session, &install_root, None, payload_v1);
     let packages_v1_path = private_parent.join("packages-installed-v1.json");
     let packages_v1 = dpkg_query_inventory(&private_root, private_parent, &packages_v1_path);
     assert_package_version(&packages_v1, Some("1.0-1"));
@@ -741,7 +853,20 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
         "selected_root_directory_entry"
     );
 
-    dpkg_install(&private_root, private_parent, &deb_v2, false);
+    let observed_v2_session = private_parent.join("observed-upgrade-v2.session");
+    audit_dpkg_install(
+        &private_root,
+        private_parent,
+        &install_root,
+        &deb_v2,
+        &observed_v2_session,
+    );
+    assert_observed_dpkg_transition(
+        &observed_v2_session,
+        &install_root,
+        Some(payload_v1),
+        payload_v2,
+    );
     let packages_v2_path = private_parent.join("packages-installed-v2.json");
     let packages_v2 = dpkg_query_inventory(&private_root, private_parent, &packages_v2_path);
     assert_package_version(&packages_v2, Some("2.0-1"));
