@@ -253,6 +253,80 @@ function Get-MsiInstallArgumentVector {
     )
 }
 
+function Get-SafeFileIoOperationClass {
+    param([AllowNull()][string] $Operation)
+
+    $known = @(
+        'name', 'create_name', 'delete_name', 'rundown_name', 'create_request',
+        'read_request', 'write_request', 'set_information_request', 'delete_request',
+        'rename_request', 'query_information_request', 'file_system_control_request',
+        'cleanup', 'close', 'flush_request'
+    )
+    if ($Operation -cin $known) { return $Operation }
+    if ([string]::IsNullOrEmpty($Operation)) { return 'unknown' }
+    return 'other'
+}
+
+function Get-SafePathNamespaceClass {
+    param([AllowNull()][string] $Path)
+
+    if ([string]::IsNullOrEmpty($Path)) { return 'unknown' }
+    if ($Path -cmatch '^[A-Za-z]:\\') { return 'dos_drive' }
+    if ($Path.StartsWith('\Device\', [StringComparison]::OrdinalIgnoreCase) -or
+        $Path.StartsWith('\??\', [StringComparison]::OrdinalIgnoreCase)) {
+        return 'nt_device'
+    }
+    if ($Path.StartsWith('\\?\', [StringComparison]::Ordinal)) { return 'verbatim' }
+    if ($Path.StartsWith('\\', [StringComparison]::Ordinal)) { return 'unc' }
+    return 'relative_or_other'
+}
+
+function Get-SafeEtwDiagnosticClass {
+    param([AllowNull()][string] $Diagnostic)
+
+    if ([string]::IsNullOrEmpty($Diagnostic)) { return 'unknown' }
+    switch -Regex ($Diagnostic) {
+        '^event_or_payload_limit_reached$' { return 'event_or_payload_limit_reached' }
+        '^invalid_or_unsupported_etw_record_seen$' { return 'invalid_or_unsupported_etw_record_seen' }
+        '^oversized_or_null_etw_payload_events:[0-9]+$' { return 'oversized_or_null_etw_payload_events' }
+        '^unexpected_provider_events:[0-9]+$' { return 'unexpected_provider_events' }
+        '^etw_reported_event_loss$' { return 'etw_reported_event_loss' }
+        '^etw_loss_statistics_unavailable$' { return 'etw_loss_statistics_unavailable' }
+        '^etw_final_loss_statistics_unavailable$' { return 'etw_final_loss_statistics_unavailable' }
+        '^etw_pre_stop_query_failed:[0-9]+$' { return 'etw_pre_stop_query_failed' }
+        '^etw_stop_failed:[0-9]+$' { return 'etw_stop_failed' }
+        '^duration_limit_reached;' { return 'duration_limit_reached' }
+        default { return 'other' }
+    }
+}
+
+function Get-SafeAssociationDiagnosticClass {
+    param([AllowNull()][string] $Diagnostic)
+
+    $known = @(
+        'different_namespaces_remain_unresolved',
+        'raw_cross_check_rejected_file_name_events',
+        'no_same_namespace_exact_path_candidate_was_observed',
+        'runtime_observation_limit_reached',
+        'association_output_limit_reached',
+        'selected_root_is_not_a_dos_drive_path',
+        'runtime_capture_completeness_is_unknown'
+    )
+    if ($Diagnostic -cin $known) { return $Diagnostic }
+    if ([string]::IsNullOrEmpty($Diagnostic)) { return 'unknown' }
+    return 'other'
+}
+
+function Add-SafeSummaryCount {
+    param(
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary] $Counts,
+        [Parameter(Mandatory = $true)][string] $Class
+    )
+
+    if (-not $Counts.Contains($Class)) { $Counts[$Class] = 0 }
+    $Counts[$Class] = [int]$Counts[$Class] + 1
+}
+
 function Get-StartupSourceStatus {
     param(
         [Parameter(Mandatory = $true)] $Document,
@@ -315,6 +389,7 @@ function Assert-StartupObservation {
 
     $beforeServices = @($before.service_entries | Where-Object { $_.service_name -ceq $ServiceName })
     $beforeTasks = @($before.scheduled_task_entries | Where-Object { $_.task_path -ceq $TaskPath })
+    $beforeActions = @($before.scheduled_task_actions | Where-Object { $_.task_path -ceq $TaskPath })
     $afterServices = @($after.service_entries | Where-Object { $_.service_name -ceq $ServiceName })
     $afterTasks = @($after.scheduled_task_entries | Where-Object { $_.task_path -ceq $TaskPath })
     $serviceStatusBefore = Get-StartupSourceStatus -Document $before -SourceId 'service_start_configuration'
@@ -326,19 +401,21 @@ function Assert-StartupObservation {
             throw "Startup source returned an unsupported status '$status'."
         }
     }
-    if ($beforeServices.Count -ne 0 -or $beforeTasks.Count -ne 0) {
+    if ($beforeServices.Count -ne 0 -or $beforeTasks.Count -ne 0 -or $beforeActions.Count -ne 0) {
         throw 'A generated startup fixture identity was present in the before artifact.'
     }
 
     $serviceAvailable = $serviceStatusAfter -cin @('complete', 'partial')
     $taskAvailable = $taskStatusAfter -cin @('complete', 'partial')
     if ($serviceAvailable) {
-        if (($serviceStatusAfter -ceq 'complete' -and $afterServices.Count -ne 1) -or $afterServices.Count -gt 1) {
-            throw 'The SCM source did not show exactly one fixture service despite complete coverage, or showed ambiguous duplicate identities.'
+        if ($afterServices.Count -ne 1) {
+            throw "The SCM source status is $serviceStatusAfter but did not expose exactly one authored fixture service row (observed $($afterServices.Count))."
         }
-        if ($afterServices.Count -eq 1 -and
-            ($afterServices[0].start_type -cne 'disabled' -or
-                $afterServices[0].binary_path -notlike "*$([IO.Path]::GetFileName($InertImagePath))*")) {
+        $serviceIndex = [Array]::IndexOf($after.service_entries, $afterServices[0])
+        if ($afterServices[0].evidence.source -cne 'EnumServicesStatusExW/OpenServiceW/QueryServiceConfigW/QueryServiceConfig2W' -or
+            $serviceIndex -lt 0 -or $afterServices[0].evidence.service_index -ne $serviceIndex -or
+            $afterServices[0].start_type -cne 'disabled' -or
+            $afterServices[0].binary_path -notlike "*$([IO.Path]::GetFileName($InertImagePath))*") {
             throw 'The after artifact did not show exactly one disabled SCM fixture with its unique inert image path.'
         }
     }
@@ -346,26 +423,40 @@ function Assert-StartupObservation {
         throw 'An unavailable SCM source unexpectedly exposed a fixture service row.'
     }
     $afterActions = @($after.scheduled_task_actions | Where-Object {
-        $_.task_path -ceq $TaskPath -and $_.action_index -eq 0
+        $_.task_path -ceq $TaskPath
     })
     if ($taskAvailable) {
-        if (($taskStatusAfter -ceq 'complete' -and ($afterTasks.Count -ne 1 -or $afterActions.Count -ne 1)) -or
-            $afterTasks.Count -gt 1 -or $afterActions.Count -gt 1) {
-            throw 'The Task Scheduler source did not show the complete fixture rows or returned ambiguous duplicate identities.'
+        if ($afterTasks.Count -ne 1 -or $afterActions.Count -ne 1) {
+            throw "The Task Scheduler source status is $taskStatusAfter but did not expose exactly one authored fixture trigger and one action row (triggers=$($afterTasks.Count), actions=$($afterActions.Count))."
         }
-        if ($afterTasks.Count -eq 1 -and ($afterTasks[0].task_enabled -ne $false -or
-            $afterTasks[0].trigger_type -cne 'logon' -or $afterTasks[0].trigger_enabled -ne $false)) {
-            throw 'The after artifact did not show exactly one disabled task and disabled logon trigger.'
+        $taskRow = $afterTasks[0]
+        $actionRow = $afterActions[0]
+        if ($actionRow.action_index -ne 0) {
+            throw 'The authored fixture action did not retain its expected first-action index.'
         }
-        if ($afterActions.Count -eq 1 -and ($afterActions[0].status -cne 'observed' -or
-            $afterActions[0].executable_path -cne [IO.Path]::GetFullPath($InertImagePath) -or
+        if ($taskRow.trigger_type -cne 'logon' -or $taskRow.task_enabled -ne $false -or
+            $taskRow.trigger_enabled -ne $false -or
+            $taskRow.startup_state.configured -cne 'present' -or
+            $taskRow.startup_state.effective.status -cne 'unknown' -or
+            $taskRow.startup_state.observed.status -cne 'unknown' -or
+            $taskRow.evidence.source -cne 'Task Scheduler IRegisteredTask/ITaskDefinition/ITrigger' -or
+            -not ($taskRow.evidence.task_index -is [ValueType]) -or
+            -not ($taskRow.evidence.trigger_index -is [ValueType]) -or
+            $taskRow.evidence.trigger_index -ne 0) {
+            throw 'The after artifact did not show exactly one disabled fixture task and disabled logon trigger with exact source indexes.'
+        }
+        if ($actionRow.status -cne 'observed' -or $actionRow.action_type -cne 'exec' -or
+            $actionRow.executable_path -cne [IO.Path]::GetFullPath($InertImagePath) -or
             (Test-Path -LiteralPath $InertImagePath) -or
-            $afterActions[0].startup_state.effective.status -cne 'unknown' -or
-            $afterActions[0].startup_state.observed.status -cne 'unknown')) {
-            throw 'The after artifact did not preserve the exact inert task action and unknown effective/observed state.'
+            $actionRow.startup_state.effective.status -cne 'unknown' -or
+            $actionRow.startup_state.observed.status -cne 'unknown' -or
+            $actionRow.evidence.source -cne 'Task Scheduler IActionCollection/IExecAction' -or
+            $actionRow.evidence.task_index -ne $taskRow.evidence.task_index -or
+            $actionRow.evidence.action_index -ne 0) {
+            throw 'The after artifact did not preserve exactly one inert fixture Exec action with indexed evidence and unknown effective/observed state.'
         }
     }
-    elseif ($afterTasks.Count -ne 0) {
+    elseif ($afterTasks.Count -ne 0 -or $afterActions.Count -ne 0) {
         throw 'An unavailable Task Scheduler source unexpectedly exposed a fixture row.'
     }
 
@@ -675,6 +766,8 @@ function Invoke-ObservedMsiInstall {
     }
     $rawPayloadHashes = @{}
     $payloadNameEvidence = [System.Collections.Generic.List[object]]::new()
+    $payloadOperationClassCounts = [ordered]@{}
+    $payloadNamespaceClassCounts = [ordered]@{}
     for ($eventIndex = 0; $eventIndex -lt $capture.events.Count; $eventIndex++) {
         $event = $capture.events[$eventIndex]
         if ($event.event_kind -ne 'file_io_observation' -or $event.observation_decoding.status -ne 'decoded' -or
@@ -682,6 +775,9 @@ function Invoke-ObservedMsiInstall {
             [System.IO.Path]::GetFileName([string]$event.observation_decoding.observation.activity.observation.path) -ine 'payload.bin') {
             continue
         }
+        $fileObservation = $event.observation_decoding.observation.activity.observation
+        Add-SafeSummaryCount -Counts $payloadOperationClassCounts -Class (Get-SafeFileIoOperationClass -Operation ([string]$fileObservation.operation))
+        Add-SafeSummaryCount -Counts $payloadNamespaceClassCounts -Class (Get-SafePathNamespaceClass -Path ([string]$fileObservation.path))
         $rawPayload = [Convert]::FromHexString([string]$event.raw_payload_hex)
         $rawPayloadHash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::HashData($rawPayload)).Replace('-', '').ToLowerInvariant()
         $payloadNameUtf16 = [System.Text.Encoding]::Unicode.GetBytes('payload.bin')
@@ -726,7 +822,52 @@ function Invoke-ObservedMsiInstall {
     elseif ($association.association_status -eq 'insufficient_evidence' -and
         $association.summary.candidate_match_count -eq 0 -and
         @($association.diagnostics | Where-Object { $_ -in @('different_namespaces_remain_unresolved', 'no_same_namespace_exact_path_candidate_was_observed') }).Count -gt 0) {
-        Write-Output "ETW observed the fixture payload basename in decoded file-name rows, but the comparator reported no exact path candidate; root/runtime association remains unresolved. Evidence references (capped at 8): $(@($payloadNameEvidence | Select-Object -First 8) | ConvertTo-Json -Compress -Depth 4)"
+        $captureDiagnosticClassCounts = [ordered]@{}
+        foreach ($diagnostic in @($capture.diagnostics)) {
+            Add-SafeSummaryCount -Counts $captureDiagnosticClassCounts -Class (Get-SafeEtwDiagnosticClass -Diagnostic ([string]$diagnostic))
+        }
+        $associationDiagnosticClassCounts = [ordered]@{}
+        foreach ($diagnostic in @($association.diagnostics)) {
+            Add-SafeSummaryCount -Counts $associationDiagnosticClassCounts -Class (Get-SafeAssociationDiagnosticClass -Diagnostic ([string]$diagnostic))
+        }
+        $loss = $capture.event_loss
+        $lossCountersAvailable = $null -ne $loss -and $loss.loss_statistics_available -eq $true
+        $crossCheckCountAvailable = $null -ne $association.summary -and
+            $null -ne $association.summary.PSObject.Properties['cross_check_rejected_event_count'] -and
+            $association.summary.cross_check_rejected_event_count -is [ValueType]
+        $collectionClass = if ($capture.collection_status -cin @('complete', 'partial')) { [string]$capture.collection_status } else { 'other' }
+        $stopReasonClass = if ($capture.stop_reason -cin @('target_exited', 'duration_limit_reached', 'event_limit_reached', 'etw_loss_reported', 'etw_statistics_unavailable')) { [string]$capture.stop_reason } else { 'other' }
+        $safeAssociationSummary = [ordered]@{
+            capture_collection_status = $collectionClass
+            capture_stop_reason = $stopReasonClass
+            payload_name_observation_count = $payloadNameEvidence.Count
+            raw_payload_basename_byte_check_count = $payloadNameEvidence.Count
+            file_io_operation_class_counts = $payloadOperationClassCounts
+            payload_path_namespace_class_counts = $payloadNamespaceClassCounts
+            association_namespace_counts = [ordered]@{
+                name_bearing_file_events = [long]$association.summary.name_bearing_file_event_count
+                directional_file_name_events = [long]$association.summary.directional_file_name_event_count
+                same_dos_drive_events = [long]$association.summary.same_dos_drive_event_count
+                nt_device_namespace_events = [long]$association.summary.nt_device_namespace_event_count
+                unc_namespace_events = [long]$association.summary.unc_namespace_event_count
+                verbatim_namespace_events = [long]$association.summary.verbatim_namespace_event_count
+                relative_or_other_namespace_events = [long]$association.summary.relative_or_other_namespace_event_count
+                different_dos_drive_events = [long]$association.summary.different_dos_drive_event_count
+                runtime_rows_omitted = [long]$association.summary.runtime_observation_rows_omitted_to_limit
+            }
+            raw_cross_check_count_available = $crossCheckCountAvailable
+            association_capture_wide_cross_check_rejected_file_name_event_count = if ($crossCheckCountAvailable) { [long]$association.summary.cross_check_rejected_event_count } else { $null }
+            association_diagnostic_class_counts = $associationDiagnosticClassCounts
+            capture_diagnostic_array_available = $null -ne $capture.PSObject.Properties['diagnostics']
+            capture_diagnostic_entry_count = @($capture.diagnostics).Count
+            capture_diagnostic_class_counts = $captureDiagnosticClassCounts
+            loss_counters_available = $lossCountersAvailable
+            final_loss_snapshot_available = ($null -ne $loss -and $loss.final_snapshot_available -eq $true)
+            events_lost = if ($lossCountersAvailable) { [long]$loss.events_lost } else { $null }
+            log_buffers_lost = if ($lossCountersAvailable) { [long]$loss.log_buffers_lost } else { $null }
+            real_time_buffers_lost = if ($lossCountersAvailable) { [long]$loss.real_time_buffers_lost } else { $null }
+        }
+        Write-Output "ETW recorded decoded payload-basename observations, but no exact path candidate was available; the selected-root/runtime relationship remains unresolved. Bounded enum/count diagnostics only: $($safeAssociationSummary | ConvertTo-Json -Compress -Depth 6). Evidence references (capped at 8): $(@($payloadNameEvidence | Select-Object -First 8) | ConvertTo-Json -Compress -Depth 4)"
     }
     else {
         throw 'ETW payload-name evidence was not supported by a candidate or an explicit unresolved namespace diagnostic.'
