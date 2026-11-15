@@ -264,7 +264,25 @@ pub fn collect_and_publish(
         let (status, diagnostics) = status_from_serialized(&doc, "status");
         let value = serde_json::to_vec(&doc)
             .map_err(|e| format!("could not serialize startup inventory: {e}"))?;
-        sources.push(source(SourceRole::Startup, "selected Run/RunOnce, Startup folders, services including read-only delayed-auto-start, dependency, load-order group, and service trigger configuration, visible boot/logon scheduled tasks, and local ROOT\\subscription WMI permanent event subscriptions", doc.capture_started_at_unix_ms, doc.capture_ended_at_unix_ms, status, diagnostics, vec![("max_startup_entries", 8192), ("max_service_trigger_entries", 8192), ("max_service_trigger_data_bytes", 1048576), ("deadline_ms_between_calls", 10000)]));
+        let scope = if options.observation_window {
+            "the same selected v10 Windows startup configuration sources, including local ROOT\\subscription WMI permanent event subscriptions, inventoried before and after the bounded ETW command; configuration only, no execution or causation claim"
+        } else {
+            "selected Run/RunOnce, Startup folders, services including read-only delayed-auto-start, dependency, load-order group, and service trigger configuration, visible boot/logon scheduled tasks, and local ROOT\\subscription WMI permanent event subscriptions"
+        };
+        sources.push(source(
+            SourceRole::Startup,
+            scope,
+            doc.capture_started_at_unix_ms,
+            doc.capture_ended_at_unix_ms,
+            status,
+            diagnostics,
+            vec![
+                ("max_startup_entries", 8192),
+                ("max_service_trigger_entries", 8192),
+                ("max_service_trigger_data_bytes", 1048576),
+                ("deadline_ms_between_calls", 10000),
+            ],
+        ));
         artifacts.push(artifact(
             ArtifactKind::WindowsStartup,
             "startup.windows.json",
@@ -575,6 +593,55 @@ pub fn collect_and_publish(
             doc.schema_version,
             bytes,
         ));
+        if options.startup {
+            let startup_after = crate::inventory::collect_windows_startup();
+            let (after_status, after_diagnostics) =
+                status_from_serialized(&startup_after, "status");
+            let startup_source = sources
+                .iter_mut()
+                .find(|source| source.role == SourceRole::Startup)
+                .expect("startup source was collected before the observation window");
+            startup_source.ended_at_unix_ms = startup_after.capture_ended_at_unix_ms;
+            if startup_source.status != SourceStatus::Complete
+                || after_status != SourceStatus::Complete
+            {
+                startup_source.status = SourceStatus::Partial;
+            }
+            startup_source
+                .diagnostic_codes
+                .extend(after_diagnostics.into_iter().map(str::to_owned));
+            startup_source.diagnostic_codes.sort();
+            startup_source.diagnostic_codes.dedup();
+            if startup_source.diagnostic_codes.len()
+                > crate::audit_session::MAX_DIAGNOSTIC_CODES_PER_SOURCE
+            {
+                startup_source
+                    .diagnostic_codes
+                    .truncate(crate::audit_session::MAX_DIAGNOSTIC_CODES_PER_SOURCE);
+                startup_source.status = SourceStatus::Partial;
+            }
+            let startup_bytes = serde_json::to_vec(&startup_after)
+                .map_err(|e| format!("could not serialize after startup inventory: {e}"))?;
+            let existing_bytes = artifacts.iter().try_fold(0usize, |total, artifact| {
+                total.checked_add(artifact.bytes.len())
+            });
+            if startup_bytes.len() as u64 > MAX_SESSION_ARTIFACT_BYTES
+                || existing_bytes
+                    .and_then(|total| total.checked_add(startup_bytes.len()))
+                    .is_none_or(|total| {
+                        total > MAX_WINDOWS_SESSION_BYTES.saturating_sub(512 * 1024)
+                    })
+            {
+                return Err("after startup inventory exceeds the audit-session artifact or aggregate byte limit".to_owned());
+            }
+            artifacts.push(artifact(
+                ArtifactKind::WindowsStartupAfter,
+                "startup-after.windows.json",
+                "sideeffect.windows_startup_inventory",
+                startup_after.schema_version,
+                startup_bytes,
+            ));
+        }
     }
 
     let context = host_context();
@@ -700,6 +767,8 @@ fn build_manifest(
             .iter()
             .filter(|artifact| {
                 role_kind(source.role) == Some(artifact.kind)
+                    || (source.role == SourceRole::Startup
+                        && artifact.kind == ArtifactKind::WindowsStartupAfter)
                     || (source.role == SourceRole::SelectedRoot
                         && artifact.kind == ArtifactKind::SelectedRootAfter)
             })
@@ -922,7 +991,8 @@ fn collect_windows_startup_for_session(
         crate::audit_session::AUDIT_SESSION_V13_SCHEMA_VERSION => Ok(collect_windows_startup_v8()),
         crate::audit_session::AUDIT_SESSION_V14_SCHEMA_VERSION => Ok(collect_windows_startup_v9()),
         crate::audit_session::AUDIT_SESSION_V15_SCHEMA_VERSION
-        | crate::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION => {
+        | crate::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION
+        | crate::audit_session::AUDIT_SESSION_V17_SCHEMA_VERSION => {
             Ok(crate::inventory::collect_windows_startup())
         }
         _ => Err("unsupported Windows audit-session schema version".to_owned()),
@@ -931,7 +1001,11 @@ fn collect_windows_startup_for_session(
 
 fn session_schema_version(options: &WindowsAuditOptions) -> u32 {
     if options.observation_window {
-        crate::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION
+        if options.startup {
+            crate::audit_session::AUDIT_SESSION_V17_SCHEMA_VERSION
+        } else {
+            crate::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION
+        }
     } else if options.startup {
         crate::audit_session::AUDIT_SESSION_V15_SCHEMA_VERSION
     } else if options.app_paths {
@@ -1005,12 +1079,19 @@ mod tests {
             observation_window: true,
             root_path: Some(std::path::PathBuf::from("C:\\scope")),
             include_runtime: true,
-            startup: true,
             ..WindowsAuditOptions::default()
         };
         assert_eq!(
             session_schema_version(&observation),
             crate::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION
+        );
+        let observation_with_startup = WindowsAuditOptions {
+            startup: true,
+            ..observation.clone()
+        };
+        assert_eq!(
+            session_schema_version(&observation_with_startup),
+            crate::audit_session::AUDIT_SESSION_V17_SCHEMA_VERSION
         );
 
         let base = std::env::temp_dir().join(format!(
