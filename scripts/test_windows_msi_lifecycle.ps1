@@ -801,6 +801,9 @@ function Invoke-ObservedMsiInstall {
     if ($payloadNameEvidence.Count -eq 0) {
         throw 'ETW capture did not contain a decoded file-name observation for the fixture payload basename.'
     }
+    Assert-ObservedNtRootRuntimeAssociation -SessionPath $SessionPath -Comparison $comparison `
+        -ExpectedDeltaKind $ExpectedDeltaKind -Capture $capture -CaptureArtifactHash $captureArtifactHash `
+        -RawPayloadHashes $rawPayloadHashes
 
     $candidate = @($association.associations | Where-Object { $_.candidate_path -ceq $expectedPath -and $_.delta_kind -eq $ExpectedDeltaKind -and $_.etw_operation -eq 'create_name' })
     if ($candidate.Count -gt 0) {
@@ -1145,8 +1148,8 @@ function Assert-ObservedSessionSoftwareComparison {
     $manifestItem = Get-Item -LiteralPath $manifestPath
     if ($manifestItem.Length -gt 1048576) { throw 'Observation session manifest exceeded the bounded acceptance size.' }
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-    if ($manifest.schema -ne 'sideeffect.audit_session' -or $manifest.schema_version -ne 18) {
-        throw 'Observed MSI package session did not use the v18 observation manifest.'
+    if ($manifest.schema -ne 'sideeffect.audit_session' -or $manifest.schema_version -ne 19) {
+        throw 'Observed MSI package session did not use the v19 observation manifest.'
     }
     $packageSources = @($manifest.sources | Where-Object { $_.role -eq 'packages' })
     if ($packageSources.Count -ne 1) { throw 'Observed MSI session did not have exactly one manifest-linked package source.' }
@@ -1265,6 +1268,176 @@ function Assert-ObservedSessionSoftwareComparison {
     else {
         Write-Output 'Observed-session MSI ProductCode transitions were matched to exact current-user Uninstall subkeys and evidence-linked software diff rows.'
     }
+}
+
+function Assert-ObservedNtRootRuntimeAssociation {
+    param(
+        [Parameter(Mandatory = $true)][string] $SessionPath,
+        [Parameter(Mandatory = $true)] $Comparison,
+        [Parameter(Mandatory = $true)][string] $ExpectedDeltaKind,
+        [Parameter(Mandatory = $true)] $Capture,
+        [Parameter(Mandatory = $true)][string] $CaptureArtifactHash,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary] $RawPayloadHashes
+    )
+
+    $association = $Comparison.root_nt_runtime_association
+    if ($null -eq $association -or
+        $association.schema -cne 'sideeffect.windows_root_nt_runtime_association' -or
+        $association.schema_version -ne 1 -or $association.platform -cne 'windows' -or
+        $association.status -cne 'partial' -or $association.capture_completeness -cne 'unknown' -or
+        $association.claim -cne 'exact_stable_held_handle_nt_device_path_candidate_only_no_success_ownership_or_causation' -or
+        $association.root_diff_status -cne 'complete') {
+        throw 'Observation did not provide the bounded partial/unknown v19 NT namespace comparison.'
+    }
+
+    $manifestPath = Join-Path $SessionPath 'session.json'
+    Assert-UnderPath -Child $manifestPath -Parent $SessionPath -Label 'v19 observation manifest'
+    if ((Get-Item -LiteralPath $manifestPath).Length -gt 1048576) {
+        throw 'The v19 observation manifest exceeded the bounded acceptance read size.'
+    }
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    if ($manifest.schema -cne 'sideeffect.audit_session' -or $manifest.schema_version -ne 19) {
+        throw 'The NT namespace comparison did not use the v19 observation envelope.'
+    }
+    $rootSource = @($manifest.sources | Where-Object { $_.role -eq 'selected_root' })
+    $runtimeSource = @($manifest.sources | Where-Object { $_.role -eq 'runtime' })
+    if ($rootSource.Count -ne 1 -or $runtimeSource.Count -ne 1) {
+        throw 'The v19 NT comparison did not have unique selected-root and runtime sources.'
+    }
+    $namespaceRef = @($rootSource[0].artifacts | Where-Object { $_.kind -eq 'windows_root_namespace_identity' -and $_.path -eq 'root-namespace.windows.json' })
+    $beforeRef = @($rootSource[0].artifacts | Where-Object { $_.kind -eq 'selected_root' -and $_.path -eq 'root-snapshot.json' })
+    $afterRef = @($rootSource[0].artifacts | Where-Object { $_.kind -eq 'selected_root_after' -and $_.path -eq 'root-snapshot-after.json' })
+    $captureRef = @($runtimeSource[0].artifacts | Where-Object { $_.kind -eq 'windows_runtime_capture' -and $_.path -eq 'runtime.windows.json' })
+    if ($namespaceRef.Count -ne 1 -or $beforeRef.Count -ne 1 -or $afterRef.Count -ne 1 -or $captureRef.Count -ne 1) {
+        throw 'The v19 selected-root namespace or ETW artifact references were missing or ambiguous.'
+    }
+    if ($namespaceRef[0].schema -cne 'sideeffect.windows_root_namespace_identity' -or
+        $namespaceRef[0].schema_version -ne 1 -or
+        $beforeRef[0].schema -cne 'sideeffect.selected_root_inventory' -or
+        $afterRef[0].schema -cne 'sideeffect.selected_root_inventory') {
+        throw 'The v19 root namespace or selected-root artifact references did not use their fixed schemas.'
+    }
+    $namespacePath = Join-Path $SessionPath 'root-namespace.windows.json'
+    Assert-UnderPath -Child $namespacePath -Parent $SessionPath -Label 'root namespace artifact'
+    $namespaceItem = Get-Item -LiteralPath $namespacePath
+    if ($namespaceItem.Length -gt 1048576 -or $namespaceItem.Length -ne [long]$namespaceRef[0].byte_length) {
+        throw 'The root namespace identity artifact exceeded its v19 byte bound or manifest length.'
+    }
+    $namespaceBytes = [System.IO.File]::ReadAllBytes($namespacePath)
+    $namespaceDigest = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($namespaceBytes)).ToLowerInvariant()
+    if ($namespaceDigest -cne $namespaceRef[0].sha256 -or
+        $association.root_namespace_artifact_sha256 -cne $namespaceDigest -or
+        $association.before_root_artifact_sha256 -cne $beforeRef[0].sha256 -or
+        $association.after_root_artifact_sha256 -cne $afterRef[0].sha256 -or
+        $association.capture_artifact_sha256 -cne $captureRef[0].sha256 -or
+        $association.capture_artifact_sha256 -cne $CaptureArtifactHash -or
+        $association.capture_document_sha256 -cne $Capture.document_sha256) {
+        throw 'The v19 NT comparison artifact digests did not match the session-linked root and ETW evidence.'
+    }
+    $namespace = [System.Text.Encoding]::UTF8.GetString($namespaceBytes) | ConvertFrom-Json
+    if ($namespace.schema -cne 'sideeffect.windows_root_namespace_identity' -or
+        $namespace.schema_version -ne 1 -or $namespace.platform -cne 'windows' -or
+        $namespace.status -cnotin @('complete', 'partial') -or
+        $namespace.before.root_snapshot_sha256 -cne $beforeRef[0].sha256 -or
+        $namespace.after.root_snapshot_sha256 -cne $afterRef[0].sha256) {
+        throw 'The root namespace identity artifact did not bind both selected-root snapshots.'
+    }
+
+    $summary = $association.summary
+    $boundedCounts = @(
+        $summary.delta_count, $summary.raw_checked_nt_device_event_count,
+        $summary.raw_cross_check_rejected_event_count, $summary.opposite_direction_event_count,
+        $summary.runtime_observation_rows_omitted_to_limit,
+        $summary.candidate_match_count, $summary.ambiguous_candidate_count, $summary.unmatched_delta_count
+    )
+    foreach ($count in $boundedCounts) {
+        if ($count -isnot [ValueType] -or [long]$count -lt 0 -or [long]$count -gt 100000) {
+            throw 'The v19 NT comparison contained a missing or out-of-range bounded summary count.'
+        }
+    }
+    $associations = @($association.associations)
+    if ($associations.Count -gt 20000 -or $summary.candidate_match_count -ne $associations.Count -or
+        $summary.delta_count -ne 1 -or $summary.runtime_observation_rows_omitted_to_limit -gt 50000) {
+        throw 'The v19 NT comparison summary did not match its bounded retained association rows.'
+    }
+    $allowedDiagnostics = @(
+        'root_namespace_artifact_reference_mismatch', 'root_namespace_or_identity_changed',
+        'root_namespace_identity_unavailable', 'root_nt_device_namespace_unsupported',
+        'association_output_limit_reached'
+    )
+    $diagnostics = @($association.diagnostics)
+    if ($diagnostics.Count -gt 8 -or @($diagnostics | Where-Object { $_ -cnotin $allowedDiagnostics }).Count -gt 0) {
+        throw 'The v19 NT comparison returned an unknown or unbounded diagnostic.'
+    }
+
+    $associationsOmitted = [long]$association.associations_omitted_to_output_limit
+    $evidenceReferencesOmitted = [long]$association.evidence_references_omitted_to_output_limit
+    if ($associationsOmitted -lt 0 -or $associationsOmitted -gt 20000 -or
+        $evidenceReferencesOmitted -lt 0 -or $evidenceReferencesOmitted -gt 50000) {
+        throw 'The v19 NT comparison association omission count was outside its output bound.'
+    }
+    if ($summary.candidate_match_count -eq 0) {
+        if ($association.association_status -cne 'insufficient_evidence' -or $associations.Count -ne 0 -or
+            ($summary.unmatched_delta_count -eq 0 -and $associationsOmitted -eq 0)) {
+            throw 'The v19 NT comparison lacked both an exact candidate and an explicit unmatched-delta count.'
+        }
+        $namespaceState = if ($namespace.status -eq 'complete' -and $namespace.before.nt_path_utf16le_hex -eq $namespace.after.nt_path_utf16le_hex) {
+            'stable_root_namespace'
+        }
+        else {
+            'namespace_partial_or_changed'
+        }
+        Write-Output "No exact NT device path candidate was retained (status=$($association.association_status); namespace=$namespaceState; raw_checked_nt_events=$($summary.raw_checked_nt_device_event_count); raw_cross_check_rejected=$($summary.raw_cross_check_rejected_event_count); opposite_direction_events=$($summary.opposite_direction_event_count); unmatched_deltas=$($summary.unmatched_delta_count); omitted_rows=$($summary.runtime_observation_rows_omitted_to_limit); association_rows_omitted=$associationsOmitted; evidence_refs_omitted=$evidenceReferencesOmitted; diagnostic_codes=$($diagnostics -join ',')). NT comparison remains partial/unknown and does not establish causation."
+        return
+    }
+
+    if ($association.association_status -cne 'candidate_match') {
+        throw 'The v19 NT comparison retained candidates without reporting candidate_match.'
+    }
+    $expectedRootHex = [string]$namespace.after.nt_path_utf16le_hex
+    if ([string]::IsNullOrWhiteSpace($expectedRootHex) -or
+        $namespace.before.status -cne 'observed' -or $namespace.after.status -cne 'observed' -or
+        $namespace.before.nt_path_utf16le_hex -cne $namespace.after.nt_path_utf16le_hex -or
+        $namespace.before.volume_serial -ne $namespace.after.volume_serial -or
+        $namespace.before.file_index -ne $namespace.after.file_index) {
+        throw 'An NT candidate was present without stable before/after root-handle identity evidence.'
+    }
+    if (-not $expectedRootHex.EndsWith('5c00', [System.StringComparison]::Ordinal)) { $expectedRootHex += '5c00' }
+    $payloadNameHex = [System.BitConverter]::ToString([System.Text.Encoding]::Unicode.GetBytes('payload.bin')).Replace('-', '').ToLowerInvariant()
+    $expectedNtPathHex = $expectedRootHex + $payloadNameHex
+    $expectedNtPath = [System.Text.Encoding]::Unicode.GetString([Convert]::FromHexString($expectedNtPathHex))
+    $rootDelta = @($Comparison.root_diff.deltas | Where-Object {
+        $_.kind -eq $ExpectedDeltaKind -and $_.name -ceq 'payload.bin'
+    })
+    if ($rootDelta.Count -ne 1) { throw 'The selected-root payload delta was not unique for NT candidate validation.' }
+    foreach ($candidate in $associations) {
+        if ($candidate.candidate_path_namespace -cne 'nt_device' -or
+            $candidate.candidate_path_utf16le_hex -cne $expectedNtPathHex -or
+            $candidate.status -notin @('candidate_match', 'ambiguous_candidate_match', 'partial_candidate_match') -or
+            $candidate.delta_kind -cne $ExpectedDeltaKind -or
+            $candidate.delta_name_identity_hex -cne $rootDelta[0].name_identity_hex -or
+            $candidate.etw_operation -cne 'create_name' -or @($candidate.runtime_evidence).Count -eq 0) {
+            throw 'The v19 NT candidate did not exactly match the expected payload delta and NT device path.'
+        }
+        foreach ($evidence in @($candidate.runtime_evidence)) {
+            if ($evidence.capture_document_sha256 -cne $Capture.document_sha256 -or
+                $evidence.etw_operation -cne 'create_name' -or $evidence.json_pointer -notmatch '^/events/([0-9]+)$') {
+                throw 'An NT candidate evidence reference did not bind to the v19 capture document and create-name operation.'
+            }
+            $eventIndex = [int]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture)
+            if ($eventIndex -lt 0 -or $eventIndex -ge $Capture.events.Count) {
+                throw 'An NT candidate evidence pointer was outside the capture event array.'
+            }
+            $event = $Capture.events[$eventIndex]
+            if (-not $RawPayloadHashes.Contains([string]$event.record_ordinal) -or
+                $event.record_ordinal -ne $evidence.record_ordinal -or
+                $RawPayloadHashes[[string]$event.record_ordinal] -cne $evidence.raw_payload_sha256 -or
+                $event.observation_decoding.observation.activity.observation.path -cne $expectedNtPath) {
+                throw 'An NT candidate evidence pointer did not resolve to the exact raw-verified NT payload path.'
+            }
+        }
+    }
+    Write-Output "Verified $($summary.candidate_match_count) exact NT device path candidate(s) against the held-root namespace, selected-root delta, and raw-checked ETW evidence; this is candidate evidence only and does not establish success, ownership, or causation."
 }
 
 function Get-GeneratedUninstallKeyDiagnostics {

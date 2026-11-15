@@ -492,6 +492,9 @@ fn artifact_kind_name(kind: crate::audit_session::ArtifactKind) -> &'static str 
         crate::audit_session::ArtifactKind::WindowsStartupAfter => "windows_startup_after",
         crate::audit_session::ArtifactKind::WindowsSoftware => "windows_software",
         crate::audit_session::ArtifactKind::WindowsSoftwareAfter => "windows_software_after",
+        crate::audit_session::ArtifactKind::WindowsRootNamespaceIdentity => {
+            "windows_root_namespace_identity"
+        }
         crate::audit_session::ArtifactKind::WindowsMsix => "windows_msix",
         crate::audit_session::ArtifactKind::WindowsAppPaths => "windows_app_paths",
         crate::audit_session::ArtifactKind::WindowsProcesses => "windows_processes",

@@ -18,7 +18,7 @@ const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 // v18 can publish before/after software plus the existing largest set of optional sources.
-const MAX_ENTRIES: usize = 13;
+const MAX_ENTRIES: usize = 14;
 
 #[derive(Debug)]
 pub struct VerifiedAuditSession {

@@ -44,6 +44,7 @@ mod windows_app_paths_diff;
 #[cfg(windows)]
 mod windows_msix;
 mod windows_msix_diff;
+mod windows_root_namespace;
 #[cfg(windows)]
 mod windows_root_runtime_association;
 mod windows_software_diff;
@@ -106,8 +107,10 @@ pub use windows_msix_diff::{
 };
 #[cfg(windows)]
 pub use windows_root_runtime_association::{
-    WindowsRootRuntimeAssociation, WindowsRootRuntimeAssociationReport,
-    WindowsRootRuntimeAssociationSummary, WindowsRootRuntimeEvidence,
+    WindowsRootNamespaceRuntimeAssociation, WindowsRootNamespaceRuntimeAssociationReport,
+    WindowsRootNamespaceRuntimeAssociationSummary, WindowsRootRuntimeAssociation,
+    WindowsRootRuntimeAssociationReport, WindowsRootRuntimeAssociationSummary,
+    WindowsRootRuntimeEvidence, associate_windows_root_namespace_runtime_diff,
     associate_windows_root_runtime_diff,
 };
 pub use windows_software_diff::{
@@ -168,6 +171,10 @@ pub use root_snapshot::{
     RootContentHashing, RootDiagnostic, RootEntry, RootEntryEvidence, RootIdentity, RootSnapshot,
     RootSnapshotLimits, collect_root_snapshot, collect_root_snapshot_with_hash,
 };
+#[cfg(windows)]
+pub use root_snapshot::{
+    WindowsRootHandleNamespaceIdentity, collect_root_snapshot_with_windows_namespace,
+};
 pub use root_snapshot_diff::{
     RootSnapshotDelta, RootSnapshotDiff, RootSnapshotDiffCounts, RootSnapshotDiffError,
     RootSnapshotSide, compare_observation_root_inventory_json,
@@ -216,3 +223,8 @@ pub use windows_app_paths::{
 };
 #[cfg(windows)]
 pub use windows_msix::{WindowsMsixInventoryDocument, WindowsMsixStatus, collect_windows_msix};
+pub use windows_root_namespace::{
+    WINDOWS_ROOT_NAMESPACE_MAX_BYTES, WINDOWS_ROOT_NAMESPACE_MAX_PATH_UTF16_UNITS,
+    WINDOWS_ROOT_NAMESPACE_SCHEMA, WINDOWS_ROOT_NAMESPACE_SCHEMA_VERSION,
+    WindowsRootNamespaceDocument, WindowsRootNamespaceSide,
+};

@@ -119,6 +119,9 @@ pub fn collect_and_publish(
     let mut artifacts = Vec::new();
     let mut sources = Vec::new();
     let mut runtime_coverage_detail = None;
+    let mut root_namespace_before = None;
+    let mut root_snapshot_before_sha256 = None;
+    let mut root_identity_before = None;
 
     if options.software {
         let doc = collect_windows_software();
@@ -333,10 +336,24 @@ pub fn collect_and_publish(
         ));
     }
     if let Some(root_path) = &options.root_path {
-        let doc = crate::inventory::collect_root_snapshot_with_hash(
-            root_path,
-            options.hash_root_regular_files,
-        );
+        let (doc, namespace_identity) = if session_schema_version(options)
+            >= crate::audit_session::AUDIT_SESSION_V19_SCHEMA_VERSION
+        {
+            crate::inventory::collect_root_snapshot_with_windows_namespace(
+                root_path,
+                options.hash_root_regular_files,
+            )
+        } else {
+            (
+                crate::inventory::collect_root_snapshot_with_hash(
+                    root_path,
+                    options.hash_root_regular_files,
+                ),
+                None,
+            )
+        };
+        root_namespace_before = namespace_identity;
+        root_identity_before = doc.root.clone();
         let status = match doc.status {
             "complete" => SourceStatus::Complete,
             "partial" => SourceStatus::Partial,
@@ -390,6 +407,7 @@ pub fn collect_and_publish(
         ));
         let value = serde_json::to_vec(&doc)
             .map_err(|error| format!("could not serialize selected-root inventory: {error}"))?;
+        root_snapshot_before_sha256 = Some(sha256_hex(&value));
         let root_artifact = artifact(
             ArtifactKind::SelectedRoot,
             "root-snapshot.json",
@@ -542,10 +560,23 @@ pub fn collect_and_publish(
 
     if options.observation_window {
         let root = options.root_path.as_deref().expect("validated root path");
-        let doc = crate::inventory::collect_root_snapshot_with_hash(
-            root,
-            options.hash_root_regular_files,
-        );
+        let (doc, namespace_identity) = if session_schema_version(options)
+            >= crate::audit_session::AUDIT_SESSION_V19_SCHEMA_VERSION
+        {
+            crate::inventory::collect_root_snapshot_with_windows_namespace(
+                root,
+                options.hash_root_regular_files,
+            )
+        } else {
+            (
+                crate::inventory::collect_root_snapshot_with_hash(
+                    root,
+                    options.hash_root_regular_files,
+                ),
+                None,
+            )
+        };
+        let root_namespace_after = namespace_identity;
         let (status, diagnostics) = status_from_serialized(&doc, "status");
         if let Some(root_source) = sources
             .iter_mut()
@@ -586,6 +617,7 @@ pub fn collect_and_publish(
         if !fits {
             return Err("after selected-root inventory exceeds the audit-session artifact or aggregate byte limit".to_owned());
         }
+        let root_snapshot_after_sha256 = sha256_hex(&bytes);
         artifacts.push(artifact(
             ArtifactKind::SelectedRootAfter,
             "root-snapshot-after.json",
@@ -593,6 +625,78 @@ pub fn collect_and_publish(
             doc.schema_version,
             bytes,
         ));
+        if session_schema_version(options) >= crate::audit_session::AUDIT_SESSION_V19_SCHEMA_VERSION
+        {
+            let make_side = |root_identity: Option<&crate::inventory::RootIdentity>,
+                             identity: Option<
+                crate::inventory::WindowsRootHandleNamespaceIdentity,
+            >,
+                             snapshot_sha256: String| {
+                crate::inventory::WindowsRootNamespaceSide {
+                    status: identity
+                        .as_ref()
+                        .map_or("unavailable", |item| item.status)
+                        .to_owned(),
+                    root_snapshot_sha256: snapshot_sha256,
+                    root_path_utf16le_hex: root_identity.map(|item| item.path_utf16le_hex.clone()),
+                    nt_path_utf16le_hex: identity.and_then(|item| item.nt_path_utf16le_hex),
+                    volume_serial: root_identity.and_then(|item| item.device_or_volume_serial),
+                    file_index: root_identity.and_then(|item| item.inode_or_file_index),
+                }
+            };
+            let before_snapshot_sha256 = root_snapshot_before_sha256
+                .take()
+                .ok_or_else(|| "before selected-root digest was unavailable".to_owned())?;
+            let namespace_document = crate::inventory::WindowsRootNamespaceDocument::new(
+                make_side(
+                    root_identity_before.as_ref(),
+                    root_namespace_before.take(),
+                    before_snapshot_sha256,
+                ),
+                make_side(
+                    doc.root.as_ref(),
+                    root_namespace_after,
+                    root_snapshot_after_sha256,
+                ),
+            );
+            let namespace_bytes = serde_json::to_vec(&namespace_document)
+                .map_err(|e| format!("could not serialize root namespace identity: {e}"))?;
+            if namespace_bytes.len() > crate::inventory::WINDOWS_ROOT_NAMESPACE_MAX_BYTES
+                || namespace_bytes.len() as u64 > MAX_SESSION_ARTIFACT_BYTES
+            {
+                return Err("root namespace identity exceeds the artifact byte limit".to_owned());
+            }
+            let root_source = sources
+                .iter_mut()
+                .find(|source| source.role == SourceRole::SelectedRoot)
+                .expect("selected-root source was collected before the observation window");
+            root_source.applied_limits.extend([
+                crate::audit_session::AppliedLimit {
+                    code: "max_nt_root_path_utf16_units".to_owned(),
+                    value: crate::inventory::WINDOWS_ROOT_NAMESPACE_MAX_PATH_UTF16_UNITS as u64,
+                },
+                crate::audit_session::AppliedLimit {
+                    code: "max_root_namespace_artifact_bytes".to_owned(),
+                    value: crate::inventory::WINDOWS_ROOT_NAMESPACE_MAX_BYTES as u64,
+                },
+            ]);
+            root_source
+                .scope
+                .push_str("; exact NT root-handle namespace sampled at both endpoints");
+            if namespace_document.status != "complete" {
+                root_source.status = SourceStatus::Partial;
+                root_source
+                    .diagnostic_codes
+                    .push("root_namespace_identity_partial".to_owned());
+            }
+            artifacts.push(artifact(
+                ArtifactKind::WindowsRootNamespaceIdentity,
+                "root-namespace.windows.json",
+                crate::inventory::WINDOWS_ROOT_NAMESPACE_SCHEMA,
+                crate::inventory::WINDOWS_ROOT_NAMESPACE_SCHEMA_VERSION,
+                namespace_bytes,
+            ));
+        }
         if options.startup {
             let startup_after = crate::inventory::collect_windows_startup();
             let (after_status, after_diagnostics) =
@@ -823,7 +927,10 @@ fn build_manifest(
                     || (source.role == SourceRole::Startup
                         && artifact.kind == ArtifactKind::WindowsStartupAfter)
                     || (source.role == SourceRole::SelectedRoot
-                        && artifact.kind == ArtifactKind::SelectedRootAfter)
+                        && (artifact.kind == ArtifactKind::SelectedRootAfter
+                            || (schema_version
+                                >= crate::audit_session::AUDIT_SESSION_V19_SCHEMA_VERSION
+                                && artifact.kind == ArtifactKind::WindowsRootNamespaceIdentity)))
             })
             .map(|artifact| SessionArtifactRef {
                 kind: artifact.kind,
@@ -1046,7 +1153,8 @@ fn collect_windows_startup_for_session(
         crate::audit_session::AUDIT_SESSION_V15_SCHEMA_VERSION
         | crate::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION
         | crate::audit_session::AUDIT_SESSION_V17_SCHEMA_VERSION
-        | crate::audit_session::AUDIT_SESSION_V18_SCHEMA_VERSION => {
+        | crate::audit_session::AUDIT_SESSION_V18_SCHEMA_VERSION
+        | crate::audit_session::AUDIT_SESSION_V19_SCHEMA_VERSION => {
             Ok(crate::inventory::collect_windows_startup())
         }
         _ => Err("unsupported Windows audit-session schema version".to_owned()),
@@ -1055,13 +1163,7 @@ fn collect_windows_startup_for_session(
 
 fn session_schema_version(options: &WindowsAuditOptions) -> u32 {
     if options.observation_window {
-        if options.software {
-            crate::audit_session::AUDIT_SESSION_V18_SCHEMA_VERSION
-        } else if options.startup {
-            crate::audit_session::AUDIT_SESSION_V17_SCHEMA_VERSION
-        } else {
-            crate::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION
-        }
+        crate::audit_session::AUDIT_SESSION_V19_SCHEMA_VERSION
     } else if options.startup {
         crate::audit_session::AUDIT_SESSION_V15_SCHEMA_VERSION
     } else if options.app_paths {
@@ -1130,7 +1232,7 @@ mod tests {
     }
 
     #[test]
-    fn observation_session_uses_v16_and_rejects_output_under_the_root() {
+    fn new_observation_sessions_use_v19_with_optional_paired_sources() {
         let observation = WindowsAuditOptions {
             observation_window: true,
             root_path: Some(std::path::PathBuf::from("C:\\scope")),
@@ -1139,7 +1241,7 @@ mod tests {
         };
         assert_eq!(
             session_schema_version(&observation),
-            crate::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION
+            crate::audit_session::AUDIT_SESSION_V19_SCHEMA_VERSION
         );
         let observation_with_startup = WindowsAuditOptions {
             startup: true,
@@ -1147,7 +1249,7 @@ mod tests {
         };
         assert_eq!(
             session_schema_version(&observation_with_startup),
-            crate::audit_session::AUDIT_SESSION_V17_SCHEMA_VERSION
+            crate::audit_session::AUDIT_SESSION_V19_SCHEMA_VERSION
         );
         let observation_with_packages = WindowsAuditOptions {
             software: true,
@@ -1155,7 +1257,7 @@ mod tests {
         };
         assert_eq!(
             session_schema_version(&observation_with_packages),
-            crate::audit_session::AUDIT_SESSION_V18_SCHEMA_VERSION
+            crate::audit_session::AUDIT_SESSION_V19_SCHEMA_VERSION
         );
         let observation_with_startup_and_packages = WindowsAuditOptions {
             startup: true,
@@ -1163,7 +1265,7 @@ mod tests {
         };
         assert_eq!(
             session_schema_version(&observation_with_startup_and_packages),
-            crate::audit_session::AUDIT_SESSION_V18_SCHEMA_VERSION
+            crate::audit_session::AUDIT_SESSION_V19_SCHEMA_VERSION
         );
 
         let base = std::env::temp_dir().join(format!(

@@ -2020,7 +2020,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             }
             #[cfg(windows)]
             {
-                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages] [--msix] [--app-paths] [--processes] [--startup] [--path-executables] [--root DIRECTORY [--hash-regular-files]] [--observe-root DIRECTORY [--hash-regular-files] --runtime-source windows-etw --runtime-duration-seconds 1..60 -- PROGRAM [ARGS...]] [--permission PATH]...\nCollects selected bounded native Windows inventories and optional system-wide ETW observations into one current-user-private session directory. --observe-root requires a selected root and bounded ETW command, records before/after direct-child snapshots alongside runtime evidence, and requires the output directory to be outside the observed root. Use compare-observation SESSION_DIR for a verified evidence-linked temporal diff; changes do not establish causation. --packages reads bounded Uninstall registry registrations; with --observe-root it records a second snapshot after the command and envelope v18 links both for a typed software-registration comparison. --msix separately reads bounded current-user MSIX package registrations and does not activate packages or inspect package files. --app-paths adds selected current-user and accessible machine App Paths registrations without checking or launching registered paths; App-Paths-only sessions emit envelope v11. --startup includes bounded local ROOT\\subscription WMI rows and emits envelope v15 with startup artifact v10, including read-only service delayed-auto-start, dependency, load-order group, and trigger configuration; selecting --app-paths as well retains the App Paths source in v15. With --observe-root, startup is collected again after the bounded ETW command and envelopes v17/v18 link both startup artifacts for compare-observation. Dependencies and group membership are configured SCM values only: they do not establish effective startup order, activation, or runtime behavior. The delayed bit is ignored unless the service is configured for automatic start and does not state an exact start time or prove execution. WMI query, command, script, and service-trigger data are inert evidence. Session v10/v11 startup artifacts remain v6; v12 remains readable with startup v7; v13 remains readable with startup v8. --root snapshots one selected directory and its direct children; it reads metadata only by default. --hash-regular-files opts into bounded SHA-256 reads of direct-child regular files and requires --root or --observe-root. Hashes are sensitive equality fingerprints, not authenticity evidence. Collection does not recurse. Review root paths and names before sharing a session. --path-executables snapshots current-process PATH metadata heuristically and never runs files or resolves commands through a shell. --permission inspects explicitly selected paths only. ETW requires permission to control the shared NT Kernel Logger; SideEffect never elevates. The command is passed as separate arguments and is not started unless ETW setup succeeds. Capture completeness is unknown, so runtime-containing sessions are partial."
+                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages] [--msix] [--app-paths] [--processes] [--startup] [--path-executables] [--root DIRECTORY [--hash-regular-files]] [--observe-root DIRECTORY [--hash-regular-files] --runtime-source windows-etw --runtime-duration-seconds 1..60 -- PROGRAM [ARGS...]] [--permission PATH]...\nCollects selected bounded native Windows inventories and optional system-wide ETW observations into one current-user-private session directory. --observe-root requires a selected root and bounded ETW command, records before/after direct-child snapshots alongside runtime evidence, captures bounded NT root-handle namespace metadata for both snapshots, and requires the output directory to be outside the observed root. New Windows observation sessions use envelope v19; --packages and --startup remain optional and retain paired before/after artifacts when selected. --packages reads bounded Uninstall registry registrations; selected packages produce paired snapshots for a typed software-registration comparison. --msix separately reads bounded current-user MSIX package registrations and does not activate packages or inspect package files. --app-paths adds selected current-user and accessible machine App Paths registrations without checking or launching registered paths; App-Paths-only sessions emit envelope v11. --startup includes bounded local ROOT\\subscription WMI rows and emits envelope v15 with startup artifact v10, including read-only service delayed-auto-start, dependency, load-order group, and trigger configuration; selecting --app-paths as well retains the App Paths source in v15. With --observe-root, startup is collected again after the bounded ETW command and paired startup artifacts are linked for compare-observation. Dependencies and group membership are configured SCM values only: they do not establish effective startup order, activation, or runtime behavior. The delayed bit is ignored unless the service is configured for automatic start and does not state an exact start time or prove execution. WMI query, command, script, and service-trigger data are inert evidence. Session v10/v11 startup artifacts remain v6; v12 remains readable with startup v7; v13 remains readable with startup v8. --root snapshots one selected directory and its direct children; it reads metadata only by default. --hash-regular-files opts into bounded SHA-256 reads of direct-child regular files and requires --root or --observe-root. Hashes are sensitive equality fingerprints, not authenticity evidence. Collection does not recurse. Review root paths and names before sharing a session. --path-executables snapshots current-process PATH metadata heuristically and never runs files or resolves commands through a shell. --permission inspects explicitly selected paths only. ETW requires permission to control the shared NT Kernel Logger; SideEffect never elevates. The command is passed as separate arguments and is not started unless ETW setup succeeds. Capture completeness is unknown, so runtime-containing sessions are partial."
             }
             #[cfg(not(any(target_os = "linux", windows)))]
             {
@@ -2064,7 +2064,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect compare-sessions BEFORE_SESSION_DIR AFTER_SESSION_DIR\nVerifies both local audit sessions, reports metadata comparability, and compares bounded item-level inventory and runtime evidence from verified artifacts. Per-source status and evidence references remain visible; missing, partial, unsupported, or incompatible sources do not become empty results. This is not an exhaustive history or coverage claim, and it does not establish causation or event absence. Incomparable or partial results exit with status 2 and include stable reason codes."
         }
         "compare-observation" => {
-            "Usage: sideeffect compare-observation VERIFIED_OBSERVATION_SESSION_DIR\nVerifies one v16, v17, or v18 observation session and compares selected-root snapshots; v17/v18 Windows sessions compare paired startup snapshots, and v18 compares paired Windows Uninstall-registration snapshots when --packages was selected. Linux adds exact-path candidates from the manifest-verified strace trace; Windows adds exact lexical candidates only for same-spelling absolute DOS drive paths in raw-cross-checked ETW FileIo name observations. Results cite input artifacts and raw rows. Linux locators bind to trace digest and raw row offsets; Windows locators bind to capture document digest, event-array row, and raw-payload digest. ETW file-name records do not report operation success. Path matches do not prove mutation, process identity, or cause, and do not establish causation. Runtime source and capture completeness remain distinct. Unsupported path namespaces remain unresolved."
+            "Usage: sideeffect compare-observation VERIFIED_OBSERVATION_SESSION_DIR\nVerifies one v16-v19 observation session and compares selected-root snapshots; v17/v18 and v19 Windows sessions compare paired startup snapshots when present, v18 compares paired Windows Uninstall-registration snapshots, and v19 compares paired software snapshots when --packages was selected. Windows v19 adds exact NT-device path candidates only when the before/after held-root NT path and nonzero volume/file-index hints are stable; it does not translate DOS, volume-GUID, UNC, verbatim, or other namespaces. Existing DOS matching remains exact and lexical. Linux adds exact-path candidates from the manifest-verified strace trace; Windows matches require raw-cross-checked ETW FileIo name observations. Results cite input artifacts and raw rows. Linux locators bind to trace digest and raw row offsets; Windows locators bind to capture document digest, event-array row, and raw-payload digest. ETW file-name records do not report operation success. Path matches do not prove mutation, process identity, or cause, and do not establish causation. Runtime source and capture completeness remain distinct. Unsupported path namespaces remain unresolved."
         }
         "baseline" => {
             "Usage: sideeffect baseline preview --label LABEL --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect baseline create --profile NEW_PROFILE.json --label LABEL --confirm-sha256 PREVIEW_SHA256 --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect baseline compare --profile PROFILE.json --baseline-session SESSION_DIR [--baseline-session SESSION_DIR...] --session CANDIDATE_SESSION_DIR [--session CANDIDATE_SESSION_DIR...]\nPreviews a bounded set of 1..=16 verified audit sessions and prints a deterministic preview digest. Creating a profile requires the exact digest and writes a new current-user-private file without replacing an existing file. Partial, incomplete, or loss-affected inputs are shown with their unknown coverage but cannot be promoted into a profile. A profile records only reviewed observations: software and signer identity are not recorded. Comparison requires the exact approved baseline sessions and matching manifest digests; a missing, replaced, or additional session prevents item comparison and exits with status 2. Candidate item differences are reported against the existing evidence-linked session diff, but the candidate is never absorbed automatically. Removal and absence claims are withheld when either side declares incomplete or unknown coverage. Differences do not establish unsafe behavior, causation, or complete system coverage."
@@ -6765,6 +6765,13 @@ struct ObservationWindowReport<'a> {
     #[cfg(windows)]
     root_runtime_association: Option<sideeffect::inventory::WindowsRootRuntimeAssociationReport>,
     root_runtime_association_diagnostic: Option<&'static str>,
+    #[cfg(windows)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_nt_runtime_association:
+        Option<sideeffect::inventory::WindowsRootNamespaceRuntimeAssociationReport>,
+    #[cfg(windows)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_nt_runtime_association_diagnostic: Option<&'static str>,
 }
 
 #[cfg(windows)]
@@ -7228,6 +7235,70 @@ fn compare_observation(session_path: &OsString) -> Result<ExitCode, String> {
             .as_ref()
             .is_some_and(|diff| diff.status == "complete");
     #[cfg(windows)]
+    let (root_nt_runtime_association, root_nt_runtime_association_diagnostic) =
+        if manifest.schema_version >= sideeffect::audit_session::AUDIT_SESSION_V19_SCHEMA_VERSION {
+            let result = (|| {
+                use sideeffect::audit_session::ArtifactKind;
+                let namespace_ref = root
+                    .artifacts
+                    .iter()
+                    .find(|artifact| artifact.kind == ArtifactKind::WindowsRootNamespaceIdentity)
+                    .ok_or("root_namespace_artifact_missing")?;
+                if namespace_ref.path != "root-namespace.windows.json"
+                    || namespace_ref.schema != sideeffect::inventory::WINDOWS_ROOT_NAMESPACE_SCHEMA
+                    || namespace_ref.schema_version
+                        != sideeffect::inventory::WINDOWS_ROOT_NAMESPACE_SCHEMA_VERSION
+                {
+                    return Err("root_namespace_artifact_contract_mismatch");
+                }
+                let find_verified = |reference: &sideeffect::audit_session::SessionArtifactRef| {
+                    verified
+                        .artifacts()
+                        .iter()
+                        .find(|artifact| {
+                            artifact.kind() == reference.kind && artifact.path() == reference.path
+                        })
+                        .map(|artifact| artifact.bytes())
+                        .ok_or("root_namespace_artifact_reference_mismatch")
+                };
+                let namespace_bytes = find_verified(namespace_ref)?;
+                if namespace_ref.byte_length != namespace_bytes.len() as u64
+                    || namespace_ref.sha256 != format!("{:x}", Sha256::digest(namespace_bytes))
+                {
+                    return Err("root_namespace_artifact_reference_mismatch");
+                }
+                let namespace =
+                    sideeffect::inventory::WindowsRootNamespaceDocument::parse(namespace_bytes)
+                        .map_err(|_| "root_namespace_artifact_invalid")?;
+                let runtime_ref = runtime
+                    .artifacts
+                    .iter()
+                    .find(|artifact| artifact.kind == ArtifactKind::WindowsRuntimeCapture)
+                    .ok_or("runtime_artifact_missing")?;
+                let capture_bytes = find_verified(runtime_ref)?;
+                let before_root_bytes = find_verified(before_ref)?;
+                let after_root_bytes = find_verified(after_ref)?;
+                let verified_diff = root_diff.as_ref().ok_or("selected_root_unavailable")?;
+                sideeffect::inventory::associate_windows_root_namespace_runtime_diff(
+                    verified_diff,
+                    capture_bytes,
+                    &namespace,
+                    &namespace_ref.sha256,
+                    before_root_bytes,
+                    &before_ref.sha256,
+                    after_root_bytes,
+                    &after_ref.sha256,
+                )
+                .map_err(|_| "root_nt_runtime_association_unavailable")
+            })();
+            match result {
+                Ok(report) => (Some(report), None),
+                Err(diagnostic) => (None, Some(diagnostic)),
+            }
+        } else {
+            (None, None)
+        };
+    #[cfg(windows)]
     let complete = root_runtime_complete
         && software_comparison_status.is_none_or(|status| status == "complete")
         && software_source_status
@@ -7287,6 +7358,10 @@ fn compare_observation(session_path: &OsString) -> Result<ExitCode, String> {
         #[cfg(windows)]
         root_runtime_association,
         root_runtime_association_diagnostic,
+        #[cfg(windows)]
+        root_nt_runtime_association,
+        #[cfg(windows)]
+        root_nt_runtime_association_diagnostic,
     };
     let mut output = CappedBuffer::new(MAX_REPORT_BYTES);
     serde_json::to_writer(&mut output, &report)
