@@ -269,8 +269,28 @@ function Invoke-ObservedMsiInstall {
         [Parameter(Mandatory = $true)][string] $MsiPath,
         [Parameter(Mandatory = $true)][string] $InstallRoot,
         [Parameter(Mandatory = $true)][string] $LogPath,
-        [Parameter(Mandatory = $true)][string] $SessionPath
+        [Parameter(Mandatory = $true)][string] $SessionPath,
+        [Parameter(Mandatory = $true)][ValidateSet('added', 'changed')][string] $ExpectedDeltaKind,
+        [Parameter(Mandatory = $true)][string] $ExpectedPayloadSha256,
+        [Parameter()][string] $ExpectedPreviousPayloadSha256,
+        [Parameter(Mandatory = $true)][string] $Description
     )
+
+    $ExpectedPayloadSha256 = $ExpectedPayloadSha256.ToLowerInvariant()
+    if ($ExpectedDeltaKind -eq 'added') {
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedPreviousPayloadSha256)) {
+            throw 'An added selected-root delta cannot have a previous payload SHA-256.'
+        }
+    }
+    else {
+        $ExpectedPreviousPayloadSha256 = $ExpectedPreviousPayloadSha256.ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($ExpectedPreviousPayloadSha256)) {
+            throw 'A changed selected-root delta requires the previous payload SHA-256.'
+        }
+        if ($ExpectedPreviousPayloadSha256 -ceq $ExpectedPayloadSha256) {
+            throw 'A changed selected-root delta requires distinct before and after payload SHA-256 values.'
+        }
+    }
 
     Assert-UnderPath -Child $MsiPath -Parent $script:TestRoot -Label 'observed MSI fixture'
     Assert-UnderPath -Child $InstallRoot -Parent $script:TestRoot -Label 'observed MSI install root'
@@ -306,20 +326,41 @@ function Invoke-ObservedMsiInstall {
         $comparison.runtime_capture_completeness -ne 'unknown') {
         throw "Observed MSI session did not retain complete root comparison and unknown/partial runtime status: $($comparison | ConvertTo-Json -Compress -Depth 12)"
     }
-    if ($comparison.root_diff.counts.additions -ne 1 -or $comparison.root_diff.deltas.Count -ne 1) {
-        throw 'Observed MSI session did not report exactly one selected-root addition.'
+    $counts = $comparison.root_diff.counts
+    $expectedAdditions = if ($ExpectedDeltaKind -eq 'added') { 1 } else { 0 }
+    $expectedChanges = if ($ExpectedDeltaKind -eq 'changed') { 1 } else { 0 }
+    $deltas = @($comparison.root_diff.deltas)
+    if ($counts.additions -ne $expectedAdditions -or $counts.changes -ne $expectedChanges -or
+        $counts.removals -ne 0 -or $deltas.Count -ne 1) {
+        throw "Observed MSI session did not report exactly one selected-root $ExpectedDeltaKind delta: $($comparison.root_diff | ConvertTo-Json -Compress -Depth 12)"
     }
-    $delta = $comparison.root_diff.deltas[0]
+    $delta = $deltas[0]
     $payloadPath = Join-Path $InstallRoot 'payload.bin'
     $afterRootPath = Join-Path $SessionPath 'root-snapshot-after.json'
     $afterRoot = Get-Content -LiteralPath $afterRootPath -Raw | ConvertFrom-Json
     $afterRows = @($afterRoot.entries | Where-Object { $_.display_name -ceq 'payload.bin' })
     $payloadHash = (Get-FileHash -LiteralPath $payloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($delta.kind -ne 'added' -or $delta.name -cne 'payload.bin' -or
+    if ($payloadHash -cne $ExpectedPayloadSha256) {
+        throw "Installed payload SHA-256 $payloadHash did not match the expected post-transition payload SHA-256 $ExpectedPayloadSha256."
+    }
+    if ($delta.kind -ne $ExpectedDeltaKind -or $delta.name -cne 'payload.bin' -or
         $delta.after.evidence_source -ne 'selected_root_directory_entry' -or
         $afterRows.Count -ne 1 -or $delta.after.entry_ordinal -ne $afterRows[0].ordinal -or
-        $afterRows[0].content_sha256 -cne $payloadHash -or $afterRows[0].content_hash_status -ne 'observed') {
-        throw 'Observed MSI root addition did not match the installed payload SHA-256 and verified after-snapshot evidence ordinal.'
+        $afterRows[0].content_sha256 -cne $ExpectedPayloadSha256 -or $afterRows[0].content_hash_status -ne 'observed') {
+        throw "Observed MSI root $ExpectedDeltaKind did not match the installed payload SHA-256 and verified after-snapshot evidence ordinal."
+    }
+    if ($ExpectedDeltaKind -eq 'changed') {
+        $beforeRootPath = Join-Path $SessionPath 'root-snapshot.json'
+        $beforeRoot = Get-Content -LiteralPath $beforeRootPath -Raw | ConvertFrom-Json
+        $beforeRows = @($beforeRoot.entries | Where-Object { $_.display_name -ceq 'payload.bin' })
+        if ($null -eq $delta.before -or $delta.before.evidence_source -ne 'selected_root_directory_entry' -or
+            $beforeRows.Count -ne 1 -or $delta.before.entry_ordinal -ne $beforeRows[0].ordinal -or
+            $beforeRows[0].content_sha256 -cne $ExpectedPreviousPayloadSha256 -or $beforeRows[0].content_hash_status -ne 'observed') {
+            throw 'Observed MSI root change did not match the previous payload SHA-256 and verified before-snapshot evidence ordinal.'
+        }
+        if (-not (@($delta.changed_fields) -contains 'content_sha256')) {
+            throw 'Observed MSI root change did not report the selected-root content_sha256 change.'
+        }
     }
 
     $expectedPath = [System.IO.Path]::GetFullPath($payloadPath)
@@ -385,7 +426,7 @@ function Invoke-ObservedMsiInstall {
         throw 'ETW capture did not contain a decoded file-name observation for the fixture payload basename.'
     }
 
-    $candidate = @($association.associations | Where-Object { $_.candidate_path -ceq $expectedPath -and $_.delta_kind -eq 'added' -and $_.etw_operation -eq 'create_name' })
+    $candidate = @($association.associations | Where-Object { $_.candidate_path -ceq $expectedPath -and $_.delta_kind -eq $ExpectedDeltaKind -and $_.etw_operation -eq 'create_name' })
     if ($candidate.Count -gt 0) {
         foreach ($evidence in $candidate[0].runtime_evidence) {
             if ($evidence.capture_document_sha256 -cne $capture.document_sha256 -or $evidence.etw_operation -ne 'create_name' -or
@@ -414,7 +455,7 @@ function Invoke-ObservedMsiInstall {
     else {
         throw "ETW payload-name evidence was not supported by a candidate or an explicit unresolved namespace diagnostic: $($association | ConvertTo-Json -Compress -Depth 12)"
     }
-    Write-Output "Observed v1 MSI install with one selected-root addition and decoded msiexec target evidence; capture completeness remains unknown."
+    Write-Output "$Description produced one selected-root $ExpectedDeltaKind delta for the expected payload SHA-256 with decoded msiexec target evidence; capture completeness and causality remain unknown."
 }
 
 function Uninstall-Msi {
@@ -1001,6 +1042,8 @@ try {
     $payloadV2Path = Join-Path $script:TestRoot 'payload-v2.bin'
     [System.IO.File]::WriteAllBytes($payloadV1Path, $payloadV1)
     [System.IO.File]::WriteAllBytes($payloadV2Path, $payloadV2)
+    $payloadV1Sha256 = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($payloadV1)).ToLowerInvariant()
+    $payloadV2Sha256 = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($payloadV2)).ToLowerInvariant()
     $wxsV1 = Join-Path $script:TestRoot 'fixture-v1.wxs'
     $wxsV2 = Join-Path $script:TestRoot 'fixture-v2.wxs'
     $objV1 = Join-Path $script:TestRoot 'fixture-v1.wixobj'
@@ -1013,6 +1056,7 @@ try {
     $beforePath = Join-Path $script:TestRoot 'before-install.json'
     $snapshotV1Path = Join-Path $script:TestRoot 'installed-v1.json'
     $observationV1Path = Join-Path $script:TestRoot 'observed-install-v1'
+    $observationV2Path = Join-Path $script:TestRoot 'observed-upgrade-v2'
     $snapshotV2Path = Join-Path $script:TestRoot 'installed-v2.json'
     $snapshotDowngradePath = Join-Path $script:TestRoot 'downgraded-v1.json'
     $snapshotUninstallPath = Join-Path $script:TestRoot 'uninstalled.json'
@@ -1033,7 +1077,7 @@ try {
     }
 
     $installationStarted = $true
-    Invoke-ObservedMsiInstall -MsiPath $msiV1 -InstallRoot $script:InstallRoot -LogPath (Join-Path $script:TestRoot 'install-v1.log') -SessionPath $observationV1Path
+    Invoke-ObservedMsiInstall -MsiPath $msiV1 -InstallRoot $script:InstallRoot -LogPath (Join-Path $script:TestRoot 'install-v1.log') -SessionPath $observationV1Path -ExpectedDeltaKind 'added' -ExpectedPayloadSha256 $payloadV1Sha256 -Description 'Observed v1 MSI install'
     Assert-ProductVersion -ProductCode $productCodeV1 -Version '1.0.0' -LogPath (Join-Path $script:TestRoot 'install-v1.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin')
     Assert-InstalledPayload -ProductCode $productCodeV1 -LogPath (Join-Path $script:TestRoot 'install-v1.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin') -ExpectedBytes $payloadV1
     $snapshotV1 = Get-InventorySnapshot -Path $snapshotV1Path
@@ -1061,7 +1105,7 @@ try {
     Assert-SoftwareLifecycleDiff -Diff $softwareInstallDiff -Before $softwareBefore -After $softwareV1 -AddedVersions @('1.0.0')
     Write-Output "MSI v1 installed; observed selected-root SHA-256: $($entryV1.content_sha256)"
 
-    Install-Msi -MsiPath $msiV2 -InstallRoot $script:InstallRoot -LogPath (Join-Path $script:TestRoot 'update-v2.log') -Description 'MSI v2 major upgrade'
+    Invoke-ObservedMsiInstall -MsiPath $msiV2 -InstallRoot $script:InstallRoot -LogPath (Join-Path $script:TestRoot 'update-v2.log') -SessionPath $observationV2Path -ExpectedDeltaKind 'changed' -ExpectedPayloadSha256 $payloadV2Sha256 -ExpectedPreviousPayloadSha256 $payloadV1Sha256 -Description 'Observed v2 MSI major upgrade'
     Assert-ProductAbsent -ProductCode $productCodeV1
     Assert-ProductVersion -ProductCode $productCodeV2 -Version '2.0.0' -LogPath (Join-Path $script:TestRoot 'update-v2.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin')
     Assert-InstalledPayload -ProductCode $productCodeV2 -LogPath (Join-Path $script:TestRoot 'update-v2.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin') -ExpectedBytes $payloadV2
