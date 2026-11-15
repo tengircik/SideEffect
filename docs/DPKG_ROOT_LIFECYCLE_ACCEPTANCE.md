@@ -51,7 +51,10 @@ change candidate at the destination path. The staging name appears in neither
 snapshot, so it produces no selected-root delta; only the destination supports
 one candidate for install and upgrade. For purge, the test requires one
 candidate for the removed payload from the exact successful supported
-`unlink`, `unlinkat`, or rename-source row selected by the association. It
+`unlink`, `unlinkat`, or rename-source row selected by the association. For
+`unlinkat`, a bare `AT_FDCWD` or an absolute `-yy` annotation is accepted only
+with flags `0` and an exact absolute operand; the annotation is display context,
+not a path-resolution fallback. It
 checks that locator against the raw trace bytes and observed result. Each
 observed transition has no unmatched selected-root delta. Downgrade still uses
 the direct private-root dpkg helper and package/root snapshots, but is not

@@ -156,7 +156,7 @@ pub fn associate_root_runtime_diff(
                 Some("unlinkat") => {
                     // Directory-fd-relative and `AT_REMOVEDIR` forms are excluded; only
                     // the absolute-path, file-removal spelling is eligible.
-                    if args.len() != 3 || args[0] != "AT_FDCWD" || args[2] != "0" {
+                    if args.len() != 3 || !at_fdcwd_operand(args[0]) || args[2] != "0" {
                         continue;
                     }
                     if !syscall_succeeded(record) {
@@ -355,7 +355,7 @@ pub fn associate_root_runtime_diff(
         },
         limitations: vec![
             "Only exact absolute lexical paths in successful openat O_CREAT or O_TRUNC calls are considered for additions and changes; successful O_CREAT may open an existing file and does not prove a change.",
-            "Only exact absolute lexical paths in successful unlink calls, and in successful unlinkat calls with AT_FDCWD and flags 0, are considered for removals; unlinkat AT_REMOVEDIR, directory-fd-relative, relative, and malformed calls are excluded.",
+            "Only exact absolute lexical paths in successful unlink calls, and in successful unlinkat calls with AT_FDCWD (bare or absolute -yy annotated) and flags 0, are considered for removals; the annotation is accepted only as display context for an absolute operand. unlinkat AT_REMOVEDIR, directory-fd-relative, relative, and malformed calls are excluded.",
             "Failed or unknown write-intent or removal-intent outcomes are counted but never treated as mutations.",
             "A successful rename with two plain absolute operands can support a removal at its source and an addition or change at its destination; successful renameat and renameat2 calls require AT_FDCWD directory-fd operands (bare or absolute -yy annotated) and strict absolute path operands, and renameat2 requires flags exactly 0; directory-fd-relative, relative, escaped, aliased, non-zero-flag, and failed or unknown renames are excluded, and a failed or unknown rename counts once against each intent.",
             "Successful open calls are associated only with selected-root additions or changed rows, and successful removal intents only with removed rows; a successful rename destination is treated as a write intent and its source as a removal intent; every other file mutation syscall remains unsupported.",
@@ -614,6 +614,16 @@ mod tests {
             report.associations[0].runtime_evidence[0].syscall,
             "unlinkat"
         );
+
+        // strace -yy can annotate AT_FDCWD with its current directory. Since the
+        // path argument is absolute, that annotation is context only.
+        let report = associate_root_runtime_diff(
+            &diff,
+            b"unlinkat(AT_FDCWD</tmp/r5-root>, \"/tmp/r5-root/item\", 0) = 0\n",
+        )
+        .unwrap();
+        assert_eq!(report.associations.len(), 1);
+        assert_eq!(report.associations[0].status, "candidate_match");
     }
 
     #[test]
