@@ -253,6 +253,210 @@ function Get-MsiInstallArgumentVector {
     )
 }
 
+function Get-StartupSourceStatus {
+    param(
+        [Parameter(Mandatory = $true)] $Document,
+        [Parameter(Mandatory = $true)][string] $SourceId
+    )
+
+    $sources = @($Document.sources | Where-Object { $_.id -ceq $SourceId })
+    if ($sources.Count -ne 1) {
+        throw "Startup snapshot did not contain exactly one '$SourceId' source status."
+    }
+    return [string]$sources[0].status
+}
+
+function Assert-StartupObservation {
+    param(
+        [Parameter(Mandatory = $true)] $Comparison,
+        [Parameter(Mandatory = $true)][string] $SessionPath,
+        [Parameter(Mandatory = $true)][string] $ServiceName,
+        [Parameter(Mandatory = $true)][string] $TaskPath,
+        [Parameter(Mandatory = $true)][string] $InertImagePath
+    )
+
+    if ($Comparison.startup_comparison_status -cnotin @('complete', 'partial') -or
+        $Comparison.startup_source_status -cnotin @('complete', 'partial', 'unknown', 'not_checked', 'unsupported', 'not_applicable', 'unavailable', 'access_denied', 'failed', 'timed_out', 'output_limit_exceeded') -or
+        $null -eq $Comparison.startup_diff -or
+        $Comparison.startup_diff.schema -cne 'sideeffect.startup_inventory_diff' -or
+        $Comparison.startup_diff.platform -cne 'windows') {
+        throw 'The verified observation did not expose a bounded paired Windows startup comparison with supported status values.'
+    }
+    $beforeRef = $Comparison.startup_before_artifact
+    $afterRef = $Comparison.startup_after_artifact
+    if ($null -eq $beforeRef -or $null -eq $afterRef -or $beforeRef.path -ceq $afterRef.path -or
+        $beforeRef.kind -cne 'windows_startup' -or $afterRef.kind -cne 'windows_startup_after' -or
+        $beforeRef.schema -cne 'sideeffect.windows_startup_inventory' -or
+        $afterRef.schema -cne 'sideeffect.windows_startup_inventory' -or
+        $beforeRef.schema_version -ne 10 -or $afterRef.schema_version -ne 10) {
+        throw 'The comparison did not link distinct before and after startup artifacts from the same session.'
+    }
+    $beforePath = Join-Path $SessionPath ([string]$beforeRef.path)
+    $afterPath = Join-Path $SessionPath ([string]$afterRef.path)
+    Assert-UnderPath -Child $beforePath -Parent $SessionPath -Label 'before startup artifact'
+    Assert-UnderPath -Child $afterPath -Parent $SessionPath -Label 'after startup artifact'
+    foreach ($path in @($beforePath, $afterPath)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path).Length -gt 64MB) {
+            throw 'A linked startup artifact was missing or exceeded the acceptance read bound.'
+        }
+    }
+    $before = Get-Content -LiteralPath $beforePath -Raw | ConvertFrom-Json
+    $after = Get-Content -LiteralPath $afterPath -Raw | ConvertFrom-Json
+    foreach ($document in @($before, $after)) {
+        if ($document.schema -cne 'sideeffect.windows_startup_inventory' -or $document.schema_version -ne 10 -or
+            $document.status -cnotin @('complete', 'partial')) {
+            throw 'A linked startup artifact did not retain the supported Windows startup v10 contract and explicit status.'
+        }
+    }
+    if ($Comparison.startup_before_document_status -cne $before.status -or
+        $Comparison.startup_after_document_status -cne $after.status) {
+        throw 'The comparison did not preserve the explicit before and after startup document statuses.'
+    }
+
+    $beforeServices = @($before.service_entries | Where-Object { $_.service_name -ceq $ServiceName })
+    $beforeTasks = @($before.scheduled_task_entries | Where-Object { $_.task_path -ceq $TaskPath })
+    $afterServices = @($after.service_entries | Where-Object { $_.service_name -ceq $ServiceName })
+    $afterTasks = @($after.scheduled_task_entries | Where-Object { $_.task_path -ceq $TaskPath })
+    $serviceStatusBefore = Get-StartupSourceStatus -Document $before -SourceId 'service_start_configuration'
+    $serviceStatusAfter = Get-StartupSourceStatus -Document $after -SourceId 'service_start_configuration'
+    $taskStatusBefore = Get-StartupSourceStatus -Document $before -SourceId 'scheduled_task_triggers'
+    $taskStatusAfter = Get-StartupSourceStatus -Document $after -SourceId 'scheduled_task_triggers'
+    foreach ($status in @($serviceStatusBefore, $serviceStatusAfter, $taskStatusBefore, $taskStatusAfter)) {
+        if ($status -cnotin @('complete', 'partial', 'not_present', 'unavailable', 'inaccessible', 'unsupported', 'not_checked', 'error')) {
+            throw "Startup source returned an unsupported status '$status'."
+        }
+    }
+    if ($beforeServices.Count -ne 0 -or $beforeTasks.Count -ne 0) {
+        throw 'A generated startup fixture identity was present in the before artifact.'
+    }
+
+    $serviceAvailable = $serviceStatusAfter -cin @('complete', 'partial')
+    $taskAvailable = $taskStatusAfter -cin @('complete', 'partial')
+    if ($serviceAvailable) {
+        if (($serviceStatusAfter -ceq 'complete' -and $afterServices.Count -ne 1) -or $afterServices.Count -gt 1) {
+            throw 'The SCM source did not show exactly one fixture service despite complete coverage, or showed ambiguous duplicate identities.'
+        }
+        if ($afterServices.Count -eq 1 -and
+            ($afterServices[0].start_type -cne 'disabled' -or
+                $afterServices[0].binary_path -notlike "*$([IO.Path]::GetFileName($InertImagePath))*")) {
+            throw 'The after artifact did not show exactly one disabled SCM fixture with its unique inert image path.'
+        }
+    }
+    elseif ($afterServices.Count -ne 0) {
+        throw 'An unavailable SCM source unexpectedly exposed a fixture service row.'
+    }
+    $afterActions = @($after.scheduled_task_actions | Where-Object {
+        $_.task_path -ceq $TaskPath -and $_.action_index -eq 0
+    })
+    if ($taskAvailable) {
+        if (($taskStatusAfter -ceq 'complete' -and ($afterTasks.Count -ne 1 -or $afterActions.Count -ne 1)) -or
+            $afterTasks.Count -gt 1 -or $afterActions.Count -gt 1) {
+            throw 'The Task Scheduler source did not show the complete fixture rows or returned ambiguous duplicate identities.'
+        }
+        if ($afterTasks.Count -eq 1 -and ($afterTasks[0].task_enabled -ne $false -or
+            $afterTasks[0].trigger_type -cne 'logon' -or $afterTasks[0].trigger_enabled -ne $false)) {
+            throw 'The after artifact did not show exactly one disabled task and disabled logon trigger.'
+        }
+        if ($afterActions.Count -eq 1 -and ($afterActions[0].status -cne 'observed' -or
+            $afterActions[0].executable_path -cne [IO.Path]::GetFullPath($InertImagePath) -or
+            (Test-Path -LiteralPath $InertImagePath) -or
+            $afterActions[0].startup_state.effective.status -cne 'unknown' -or
+            $afterActions[0].startup_state.observed.status -cne 'unknown')) {
+            throw 'The after artifact did not preserve the exact inert task action and unknown effective/observed state.'
+        }
+    }
+    elseif ($afterTasks.Count -ne 0) {
+        throw 'An unavailable Task Scheduler source unexpectedly exposed a fixture row.'
+    }
+
+    $startupDiff = $Comparison.startup_diff
+    if ($Comparison.startup_comparison_status -ceq 'complete') {
+        $expected = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+        if ($serviceStatusAfter -ceq 'complete') {
+            [void]$expected.Add('service_configuration', "/service_entries/$([array]::IndexOf($after.service_entries, $afterServices[0]))")
+        }
+        if ($taskStatusAfter -ceq 'complete') {
+            [void]$expected.Add('scheduled_task_trigger', "/scheduled_task_entries/$([array]::IndexOf($after.scheduled_task_entries, $afterTasks[0]))")
+            $actionRow = @($after.scheduled_task_actions | Where-Object { $_.task_path -ceq $TaskPath -and $_.action_index -eq 0 })[0]
+            [void]$expected.Add('scheduled_task_action_sequence', "/scheduled_task_actions/$([array]::IndexOf($after.scheduled_task_actions, $actionRow))")
+        }
+        foreach ($category in $expected.Keys) {
+            $deltas = @($startupDiff.deltas | Where-Object {
+                $_.category -ceq $category -and $_.kind -ceq 'observed_after_only' -and
+                $null -eq $_.before -and $null -ne $_.after -and
+                @($_.after.references | Where-Object { $_ -ceq $expected[$category] }).Count -eq 1
+            })
+            if ($deltas.Count -ne 1) {
+                throw "Complete startup diff did not link exactly one after-only $category delta to its startup artifact."
+            }
+        }
+    }
+    else {
+        if ($startupDiff.status -cne 'partial') {
+            throw 'Partial startup comparison did not retain its explicit partial status.'
+        }
+        Write-Output "Startup comparison remained partial; source statuses: SCM $serviceStatusBefore -> $serviceStatusAfter, Task Scheduler $taskStatusBefore -> $taskStatusAfter. Unavailable configuration remains unknown."
+    }
+    Write-Output "Same-session startup links verified: before='$($beforeRef.path)' ($($before.status)); after='$($afterRef.path)' ($($after.status)); source statuses SCM=$serviceStatusAfter, TaskScheduler=$taskStatusAfter; no causal inference."
+}
+
+function Remove-MsiObservationFixtures {
+    param(
+        [Parameter(Mandatory = $true)][string] $ServiceName,
+        [Parameter(Mandatory = $true)][string] $TaskName,
+        [Parameter(Mandatory = $true)][string] $OwnershipMarkerPath
+    )
+
+    if (-not (Test-Path -LiteralPath $OwnershipMarkerPath -PathType Leaf) -or
+        (Get-Item -LiteralPath $OwnershipMarkerPath).Length -gt 4096) {
+        throw 'The exact startup fixture ownership marker was missing or exceeded its bound; refusing cleanup by name alone.'
+    }
+    $ownership = Get-Content -LiteralPath $OwnershipMarkerPath -Raw | ConvertFrom-Json
+    if ($ownership.service_name -cne $ServiceName -or $ownership.task_name -cne $TaskName -or
+        $ServiceName -cnotmatch '^SeR5-[0-9a-f]{32}$' -or $TaskName -cnotmatch '^SideEffectR5Msi-[0-9a-f]{32}$') {
+        throw 'The startup fixture ownership marker did not match the generated exact identities.'
+    }
+
+    $failures = [System.Collections.Generic.List[string]]::new()
+    $taskMatches = @()
+    try {
+        $taskMatches = @(Get-ScheduledTask -TaskPath '\' -ErrorAction Stop | Where-Object { $_.TaskName -ceq $TaskName })
+        if ($taskMatches.Count -gt 1) {
+            $failures.Add('multiple exact Task Scheduler fixture identities were returned')
+        }
+        elseif ($taskMatches.Count -eq 1) {
+            Unregister-ScheduledTask -TaskName $TaskName -TaskPath '\' -Confirm:$false -ErrorAction Stop | Out-Null
+            $deadline = [DateTime]::UtcNow.AddSeconds(10)
+            do {
+                Start-Sleep -Milliseconds 100
+                $remaining = @(Get-ScheduledTask -TaskPath '\' -ErrorAction Stop | Where-Object { $_.TaskName -ceq $TaskName })
+            } while ($remaining.Count -gt 0 -and [DateTime]::UtcNow -lt $deadline)
+            if ($remaining.Count -gt 0) { $failures.Add('exact Task Scheduler fixture did not disappear within the bounded wait') }
+        }
+    }
+    catch { $failures.Add("Task Scheduler removal failed: $($_.Exception.Message)") }
+
+    $sc = Join-Path $env:WINDIR 'System32\sc.exe'
+    try {
+        $probe = Start-Process -FilePath $sc -ArgumentList @('query', $ServiceName) -Wait -PassThru -NoNewWindow
+        if ($probe.ExitCode -eq 0) {
+            $delete = Start-Process -FilePath $sc -ArgumentList @('delete', $ServiceName) -Wait -PassThru -NoNewWindow
+            if ($delete.ExitCode -ne 0) { $failures.Add("SCM rejected deletion of exact service fixture (exit $($delete.ExitCode))") }
+            $deadline = [DateTime]::UtcNow.AddSeconds(10)
+            do {
+                Start-Sleep -Milliseconds 100
+                $probe = Start-Process -FilePath $sc -ArgumentList @('query', $ServiceName) -Wait -PassThru -NoNewWindow
+            } while ($probe.ExitCode -eq 0 -and [DateTime]::UtcNow -lt $deadline)
+            if ($probe.ExitCode -ne 1060) { $failures.Add('exact SCM fixture did not disappear within the bounded wait') }
+        }
+        elseif ($probe.ExitCode -ne 1060) {
+            $failures.Add("SCM could not verify exact service fixture absence (exit $($probe.ExitCode))")
+        }
+    }
+    catch { $failures.Add("SCM fixture removal failed: $($_.Exception.Message)") }
+    if ($failures.Count -gt 0) { throw ($failures -join '; ') }
+}
+
 function Get-MsiInstallArgumentLine {
     param(
         [Parameter(Mandatory = $true)][string] $MsiPath,
@@ -297,18 +501,81 @@ function Invoke-ObservedMsiInstall {
     Assert-UnderPath -Child $LogPath -Parent $script:TestRoot -Label 'observed MSI log'
     Assert-UnderPath -Child $SessionPath -Parent $script:TestRoot -Label 'MSI observation session'
     $msiArguments = Get-MsiInstallArgumentVector -MsiPath $MsiPath -InstallRoot $InstallRoot -LogPath $LogPath
+    $fixtureId = [Guid]::NewGuid().ToString('N')
+    $fixtureServiceName = "SeR5-$fixtureId"
+    $fixtureTaskName = "SideEffectR5Msi-$fixtureId"
+    $fixtureTaskPath = "\$fixtureTaskName"
+    $inertImagePath = Join-Path $script:TestRoot "intentionally-absent-$fixtureId.exe"
+    $exitCodePath = Join-Path $script:TestRoot "msiexec-exit-$fixtureId.txt"
+    $ownershipMarkerPath = Join-Path $script:TestRoot "startup-fixture-owner-$fixtureId.json"
+    $wrapperPath = Join-Path $PSScriptRoot 'test_windows_msi_observation_wrapper.ps1'
+    $powershellPath = Join-Path $PSHOME 'pwsh.exe'
+    if (-not (Test-Path -LiteralPath $wrapperPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $powershellPath -PathType Leaf)) {
+        throw 'The fixed hosted-runner observation wrapper or PowerShell 7 executable was unavailable.'
+    }
+    foreach ($path in @($inertImagePath, $exitCodePath, $ownershipMarkerPath)) {
+        Assert-UnderPath -Child $path -Parent $script:TestRoot -Label 'startup observation fixture path'
+        if (Test-Path -LiteralPath $path) {
+            throw 'A generated startup fixture path already exists; refusing to reuse it.'
+        }
+    }
+    if (Get-ScheduledTask -TaskPath '\' -ErrorAction Stop | Where-Object { $_.TaskName -ceq $fixtureTaskName }) {
+        throw 'The generated Task Scheduler identity already exists; refusing to alter it.'
+    }
+    $scPath = Join-Path $env:WINDIR 'System32\sc.exe'
+    $serviceProbe = Start-Process -FilePath $scPath -ArgumentList @('query', $fixtureServiceName) -Wait -PassThru -NoNewWindow
+    if ($serviceProbe.ExitCode -ne 1060) {
+        throw 'The generated SCM identity already exists or could not be verified absent.'
+    }
+    [IO.File]::WriteAllText($ownershipMarkerPath, (@{ service_name = $fixtureServiceName; task_name = $fixtureTaskName } | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+    $argumentsBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($msiArguments | ConvertTo-Json -Compress)))
+    $wrapperArguments = @(
+        '-NoProfile', '-NonInteractive', '-File', $wrapperPath,
+        '-ServiceName', $fixtureServiceName,
+        '-TaskName', $fixtureTaskName,
+        '-InertImagePath', $inertImagePath,
+        '-MsiexecPath', $script:MsiexecPath,
+        '-ArgumentsJsonBase64', $argumentsBase64,
+        '-ExitCodePath', $exitCodePath,
+        '-OwnershipMarkerPath', $ownershipMarkerPath
+    )
     $auditArguments = @(
         'audit', '--output', $SessionPath,
         '--observe-root', $InstallRoot, '--hash-regular-files',
-        '--runtime-source', 'windows-etw', '--runtime-duration-seconds', '30',
-        '--', $script:MsiexecPath
-    ) + $msiArguments
-    & $script:SideEffectPath @auditArguments
-    $auditExitCode = $LASTEXITCODE
+        '--startup', '--runtime-source', 'windows-etw', '--runtime-duration-seconds', '30',
+        '--', $powershellPath
+    ) + $wrapperArguments
+    try {
+        & $script:SideEffectPath @auditArguments
+        $auditExitCode = $LASTEXITCODE
+    }
+    finally {
+        try {
+            Remove-MsiObservationFixtures -ServiceName $fixtureServiceName -TaskName $fixtureTaskName -OwnershipMarkerPath $ownershipMarkerPath
+        }
+        catch {
+            $script:ObservationFixtureCleanupErrors.Add("$Description startup fixture cleanup failed: $($_.Exception.Message)")
+        }
+    }
     if ($auditExitCode -ne 2) {
         throw "SideEffect observed MSI install returned exit code $auditExitCode; expected partial exit 2 because ETW completeness is unknown."
     }
     $global:LASTEXITCODE = 0
+
+    if (-not (Test-Path -LiteralPath $exitCodePath -PathType Leaf) -or (Get-Item -LiteralPath $exitCodePath).Length -gt 128) {
+        throw 'The hosted wrapper did not produce its bounded msiexec result sidecar.'
+    }
+    $msiexecResult = Get-Content -LiteralPath $exitCodePath -Raw | ConvertFrom-Json
+    $msiExitCode = 0
+    $msiexecPid = [uint32]0
+    if (-not [int]::TryParse([string]$msiexecResult.exit_code, [ref]$msiExitCode) -or
+        -not [uint32]::TryParse([string]$msiexecResult.process_id, [ref]$msiexecPid) -or $msiexecPid -eq 0) {
+        throw 'The wrapper msiexec result sidecar was malformed.'
+    }
+    if ($msiExitCode -ne 0) {
+        throw "$Description preserved msiexec exit code $msiExitCode; installation did not succeed."
+    }
 
     $comparisonOutput = & $script:SideEffectPath 'compare-observation' $SessionPath | Out-String
     $comparisonExitCode = $LASTEXITCODE
@@ -324,7 +591,7 @@ function Invoke-ObservedMsiInstall {
         $comparison.root_source_status -ne 'complete' -or
         $comparison.runtime_source_status -ne 'partial' -or
         $comparison.runtime_capture_completeness -ne 'unknown') {
-        throw "Observed MSI session did not retain complete root comparison and unknown/partial runtime status: $($comparison | ConvertTo-Json -Compress -Depth 12)"
+        throw "Observed MSI session status was not complete selected-root plus partial/unknown ETW (root=$($comparison.root_comparison_status), runtime=$($comparison.runtime_source_status), completeness=$($comparison.runtime_capture_completeness))."
     }
     $counts = $comparison.root_diff.counts
     $expectedAdditions = if ($ExpectedDeltaKind -eq 'added') { 1 } else { 0 }
@@ -332,7 +599,7 @@ function Invoke-ObservedMsiInstall {
     $deltas = @($comparison.root_diff.deltas)
     if ($counts.additions -ne $expectedAdditions -or $counts.changes -ne $expectedChanges -or
         $counts.removals -ne 0 -or $deltas.Count -ne 1) {
-        throw "Observed MSI session did not report exactly one selected-root $ExpectedDeltaKind delta: $($comparison.root_diff | ConvertTo-Json -Compress -Depth 12)"
+        throw "Observed MSI session did not report exactly one selected-root $ExpectedDeltaKind delta (additions=$($counts.additions), changes=$($counts.changes), removals=$($counts.removals), rows=$($deltas.Count))."
     }
     $delta = $deltas[0]
     $payloadPath = Join-Path $InstallRoot 'payload.bin'
@@ -367,7 +634,7 @@ function Invoke-ObservedMsiInstall {
     $association = $comparison.root_runtime_association
     if ($null -eq $association -or $association.claim -ne 'exact_lexical_dos_drive_path_candidate_only_no_success_ownership_or_causation' -or
         $association.status -ne 'partial' -or $association.capture_completeness -ne 'unknown') {
-        throw "Observation comparison did not retain the bounded claim and unknown ETW completeness: $($association | ConvertTo-Json -Compress -Depth 12)"
+        throw 'Observation comparison did not retain the bounded lexical-candidate claim and unknown ETW completeness.'
     }
 
     $runtimeArtifact = @($comparison.runtime_artifacts | Where-Object { $_.path -eq 'runtime.windows.json' })
@@ -385,17 +652,26 @@ function Invoke-ObservedMsiInstall {
     $capture = [System.Text.Encoding]::UTF8.GetString($captureBytes) | ConvertFrom-Json
     if ($capture.schema -ne 'sideeffect.windows_runtime_capture' -or $capture.schema_version -ne 3 -or
         $capture.document_sha256 -cne $association.capture_document_sha256 -or
-        $association.capture_artifact_sha256 -cne $captureArtifactHash) {
-        throw 'ETW capture document digest or distinct capture artifact digest did not match the comparison evidence.'
+        $association.capture_artifact_sha256 -cne $captureArtifactHash -or
+        $capture.target.exit_code -ne $msiExitCode) {
+        throw 'ETW capture digests or target exit code did not match the verified MSI child result.'
     }
     $targetPid = [uint32]$capture.target.process_id
     $targetStarts = @($capture.events | Where-Object {
         $_.event_kind -eq 'process_start' -and $_.payload_decoding.status -eq 'decoded' -and
         [uint32]$_.payload_decoding.process_id -eq $targetPid -and
-        [System.IO.Path]::GetFileName([string]$_.payload_decoding.image_file_name) -ieq 'msiexec.exe'
+        [System.IO.Path]::GetFileName([string]$_.payload_decoding.image_file_name) -ieq 'pwsh.exe'
     })
     if ($targetPid -eq 0 -or $targetStarts.Count -eq 0) {
-        throw 'ETW capture did not contain a decoded process-start row for the actual msiexec target PID.'
+        throw 'ETW capture did not contain a decoded process-start row for the fixed PowerShell harness target PID.'
+    }
+    $msiexecStarts = @($capture.events | Where-Object {
+        $_.event_kind -eq 'process_start' -and $_.payload_decoding.status -eq 'decoded' -and
+        [uint32]$_.payload_decoding.process_id -eq $msiexecPid -and
+        [System.IO.Path]::GetFileName([string]$_.payload_decoding.image_file_name) -ieq 'msiexec.exe'
+    })
+    if ($msiexecStarts.Count -eq 0) {
+        throw 'ETW capture did not contain a decoded process-start row for the exact waited msiexec child PID; no relationship is inferred when its row is missing.'
     }
     $rawPayloadHashes = @{}
     $payloadNameEvidence = [System.Collections.Generic.List[object]]::new()
@@ -453,9 +729,10 @@ function Invoke-ObservedMsiInstall {
         Write-Output "ETW observed the fixture payload basename in decoded file-name rows, but the comparator reported no exact path candidate; root/runtime association remains unresolved. Evidence references (capped at 8): $(@($payloadNameEvidence | Select-Object -First 8) | ConvertTo-Json -Compress -Depth 4)"
     }
     else {
-        throw "ETW payload-name evidence was not supported by a candidate or an explicit unresolved namespace diagnostic: $($association | ConvertTo-Json -Compress -Depth 12)"
+        throw 'ETW payload-name evidence was not supported by a candidate or an explicit unresolved namespace diagnostic.'
     }
-    Write-Output "$Description produced one selected-root $ExpectedDeltaKind delta for the expected payload SHA-256 with decoded msiexec target evidence; capture completeness and causality remain unknown."
+    Assert-StartupObservation -Comparison $comparison -SessionPath $SessionPath -ServiceName $fixtureServiceName -TaskPath $fixtureTaskPath -InertImagePath $inertImagePath
+    Write-Output "$Description produced one selected-root $ExpectedDeltaKind delta for the expected payload SHA-256. ETW separately recorded the wrapper target and an msiexec child process-start row; completeness and causality remain unknown."
 }
 
 function Uninstall-Msi {
@@ -967,6 +1244,16 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hoste
 if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP) -or [string]::IsNullOrWhiteSpace($env:WIX)) {
     throw 'RUNNER_TEMP and WIX must be provided by the GitHub-hosted Windows runner.'
 }
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = [Security.Principal.WindowsPrincipal]::new($identity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'The hosted runner token is not already administrative; the MSI acceptance will not elevate.'
+}
+foreach ($commandName in @('Get-ScheduledTask', 'New-ScheduledTask', 'New-ScheduledTaskAction', 'New-ScheduledTaskPrincipal', 'New-ScheduledTaskSettingsSet', 'New-ScheduledTaskTrigger', 'Register-ScheduledTask', 'Unregister-ScheduledTask')) {
+    if (-not (Get-Command $commandName -ErrorAction SilentlyContinue)) {
+        throw "Required Task Scheduler command $commandName is unavailable."
+    }
+}
 
 Add-Type -TypeDefinition @'
 using System.Runtime.InteropServices;
@@ -1021,6 +1308,7 @@ $script:HostedRegistryFixtureCreated = $false
 $script:HostedRegistryFixtureProductCode = $null
 $testFailure = $null
 $cleanupErrors = [System.Collections.Generic.List[string]]::new()
+$script:ObservationFixtureCleanupErrors = [System.Collections.Generic.List[string]]::new()
 
 try {
     New-Item -ItemType Directory -Path $script:TestRoot -ErrorAction Stop | Out-Null
@@ -1191,6 +1479,9 @@ finally {
             }
         }
         Remove-HostedRegistryFixtureRegistration
+        foreach ($cleanupError in $script:ObservationFixtureCleanupErrors) {
+            $cleanupErrors.Add($cleanupError)
+        }
         $registeredFixtureRemains = $false
         foreach ($productCode in @($productCodeV2, $productCodeV1)) {
             if ($null -ne (Get-ProductRegistration -ProductCode $productCode)) {
@@ -1198,9 +1489,14 @@ finally {
             }
         }
         if ($createdTestRoot -and (Test-Path -LiteralPath $script:TestRoot)) {
-            if ($registeredFixtureRemains) {
-                Write-Warning "Fixture files were retained because an MSI product remains registered: $script:TestRoot"
-                $cleanupErrors.Add("Fixture MSI registration remains; retained fixture files at $script:TestRoot")
+            if ($registeredFixtureRemains -or $script:ObservationFixtureCleanupErrors.Count -gt 0) {
+                if ($registeredFixtureRemains) {
+                    Write-Warning "Fixture files were retained because an MSI product remains registered: $script:TestRoot"
+                    $cleanupErrors.Add("Fixture MSI registration remains; retained fixture files at $script:TestRoot")
+                }
+                else {
+                    Write-Warning "Startup fixture cleanup was incomplete; retained test evidence at $script:TestRoot"
+                }
             }
             else {
                 Assert-UnderPath -Child $script:TestRoot -Parent $runnerTemp -Label 'MSI cleanup target'
