@@ -146,11 +146,15 @@ fn is_diagnostic_code(value: &str) -> bool {
 
 #[cfg(test)]
 fn utf16le_hex(value: &str) -> String {
-    value
-        .encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(value.encode_utf16().count().saturating_mul(4));
+    for unit in value.encode_utf16() {
+        for byte in unit.to_le_bytes() {
+            result.push(HEX[(byte >> 4) as usize] as char);
+            result.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    result
 }
 
 #[cfg(test)]
