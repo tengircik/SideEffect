@@ -568,6 +568,8 @@ function Invoke-ObservedMsiInstall {
         [Parameter(Mandatory = $true)][ValidateSet('added', 'changed')][string] $ExpectedDeltaKind,
         [Parameter(Mandatory = $true)][string] $ExpectedPayloadSha256,
         [Parameter()][string] $ExpectedPreviousPayloadSha256,
+        [Parameter(Mandatory = $true)][string] $ExpectedProductCode,
+        [Parameter()][string] $ExpectedPreviousProductCode,
         [Parameter(Mandatory = $true)][string] $Description
     )
 
@@ -634,7 +636,7 @@ function Invoke-ObservedMsiInstall {
     $auditArguments = @(
         'audit', '--output', $SessionPath,
         '--observe-root', $InstallRoot, '--hash-regular-files',
-        '--startup', '--runtime-source', 'windows-etw', '--runtime-duration-seconds', '30',
+        '--startup', '--packages', '--runtime-source', 'windows-etw', '--runtime-duration-seconds', '30',
         '--', $powershellPath
     ) + $wrapperArguments
     try {
@@ -684,6 +686,8 @@ function Invoke-ObservedMsiInstall {
         $comparison.runtime_capture_completeness -ne 'unknown') {
         throw "Observed MSI session status was not complete selected-root plus partial/unknown ETW (root=$($comparison.root_comparison_status), runtime=$($comparison.runtime_source_status), completeness=$($comparison.runtime_capture_completeness))."
     }
+    Assert-ObservedSessionSoftwareComparison -SessionPath $SessionPath -Comparison $comparison `
+        -ProductCode $ExpectedProductCode -PreviousProductCode $ExpectedPreviousProductCode
     $counts = $comparison.root_diff.counts
     $expectedAdditions = if ($ExpectedDeltaKind -eq 'added') { 1 } else { 0 }
     $expectedChanges = if ($ExpectedDeltaKind -eq 'changed') { 1 } else { 0 }
@@ -1102,13 +1106,15 @@ function Get-FixtureSoftwareRegistrations {
     param(
         [Parameter(Mandatory = $true)] $Document,
         [Parameter(Mandatory = $true)][string] $DisplayName,
-        [Parameter(Mandatory = $true)][string] $Version
+        [Parameter(Mandatory = $true)][string] $Version,
+        [Parameter()][string] $ProductCode
     )
 
     $matches = @($Document.registrations | Where-Object {
         $_.display_name -eq $DisplayName -and
         $_.evidence.hive -eq 'HKEY_CURRENT_USER' -and
         $_.evidence.registry_view -in @('native', 'wow64_32') -and
+        ([string]::IsNullOrEmpty($ProductCode) -or $_.registry_subkey -ceq $ProductCode) -and
         (@($_.values | Where-Object { $_.name -eq 'DisplayVersion' -and $_.text -eq $Version }).Count -eq 1)
     })
     foreach ($view in @('native', 'wow64_32')) {
@@ -1117,6 +1123,148 @@ function Get-FixtureSoftwareRegistrations {
         }
     }
     return $matches
+}
+
+function Assert-ObservedSessionSoftwareComparison {
+    param(
+        [Parameter(Mandatory = $true)][string] $SessionPath,
+        [Parameter(Mandatory = $true)] $Comparison,
+        [Parameter(Mandatory = $true)][string] $ProductCode,
+        [Parameter()][string] $PreviousProductCode
+    )
+
+    if ($Comparison.software_comparison_status -notin @('complete', 'partial') -or
+        $null -eq $Comparison.software_diff -or
+        $Comparison.software_diff.schema -ne 'sideeffect.windows_software_inventory_diff' -or
+        $Comparison.software_diff.schema_version -ne 1) {
+        throw 'Observed MSI session did not provide a typed Windows software-registration v1 comparison.'
+    }
+
+    $manifestPath = Join-Path $SessionPath 'session.json'
+    Assert-UnderPath -Child $manifestPath -Parent $SessionPath -Label 'observation session manifest'
+    $manifestItem = Get-Item -LiteralPath $manifestPath
+    if ($manifestItem.Length -gt 1048576) { throw 'Observation session manifest exceeded the bounded acceptance size.' }
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    if ($manifest.schema -ne 'sideeffect.audit_session' -or $manifest.schema_version -ne 18) {
+        throw 'Observed MSI package session did not use the v18 observation manifest.'
+    }
+    $packageSources = @($manifest.sources | Where-Object { $_.role -eq 'packages' })
+    if ($packageSources.Count -ne 1) { throw 'Observed MSI session did not have exactly one manifest-linked package source.' }
+    if ($Comparison.software_source_status -cne $packageSources[0].status) {
+        throw 'Observed MSI software source status did not match its session manifest source.'
+    }
+
+    $artifactSpecs = @(
+        [pscustomobject]@{ Property = 'software_before_artifact'; Kind = 'windows_software'; Path = 'software.windows.json'; Side = 'before' },
+        [pscustomobject]@{ Property = 'software_after_artifact'; Kind = 'windows_software_after'; Path = 'software-after.windows.json'; Side = 'after' }
+    )
+    $documents = @{}
+    foreach ($spec in $artifactSpecs) {
+        $comparisonReference = $Comparison.($spec.Property)
+        $manifestReferences = @($packageSources[0].artifacts | Where-Object { $_.kind -eq $spec.Kind -and $_.path -eq $spec.Path })
+        if ($null -eq $comparisonReference -or $manifestReferences.Count -ne 1) {
+            throw "Observed MSI $($spec.Side) software artifact was not linked exactly once by comparison and manifest."
+        }
+        $reference = $manifestReferences[0]
+        foreach ($field in @('path', 'schema', 'schema_version', 'byte_length', 'sha256')) {
+            if ($comparisonReference.$field -cne $reference.$field) {
+                throw "Observed MSI $($spec.Side) software artifact comparison reference differed from the manifest."
+            }
+        }
+        if ($reference.schema -ne 'sideeffect.windows_software_inventory' -or $reference.schema_version -ne 1) {
+            throw "Observed MSI $($spec.Side) software artifact was not the Windows software v1 schema."
+        }
+        $artifactPath = Join-Path $SessionPath $spec.Path
+        Assert-UnderPath -Child $artifactPath -Parent $SessionPath -Label 'software session artifact'
+        $item = Get-Item -LiteralPath $artifactPath
+        if ($item.Length -gt 8388608 -or $item.Length -ne [long]$reference.byte_length) {
+            throw "Observed MSI $($spec.Side) software artifact exceeded its bound or manifest byte length."
+        }
+        $bytes = [System.IO.File]::ReadAllBytes($artifactPath)
+        $digest = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+        if ($digest -cne $reference.sha256) { throw "Observed MSI $($spec.Side) software artifact did not match its manifest digest." }
+        $document = [System.Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+        if ($document.schema -ne 'sideeffect.windows_software_inventory' -or $document.schema_version -ne 1 -or $document.platform -ne 'windows') {
+            throw "Observed MSI $($spec.Side) software artifact did not decode as Windows software v1."
+        }
+        $documents[$spec.Side] = $document
+    }
+    if ($Comparison.software_before_document_status -ne $documents.before.status -or
+        $Comparison.software_after_document_status -ne $documents.after.status) {
+        throw 'Observed MSI software document statuses did not match their manifest-linked artifacts.'
+    }
+
+    $displayName = 'SideEffect R5 Synthetic MSI Fixture'
+    $productVersion = if ([string]::IsNullOrWhiteSpace($PreviousProductCode)) { '1.0.0' } else { '2.0.0' }
+    $expected = @([pscustomobject]@{
+        Code = $ProductCode
+        Version = $productVersion
+        Kind = 'added'
+    })
+    if (-not [string]::IsNullOrWhiteSpace($PreviousProductCode)) {
+        $expected += [pscustomobject]@{ Code = $PreviousProductCode; Version = '1.0.0'; Kind = 'removed' }
+    }
+    $unknown = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in $expected) {
+        $beforeRows = @(Get-FixtureSoftwareRegistrations -Document $documents.before -DisplayName $displayName -Version $entry.Version -ProductCode $entry.Code)
+        $afterRows = @(Get-FixtureSoftwareRegistrations -Document $documents.after -DisplayName $displayName -Version $entry.Version -ProductCode $entry.Code)
+        $views = @($beforeRows | ForEach-Object { $_.evidence.registry_view })
+        $views += @($afterRows | ForEach-Object { $_.evidence.registry_view })
+        $views = @($views | Sort-Object -Unique)
+        if ($views.Count -eq 0) {
+            $unknown.Add("$($entry.Version):not_observed")
+            continue
+        }
+        foreach ($view in $views) {
+            $sourceId = if ($view -eq 'native') { 'current_user_native_uninstall' } else { 'current_user_32_uninstall' }
+            $source = @($Comparison.software_diff.sources | Where-Object { $_.source_id -eq $sourceId })
+            if ($source.Count -ne 1 -or $source[0].before_status -notin @('complete', 'not_present') -or
+                $source[0].after_status -notin @('complete', 'not_present')) {
+                $unknown.Add("$($entry.Version):$view`_source_partial")
+                continue
+            }
+            $beforePresent = @($beforeRows | Where-Object { $_.evidence.registry_view -eq $view }).Count -eq 1
+            $afterPresent = @($afterRows | Where-Object { $_.evidence.registry_view -eq $view }).Count -eq 1
+            if ($entry.Kind -eq 'added') {
+                if ($beforePresent) {
+                    throw "Observed MSI ProductCode addition was already present before the transition in $view."
+                }
+                if (-not $afterPresent) { continue }
+            }
+            else {
+                if ($afterPresent) {
+                    throw "Observed MSI ProductCode removal remained present after the transition in $view."
+                }
+                if (-not $beforePresent) { continue }
+            }
+            $kind = $entry.Kind
+            $deltas = @($Comparison.software_diff.deltas | Where-Object {
+                $_.kind -eq $kind -and $_.identity.source_id -eq $sourceId -and
+                $_.identity.registry_view -eq $view -and $_.identity.registry_subkey -ceq $entry.Code
+            })
+            if ($deltas.Count -ne 1) {
+                throw "Observed MSI ProductCode registration transition for $($entry.Version) lacked exactly one evidence-linked $kind delta in $view."
+            }
+            if ($kind -eq 'added') {
+                Assert-SoftwareDiffSideEvidence -Delta $deltas[0] -Side 'after' -Snapshot $documents.after
+                if ($deltas[0].after.display_name -cne $displayName -or $deltas[0].after.display_version -cne $entry.Version) {
+                    throw "Observed MSI ProductCode addition did not retain the expected fixture facts for $($entry.Version)."
+                }
+            }
+            else {
+                Assert-SoftwareDiffSideEvidence -Delta $deltas[0] -Side 'before' -Snapshot $documents.before
+                if ($deltas[0].before.display_name -cne $displayName -or $deltas[0].before.display_version -cne $entry.Version) {
+                    throw "Observed MSI ProductCode removal did not retain the expected fixture facts for $($entry.Version)."
+                }
+            }
+        }
+    }
+    if ($unknown.Count -gt 0) {
+        Write-Output "Observed-session MSI ProductCode registration evidence is unknown or partial for bounded views ($($unknown -join ', ')); MSI API success is not treated as an Uninstall-registry observation."
+    }
+    else {
+        Write-Output 'Observed-session MSI ProductCode transitions were matched to exact current-user Uninstall subkeys and evidence-linked software diff rows.'
+    }
 }
 
 function Get-GeneratedUninstallKeyDiagnostics {
@@ -1506,7 +1654,7 @@ try {
     }
 
     $installationStarted = $true
-    Invoke-ObservedMsiInstall -MsiPath $msiV1 -InstallRoot $script:InstallRoot -LogPath (Join-Path $script:TestRoot 'install-v1.log') -SessionPath $observationV1Path -ExpectedDeltaKind 'added' -ExpectedPayloadSha256 $payloadV1Sha256 -Description 'Observed v1 MSI install'
+    Invoke-ObservedMsiInstall -MsiPath $msiV1 -InstallRoot $script:InstallRoot -LogPath (Join-Path $script:TestRoot 'install-v1.log') -SessionPath $observationV1Path -ExpectedDeltaKind 'added' -ExpectedPayloadSha256 $payloadV1Sha256 -ExpectedProductCode $productCodeV1 -Description 'Observed v1 MSI install'
     Assert-ProductVersion -ProductCode $productCodeV1 -Version '1.0.0' -LogPath (Join-Path $script:TestRoot 'install-v1.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin')
     Assert-InstalledPayload -ProductCode $productCodeV1 -LogPath (Join-Path $script:TestRoot 'install-v1.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin') -ExpectedBytes $payloadV1
     $snapshotV1 = Get-InventorySnapshot -Path $snapshotV1Path
@@ -1534,7 +1682,7 @@ try {
     Assert-SoftwareLifecycleDiff -Diff $softwareInstallDiff -Before $softwareBefore -After $softwareV1 -AddedVersions @('1.0.0')
     Write-Output "MSI v1 installed; observed selected-root SHA-256: $($entryV1.content_sha256)"
 
-    Invoke-ObservedMsiInstall -MsiPath $msiV2 -InstallRoot $script:InstallRoot -LogPath (Join-Path $script:TestRoot 'update-v2.log') -SessionPath $observationV2Path -ExpectedDeltaKind 'changed' -ExpectedPayloadSha256 $payloadV2Sha256 -ExpectedPreviousPayloadSha256 $payloadV1Sha256 -Description 'Observed v2 MSI major upgrade'
+    Invoke-ObservedMsiInstall -MsiPath $msiV2 -InstallRoot $script:InstallRoot -LogPath (Join-Path $script:TestRoot 'update-v2.log') -SessionPath $observationV2Path -ExpectedDeltaKind 'changed' -ExpectedPayloadSha256 $payloadV2Sha256 -ExpectedPreviousPayloadSha256 $payloadV1Sha256 -ExpectedProductCode $productCodeV2 -ExpectedPreviousProductCode $productCodeV1 -Description 'Observed v2 MSI major upgrade'
     Assert-ProductAbsent -ProductCode $productCodeV1
     Assert-ProductVersion -ProductCode $productCodeV2 -Version '2.0.0' -LogPath (Join-Path $script:TestRoot 'update-v2.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin')
     Assert-InstalledPayload -ProductCode $productCodeV2 -LogPath (Join-Path $script:TestRoot 'update-v2.log') -PayloadPath (Join-Path $script:InstallRoot 'payload.bin') -ExpectedBytes $payloadV2
