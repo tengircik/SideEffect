@@ -6,7 +6,7 @@ use sideeffect::audit_session::{
 };
 use sideeffect::inventory::parse_dpkg_query_output;
 use sideeffect::limits::ParseLimits;
-use sideeffect::model::{SyscallOutcome, TraceRecordKind};
+use sideeffect::model::{SyscallOutcome, TraceRecord, TraceRecordKind};
 use sideeffect::trace::strace::parse_trace_bytes;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -27,6 +27,44 @@ const DPKG_QUERY: &str = "/usr/bin/dpkg-query";
 const SAFE_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+fn successful_split_removal_pairs<'a>(
+    records: &'a [TraceRecord],
+    basename: &str,
+) -> Vec<(&'a TraceRecord, &'a TraceRecord)> {
+    let mut pairs = Vec::new();
+    let mut pending: std::collections::BTreeMap<(u32, String), Vec<&TraceRecord>> =
+        std::collections::BTreeMap::new();
+    for record in records {
+        let (Some(process_id), Some(syscall)) = (record.process_id, record.syscall.as_ref()) else {
+            continue;
+        };
+        if !matches!(syscall.as_str(), "unlink" | "unlinkat") {
+            continue;
+        }
+        let key = (process_id, syscall.clone());
+        match record.kind {
+            TraceRecordKind::UnfinishedSyscall => {
+                pending.entry(key).or_default().push(record);
+            }
+            TraceRecordKind::ResumedSyscall => {
+                let Some(queue) = pending.get_mut(&key) else {
+                    continue;
+                };
+                if queue.len() == 1 {
+                    let unfinished = queue.remove(0);
+                    if unfinished.raw_line.contains(basename)
+                        && record.raw_result.as_deref() == Some("0")
+                    {
+                        pairs.push((unfinished, record));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    pairs
+}
 
 struct TempDirectory(PathBuf);
 
@@ -824,7 +862,8 @@ fn assert_observed_dpkg_transition(
                     && record.raw_line.contains(PAYLOAD_NAME)
             })
             .collect::<Vec<_>>();
-        if removal_rows.is_empty() {
+        let split_pairs = successful_split_removal_pairs(&trace.records, PAYLOAD_NAME);
+        if removal_rows.is_empty() && split_pairs.is_empty() {
             let rows = trace
                 .records
                 .iter()
@@ -844,7 +883,7 @@ fn assert_observed_dpkg_transition(
                 })
                 .collect::<Vec<_>>();
             panic!(
-                "purge delta is explicitly unmatched and no successful removal row mentions payload basename; bounded raw rows: {}",
+                "purge delta is explicitly unmatched and no successful complete removal or uniquely paired split removal mentions payload basename; bounded raw rows: {}",
                 if rows.is_empty() {
                     "none parsed".to_owned()
                 } else {
@@ -864,18 +903,43 @@ fn assert_observed_dpkg_transition(
                 "unmatched removal evidence locator must resolve to its raw trace row"
             );
         }
-        eprintln!(
-            "purge delta explicitly unmatched by absolute lexical path; basename appears in successful removal rows only, with no path identity inferred: {}",
-            removal_rows
-                .iter()
-                .take(8)
-                .map(|record| format!(
+        for (unfinished, resumed) in &split_pairs {
+            for record in [unfinished, resumed] {
+                let start = usize::try_from(record.evidence.byte_offset)
+                    .expect("trace byte offset fits the host address size");
+                let end = start
+                    .checked_add(record.evidence.byte_length as usize)
+                    .expect("trace evidence range does not overflow");
+                assert_eq!(
+                    trace_bytes.get(start..end),
+                    Some(record.raw_line.as_bytes()),
+                    "split removal evidence locator must resolve to its raw trace row"
+                );
+            }
+        }
+        let mut diagnostic_rows = removal_rows
+            .iter()
+            .take(8)
+            .map(|record| {
+                format!(
                     "{}: {}",
                     record.evidence.line_number,
                     record.raw_line.chars().take(384).collect::<String>()
-                ))
-                .collect::<Vec<_>>()
-                .join(" | ")
+                )
+            })
+            .collect::<Vec<_>>();
+        for (unfinished, resumed) in split_pairs.iter().take(4) {
+            diagnostic_rows.push(format!(
+                "{} + {} (same PID/syscall unique pair): {} || {}",
+                unfinished.evidence.line_number,
+                resumed.evidence.line_number,
+                unfinished.raw_line.chars().take(384).collect::<String>(),
+                resumed.raw_line.chars().take(384).collect::<String>()
+            ));
+        }
+        eprintln!(
+            "purge delta explicitly unmatched by absolute lexical path; validated bounded runtime evidence (no path identity inferred): {}",
+            diagnostic_rows.join(" | ")
         );
     }
 
@@ -923,6 +987,54 @@ fn assert_session_artifacts_verified<'a>(
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[test]
+fn split_purge_removal_evidence_pairs_only_unique_pid_and_syscall_rows() {
+    let prefix = b"7539 1794733592.063025 unlink(\"/tmp/private/root/usr/lib/pkg/payload.bin\" <unfinished ...>\n7539 1794733592.063214 <... unlink resumed>) = 0\n";
+    let parsed = parse_trace_bytes(prefix, ParseLimits::default()).unwrap();
+    let pairs = successful_split_removal_pairs(&parsed.records, PAYLOAD_NAME);
+    assert_eq!(pairs.len(), 1);
+    let (unfinished, resumed) = pairs[0];
+    assert_eq!(unfinished.kind, TraceRecordKind::UnfinishedSyscall);
+    assert_eq!(resumed.kind, TraceRecordKind::ResumedSyscall);
+    assert_eq!(unfinished.process_id, Some(7539));
+    assert_eq!(resumed.process_id, Some(7539));
+    assert_eq!(unfinished.syscall.as_deref(), Some("unlink"));
+    assert_eq!(resumed.syscall.as_deref(), Some("unlink"));
+    assert_eq!(resumed.raw_result.as_deref(), Some("0"));
+    for record in [unfinished, resumed] {
+        let start = record.evidence.byte_offset as usize;
+        let end = start + record.evidence.byte_length as usize;
+        assert_eq!(
+            &prefix[start..end],
+            record.raw_line.as_bytes(),
+            "each paired locator must resolve to its own raw row"
+        );
+    }
+
+    let ambiguous = b"7539 1794733592.063025 unlink(\"/tmp/private/root/payload.bin\" <unfinished ...>\n7539 1794733592.063026 unlink(\"/tmp/private/root/other.bin\" <unfinished ...>\n7539 1794733592.063214 <... unlink resumed>) = 0\n";
+    let parsed = parse_trace_bytes(ambiguous, ParseLimits::default()).unwrap();
+    assert!(successful_split_removal_pairs(&parsed.records, PAYLOAD_NAME).is_empty());
+
+    let wrong_pid = b"7539 1794733592.063025 unlink(\"/tmp/private/root/payload.bin\" <unfinished ...>\n7540 1794733592.063214 <... unlink resumed>) = 0\n";
+    let parsed = parse_trace_bytes(wrong_pid, ParseLimits::default()).unwrap();
+    assert!(successful_split_removal_pairs(&parsed.records, PAYLOAD_NAME).is_empty());
+
+    let out_of_order = b"7539 1794733592.063025 <... unlink resumed>) = 0\n7539 1794733592.063214 unlink(\"/tmp/private/root/payload.bin\" <unfinished ...>\n";
+    let parsed = parse_trace_bytes(out_of_order, ParseLimits::default()).unwrap();
+    assert!(successful_split_removal_pairs(&parsed.records, PAYLOAD_NAME).is_empty());
+
+    let failed = b"7539 1794733592.063025 unlink(\"/tmp/private/root/payload.bin\" <unfinished ...>\n7539 1794733592.063214 <... unlink resumed>) = -1 ENOENT (No such file or directory)\n";
+    let parsed = parse_trace_bytes(failed, ParseLimits::default()).unwrap();
+    assert!(successful_split_removal_pairs(&parsed.records, PAYLOAD_NAME).is_empty());
+
+    let sequential = b"7539 1794733592.063025 unlink(\"/tmp/private/root/payload.bin\" <unfinished ...>\n7539 1794733592.063214 <... unlink resumed>) = 0\n7539 1794733592.064025 unlink(\"/tmp/private/root/payload.bin\" <unfinished ...>\n7539 1794733592.064214 <... unlink resumed>) = 0\n";
+    let parsed = parse_trace_bytes(sequential, ParseLimits::default()).unwrap();
+    assert_eq!(
+        successful_split_removal_pairs(&parsed.records, PAYLOAD_NAME).len(),
+        2
+    );
 }
 
 #[test]

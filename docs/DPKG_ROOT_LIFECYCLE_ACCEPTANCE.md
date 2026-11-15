@@ -52,9 +52,13 @@ snapshot, so it produces no selected-root delta; only the destination supports
 one candidate for install and upgrade. For purge, the test checks the exact
 locator when a strict absolute lexical candidate exists for the removed payload
 from a successful supported `unlink`, `unlinkat`, or rename-source row. If the
-real purge uses an unsupported or relative spelling, the delta stays explicitly
-unmatched and the test reports only bounded successful raw removal rows that
-contain the payload basename; this does not claim absolute path identity. For
+real purge uses an unsupported or relative spelling, or strace splits an
+operation over unfinished/resumed rows, the delta stays explicitly unmatched.
+For a split removal the test pairs a later resumed row only with the unique
+earlier pending row for the same PID and syscall; sequential pairs are allowed,
+while overlapping ambiguous rows are not. It checks both raw byte locators and
+requires a successful resumed result. It reports bounded trace evidence that contains the payload
+basename without claiming absolute path identity. For
 `unlinkat`, a bare `AT_FDCWD` or an absolute `-yy` annotation is accepted only
 with flags `0` and an exact absolute operand; the annotation is display context,
 not a path-resolution fallback. A candidate locator is checked against the raw
