@@ -874,7 +874,7 @@ function Invoke-ObservedMsiInstall {
             log_buffers_lost = if ($lossCountersAvailable) { [long]$loss.log_buffers_lost } else { $null }
             real_time_buffers_lost = if ($lossCountersAvailable) { [long]$loss.real_time_buffers_lost } else { $null }
         }
-        Write-Output "ETW recorded decoded payload-basename observations, but no exact path candidate was available; the selected-root/runtime relationship remains unresolved. Bounded enum/count diagnostics only: $($safeAssociationSummary | ConvertTo-Json -Compress -Depth 6). Evidence references (capped at 8): $(@($payloadNameEvidence | Select-Object -First 8) | ConvertTo-Json -Compress -Depth 4)"
+        Write-Output "ETW recorded decoded payload-basename observations, but no exact DOS-drive candidate was available; the independent NT namespace result is reported separately. Bounded enum/count diagnostics only: $($safeAssociationSummary | ConvertTo-Json -Compress -Depth 6). Evidence references (capped at 8): $(@($payloadNameEvidence | Select-Object -First 8) | ConvertTo-Json -Compress -Depth 4)"
     }
     else {
         throw 'ETW payload-name evidence was not supported by a candidate or an explicit unresolved namespace diagnostic.'
