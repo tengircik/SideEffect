@@ -642,6 +642,57 @@ pub fn collect_and_publish(
                 startup_bytes,
             ));
         }
+        if options.software {
+            let software_after = collect_windows_software();
+            let (after_status, after_diagnostics) =
+                status_from_serialized(&software_after, "status");
+            let software_source = sources
+                .iter_mut()
+                .find(|source| source.role == SourceRole::Packages)
+                .expect("software source was collected before the observation window");
+            software_source.ended_at_unix_ms = software_after.capture_ended_at_unix_ms;
+            software_source.scope = "bounded Uninstall registry registrations observed before and after the runtime capture".to_owned();
+            if software_source.status != SourceStatus::Complete
+                || after_status != SourceStatus::Complete
+            {
+                software_source.status = SourceStatus::Partial;
+            }
+            software_source
+                .diagnostic_codes
+                .extend(after_diagnostics.into_iter().map(str::to_owned));
+            software_source.diagnostic_codes.sort();
+            software_source.diagnostic_codes.dedup();
+            if software_source.diagnostic_codes.len()
+                > crate::audit_session::MAX_DIAGNOSTIC_CODES_PER_SOURCE
+            {
+                software_source
+                    .diagnostic_codes
+                    .truncate(crate::audit_session::MAX_DIAGNOSTIC_CODES_PER_SOURCE);
+                software_source.status = SourceStatus::Partial;
+            }
+            let software_bytes = serde_json::to_vec(&software_after).map_err(|error| {
+                format!("could not serialize after software inventory: {error}")
+            })?;
+            let existing_bytes = artifacts.iter().try_fold(0usize, |total, artifact| {
+                total.checked_add(artifact.bytes.len())
+            });
+            if software_bytes.len() as u64 > MAX_SESSION_ARTIFACT_BYTES
+                || existing_bytes
+                    .and_then(|total| total.checked_add(software_bytes.len()))
+                    .is_none_or(|total| {
+                        total > MAX_WINDOWS_SESSION_BYTES.saturating_sub(512 * 1024)
+                    })
+            {
+                return Err("after software inventory exceeds the audit-session artifact or aggregate byte limit".to_owned());
+            }
+            artifacts.push(artifact(
+                ArtifactKind::WindowsSoftwareAfter,
+                "software-after.windows.json",
+                "sideeffect.windows_software_inventory",
+                1,
+                software_bytes,
+            ));
+        }
     }
 
     let context = host_context();
@@ -767,6 +818,8 @@ fn build_manifest(
             .iter()
             .filter(|artifact| {
                 role_kind(source.role) == Some(artifact.kind)
+                    || (source.role == SourceRole::Packages
+                        && artifact.kind == ArtifactKind::WindowsSoftwareAfter)
                     || (source.role == SourceRole::Startup
                         && artifact.kind == ArtifactKind::WindowsStartupAfter)
                     || (source.role == SourceRole::SelectedRoot
@@ -992,7 +1045,8 @@ fn collect_windows_startup_for_session(
         crate::audit_session::AUDIT_SESSION_V14_SCHEMA_VERSION => Ok(collect_windows_startup_v9()),
         crate::audit_session::AUDIT_SESSION_V15_SCHEMA_VERSION
         | crate::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION
-        | crate::audit_session::AUDIT_SESSION_V17_SCHEMA_VERSION => {
+        | crate::audit_session::AUDIT_SESSION_V17_SCHEMA_VERSION
+        | crate::audit_session::AUDIT_SESSION_V18_SCHEMA_VERSION => {
             Ok(crate::inventory::collect_windows_startup())
         }
         _ => Err("unsupported Windows audit-session schema version".to_owned()),
@@ -1001,7 +1055,9 @@ fn collect_windows_startup_for_session(
 
 fn session_schema_version(options: &WindowsAuditOptions) -> u32 {
     if options.observation_window {
-        if options.startup {
+        if options.software {
+            crate::audit_session::AUDIT_SESSION_V18_SCHEMA_VERSION
+        } else if options.startup {
             crate::audit_session::AUDIT_SESSION_V17_SCHEMA_VERSION
         } else {
             crate::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION
@@ -1092,6 +1148,22 @@ mod tests {
         assert_eq!(
             session_schema_version(&observation_with_startup),
             crate::audit_session::AUDIT_SESSION_V17_SCHEMA_VERSION
+        );
+        let observation_with_packages = WindowsAuditOptions {
+            software: true,
+            ..observation.clone()
+        };
+        assert_eq!(
+            session_schema_version(&observation_with_packages),
+            crate::audit_session::AUDIT_SESSION_V18_SCHEMA_VERSION
+        );
+        let observation_with_startup_and_packages = WindowsAuditOptions {
+            startup: true,
+            ..observation_with_packages
+        };
+        assert_eq!(
+            session_schema_version(&observation_with_startup_and_packages),
+            crate::audit_session::AUDIT_SESSION_V18_SCHEMA_VERSION
         );
 
         let base = std::env::temp_dir().join(format!(

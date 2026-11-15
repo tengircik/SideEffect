@@ -30,9 +30,9 @@ fn focused_help_covers_command_and_nested_inventory_topics() {
     let observation = run(&["help", "compare-observation"]);
     assert!(observation.status.success());
     let observation_help = String::from_utf8_lossy(&observation.stdout);
-    assert!(observation_help.contains("Verifies one v16 or v17 observation session"));
+    assert!(observation_help.contains("Verifies one v16, v17, or v18 observation session"));
     assert!(
-        observation_help.contains("v17 Windows sessions also compare paired startup snapshots")
+        observation_help.contains("v18 compares paired Windows Uninstall-registration snapshots")
     );
     assert!(observation_help.contains("do not establish causation"));
 

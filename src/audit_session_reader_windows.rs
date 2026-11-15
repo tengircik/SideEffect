@@ -17,7 +17,8 @@ use std::path::Path;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-const MAX_ENTRIES: usize = 12;
+// v18 can publish before/after software plus the existing largest set of optional sources.
+const MAX_ENTRIES: usize = 13;
 
 #[derive(Debug)]
 pub struct VerifiedAuditSession {
@@ -380,6 +381,7 @@ fn label(path: &str) -> &'static str {
         "root-snapshot.json" => "root-snapshot.json",
         "root-snapshot-after.json" => "root-snapshot-after.json",
         "software.windows.json" => "software.windows.json",
+        "software-after.windows.json" => "software-after.windows.json",
         "msix.windows.json" => "msix.windows.json",
         "processes.windows.json" => "processes.windows.json",
         "permissions.windows.json" => "permissions.windows.json",

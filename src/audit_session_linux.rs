@@ -528,6 +528,7 @@ pub fn collect_and_publish(
                 SourceRole::SelectedRoot
             }
             ArtifactKind::WindowsSoftware
+            | ArtifactKind::WindowsSoftwareAfter
             | ArtifactKind::WindowsMsix
             | ArtifactKind::WindowsAppPaths
             | ArtifactKind::WindowsProcesses
@@ -801,6 +802,7 @@ fn artifact_kind(file_name: &str) -> Result<ArtifactKind, String> {
         "run.json" => Ok(ArtifactKind::RuntimeManifest),
         "trace.strace" => Ok(ArtifactKind::RuntimeTrace),
         "software.windows.json" => Ok(ArtifactKind::WindowsSoftware),
+        "software-after.windows.json" => Ok(ArtifactKind::WindowsSoftwareAfter),
         "processes.windows.json" => Ok(ArtifactKind::WindowsProcesses),
         "permissions.windows.json" => Ok(ArtifactKind::WindowsPermissions),
         "startup.windows.json" => Ok(ArtifactKind::WindowsStartup),
