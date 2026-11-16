@@ -646,11 +646,14 @@ fn snapshot_diff(before: &Path, after: &Path) -> Value {
 
 fn path_bytes_hex(path: &Path) -> String {
     use std::os::unix::ffi::OsStrExt;
-    path.as_os_str()
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = path.as_os_str().as_bytes();
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn assert_selected_dpkg_version(document: &Value, admindir: &Path, version: Option<&str>) {
