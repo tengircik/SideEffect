@@ -766,7 +766,10 @@ function Invoke-ObservedMsiInstall {
         [System.IO.Path]::GetFileName([string]$_.payload_decoding.image_file_name) -ieq 'msiexec.exe'
     })
     if ($msiexecStarts.Count -eq 0) {
-        throw 'ETW capture did not contain a decoded process-start row for the exact waited msiexec child PID; no relationship is inferred when its row is missing.'
+        Write-Output 'ETW exact waited-msiexec process-start evidence is unknown: no decoded row for the sidecar PID was retained. The observed wrapper target remains independently verified; no other process row is substituted.'
+    }
+    else {
+        Write-Output 'ETW retained a decoded process-start row for the exact waited msiexec child PID; this records a separate process observation and does not establish causation.'
     }
     $rawPayloadHashes = @{}
     $payloadNameEvidence = [System.Collections.Generic.List[object]]::new()
@@ -798,8 +801,29 @@ function Invoke-ObservedMsiInstall {
             raw_payload_sha256 = $rawPayloadHash
         })
     }
+    $payloadNameEvidenceStatus = if ($payloadNameEvidence.Count -gt 0) { 'observed' } else { 'unknown_not_retained' }
     if ($payloadNameEvidence.Count -eq 0) {
-        throw 'ETW capture did not contain a decoded file-name observation for the fixture payload basename.'
+        $loss = $capture.event_loss
+        $lossCountersAvailable = $null -ne $loss -and $loss.loss_statistics_available -eq $true
+        $captureDiagnosticClassCounts = [ordered]@{}
+        foreach ($diagnostic in @($capture.diagnostics)) {
+            Add-SafeSummaryCount -Counts $captureDiagnosticClassCounts -Class (Get-SafeEtwDiagnosticClass -Diagnostic ([string]$diagnostic))
+        }
+        $safeMissingPayloadSummary = [ordered]@{
+            evidence_status = $payloadNameEvidenceStatus
+            decoded_payload_basename_observation_count = 0
+            capture_collection_status = if ($capture.collection_status -cin @('complete', 'partial')) { [string]$capture.collection_status } else { 'other' }
+            capture_stop_reason = if ($capture.stop_reason -cin @('target_exited', 'duration_limit_reached', 'event_limit_reached', 'etw_loss_reported', 'etw_statistics_unavailable')) { [string]$capture.stop_reason } else { 'other' }
+            capture_diagnostic_array_available = $null -ne $capture.PSObject.Properties['diagnostics']
+            capture_diagnostic_entry_count = @($capture.diagnostics).Count
+            capture_diagnostic_class_counts = $captureDiagnosticClassCounts
+            loss_counters_available = $lossCountersAvailable
+            final_loss_snapshot_available = ($null -ne $loss -and $loss.final_snapshot_available -eq $true)
+            events_lost = if ($lossCountersAvailable) { [long]$loss.events_lost } else { $null }
+            log_buffers_lost = if ($lossCountersAvailable) { [long]$loss.log_buffers_lost } else { $null }
+            real_time_buffers_lost = if ($lossCountersAvailable) { [long]$loss.real_time_buffers_lost } else { $null }
+        }
+        Write-Output "ETW payload FileIo basename evidence is unknown: no decoded payload.bin observation was retained. Selected-root, package, startup, artifact-integrity, wrapper-target, and any independently retained NT evidence checks remain enforced. Bounded enum/count diagnostics only: $($safeMissingPayloadSummary | ConvertTo-Json -Compress -Depth 5)"
     }
     Assert-ObservedNtRootRuntimeAssociation -SessionPath $SessionPath -Comparison $comparison `
         -ExpectedDeltaKind $ExpectedDeltaKind -Capture $capture -CaptureArtifactHash $captureArtifactHash `
@@ -825,6 +849,12 @@ function Invoke-ObservedMsiInstall {
             }
         }
         Write-Output "ETW exact DOS-path candidate linked to the installed payload; $($candidate[0].runtime_evidence.Count) raw evidence reference(s)."
+    }
+    elseif ($payloadNameEvidence.Count -eq 0) {
+        if ($candidate.Count -ne 0) {
+            throw 'ETW returned a DOS payload candidate without retained raw-verified payload-name evidence.'
+        }
+        Write-Output 'ETW DOS payload-path association is unknown because no decoded payload-basename evidence was retained; no DOS candidate is inferred.'
     }
     elseif ($association.association_status -eq 'insufficient_evidence' -and
         $association.summary.candidate_match_count -eq 0 -and
@@ -880,7 +910,7 @@ function Invoke-ObservedMsiInstall {
         throw 'ETW payload-name evidence was not supported by a candidate or an explicit unresolved namespace diagnostic.'
     }
     Assert-StartupObservation -Comparison $comparison -SessionPath $SessionPath -ServiceName $fixtureServiceName -TaskPath $fixtureTaskPath -InertImagePath $inertImagePath
-    Write-Output "$Description produced one selected-root $ExpectedDeltaKind delta for the expected payload SHA-256. ETW separately recorded the wrapper target and an msiexec child process-start row; completeness and causality remain unknown."
+    Write-Output "$Description produced one selected-root $ExpectedDeltaKind delta for the expected payload SHA-256. ETW wrapper-target evidence was verified; exact waited-msiexec and payload FileIo evidence statuses are reported separately, and capture completeness and causality remain unknown."
 }
 
 function Uninstall-Msi {
