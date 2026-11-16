@@ -74,7 +74,10 @@ pub struct RootRuntimeEvidence {
 /// Compare an already validated selected-root delta with a bounded strace trace.
 /// Only successful openat create/truncate operations are eligible for additions
 /// and changes, and only successful unlink/unlinkat operations for removals.
-/// Both directions require a plain absolute lexical operand.
+/// Successful rename, renameat, and renameat2 (flags exactly 0) operations with
+/// strict absolute operands can support removals at the source path and
+/// additions or changes at the destination path.
+/// All directions require plain absolute lexical operands.
 pub fn associate_root_runtime_diff(
     diff: &super::root_snapshot_diff::RootSnapshotDiff,
     trace_bytes: &[u8],
@@ -102,87 +105,168 @@ pub fn associate_root_runtime_diff(
             continue;
         };
         // Direction is strict: an openat write intent can only support additions
-        // or changes, and an unlink can only support a removal.
-        let candidate = match record.syscall.as_deref() {
-            Some("openat") => {
-                // The parser hint is usable here only when the source operand is an
-                // exact, plain absolute spelling without path aliases or escapes.
-                let Some(hint) = &record.lexical_path_hint else {
-                    continue;
-                };
-                let Some(flags) = args.get(2) else { continue };
-                let flag_tokens = flags.split('|').map(str::trim).collect::<Vec<_>>();
-                if flag_tokens.contains(&"O_TMPFILE")
-                    || !flag_tokens
-                        .iter()
-                        .any(|flag| matches!(*flag, "O_CREAT" | "O_TRUNC"))
-                {
-                    continue;
+        // or changes, and an unlink can only support a removal. A successful
+        // rename can support a removal at its source path and an addition or
+        // change at its destination path.
+        let candidate: Option<Vec<(&'static str, &str, DeltaDirection)>> =
+            match record.syscall.as_deref() {
+                Some("openat") => {
+                    // The parser hint is usable here only when the source operand is an
+                    // exact, plain absolute spelling without path aliases or escapes.
+                    let Some(hint) = &record.lexical_path_hint else {
+                        continue;
+                    };
+                    let Some(flags) = args.get(2) else { continue };
+                    let flag_tokens = flags.split('|').map(str::trim).collect::<Vec<_>>();
+                    if flag_tokens.contains(&"O_TMPFILE")
+                        || !flag_tokens
+                            .iter()
+                            .any(|flag| matches!(*flag, "O_CREAT" | "O_TRUNC"))
+                    {
+                        continue;
+                    }
+                    if record.outcome != Some(SyscallOutcome::Success) {
+                        failed_or_unknown_write_intent_count += 1;
+                        continue;
+                    }
+                    let Some(operand) = args.get(1) else {
+                        continue;
+                    };
+                    let Some(path) = plain_absolute_operand(operand) else {
+                        continue;
+                    };
+                    if path != hint.path {
+                        continue;
+                    }
+                    Some(vec![("openat", path, DeltaDirection::Write)])
                 }
-                if record.outcome != Some(SyscallOutcome::Success) {
-                    failed_or_unknown_write_intent_count += 1;
-                    continue;
+                Some("unlink") => {
+                    if args.len() != 1 {
+                        continue;
+                    }
+                    if !syscall_succeeded(record) {
+                        failed_or_unknown_removal_intent_count += 1;
+                        continue;
+                    }
+                    let Some(path) = plain_absolute_operand(args[0]) else {
+                        continue;
+                    };
+                    Some(vec![("unlink", path, DeltaDirection::Removal)])
                 }
-                let Some(operand) = args.get(1) else {
-                    continue;
-                };
-                let Some(path) = plain_absolute_operand(operand) else {
-                    continue;
-                };
-                if path != hint.path {
-                    continue;
+                Some("unlinkat") => {
+                    // Directory-fd-relative and `AT_REMOVEDIR` forms are excluded; only
+                    // the absolute-path, file-removal spelling is eligible.
+                    if args.len() != 3 || !at_fdcwd_operand(args[0]) || args[2] != "0" {
+                        continue;
+                    }
+                    if !syscall_succeeded(record) {
+                        failed_or_unknown_removal_intent_count += 1;
+                        continue;
+                    }
+                    let Some(path) = plain_absolute_operand(args[1]) else {
+                        continue;
+                    };
+                    Some(vec![("unlinkat", path, DeltaDirection::Removal)])
                 }
-                Some(("openat", path, &mut observed_writes))
-            }
-            Some("unlink") => {
-                if args.len() != 1 {
-                    continue;
+                Some("rename") => {
+                    // Both operands must be strict absolute byte-faithful spellings;
+                    // relative, escaped, aliased, or annotated path forms stay excluded.
+                    if args.len() != 2 {
+                        continue;
+                    }
+                    if !syscall_succeeded(record) {
+                        failed_or_unknown_write_intent_count += 1;
+                        failed_or_unknown_removal_intent_count += 1;
+                        continue;
+                    }
+                    let Some(source) = plain_absolute_operand(args[0]) else {
+                        continue;
+                    };
+                    let Some(destination) = plain_absolute_operand(args[1]) else {
+                        continue;
+                    };
+                    Some(vec![
+                        ("rename", source, DeltaDirection::Removal),
+                        ("rename", destination, DeltaDirection::Write),
+                    ])
                 }
-                if !removal_succeeded(record) {
-                    failed_or_unknown_removal_intent_count += 1;
-                    continue;
+                Some("renameat") => {
+                    // Only `AT_FDCWD` directory-fd operands, bare or absolute `-yy`
+                    // annotated, with strict absolute path operands are eligible;
+                    // directory-fd-relative and relative forms stay excluded.
+                    if args.len() != 4 || !at_fdcwd_operand(args[0]) || !at_fdcwd_operand(args[2]) {
+                        continue;
+                    }
+                    if !syscall_succeeded(record) {
+                        failed_or_unknown_write_intent_count += 1;
+                        failed_or_unknown_removal_intent_count += 1;
+                        continue;
+                    }
+                    let Some(source) = plain_absolute_operand(args[1]) else {
+                        continue;
+                    };
+                    let Some(destination) = plain_absolute_operand(args[3]) else {
+                        continue;
+                    };
+                    Some(vec![
+                        ("renameat", source, DeltaDirection::Removal),
+                        ("renameat", destination, DeltaDirection::Write),
+                    ])
                 }
-                let Some(path) = plain_absolute_operand(args[0]) else {
-                    continue;
-                };
-                Some(("unlink", path, &mut observed_removals))
-            }
-            Some("unlinkat") => {
-                // Directory-fd-relative and `AT_REMOVEDIR` forms are excluded; only
-                // the absolute-path, file-removal spelling is eligible.
-                if args.len() != 3 || args[0] != "AT_FDCWD" || args[2] != "0" {
-                    continue;
+                Some("renameat2") => {
+                    // Identical eligibility to renameat, except the flags operand
+                    // must be exactly 0; `RENAME_NOREPLACE`, `RENAME_EXCHANGE`, and
+                    // any other flag spelling stays excluded.
+                    if args.len() != 5
+                        || !at_fdcwd_operand(args[0])
+                        || !at_fdcwd_operand(args[2])
+                        || args[4] != "0"
+                    {
+                        continue;
+                    }
+                    if !syscall_succeeded(record) {
+                        failed_or_unknown_write_intent_count += 1;
+                        failed_or_unknown_removal_intent_count += 1;
+                        continue;
+                    }
+                    let Some(source) = plain_absolute_operand(args[1]) else {
+                        continue;
+                    };
+                    let Some(destination) = plain_absolute_operand(args[3]) else {
+                        continue;
+                    };
+                    Some(vec![
+                        ("renameat2", source, DeltaDirection::Removal),
+                        ("renameat2", destination, DeltaDirection::Write),
+                    ])
                 }
-                if !removal_succeeded(record) {
-                    failed_or_unknown_removal_intent_count += 1;
-                    continue;
-                }
-                let Some(path) = plain_absolute_operand(args[1]) else {
-                    continue;
-                };
-                Some(("unlinkat", path, &mut observed_removals))
-            }
-            _ => continue,
-        };
-        let Some((syscall, path, observed)) = candidate else {
+                _ => continue,
+            };
+        let Some(observations) = candidate else {
             continue;
         };
-        if eligible_runtime_observation_count >= MAX_EVIDENCE_REFS {
-            runtime_observation_rows_omitted_to_limit += 1;
-            continue;
+        for (syscall, path, direction) in observations {
+            let observed = match direction {
+                DeltaDirection::Write => &mut observed_writes,
+                DeltaDirection::Removal => &mut observed_removals,
+            };
+            if eligible_runtime_observation_count >= MAX_EVIDENCE_REFS {
+                runtime_observation_rows_omitted_to_limit += 1;
+                continue;
+            }
+            eligible_runtime_observation_count += 1;
+            observed
+                .entry(path.as_bytes().to_vec())
+                .or_default()
+                .push(RootRuntimeEvidence {
+                    trace_sha256: trace_hash.clone(),
+                    syscall: syscall.to_owned(),
+                    caller_task_id: record.process_id,
+                    line_number: record.evidence.line_number,
+                    byte_offset: record.evidence.byte_offset,
+                    byte_length: record.evidence.byte_length,
+                });
         }
-        eligible_runtime_observation_count += 1;
-        observed
-            .entry(path.as_bytes().to_vec())
-            .or_default()
-            .push(RootRuntimeEvidence {
-                trace_sha256: trace_hash.clone(),
-                syscall: syscall.to_owned(),
-                caller_task_id: record.process_id,
-                line_number: record.evidence.line_number,
-                byte_offset: record.evidence.byte_offset,
-                byte_length: record.evidence.byte_length,
-            });
     }
     let mut associations = Vec::new();
     let mut delta_count = 0;
@@ -271,9 +355,10 @@ pub fn associate_root_runtime_diff(
         },
         limitations: vec![
             "Only exact absolute lexical paths in successful openat O_CREAT or O_TRUNC calls are considered for additions and changes; successful O_CREAT may open an existing file and does not prove a change.",
-            "Only exact absolute lexical paths in successful unlink calls, and in successful unlinkat calls with AT_FDCWD and flags 0, are considered for removals; unlinkat AT_REMOVEDIR, directory-fd-relative, relative, and malformed calls are excluded.",
+            "Only exact absolute lexical paths in successful unlink calls, and in successful unlinkat calls with AT_FDCWD (bare or absolute -yy annotated) and flags 0, are considered for removals; the annotation is accepted only as display context for an absolute operand. unlinkat AT_REMOVEDIR, directory-fd-relative, relative, and malformed calls are excluded.",
             "Failed or unknown write-intent or removal-intent outcomes are counted but never treated as mutations.",
-            "Successful open calls are associated only with selected-root additions or changed rows, and successful unlink calls only with removed rows; remove, rename, and directory-removal operations other than those forms remain unsupported.",
+            "A successful rename with two plain absolute operands can support a removal at its source and an addition or change at its destination; successful renameat and renameat2 calls require AT_FDCWD directory-fd operands (bare or absolute -yy annotated) and strict absolute path operands, and renameat2 requires flags exactly 0; directory-fd-relative, relative, escaped, aliased, non-zero-flag, and failed or unknown renames are excluded, and a failed or unknown rename counts once against each intent.",
+            "Successful open calls are associated only with selected-root additions or changed rows, and successful removal intents only with removed rows; a successful rename destination is treated as a write intent and its source as a removal intent; every other file mutation syscall remains unsupported.",
             "The strace task ID is not a stable process identity and does not establish which process caused a delta.",
             "A lexical candidate does not prove the filesystem operation changed the selected-root entry.",
             "Missing candidates do not establish absence; unsupported, failed, ambiguous, or non-comparable observations remain unknown.",
@@ -319,8 +404,18 @@ pub fn associate_root_runtime_diff(
     Ok(report)
 }
 
-/// Strict plain absolute operand spelling shared by the open and unlink directions.
-/// It rejects aliases, escapes, non-ASCII bytes, and non-quoted operands.
+/// The delta kind one successful syscall operand may support. Direction stays
+/// strict: a write operand never supports a removed row, and a removal operand
+/// never supports an added or changed row.
+#[derive(Clone, Copy)]
+enum DeltaDirection {
+    Write,
+    Removal,
+}
+
+/// Strict plain absolute operand spelling shared by the open, unlink, and
+/// rename directions. It rejects aliases, escapes, non-ASCII bytes, and
+/// non-quoted operands.
 fn plain_absolute_operand(operand: &str) -> Option<&str> {
     let path = operand
         .strip_prefix('"')
@@ -337,11 +432,34 @@ fn plain_absolute_operand(operand: &str) -> Option<&str> {
     Some(path)
 }
 
-/// A removal counts only when the observed result is exactly the integer `0`.
-/// The parser derives outcomes for a selected syscall set that does not include
-/// unlink, so this reads the raw result strictly instead of guessing a success.
-fn removal_succeeded(record: &crate::model::TraceRecord) -> bool {
+/// A rename or removal counts only when the observed result is exactly the
+/// integer `0`. The parser derives outcomes for a selected syscall set that
+/// does not include unlink or rename, so this reads the raw result strictly
+/// instead of guessing a success.
+fn syscall_succeeded(record: &crate::model::TraceRecord) -> bool {
     record.raw_result.as_deref().map(str::trim) == Some("0")
+}
+
+/// Accept only an `AT_FDCWD` directory-fd operand for renameat/renameat2: the
+/// bare spelling, or the `-yy`-annotated `AT_FDCWD</absolute/path>` form. For a
+/// strict absolute path operand the kernel ignores the directory fd, so the
+/// annotation is accepted as display context only. Numeric directory fds,
+/// relative annotation bases, and every other operand stay excluded.
+fn at_fdcwd_operand(operand: &str) -> bool {
+    let Some(rest) = operand.strip_prefix("AT_FDCWD") else {
+        return false;
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    let Some(base) = rest.strip_prefix('<').and_then(|s| s.strip_suffix('>')) else {
+        return false;
+    };
+    base.starts_with('/')
+        && !base.contains('<')
+        && !base.contains('>')
+        && !base.contains('\\')
+        && base.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
 }
 
 fn split_args(input: &str) -> Option<Vec<&str>> {
@@ -496,6 +614,16 @@ mod tests {
             report.associations[0].runtime_evidence[0].syscall,
             "unlinkat"
         );
+
+        // strace -yy can annotate AT_FDCWD with its current directory. Since the
+        // path argument is absolute, that annotation is context only.
+        let report = associate_root_runtime_diff(
+            &diff,
+            b"unlinkat(AT_FDCWD</tmp/r5-root>, \"/tmp/r5-root/item\", 0) = 0\n",
+        )
+        .unwrap();
+        assert_eq!(report.associations.len(), 1);
+        assert_eq!(report.associations[0].status, "candidate_match");
     }
 
     #[test]
@@ -570,5 +698,170 @@ unlink(AT_FDCWD, \"/tmp/r5-root/item\") = 0\n";
         )
         .unwrap();
         assert!(report.associations.is_empty());
+    }
+
+    fn named_row(name: &str, name_bytes_hex: &str) -> serde_json::Value {
+        json!({"ordinal":0,"display_name":name,"name_bytes_hex":name_bytes_hex,"object_type":"regular_file","size_bytes":4,"modified_at_unix_ms":2,"device_or_volume_serial":1,"inode_or_file_index":3,"evidence":{"source":"selected_root_directory_entry","entry_ordinal":0}})
+    }
+
+    fn named_delta(
+        before_rows: serde_json::Value,
+        after_rows: serde_json::Value,
+    ) -> super::super::root_snapshot_diff::RootSnapshotDiff {
+        super::super::root_snapshot_diff::compare_selected_root_inventory_json(
+            &snapshot(before_rows),
+            &snapshot(after_rows),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn associates_successful_rename_source_with_removed_and_destination_with_added_or_changed() {
+        // The source operand can only support a removed row.
+        let report = associate_root_runtime_diff(
+            &removed(),
+            b"123.000001 rename(\"/tmp/r5-root/item\", \"/tmp/r5-root/item2\") = 0\n",
+        )
+        .unwrap();
+        assert_eq!(report.associations.len(), 1);
+        assert_eq!(report.associations[0].status, "candidate_match");
+        assert_eq!(report.associations[0].delta_kind, "removed");
+        assert_eq!(
+            report.associations[0].candidate_path_bytes_hex,
+            "2f746d702f72352d726f6f742f6974656d"
+        );
+        assert_eq!(report.associations[0].runtime_evidence[0].syscall, "rename");
+        assert_eq!(report.associations[0].runtime_evidence[0].line_number, 1);
+        assert_eq!(report.associations[0].runtime_evidence[0].byte_offset, 0);
+        assert_eq!(report.summary.delta_count, 1);
+        assert_eq!(report.summary.unmatched_delta_count, 0);
+        assert_eq!(report.summary.failed_or_unknown_removal_intent_count, 0);
+        assert_eq!(report.summary.failed_or_unknown_write_intent_count, 0);
+
+        // The destination operand can support an added row...
+        let report = associate_root_runtime_diff(
+            &added(),
+            b"rename(\"/tmp/r5-root/item2\", \"/tmp/r5-root/item\") = 0\n",
+        )
+        .unwrap();
+        assert_eq!(report.associations.len(), 1);
+        assert_eq!(report.associations[0].delta_kind, "added");
+
+        // ... and a changed row.
+        let changed = named_delta(json!([row(4)]), json!([row(5)]));
+        let report = associate_root_runtime_diff(
+            &changed,
+            b"rename(\"/tmp/r5-root/item2\", \"/tmp/r5-root/item\") = 0\n",
+        )
+        .unwrap();
+        assert_eq!(report.associations.len(), 1);
+        assert_eq!(report.associations[0].delta_kind, "changed");
+    }
+
+    #[test]
+    fn rename_operands_match_only_their_own_mutation_direction() {
+        // A rename destination never supports a removed row.
+        let report = associate_root_runtime_diff(
+            &removed(),
+            b"rename(\"/tmp/elsewhere\", \"/tmp/r5-root/item\") = 0\n",
+        )
+        .unwrap();
+        assert!(report.associations.is_empty());
+        assert_eq!(report.summary.unmatched_delta_count, 1);
+
+        // A rename source never supports an added or changed row.
+        for delta in [added(), named_delta(json!([row(4)]), json!([row(5)]))] {
+            let report = associate_root_runtime_diff(
+                &delta,
+                b"rename(\"/tmp/r5-root/item\", \"/tmp/elsewhere\") = 0\n",
+            )
+            .unwrap();
+            assert!(report.associations.is_empty());
+            assert_eq!(report.summary.unmatched_delta_count, 1);
+        }
+    }
+
+    #[test]
+    fn associates_both_operands_of_one_within_root_rename_to_their_own_deltas() {
+        let diff = named_delta(json!([row(4)]), json!([named_row("item2", "6974656d32")]));
+        let report = associate_root_runtime_diff(
+            &diff,
+            b"renameat2(AT_FDCWD, \"/tmp/r5-root/item\", AT_FDCWD, \"/tmp/r5-root/item2\", 0) = 0\n",
+        )
+        .unwrap();
+        assert_eq!(report.summary.delta_count, 2);
+        assert_eq!(report.summary.unmatched_delta_count, 0);
+        assert_eq!(report.associations.len(), 2);
+        for association in &report.associations {
+            assert_eq!(association.status, "candidate_match");
+            assert_eq!(association.runtime_evidence.len(), 1);
+            assert_eq!(association.runtime_evidence[0].syscall, "renameat2");
+            assert_eq!(association.runtime_evidence[0].line_number, 1);
+            let expected_hex = match association.delta_kind.as_str() {
+                "removed" => "2f746d702f72352d726f6f742f6974656d",
+                "added" => "2f746d702f72352d726f6f742f6974656d32",
+                other => panic!("unexpected delta kind {other}"),
+            };
+            assert_eq!(association.candidate_path_bytes_hex, expected_hex);
+        }
+    }
+
+    #[test]
+    fn associates_annotated_at_fdcwd_renameat_with_a_removed_delta() {
+        let report = associate_root_runtime_diff(
+            &removed(),
+            b"renameat(AT_FDCWD</tmp/r5-root>, \"/tmp/r5-root/item\", AT_FDCWD</tmp/r5-root>, \"/tmp/r5-root/item2\") = 0\n",
+        )
+        .unwrap();
+        assert_eq!(report.associations.len(), 1);
+        assert_eq!(
+            report.associations[0].runtime_evidence[0].syscall,
+            "renameat"
+        );
+        assert_eq!(
+            report.associations[0].candidate_path_bytes_hex,
+            "2f746d702f72352d726f6f742f6974656d"
+        );
+    }
+
+    #[test]
+    fn failed_and_malformed_renames_do_not_match() {
+        let diff = removed();
+        let trace = b"rename(\"/tmp/r5-root/item\", \"/tmp/r5-root/item2\") = -1 EACCES (Permission denied)\n\
+rename(\"item\", \"/tmp/r5-root/item2\") = 0\n\
+rename(\"/tmp/r5-root/item\", \"item2\") = 0\n\
+rename(\"/tmp/r5-root/item\") = 0\n\
+rename(\"/tmp/r5-root/item\", \"/tmp/r5-root/item2\", 0) = 0\n\
+rename(/tmp/r5-root/item, \"/tmp/r5-root/item2\") = 0\n\
+rename(\"/tmp/r5-root/ite\\x6d\", \"/tmp/r5-root/item2\") = 0\n\
+renameat(AT_FDCWD, \"/tmp/r5-root/item\", 3</tmp/r5-root>, \"/tmp/r5-root/item2\") = 0\n\
+renameat(AT_FDCWD, \"/tmp/r5-root/item\") = 0\n\
+renameat(AT_FDCWD, \"/tmp/r5-root/item\", \"/tmp/r5-root/item2\", 0) = 0\n\
+renameat2(AT_FDCWD, \"/tmp/r5-root/item\", AT_FDCWD, \"/tmp/r5-root/item2\", RENAME_NOREPLACE) = 0\n\
+renameat2(AT_FDCWD, \"/tmp/r5-root/item\", AT_FDCWD, \"/tmp/r5-root/item2\", RENAME_EXCHANGE) = 0\n\
+renameat2(AT_FDCWD, \"/tmp/r5-root/item\", AT_FDCWD, \"/tmp/r5-root/item2\") = 0\n";
+        let report = associate_root_runtime_diff(&diff, trace).unwrap();
+        assert!(report.associations.is_empty());
+        assert_eq!(report.summary.delta_count, 1);
+        assert_eq!(report.summary.unmatched_delta_count, 1);
+        assert_eq!(report.summary.failed_or_unknown_removal_intent_count, 1);
+        assert_eq!(report.summary.failed_or_unknown_write_intent_count, 1);
+    }
+
+    #[test]
+    fn repeated_successful_renames_remain_ambiguous() {
+        let diff = removed();
+        let trace = b"rename(\"/tmp/r5-root/item\", \"/tmp/a\") = 0\nrenameat(AT_FDCWD, \"/tmp/r5-root/item\", AT_FDCWD, \"/tmp/b\") = 0\n";
+        let report = associate_root_runtime_diff(&diff, trace).unwrap();
+        assert_eq!(report.associations.len(), 1);
+        assert_eq!(report.associations[0].status, "ambiguous_candidate_match");
+        assert!(report.associations[0].multiple_runtime_observations);
+        assert_eq!(report.summary.ambiguous_candidate_count, 1);
+
+        let trace = b"rename(\"/tmp/a\", \"/tmp/r5-root/item\") = 0\nrename(\"/tmp/b\", \"/tmp/r5-root/item\") = 0\n";
+        let report = associate_root_runtime_diff(&added(), trace).unwrap();
+        assert_eq!(report.associations.len(), 1);
+        assert_eq!(report.associations[0].status, "ambiguous_candidate_match");
+        assert_eq!(report.summary.ambiguous_candidate_count, 1);
     }
 }

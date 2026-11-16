@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use sideeffect::audit_session::{SourceRole, SourceStatus, parse_manifest};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -628,6 +629,26 @@ fn audit_cli_rejects_an_empty_source_selection_without_publishing() {
 }
 
 #[test]
+fn alternate_dpkg_database_is_limited_to_observation_sessions() {
+    let directory = TestDirectory::new();
+    let output = directory.0.join("alternate.session");
+    let admindir = directory.0.join("admindir");
+    fs::create_dir(&admindir).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&output)
+        .arg("--packages")
+        .arg("--dpkg-admindir")
+        .arg(&admindir)
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("requires --observe-root"));
+    assert!(!output.exists());
+}
+
+#[test]
 fn audit_cli_includes_bounded_runtime_bundle_and_preserves_argument_boundaries() {
     let directory = TestDirectory::new();
     let output = directory.0.join("runtime.session");
@@ -723,8 +744,11 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
     let created_file = observed_root.join("created-by-selected-command.txt");
     let transient_file = observed_root.join("transient-by-selected-command.txt");
     let removed_file = observed_root.join("removed-by-selected-command.txt");
+    let moved_source = observed_root.join("renamed-away-by-selected-command.txt");
+    let moved_destination = observed_root.join("renamed-in-by-selected-command.txt");
     fs::write(&removed_file, "pre-existing fixture").unwrap();
-    let script = "from pathlib import Path\nimport sys\nPath(sys.argv[1]).write_text('fixture')\ntransient = Path(sys.argv[2])\ntransient.write_text('transient fixture')\ntransient.unlink()\nPath(sys.argv[3]).unlink()";
+    fs::write(&moved_source, "fixture that will be renamed").unwrap();
+    let script = "from pathlib import Path\nimport os\nimport sys\nPath(sys.argv[1]).write_text('fixture')\ntransient = Path(sys.argv[2])\ntransient.write_text('transient fixture')\ntransient.unlink()\nPath(sys.argv[3]).unlink()\nos.rename(sys.argv[4], sys.argv[5])";
     let captured = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .arg("audit")
         .arg("--output")
@@ -740,6 +764,8 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
         .arg(&created_file)
         .arg(&transient_file)
         .arg(&removed_file)
+        .arg(&moved_source)
+        .arg(&moved_destination)
         .output()
         .unwrap();
     assert_eq!(
@@ -760,7 +786,7 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
     let manifest = parse_manifest(&fs::read(output.join("session.json")).unwrap()).unwrap();
     assert_eq!(
         manifest.schema_version,
-        sideeffect::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION
+        sideeffect::audit_session::AUDIT_SESSION_V20_SCHEMA_VERSION
     );
     let root_source = manifest
         .sources
@@ -785,17 +811,23 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
     assert_eq!(compared.status.code(), Some(2));
     let report: serde_json::Value = serde_json::from_slice(&compared.stdout).unwrap();
     assert_eq!(report["root_comparison_status"], "complete");
-    assert_eq!(report["root_diff"]["counts"]["additions"], 1);
-    assert_eq!(report["root_diff"]["counts"]["removals"], 1);
+    assert_eq!(report["root_diff"]["counts"]["additions"], 2);
+    assert_eq!(report["root_diff"]["counts"]["removals"], 2);
     let deltas = report["root_diff"]["deltas"].as_array().unwrap();
-    assert_eq!(deltas.len(), 2);
+    assert_eq!(deltas.len(), 4);
     assert!(deltas.iter().any(
         |delta| delta["kind"] == "added" && delta["name"] == "created-by-selected-command.txt"
     ));
     assert!(
+        deltas.iter().any(|delta| delta["kind"] == "added"
+            && delta["name"] == "renamed-in-by-selected-command.txt")
+    );
+    assert!(
         deltas.iter().any(|delta| delta["kind"] == "removed"
             && delta["name"] == "removed-by-selected-command.txt")
     );
+    assert!(deltas.iter().any(|delta| delta["kind"] == "removed"
+        && delta["name"] == "renamed-away-by-selected-command.txt"));
     let transient_name = transient_file.file_name().unwrap().to_str().unwrap();
     assert!(
         deltas.iter().all(|delta| delta["name"] != transient_name),
@@ -820,10 +852,13 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
     let associations = report["root_runtime_association"]["associations"]
         .as_array()
         .unwrap();
-    assert_eq!(associations.len(), 2);
+    assert_eq!(associations.len(), 4);
     let added_association = associations
         .iter()
-        .find(|association| association["delta_kind"] == "added")
+        .find(|association| {
+            association["delta_kind"] == "added"
+                && association["candidate_path"] == created_file.to_string_lossy().as_ref()
+        })
         .expect("the created file must be a lexical openat candidate");
     assert_eq!(
         added_association["candidate_path"],
@@ -831,7 +866,10 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
     );
     let removed_association = associations
         .iter()
-        .find(|association| association["delta_kind"] == "removed")
+        .find(|association| {
+            association["delta_kind"] == "removed"
+                && association["candidate_path"] == removed_file.to_string_lossy().as_ref()
+        })
         .expect("the deleted file must be a lexical unlink candidate");
     assert_eq!(
         removed_association["candidate_path"],
@@ -849,9 +887,52 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
         64
     );
 
+    // A successful rename supports a removal at its source path and an addition
+    // at its destination path, both as lexical candidates from the same row.
+    let renamed_away_association = associations
+        .iter()
+        .find(|association| {
+            association["delta_kind"] == "removed"
+                && association["candidate_path"] == moved_source.to_string_lossy().as_ref()
+        })
+        .expect("the renamed-away file must be a lexical rename source candidate");
+    let renamed_in_association = associations
+        .iter()
+        .find(|association| {
+            association["delta_kind"] == "added"
+                && association["candidate_path"] == moved_destination.to_string_lossy().as_ref()
+        })
+        .expect("the renamed-in file must be a lexical rename destination candidate");
+    assert!(
+        matches!(
+            renamed_away_association["runtime_evidence"][0]["syscall"].as_str(),
+            Some("rename" | "renameat" | "renameat2")
+        ),
+        "{}",
+        renamed_away_association["runtime_evidence"][0]["syscall"]
+    );
+    assert!(
+        matches!(
+            renamed_in_association["runtime_evidence"][0]["syscall"].as_str(),
+            Some("rename" | "renameat" | "renameat2")
+        ),
+        "{}",
+        renamed_in_association["runtime_evidence"][0]["syscall"]
+    );
+    assert_eq!(
+        renamed_away_association["runtime_evidence"][0]["line_number"],
+        renamed_in_association["runtime_evidence"][0]["line_number"],
+        "both rename candidates must reference the same syscall row"
+    );
+    assert_eq!(
+        renamed_away_association["runtime_evidence"][0]["byte_offset"],
+        renamed_in_association["runtime_evidence"][0]["byte_offset"]
+    );
+
     // The trace remains the raw runtime evidence for the transient lifecycle.
-    // Its openat path hint is source-derived, while the unlink success is read
-    // from the observed syscall result rather than inferred from the absent file.
+    // Its openat path hint is source-derived, while the unlink and rename
+    // successes are read from the observed syscall results rather than inferred
+    // from the absent file.
     let trace_path = output.join("trace.strace");
     let trace = String::from_utf8(fs::read(&trace_path).unwrap()).unwrap();
     let transient_trace_lines = trace
@@ -893,6 +974,215 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
                 && event["operation"]["result"] == "success"
         }),
         "runtime evidence must retain the observed successful open of the transient file"
+    );
+}
+
+#[test]
+fn audit_v20_preserves_partial_startup_source_evidence_without_poisoning_root_diff() {
+    let directory = TestDirectory::new();
+    let observed_root = directory.0.join("observed-root");
+    let output = directory.0.join("partial-startup.session");
+    let home = directory.0.join("home");
+    let config_home = home.join(".config");
+    let autostart = config_home.join("autostart");
+    let user_units = config_home.join("systemd/user");
+    let config_dirs = directory.0.join("xdg-config-dirs");
+    let data_dirs = directory.0.join("xdg-data-dirs");
+    let runtime_dir = directory.0.join("xdg-runtime");
+    fs::create_dir(&observed_root).unwrap();
+    fs::create_dir_all(&autostart).unwrap();
+    fs::create_dir_all(&user_units).unwrap();
+    fs::create_dir_all(&config_dirs).unwrap();
+    fs::create_dir_all(&data_dirs).unwrap();
+    fs::create_dir(&runtime_dir).unwrap();
+    fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let invalid_entry = autostart.join("invalid-symlink.desktop");
+    symlink("missing-fixture-target", &invalid_entry).unwrap();
+    let unit_path = user_units.join("sideeffect-r5-partial-startup.service");
+    fs::write(
+        &unit_path,
+        "[Unit]\nDescription=Before synthetic startup change\n[Service]\nExecStart=/nonexistent/sideeffect-fixture\n",
+    )
+    .unwrap();
+    let created_file = observed_root.join("created-during-command.txt");
+    let created_startup_entry = autostart.join("created-during-command.desktop");
+    let script = "from pathlib import Path\nimport sys\nPath(sys.argv[1]).write_text('fixture')\nPath(sys.argv[2]).write_text('[Desktop Entry]\\nType=Application\\nName=Synthetic fixture\\nExec=/nonexistent/sideeffect-fixture\\n')\nPath(sys.argv[3]).write_text('[Unit]\\nDescription=After synthetic startup change\\n[Service]\\nExecStart=/nonexistent/sideeffect-fixture\\n')\n";
+    let captured = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&output)
+        .arg("--observe-root")
+        .arg(&observed_root)
+        .arg("--startup")
+        .arg("--runtime-duration-seconds")
+        .arg("10")
+        .arg("--")
+        .arg("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(&created_file)
+        .arg(&created_startup_entry)
+        .arg(&unit_path)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_CONFIG_DIRS", &config_dirs)
+        .env("XDG_DATA_DIRS", &data_dirs)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .output()
+        .expect("launch startup observation with a private XDG fixture");
+    assert_eq!(
+        captured.status.code(),
+        Some(2),
+        "runtime capture is partial by contract: {}",
+        String::from_utf8_lossy(&captured.stderr)
+    );
+    assert!(created_file.is_file());
+    assert!(created_startup_entry.is_file());
+
+    let manifest = parse_manifest(&fs::read(output.join("session.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest.schema_version,
+        sideeffect::audit_session::AUDIT_SESSION_V20_SCHEMA_VERSION
+    );
+    let root_source = manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::SelectedRoot)
+        .expect("selected-root source");
+    assert_eq!(root_source.status, SourceStatus::Complete);
+    let startup_source = manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::Startup)
+        .expect("startup source");
+    assert_eq!(startup_source.status, SourceStatus::Partial);
+    assert!(
+        startup_source
+            .diagnostic_codes
+            .contains(&"file_not_regular".to_owned())
+    );
+    let before_ref = startup_source
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == sideeffect::audit_session::ArtifactKind::Startup)
+        .expect("startup before artifact");
+    let after_ref = startup_source
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == sideeffect::audit_session::ArtifactKind::StartupAfter)
+        .expect("startup after artifact");
+    assert_eq!(before_ref.path, "startup.json");
+    assert_eq!(after_ref.path, "startup-after.json");
+
+    let read_verified_startup = |artifact: &sideeffect::audit_session::SessionArtifactRef| {
+        let bytes = fs::read(output.join(artifact.path.as_str())).unwrap();
+        assert_eq!(artifact.byte_length, bytes.len() as u64);
+        assert_eq!(artifact.sha256, format!("{:x}", Sha256::digest(&bytes)));
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+    let before: serde_json::Value = read_verified_startup(before_ref);
+    let after: serde_json::Value = read_verified_startup(after_ref);
+    for document in [&before, &after] {
+        assert_eq!(document["status"], "partial");
+        assert_eq!(document["xdg_autostart"]["status"], "partial");
+        let directory = document["xdg_autostart"]["directories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|directory| directory["path"] == autostart.display().to_string())
+            .expect("private user autostart source row");
+        assert_eq!(directory["status"], "partial");
+        assert!(
+            directory["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic["code"] == "file_not_regular"
+                        && diagnostic["path"] == invalid_entry.display().to_string()
+                })
+        );
+    }
+    assert_eq!(
+        before["xdg_autostart"]["entries"].as_array().unwrap().len(),
+        0
+    );
+    assert_eq!(
+        after["xdg_autostart"]["entries"].as_array().unwrap().len(),
+        1
+    );
+    let before_unit_index = before["systemd_units"]["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|record| record["source_path"] == unit_path.display().to_string())
+        .expect("before systemd unit fixture evidence");
+    let after_unit_index = after["systemd_units"]["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|record| record["source_path"] == unit_path.display().to_string())
+        .expect("after systemd unit fixture evidence");
+
+    let compared = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("compare-observation")
+        .arg(&output)
+        .output()
+        .expect("compare partial-startup observation artifacts");
+    assert_eq!(compared.status.code(), Some(2));
+    let report: serde_json::Value = serde_json::from_slice(&compared.stdout).unwrap();
+    assert_eq!(report["startup_source_status"], "partial");
+    assert_eq!(report["startup_before_document_status"], "partial");
+    assert_eq!(report["startup_after_document_status"], "partial");
+    assert_eq!(report["startup_comparison_status"], "partial");
+    assert_eq!(report["startup_diff"]["status"], "partial");
+    assert_eq!(report["startup_before_artifact"]["path"], before_ref.path);
+    assert_eq!(report["startup_after_artifact"]["path"], after_ref.path);
+    assert_eq!(
+        report["startup_before_artifact"]["sha256"],
+        before_ref.sha256
+    );
+    assert_eq!(report["startup_after_artifact"]["sha256"], after_ref.sha256);
+    assert!(
+        report["startup_diff"]["counts"]["unmatched_rows_suppressed_for_incomplete_source"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    let startup_deltas = report["startup_diff"]["deltas"].as_array().unwrap();
+    assert!(
+        startup_deltas
+            .iter()
+            .all(|delta| delta["category"] != "xdg_autostart")
+    );
+    let before_unit_reference = format!("/systemd_units/records/{before_unit_index}");
+    let after_unit_reference = format!("/systemd_units/records/{after_unit_index}");
+    let preserved_unit_change = startup_deltas
+        .iter()
+        .find(|delta| {
+            delta["category"] == "systemd_units"
+                && delta["kind"] == "changed"
+                && delta["before"]["references"]
+                    .as_array()
+                    .is_some_and(|refs| refs.iter().any(|value| value == &before_unit_reference))
+                && delta["after"]["references"]
+                    .as_array()
+                    .is_some_and(|refs| refs.iter().any(|value| value == &after_unit_reference))
+        })
+        .expect("unrelated complete systemd source change remains linked");
+    assert!(
+        preserved_unit_change["changed_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "directives")
+    );
+    assert_eq!(report["root_comparison_status"], "complete");
+    assert_eq!(report["root_diff"]["counts"]["additions"], 1);
+    assert_eq!(
+        report["root_diff"]["deltas"][0]["name"],
+        "created-during-command.txt"
     );
 }
 

@@ -3,6 +3,7 @@
 use super::model::{
     INVENTORY_SCHEMA, INVENTORY_SCHEMA_VERSION, InventoryDocument, InventoryEvidence,
     InventoryPackage, InventorySource, InventorySourceStatus, InventoryStatus,
+    PackageSourceSelection,
 };
 use serde::{Deserialize, Serialize, de};
 use std::collections::{BTreeMap, BTreeSet};
@@ -132,7 +133,12 @@ pub fn compare_package_inventory_json(
         serde_json::from_slice(before_json).map_err(|_| PackageComparisonError::MalformedInput)?;
     let after: PackageInventoryInput =
         serde_json::from_slice(after_json).map_err(|_| PackageComparisonError::MalformedInput)?;
-    compare_package_inventories(&before.into_document()?, &after.into_document()?)
+    let before = before.into_document()?;
+    let after = after.into_document()?;
+    if before.source_selection != after.source_selection {
+        return Err(PackageComparisonError::ScopeMismatch);
+    }
+    compare_package_inventories(&before, &after)
 }
 
 #[derive(Deserialize)]
@@ -142,12 +148,23 @@ struct PackageInventoryInput {
     schema_version: u32,
     platform: String,
     scope: String,
+    #[serde(default)]
+    source_selection: Option<PackageSourceSelectionInput>,
     captured_at_unix_ms: u128,
     status: InventoryStatusInput,
     #[serde(deserialize_with = "deserialize_sources")]
     sources: Vec<PackageSourceInput>,
     #[serde(deserialize_with = "deserialize_packages")]
     packages: Vec<PackageInput>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackageSourceSelectionInput {
+    kind: String,
+    path_bytes_hex: String,
+    directory_device: Option<u64>,
+    directory_inode: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -250,9 +267,35 @@ struct PackageEvidenceInput {
 
 impl PackageInventoryInput {
     fn into_document(self) -> Result<InventoryDocument, PackageComparisonError> {
-        if self.schema != INVENTORY_SCHEMA || self.schema_version != INVENTORY_SCHEMA_VERSION {
+        if self.schema != INVENTORY_SCHEMA
+            || !matches!(
+                self.schema_version,
+                INVENTORY_SCHEMA_VERSION | super::model::SELECTED_DPKG_INVENTORY_SCHEMA_VERSION
+            )
+        {
             return Err(PackageComparisonError::UnsupportedSchema);
         }
+        let is_selected_dpkg =
+            self.schema_version == super::model::SELECTED_DPKG_INVENTORY_SCHEMA_VERSION;
+        let source_selection = match (is_selected_dpkg, self.source_selection) {
+            (false, None) => None,
+            (true, Some(selection))
+                if selection.kind == "dpkg_admindir"
+                    && !selection.path_bytes_hex.is_empty()
+                    && selection.path_bytes_hex.len() <= 2_048
+                    && selection.path_bytes_hex.len() % 2 == 0
+                    && selection.path_bytes_hex.starts_with("2f")
+                    && selection
+                        .path_bytes_hex
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    && selection.directory_device.is_some_and(|value| value != 0)
+                    && selection.directory_inode.is_some_and(|value| value != 0) =>
+            {
+                Some(selection)
+            }
+            _ => return Err(PackageComparisonError::ScopeMismatch),
+        };
         let sources = self
             .sources
             .into_iter()
@@ -298,8 +341,17 @@ impl PackageInventoryInput {
             "linux" => "linux",
             _ => return Err(PackageComparisonError::PlatformMismatch),
         };
-        let scope = match self.scope.as_str() {
-            "available_package_manager_databases" => "available_package_manager_databases",
+        let scope = match (self.scope.as_str(), is_selected_dpkg) {
+            ("available_package_manager_databases", false) => "available_package_manager_databases",
+            ("selected_dpkg_admindir", true)
+                if sources.len() == 1
+                    && sources[0].id == "dpkg_query"
+                    && packages
+                        .iter()
+                        .all(|package| package.source_id == "dpkg_query") =>
+            {
+                "selected_dpkg_admindir"
+            }
             _ => return Err(PackageComparisonError::ScopeMismatch),
         };
         Ok(InventoryDocument {
@@ -307,6 +359,12 @@ impl PackageInventoryInput {
             schema_version: INVENTORY_SCHEMA_VERSION,
             platform,
             scope,
+            source_selection: source_selection.map(|selection| PackageSourceSelection {
+                kind: "dpkg_admindir",
+                path_bytes_hex: selection.path_bytes_hex,
+                directory_device: selection.directory_device,
+                directory_inode: selection.directory_inode,
+            }),
             captured_at_unix_ms: self.captured_at_unix_ms,
             status: self.status.into(),
             sources,
@@ -456,6 +514,9 @@ pub fn compare_package_inventories(
         return Err(PackageComparisonError::PlatformMismatch);
     }
     if before.scope != after.scope {
+        return Err(PackageComparisonError::ScopeMismatch);
+    }
+    if before.source_selection != after.source_selection {
         return Err(PackageComparisonError::ScopeMismatch);
     }
 
@@ -778,6 +839,7 @@ mod tests {
             schema_version: INVENTORY_SCHEMA_VERSION,
             platform: "linux",
             scope: "available_package_manager_databases",
+            source_selection: None,
             captured_at_unix_ms: 10,
             status: if status == InventorySourceStatus::Complete {
                 InventoryStatus::Complete
@@ -944,5 +1006,53 @@ mod tests {
         assert_eq!(result.counts.removals, 0);
         assert_eq!(result.counts.ambiguous_identity_groups, 1);
         assert!(result.deltas.is_empty());
+    }
+
+    #[test]
+    fn selected_dpkg_scope_requires_matching_path_identity_and_dpkg_only_rows() {
+        fn selected(path: &str, source_id: &str, inode: u64) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "schema": INVENTORY_SCHEMA,
+                "schema_version": 3,
+                "platform": "linux",
+                "scope": "selected_dpkg_admindir",
+                "source_selection": {
+                    "kind": "dpkg_admindir",
+                    "path_bytes_hex": path,
+                    "directory_device": 1,
+                    "directory_inode": inode
+                },
+                "captured_at_unix_ms": 1,
+                "status": "complete",
+                "sources": [{
+                    "id": source_id,
+                    "status": "complete",
+                    "exit_code": 0,
+                    "records_seen": 0,
+                    "diagnostics": []
+                }],
+                "packages": []
+            }))
+            .unwrap()
+        }
+
+        let left = selected("2f746d702f646270", "dpkg_query", 2);
+        let matching = selected("2f746d702f646270", "dpkg_query", 2);
+        assert!(compare_package_inventory_json(&left, &matching).is_ok());
+        let different_path = selected("2f746d702f6f74686572", "dpkg_query", 2);
+        assert_eq!(
+            compare_package_inventory_json(&left, &different_path),
+            Err(PackageComparisonError::ScopeMismatch)
+        );
+        let different_identity = selected("2f746d702f646270", "dpkg_query", 3);
+        assert_eq!(
+            compare_package_inventory_json(&left, &different_identity),
+            Err(PackageComparisonError::ScopeMismatch)
+        );
+        let unrelated_source = selected("2f746d702f646270", "rpm_query", 2);
+        assert_eq!(
+            compare_package_inventory_json(&left, &unrelated_source),
+            Err(PackageComparisonError::ScopeMismatch)
+        );
     }
 }

@@ -460,7 +460,23 @@ fn captures_process_file_and_loopback_network_observations_and_reports_loss_stat
     let observation_manifest: Value =
         serde_json::from_slice(&fs::read(observation_session.join("session.json")).unwrap())
             .unwrap();
-    assert_eq!(observation_manifest["schema_version"], 16);
+    assert_eq!(observation_manifest["schema_version"], 19);
+    let selected_root_source = observation_manifest["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["role"] == "selected_root")
+        .unwrap();
+    assert!(
+        selected_root_source["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |artifact| artifact["kind"] == "windows_root_namespace_identity"
+                    && artifact["path"] == "root-namespace.windows.json"
+            )
+    );
     let observation_comparison = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
         .arg("compare-observation")
         .arg(&observation_session)

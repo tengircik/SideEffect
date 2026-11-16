@@ -1,4 +1,17 @@
 use serde_json::{Value, json};
+#[cfg(windows)]
+use sha2::{Digest, Sha256};
+#[cfg(windows)]
+use sideeffect::audit_session::{
+    ArtifactKind, AuditSessionManifest, AuditSessionSource, ContextFact, ContextFactStatus,
+    HostContext, IntervalSemantics, LossMetadata, PrivilegeContext, SessionArtifactRef,
+    SessionStatus, SourceRole, SourceStatus,
+};
+#[cfg(windows)]
+use sideeffect::windows_runtime::{
+    AppliedLimits, CollectionStatus, EventLoss, SessionMetadata, StopReason, TargetOutcome,
+    WindowsRuntimeCapture,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -71,6 +84,337 @@ fn windows_v10() -> Value {
         "wmi_event_consumers":[],
         "wmi_filter_consumer_bindings":[]
     })
+}
+
+#[cfg(windows)]
+fn verified_observation_session(directory: &Path, name: &str, include_software: bool) -> PathBuf {
+    let mut startup_before = with_entries(
+        windows_v10(),
+        vec![service("service_start", "stopped", 1)],
+        true,
+        "C:\\Synthetic\\task.exe",
+    );
+    let mut startup_after = with_entries(
+        windows_v10(),
+        vec![service("service_start", "running", 4)],
+        true,
+        "C:\\Synthetic\\task.exe",
+    );
+    for startup in [&mut startup_before, &mut startup_after] {
+        startup["status"] = json!("partial");
+        for source in startup["sources"].as_array_mut().unwrap() {
+            source["status"] = json!("partial");
+        }
+    }
+    let mut artifacts = vec![
+        (
+            ArtifactKind::SelectedRoot,
+            "root-snapshot.json",
+            "sideeffect.selected_root_inventory",
+            1,
+            json!({"schema":"sideeffect.selected_root_inventory","schema_version":1}),
+        ),
+        (
+            ArtifactKind::SelectedRootAfter,
+            "root-snapshot-after.json",
+            "sideeffect.selected_root_inventory",
+            1,
+            json!({"schema":"sideeffect.selected_root_inventory","schema_version":1}),
+        ),
+        (
+            ArtifactKind::WindowsRuntimeCapture,
+            "runtime.windows.json",
+            "sideeffect.windows_runtime_capture",
+            3,
+            json!({"schema":"sideeffect.windows_runtime_capture","schema_version":3}),
+        ),
+        (
+            ArtifactKind::WindowsStartup,
+            "startup.windows.json",
+            "sideeffect.windows_startup_inventory",
+            10,
+            startup_before,
+        ),
+        (
+            ArtifactKind::WindowsStartupAfter,
+            "startup-after.windows.json",
+            "sideeffect.windows_startup_inventory",
+            10,
+            startup_after,
+        ),
+    ];
+    if include_software {
+        artifacts.push((
+            ArtifactKind::WindowsSoftware,
+            "software.windows.json",
+            "sideeffect.windows_software_inventory",
+            1,
+            software_inventory("1.0"),
+        ));
+        artifacts.push((
+            ArtifactKind::WindowsSoftwareAfter,
+            "software-after.windows.json",
+            "sideeffect.windows_software_inventory",
+            1,
+            software_inventory("2.0"),
+        ));
+    }
+    let mut references = Vec::new();
+    let mut files = Vec::new();
+    for (kind, path, schema, version, value) in artifacts {
+        let bytes = if path == "runtime.windows.json" {
+            synthetic_runtime_capture_bytes()
+        } else {
+            serde_json::to_vec(&value).unwrap()
+        };
+        references.push(SessionArtifactRef {
+            kind,
+            path: path.to_owned(),
+            schema: schema.to_owned(),
+            schema_version: version,
+            byte_length: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        });
+        files.push((path.to_owned(), bytes));
+    }
+    let sources = vec![
+        AuditSessionSource {
+            role: SourceRole::SelectedRoot,
+            collector: Some(sideeffect::audit_session::collector_identity(
+                "windows",
+                SourceRole::SelectedRoot,
+            )),
+            platform: "windows".to_owned(),
+            scope: "synthetic selected-root observation fixture".to_owned(),
+            started_at_unix_ms: 1000,
+            ended_at_unix_ms: 1002,
+            status: SourceStatus::Partial,
+            applied_limits: vec![],
+            requested_settings: vec![],
+            effective_settings: vec![],
+            loss: None,
+            diagnostic_codes: vec!["synthetic_fixture_only".to_owned()],
+            artifacts: references[0..2].to_vec(),
+        },
+        AuditSessionSource {
+            role: SourceRole::Runtime,
+            collector: Some(sideeffect::audit_session::collector_identity(
+                "windows",
+                SourceRole::Runtime,
+            )),
+            platform: "windows".to_owned(),
+            scope: "synthetic fixture only; no live ETW capture".to_owned(),
+            started_at_unix_ms: 1000,
+            ended_at_unix_ms: 1002,
+            status: SourceStatus::Partial,
+            applied_limits: vec![],
+            requested_settings: vec![],
+            effective_settings: vec![],
+            loss: Some(LossMetadata::unknown()),
+            diagnostic_codes: vec!["synthetic_fixture_only".to_owned()],
+            artifacts: references[2..3].to_vec(),
+        },
+        AuditSessionSource {
+            role: SourceRole::Startup,
+            collector: Some(sideeffect::audit_session::collector_identity(
+                "windows",
+                SourceRole::Startup,
+            )),
+            platform: "windows".to_owned(),
+            scope: "synthetic before/after startup fixture".to_owned(),
+            started_at_unix_ms: 1000,
+            ended_at_unix_ms: 1002,
+            status: SourceStatus::Partial,
+            applied_limits: vec![],
+            requested_settings: vec![],
+            effective_settings: vec![],
+            loss: None,
+            diagnostic_codes: vec!["synthetic_fixture_only".to_owned()],
+            artifacts: references[3..5].to_vec(),
+        },
+    ];
+    let mut manifest = AuditSessionManifest {
+        schema: "sideeffect.audit_session".to_owned(),
+        schema_version: if include_software {
+            sideeffect::audit_session::AUDIT_SESSION_V18_SCHEMA_VERSION
+        } else {
+            sideeffect::audit_session::AUDIT_SESSION_V17_SCHEMA_VERSION
+        },
+        session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        platform: "windows".to_owned(),
+        architecture: "x86_64".to_owned(),
+        host_context: Some(HostContext {
+            os_name: ContextFact {
+                status: ContextFactStatus::Observed,
+                value: Some("Windows".to_owned()),
+            },
+            os_version: ContextFact {
+                status: ContextFactStatus::Unknown,
+                value: None,
+            },
+            privilege: PrivilegeContext::Unknown,
+        }),
+        started_at_unix_ms: 1000,
+        ended_at_unix_ms: 1002,
+        interval_semantics: IntervalSemantics::BestEffortNonAtomic,
+        status: SessionStatus::Partial,
+        coverage_manifest: None,
+        sources,
+    };
+    if include_software {
+        manifest.sources.push(AuditSessionSource {
+            role: SourceRole::Packages,
+            collector: Some(sideeffect::audit_session::collector_identity(
+                "windows",
+                SourceRole::Packages,
+            )),
+            platform: "windows".to_owned(),
+            scope: "synthetic before/after Uninstall registration fixture".to_owned(),
+            started_at_unix_ms: 1000,
+            ended_at_unix_ms: 1002,
+            status: SourceStatus::Complete,
+            applied_limits: vec![],
+            requested_settings: vec![],
+            effective_settings: vec![],
+            loss: None,
+            diagnostic_codes: vec!["synthetic_fixture_only".to_owned()],
+            artifacts: references[5..7].to_vec(),
+        });
+    }
+    manifest.coverage_manifest = Some(sideeffect::audit_session::CoverageManifest::from_sources(
+        &manifest.sources,
+    ));
+    manifest.validate().unwrap();
+    let mut published_files: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+        .collect();
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    published_files.push(("session.json", &manifest_bytes));
+    let path = directory.join(name);
+    sideeffect::record::publish_private_windows_directory(&path, &published_files, 8 * 1024 * 1024)
+        .unwrap();
+    path
+}
+
+#[cfg(windows)]
+fn software_inventory(version: &str) -> Value {
+    let registry_key = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
+    let utf16_units_hex = |text: &str| {
+        text.encode_utf16()
+            .map(|unit| format!("{unit:04x}"))
+            .collect::<String>()
+    };
+    let utf16le_hex = |text: &str| {
+        text.encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let subkey = "Synthetic\\Suite";
+    let display_name = "Synthetic Suite";
+    let mut document = json!({
+        "schema":"sideeffect.windows_software_inventory", "schema_version":1,
+        "platform":"windows", "scope":"current_user_and_accessible_machine_uninstall_registry_entries",
+        "capture_started_at_unix_ms":1, "capture_ended_at_unix_ms":2, "status":"complete",
+        "sources":[], "registrations":[{
+            "registry_subkey":subkey, "registry_subkey_utf16_hex":utf16_units_hex(subkey),
+            "display_name":display_name, "values":[
+                {"name":"DisplayName","registry_type":1,"type_name":"REG_SZ","text":display_name,"raw_data_hex":utf16le_hex(display_name)},
+                {"name":"DisplayVersion","registry_type":1,"type_name":"REG_SZ","text":version,"raw_data_hex":utf16le_hex(version)},
+                {"name":"Publisher","registry_type":1,"type_name":"REG_SZ","text":"Synthetic","raw_data_hex":utf16le_hex("Synthetic")}
+            ], "evidence":{"source":"RegEnumKeyExW/RegQueryValueExW","hive":"HKEY_CURRENT_USER",
+                "registry_view":"native","registry_key":registry_key,"registration_index":0,"registry_subkey":subkey}
+        }]
+    });
+    let source_ids = [
+        (
+            "current_user_native_uninstall",
+            "HKEY_CURRENT_USER",
+            "native",
+            1,
+        ),
+        (
+            "current_user_32_uninstall",
+            "HKEY_CURRENT_USER",
+            "wow64_32",
+            0,
+        ),
+        (
+            "local_machine_64_uninstall",
+            "HKEY_LOCAL_MACHINE",
+            "wow64_64",
+            0,
+        ),
+        (
+            "local_machine_32_uninstall",
+            "HKEY_LOCAL_MACHINE",
+            "wow64_32",
+            0,
+        ),
+    ];
+    document["sources"] = json!(
+        source_ids
+            .into_iter()
+            .map(|(id, hive, view, seen)| json!({
+                "id":id,"status":"complete","registrations_seen":seen,"hive":hive,
+                "registry_key":registry_key,"registry_view":view,"diagnostics":[]
+            }))
+            .collect::<Vec<_>>()
+    );
+    document
+}
+
+#[cfg(windows)]
+fn synthetic_runtime_capture_bytes() -> Vec<u8> {
+    let mut capture = WindowsRuntimeCapture {
+        schema: sideeffect::windows_runtime::WINDOWS_RUNTIME_CAPTURE_SCHEMA.to_owned(),
+        schema_version: sideeffect::windows_runtime::WINDOWS_RUNTIME_CAPTURE_SCHEMA_VERSION,
+        platform: "windows".to_owned(),
+        capture_profile: "windows_nt_kernel_process_file_network_v1".to_owned(),
+        collection_status: CollectionStatus::Partial,
+        capture_completeness: "unknown".to_owned(),
+        started_at_unix_ms: 1000,
+        ended_at_unix_ms: 1002,
+        requested_duration_seconds: 1,
+        stop_reason: StopReason::EtwStatisticsUnavailable,
+        target: TargetOutcome {
+            process_id: 42,
+            exit_code: Some(0),
+            status_available: true,
+        },
+        session: SessionMetadata {
+            name: "synthetic_fixture".to_owned(),
+            provider: "synthetic fixture only".to_owned(),
+            scope: "synthetic_fixture_only".to_owned(),
+            buffer_size_kb_requested: 16,
+            minimum_buffers_requested: 8,
+            maximum_buffers_requested: 32,
+            buffer_count_reported: 8,
+            provider_process_id_header_semantics: "fixture context only".to_owned(),
+        },
+        limits: AppliedLimits {
+            maximum_duration_seconds: 60,
+            maximum_events: 50_000,
+            maximum_total_payload_bytes: 8 * 1024 * 1024,
+            maximum_payload_bytes_per_event: 64 * 1024,
+            maximum_document_bytes: 32 * 1024 * 1024,
+        },
+        event_loss: EventLoss {
+            events_lost: 0,
+            log_buffers_lost: 0,
+            real_time_buffers_lost: 0,
+            loss_statistics_available: false,
+            observation: "unavailable".to_owned(),
+            final_snapshot_available: false,
+        },
+        document_sha256: String::new(),
+        events: vec![],
+        diagnostics: vec!["synthetic_fixture_not_a_live_capture".to_owned()],
+    };
+    let canonical = serde_json::to_vec(&capture).unwrap();
+    capture.document_sha256 = format!("{:x}", Sha256::digest(canonical));
+    serde_json::to_vec(&capture).unwrap()
 }
 
 fn service(trigger_action: &str, state: &str, raw_state_code: u64) -> Value {
@@ -330,5 +674,140 @@ fn windows_v10_scm_state_is_separate_from_startup_configuration_and_observed_act
     assert_eq!(
         before["scheduled_task_actions"][0]["startup_state"]["observed"]["status"],
         "unknown"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn compare_observation_v17_reads_paired_partial_startup_and_rejects_missing_or_tampered_artifacts()
+{
+    let temp = TempDirectory::new();
+    let valid_session = verified_observation_session(&temp.0, "valid-v17", false);
+    let compared = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("compare-observation")
+        .arg(&valid_session)
+        .output()
+        .unwrap();
+    assert_eq!(
+        compared.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&compared.stderr)
+    );
+    let report: Value = serde_json::from_slice(&compared.stdout).unwrap();
+    assert_eq!(report["status"], "partial");
+    assert_eq!(report["startup_comparison_status"], "partial");
+    assert_eq!(report["startup_source_status"], "partial");
+    assert_eq!(report["startup_before_document_status"], "partial");
+    assert_eq!(report["startup_after_document_status"], "partial");
+    assert_eq!(report["startup_diff"]["status"], "partial");
+    assert_eq!(report["startup_diff"]["counts"]["changed"], 1);
+    assert!(report.get("software_diff").is_none());
+    assert_eq!(
+        report["startup_before_artifact"]["path"],
+        "startup.windows.json"
+    );
+    assert_eq!(
+        report["startup_after_artifact"]["path"],
+        "startup-after.windows.json"
+    );
+    for artifact in ["startup_before_artifact", "startup_after_artifact"] {
+        assert_eq!(report[artifact]["sha256"].as_str().unwrap().len(), 64);
+    }
+
+    let missing_session = verified_observation_session(&temp.0, "missing-v17-artifact", false);
+    fs::remove_file(missing_session.join("startup-after.windows.json")).unwrap();
+    let missing = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("compare-observation")
+        .arg(&missing_session)
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("could not read audit session"));
+
+    let tampered_session = verified_observation_session(&temp.0, "tampered-v17-artifact", false);
+    let tampered_path = tampered_session.join("startup-after.windows.json");
+    let mut tampered_bytes = fs::read(&tampered_path).unwrap();
+    let timestamp = b"capture_ended_at_unix_ms\":2";
+    let timestamp_end = tampered_bytes
+        .windows(timestamp.len())
+        .position(|window| window == timestamp)
+        .map(|offset| offset + timestamp.len() - 1)
+        .expect("synthetic startup fixture timestamp");
+    tampered_bytes[timestamp_end] = b'3';
+    fs::write(tampered_path, tampered_bytes).unwrap();
+    let tampered = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("compare-observation")
+        .arg(&tampered_session)
+        .output()
+        .unwrap();
+    assert_eq!(tampered.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&tampered.stderr).contains("does not match its declared SHA-256")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn compare_observation_v18_compares_verified_software_pair_and_rejects_bad_evidence() {
+    let temp = TempDirectory::new();
+    let valid_session = verified_observation_session(&temp.0, "valid-v18", true);
+    let compared = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("compare-observation")
+        .arg(&valid_session)
+        .output()
+        .unwrap();
+    assert_eq!(compared.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&compared.stdout).unwrap();
+    assert_eq!(report["software_comparison_status"], "complete");
+    assert_eq!(report["software_source_status"], "complete");
+    assert_eq!(report["software_before_document_status"], "complete");
+    assert_eq!(report["software_after_document_status"], "complete");
+    assert_eq!(
+        report["software_before_artifact"]["path"],
+        "software.windows.json"
+    );
+    assert_eq!(
+        report["software_after_artifact"]["path"],
+        "software-after.windows.json"
+    );
+    assert_eq!(
+        report["software_diff"]["schema"],
+        "sideeffect.windows_software_inventory_diff"
+    );
+    assert_eq!(report["software_diff"]["counts"]["changes"], 1);
+    assert_eq!(
+        report["software_diff"]["deltas"][0]["changed_fields"],
+        json!(["display_version"])
+    );
+
+    let missing_session = verified_observation_session(&temp.0, "missing-v18-after", true);
+    fs::remove_file(missing_session.join("software-after.windows.json")).unwrap();
+    let missing = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("compare-observation")
+        .arg(&missing_session)
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("could not read audit session"));
+
+    let tampered_session = verified_observation_session(&temp.0, "tampered-v18-after", true);
+    let tampered_path = tampered_session.join("software-after.windows.json");
+    let mut bytes = fs::read(&tampered_path).unwrap();
+    let marker = b"Synthetic Suite";
+    let offset = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .unwrap();
+    bytes[offset + marker.len() - 1] = b'a';
+    fs::write(tampered_path, bytes).unwrap();
+    let tampered = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("compare-observation")
+        .arg(&tampered_session)
+        .output()
+        .unwrap();
+    assert_eq!(tampered.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&tampered.stderr).contains("does not match its declared SHA-256")
     );
 }

@@ -44,6 +44,7 @@ pub(crate) struct PackageSourceConfig {
     pub(crate) stderr_limit: usize,
     pub(crate) row_limit: usize,
     pub(crate) timeout: Duration,
+    pub(crate) dpkg_admindir: Option<std::path::PathBuf>,
 }
 
 pub(crate) fn current_time_unix_ms() -> u128 {
@@ -71,6 +72,7 @@ pub fn collect_debian_packages() -> InventoryDocument {
             stderr_limit: MAX_INVENTORY_STDERR_BYTES,
             row_limit: MAX_INVENTORY_ROWS,
             timeout: COMMAND_TIMEOUT,
+            dpkg_admindir: None,
         },
         current_time_unix_ms(),
     )
@@ -90,10 +92,14 @@ pub(crate) fn collect_package_source(
         stderr_limit,
         row_limit,
         timeout: command_timeout,
+        dpkg_admindir,
     } = config;
     let mut document = empty_document(source_id, captured_at_unix_ms);
 
     let mut command = Command::new(executable);
+    if let Some(admindir) = &dpkg_admindir {
+        command.arg("--admindir").arg(admindir.as_os_str());
+    }
     command
         .args(args)
         // Clear dpkg and shell-related redirection variables (including DPKG_ADMINDIR,
@@ -685,6 +691,7 @@ fn empty_document(source_id: &'static str, captured_at_unix_ms: u128) -> Invento
         schema_version: INVENTORY_SCHEMA_VERSION,
         platform: "linux",
         scope: "available_package_manager_databases",
+        source_selection: None,
         captured_at_unix_ms,
         status: InventoryStatus::Partial,
         sources: vec![InventorySource {

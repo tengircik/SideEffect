@@ -563,6 +563,7 @@ fn fixed_entry_label(name: &[u8]) -> &'static str {
         b"root-snapshot.json" => "root-snapshot.json",
         b"root-snapshot-after.json" => "root-snapshot-after.json",
         b"software.windows.json" => "software.windows.json",
+        b"software-after.windows.json" => "software-after.windows.json",
         b"processes.windows.json" => "processes.windows.json",
         b"permissions.windows.json" => "permissions.windows.json",
         b"startup.windows.json" => "startup.windows.json",

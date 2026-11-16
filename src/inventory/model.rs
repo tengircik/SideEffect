@@ -2,6 +2,7 @@ use serde::Serialize;
 
 pub const INVENTORY_SCHEMA: &str = "sideeffect.inventory";
 pub const INVENTORY_SCHEMA_VERSION: u32 = 2;
+pub const SELECTED_DPKG_INVENTORY_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,10 +32,21 @@ pub struct InventoryDocument {
     pub schema_version: u32,
     pub platform: &'static str,
     pub scope: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_selection: Option<PackageSourceSelection>,
     pub captured_at_unix_ms: u128,
     pub status: InventoryStatus,
     pub sources: Vec<InventorySource>,
     pub packages: Vec<InventoryPackage>,
+}
+
+/// Exact selected dpkg database identity for alternate, isolated inventories.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PackageSourceSelection {
+    pub kind: &'static str,
+    pub path_bytes_hex: String,
+    pub directory_device: Option<u64>,
+    pub directory_inode: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

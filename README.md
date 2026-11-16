@@ -16,6 +16,36 @@ SideEffect turns selected local software sources and bounded runtime captures in
 
 ![SideEffect audit workflow: choose scope, collect locally, follow evidence, compare runs](assets/audit-flow.svg)
 
+## CLI quickstart: bounded observation from source
+
+These commands use the current source checkout; the published v0.1.0 archives predate the v19/v20 observation-session formats below. Build with Rust 1.85 or later. Runtime capture also needs `strace` 6.8 or later on Linux. Native Windows ETW requires a token already permitted to control the NT Kernel Logger; SideEffect does not elevate automatically.
+
+Linux x86_64 (from the repository root):
+
+```sh
+cargo build --release --locked
+mkdir -p ./observed-root
+./target/release/sideeffect audit --output ./audit-session --observe-root ./observed-root --packages --startup --runtime-duration-seconds 10 -- /usr/bin/id
+audit_status=$?
+printf 'audit exit status: %s\n' "$audit_status"
+./target/release/sideeffect inspect --format text --session ./audit-session
+./target/release/sideeffect compare-observation ./audit-session
+```
+
+Native Windows x64 PowerShell (from the repository root; run in an already-authorized token):
+
+```powershell
+cargo build --release --locked
+New-Item -ItemType Directory -Path .\observed-root -Force | Out-Null
+.\target\release\sideeffect.exe audit --output .\audit-session --observe-root .\observed-root --packages --startup --runtime-source windows-etw --runtime-duration-seconds 10 -- "$env:SystemRoot\System32\whoami.exe"
+$auditStatus = $LASTEXITCODE
+"audit exit status: $auditStatus"
+.\target\release\sideeffect.exe inspect --format text --session .\audit-session
+.\target\release\sideeffect.exe compare-observation .\audit-session
+```
+
+Choose a new session directory for each run and keep it outside `observed-root`. The observation snapshots the selected directory's direct children and the selected package/startup sources around a bounded command; it is not an atomic or exhaustive system snapshot. Runtime capture completeness is unknown, so partial or unavailable selected sources can produce exit status `2`; inspect the session status and diagnostics, then use `compare-observation` for its evidence-linked temporal differences. A nonzero status is not a reason to discard a published partial session. Windows ETW is system-wide during its bounded window and may include unrelated activity. Sessions retain raw trace/ETW evidence and can contain local paths, command arguments, package or startup details, and other sensitive data. Keep them private and review before sharing. These outputs do not establish causation or safety.
+
 ## Start with your AI agent
 
 Install the `sideeffect-audit` Agent Skill for Codex, Claude Code, Cursor, Gemini CLI, GitHub Copilot, OpenCode, Windsurf, and other agents supported by the Agent Skills installer. The skill lets your chosen agent use SideEffect's deterministic CLI; it does not require SideEffect's experimental local-model commands.

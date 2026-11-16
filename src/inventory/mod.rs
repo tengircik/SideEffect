@@ -44,6 +44,7 @@ mod windows_app_paths_diff;
 #[cfg(windows)]
 mod windows_msix;
 mod windows_msix_diff;
+mod windows_root_namespace;
 #[cfg(windows)]
 mod windows_root_runtime_association;
 mod windows_software_diff;
@@ -63,6 +64,7 @@ pub use effective_access_windows::{
 pub use model::{
     INVENTORY_SCHEMA, INVENTORY_SCHEMA_VERSION, InventoryDiagnostic, InventoryDocument,
     InventoryEvidence, InventoryPackage, InventorySource, InventorySourceStatus, InventoryStatus,
+    PackageSourceSelection, SELECTED_DPKG_INVENTORY_SCHEMA_VERSION,
 };
 pub use package_diff::{
     PackageChangeKind, PackageComparisonCounts, PackageComparisonDiagnostic,
@@ -106,8 +108,10 @@ pub use windows_msix_diff::{
 };
 #[cfg(windows)]
 pub use windows_root_runtime_association::{
-    WindowsRootRuntimeAssociation, WindowsRootRuntimeAssociationReport,
-    WindowsRootRuntimeAssociationSummary, WindowsRootRuntimeEvidence,
+    WindowsRootNamespaceRuntimeAssociation, WindowsRootNamespaceRuntimeAssociationReport,
+    WindowsRootNamespaceRuntimeAssociationSummary, WindowsRootRuntimeAssociation,
+    WindowsRootRuntimeAssociationReport, WindowsRootRuntimeAssociationSummary,
+    WindowsRootRuntimeEvidence, associate_windows_root_namespace_runtime_diff,
     associate_windows_root_runtime_diff,
 };
 pub use windows_software_diff::{
@@ -123,7 +127,10 @@ pub use windows_software_diff::{
 pub use debian::collect_debian_packages;
 pub use debian::parse_dpkg_query_output;
 #[cfg(target_os = "linux")]
-pub use packages::collect_packages;
+pub use packages::{
+    MAX_DPKG_ADMINDIR_PATH_BYTES, collect_packages, collect_packages_from_dpkg_admindir,
+    dpkg_admindir_identity, validate_dpkg_admindir,
+};
 #[cfg(windows)]
 pub use packages_windows::{
     WindowsRegistryValue, WindowsSoftwareDiagnostic, WindowsSoftwareInventoryDocument,
@@ -168,11 +175,17 @@ pub use root_snapshot::{
     RootContentHashing, RootDiagnostic, RootEntry, RootEntryEvidence, RootIdentity, RootSnapshot,
     RootSnapshotLimits, collect_root_snapshot, collect_root_snapshot_with_hash,
 };
+#[cfg(windows)]
+pub use root_snapshot::{
+    WindowsRootHandleNamespaceIdentity, collect_root_snapshot_with_windows_namespace,
+};
 pub use root_snapshot_diff::{
     RootSnapshotDelta, RootSnapshotDiff, RootSnapshotDiffCounts, RootSnapshotDiffError,
     RootSnapshotSide, compare_observation_root_inventory_json,
     compare_selected_root_inventory_json, is_selected_root_inventory_json,
 };
+#[cfg(target_os = "linux")]
+pub(crate) use startup::collect_startup_for_observation;
 #[cfg(target_os = "linux")]
 pub use startup::{
     Directory as StartupDirectory, Entry as XdgStartupEntry, KeyEvidence as StartupKeyEvidence,
@@ -216,3 +229,8 @@ pub use windows_app_paths::{
 };
 #[cfg(windows)]
 pub use windows_msix::{WindowsMsixInventoryDocument, WindowsMsixStatus, collect_windows_msix};
+pub use windows_root_namespace::{
+    WINDOWS_ROOT_NAMESPACE_MAX_BYTES, WINDOWS_ROOT_NAMESPACE_MAX_PATH_UTF16_UNITS,
+    WINDOWS_ROOT_NAMESPACE_SCHEMA, WINDOWS_ROOT_NAMESPACE_SCHEMA_VERSION,
+    WindowsRootNamespaceDocument, WindowsRootNamespaceSide,
+};

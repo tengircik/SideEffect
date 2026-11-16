@@ -74,6 +74,15 @@ pub struct RootIdentity {
     pub inode_or_file_index: Option<u64>,
 }
 
+/// Exact point-in-time namespace identity read from the selected Windows root handle.
+/// This is kept outside `RootIdentity` so historical selected-root v1/v2 JSON stays fixed.
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowsRootHandleNamespaceIdentity {
+    pub nt_path_utf16le_hex: Option<String>,
+    pub status: &'static str,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct RootEntry {
     pub ordinal: usize,
@@ -564,7 +573,7 @@ mod platform {
         FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, FILE_TYPE_DISK, FileAttributeTagInfo, FileBasicInfo,
         FileIdBothDirectoryInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
-        GetFileType, OPEN_EXISTING,
+        GetFileType, GetFinalPathNameByHandleW, OPEN_EXISTING, VOLUME_NAME_NT,
     };
 
     struct HandleGuard(HANDLE);
@@ -776,6 +785,24 @@ mod platform {
     }
 
     pub fn collect(root_path: &Path, hash_regular_files: bool) -> RootSnapshot {
+        collect_internal(root_path, hash_regular_files, None)
+    }
+
+    pub fn collect_with_namespace(
+        root_path: &Path,
+        hash_regular_files: bool,
+    ) -> (RootSnapshot, Option<WindowsRootHandleNamespaceIdentity>) {
+        let mut namespace_identity = None;
+        let snapshot =
+            collect_internal(root_path, hash_regular_files, Some(&mut namespace_identity));
+        (snapshot, namespace_identity)
+    }
+
+    fn collect_internal(
+        root_path: &Path,
+        hash_regular_files: bool,
+        namespace_identity: Option<&mut Option<WindowsRootHandleNamespaceIdentity>>,
+    ) -> RootSnapshot {
         let started = now_unix_ms();
         let start = Instant::now();
         let mut out = empty_snapshot("windows", started);
@@ -861,6 +888,17 @@ mod platform {
                 (id != 0).then_some(id)
             },
         });
+        if let Some(output) = namespace_identity {
+            let nt_path = final_nt_path(raw);
+            *output = Some(WindowsRootHandleNamespaceIdentity {
+                status: if nt_path.is_some() {
+                    "observed"
+                } else {
+                    "unavailable"
+                },
+                nt_path_utf16le_hex: nt_path.as_deref().map(exact_utf16le_hex),
+            });
+        }
         let mut aggregate = 0usize;
         let mut ordinal = 0usize;
         let mut actual_hash_bytes = 0u64;
@@ -1015,6 +1053,27 @@ mod platform {
         finish(out)
     }
 
+    fn final_nt_path(handle: HANDLE) -> Option<Vec<u16>> {
+        let mut buffer = vec![0u16; MAX_ROOT_PATH_BYTES_OR_UTF16_UNITS + 1];
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                handle,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                VOLUME_NAME_NT,
+            )
+        } as usize;
+        if length == 0
+            || length >= buffer.len()
+            || length > MAX_ROOT_PATH_BYTES_OR_UTF16_UNITS
+            || buffer[..length].is_empty()
+            || buffer[..length].contains(&0)
+        {
+            return None;
+        }
+        Some(buffer[..length].to_vec())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::exact_utf16le_hex;
@@ -1043,6 +1102,14 @@ pub fn collect_root_snapshot(root_path: &Path) -> RootSnapshot {
 
 pub fn collect_root_snapshot_with_hash(root_path: &Path, hash_regular_files: bool) -> RootSnapshot {
     platform::collect(root_path, hash_regular_files)
+}
+
+#[cfg(windows)]
+pub fn collect_root_snapshot_with_windows_namespace(
+    root_path: &Path,
+    hash_regular_files: bool,
+) -> (RootSnapshot, Option<WindowsRootHandleNamespaceIdentity>) {
+    platform::collect_with_namespace(root_path, hash_regular_files)
 }
 
 fn configure_hashing(snapshot: &mut RootSnapshot, requested: bool) {

@@ -18,6 +18,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::ffi::OsString;
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -28,6 +29,7 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug, Default)]
 pub struct AuditOptions {
     pub packages: bool,
+    pub dpkg_admindir: Option<PathBuf>,
     pub processes: bool,
     pub startup: bool,
     pub path_executables: bool,
@@ -51,6 +53,15 @@ struct Artifact {
     file_name: &'static str,
     bytes: Vec<u8>,
 }
+
+struct PackageInventoryCapture {
+    document: crate::inventory::InventoryDocument,
+    admindir_identity_pair: Option<AdmindirIdentityPair>,
+}
+
+type DirectoryIdentity = (u64, u64);
+type AdmindirIdentitySpan = (Option<DirectoryIdentity>, Option<DirectoryIdentity>);
+type AdmindirIdentityPair = AdmindirIdentitySpan;
 
 /// Collect selected Linux inventory sources and atomically publish one private session directory.
 pub fn collect_and_publish(
@@ -95,6 +106,19 @@ pub fn collect_and_publish(
             "runtime audit duration must be a whole number of seconds from 1 to 3600".to_owned(),
         );
     }
+    let dpkg_admindir = match options.dpkg_admindir.as_deref() {
+        Some(_) if !options.packages => {
+            return Err("audit --dpkg-admindir requires --packages".to_owned());
+        }
+        Some(_) if !options.observation_window => {
+            return Err("audit --dpkg-admindir requires --observe-root".to_owned());
+        }
+        Some(path) => Some(
+            crate::inventory::validate_dpkg_admindir(path)
+                .map_err(|code| format!("invalid --dpkg-admindir selection: {code}"))?,
+        ),
+        None => None,
+    };
     if options.observation_window
         && (options.root_path.is_none() || options.runtime_program.is_none())
     {
@@ -125,14 +149,16 @@ pub fn collect_and_publish(
     let mut artifacts = Vec::new();
     let mut sources = Vec::new();
     let mut runtime_coverage_detail = None;
+    let mut dpkg_before_identity_pair = None;
 
     if options.packages {
         let started = now_unix_ms()?;
-        let document = collect_packages();
+        let capture = collect_package_inventory(dpkg_admindir.as_deref());
         let ended = now_unix_ms()?;
-        let value = serde_json::to_value(&document)
+        dpkg_before_identity_pair = capture.admindir_identity_pair;
+        let value = serde_json::to_value(&capture.document)
             .map_err(|error| format!("could not inspect package inventory metadata: {error}"))?;
-        sources.push(build_source(
+        let mut source = build_source(
             SourceRole::Packages,
             &value,
             started,
@@ -151,8 +177,12 @@ pub fn collect_and_publish(
                     crate::limits::MAX_INVENTORY_STDERR_BYTES as u64,
                 ),
             ],
-        )?);
-        artifacts.push(artifact("packages.json", &document)?);
+        )?;
+        if let Some(admindir) = dpkg_admindir.as_deref() {
+            source.scope = dpkg_admindir_scope(admindir, dpkg_before_identity_pair, None);
+        }
+        sources.push(source);
+        artifacts.push(artifact("packages.json", &capture.document)?);
     }
 
     if options.processes {
@@ -187,7 +217,11 @@ pub fn collect_and_publish(
     }
 
     if options.startup {
-        let document = collect_startup();
+        let document = if options.observation_window {
+            crate::inventory::collect_startup_for_observation()
+        } else {
+            collect_startup()
+        };
         let value = serde_json::to_value(&document)
             .map_err(|error| format!("could not inspect startup inventory metadata: {error}"))?;
         sources.push(build_source(
@@ -477,6 +511,64 @@ pub fn collect_and_publish(
             }
             .to_owned();
         }
+        if options.packages {
+            let started = now_unix_ms()?;
+            let mut capture = collect_package_inventory(dpkg_admindir.as_deref());
+            let ended = now_unix_ms()?;
+            if let (Some(before), Some(after)) =
+                (dpkg_before_identity_pair, capture.admindir_identity_pair)
+            {
+                if before.0.is_none()
+                    || before.0 != before.1
+                    || after.0.is_none()
+                    || after.0 != after.1
+                    || before.0 != after.0
+                {
+                    mark_package_inventory_partial(
+                        &mut capture.document,
+                        "dpkg_admindir_identity_changed",
+                    );
+                }
+            } else if dpkg_admindir.is_some() {
+                mark_package_inventory_partial(
+                    &mut capture.document,
+                    "dpkg_admindir_identity_unavailable",
+                );
+            }
+            let value = serde_json::to_value(&capture.document)
+                .map_err(|error| format!("could not inspect after package inventory: {error}"))?;
+            if let Some(source) = sources
+                .iter_mut()
+                .find(|source| source.role == SourceRole::Packages)
+            {
+                update_after_source(source, &value, started, ended);
+                if let Some(admindir) = dpkg_admindir.as_deref() {
+                    source.scope = dpkg_admindir_scope(
+                        admindir,
+                        dpkg_before_identity_pair,
+                        capture.admindir_identity_pair,
+                    );
+                }
+            }
+            artifacts.push(artifact("packages-after.json", &capture.document)?);
+        }
+        if options.startup {
+            let document = crate::inventory::collect_startup_for_observation();
+            let value = serde_json::to_value(&document)
+                .map_err(|error| format!("could not inspect after startup inventory: {error}"))?;
+            if let Some(source) = sources
+                .iter_mut()
+                .find(|source| source.role == SourceRole::Startup)
+            {
+                update_after_source(
+                    source,
+                    &value,
+                    document.capture_started_at_unix_ms,
+                    document.capture_ended_at_unix_ms,
+                );
+            }
+            artifacts.push(artifact("startup-after.json", &document)?);
+        }
         let existing_bytes = artifacts.iter().try_fold(0_u64, |total, artifact| {
             total.checked_add(artifact.bytes.len() as u64)
         });
@@ -520,19 +612,24 @@ pub fn collect_and_publish(
         let kind = artifact_kind(artifact.file_name)?;
         let role = match kind {
             ArtifactKind::Packages => SourceRole::Packages,
+            ArtifactKind::PackagesAfter => SourceRole::Packages,
             ArtifactKind::Processes => SourceRole::Processes,
             ArtifactKind::Permissions => SourceRole::Permissions,
             ArtifactKind::Startup => SourceRole::Startup,
+            ArtifactKind::StartupAfter => SourceRole::Startup,
             ArtifactKind::PathExecutables => SourceRole::PathExecutables,
             ArtifactKind::SelectedRoot | ArtifactKind::SelectedRootAfter => {
                 SourceRole::SelectedRoot
             }
             ArtifactKind::WindowsSoftware
+            | ArtifactKind::WindowsSoftwareAfter
             | ArtifactKind::WindowsMsix
             | ArtifactKind::WindowsAppPaths
             | ArtifactKind::WindowsProcesses
             | ArtifactKind::WindowsPermissions
             | ArtifactKind::WindowsStartup
+            | ArtifactKind::WindowsStartupAfter
+            | ArtifactKind::WindowsRootNamespaceIdentity
             | ArtifactKind::WindowsRuntimeCapture => {
                 return Err(
                     "Windows artifacts are not supported in Linux audit collection".to_owned(),
@@ -561,7 +658,7 @@ pub fn collect_and_publish(
     let manifest = AuditSessionManifest {
         schema: AUDIT_SESSION_SCHEMA.to_owned(),
         schema_version: if options.observation_window {
-            crate::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION
+            crate::audit_session::AUDIT_SESSION_V20_SCHEMA_VERSION
         } else {
             AUDIT_SESSION_V9_SCHEMA_VERSION
         },
@@ -763,6 +860,105 @@ fn artifact<T: Serialize>(file_name: &'static str, document: &T) -> Result<Artif
     Ok(Artifact { file_name, bytes })
 }
 
+fn update_after_source(
+    source: &mut AuditSessionSource,
+    document: &Value,
+    started_at_unix_ms: u128,
+    ended_at_unix_ms: u128,
+) {
+    source.ended_at_unix_ms = ended_at_unix_ms.max(started_at_unix_ms);
+    if document.get("status").and_then(Value::as_str) != Some("complete") {
+        source.status = SourceStatus::Partial;
+    }
+    source.diagnostic_codes.extend(collect_codes(document));
+    source.diagnostic_codes.sort();
+    source.diagnostic_codes.dedup();
+    if source.diagnostic_codes.len() > MAX_DIAGNOSTICS {
+        source.diagnostic_codes.truncate(MAX_DIAGNOSTICS);
+        source.status = SourceStatus::Partial;
+    }
+}
+
+fn collect_package_inventory(admindir: Option<&Path>) -> PackageInventoryCapture {
+    let Some(admindir) = admindir else {
+        return PackageInventoryCapture {
+            document: collect_packages(),
+            admindir_identity_pair: None,
+        };
+    };
+    let before = crate::inventory::dpkg_admindir_identity(admindir);
+    let mut document = crate::inventory::collect_packages_from_dpkg_admindir(admindir);
+    let after = crate::inventory::dpkg_admindir_identity(admindir);
+    if before.is_none() || before != after {
+        mark_package_inventory_partial(&mut document, "dpkg_admindir_identity_unavailable");
+    }
+    PackageInventoryCapture {
+        document,
+        admindir_identity_pair: Some((before, after)),
+    }
+}
+
+fn mark_package_inventory_partial(
+    document: &mut crate::inventory::InventoryDocument,
+    code: &'static str,
+) {
+    document.status = crate::inventory::InventoryStatus::Partial;
+    if let Some(source) = document.sources.first_mut() {
+        source.status = crate::inventory::InventorySourceStatus::Partial;
+        if !source
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == code)
+        {
+            source
+                .diagnostics
+                .push(crate::inventory::InventoryDiagnostic {
+                    code,
+                    line: None,
+                    byte_offset: None,
+                    byte_length: None,
+                    record_sha256: None,
+                });
+        }
+    }
+}
+
+fn dpkg_admindir_scope(
+    admindir: &Path,
+    before: Option<AdmindirIdentitySpan>,
+    after: Option<AdmindirIdentitySpan>,
+) -> String {
+    fn pair_text(pair: Option<AdmindirIdentitySpan>) -> String {
+        let Some((start, end)) = pair else {
+            return "not_selected".to_owned();
+        };
+        let identity_text = |identity: Option<(u64, u64)>| {
+            identity.map_or_else(
+                || "unknown".to_owned(),
+                |(device, inode)| format!("{device}:{inode}"),
+            )
+        };
+        format!("{}~{}", identity_text(start), identity_text(end))
+    }
+    format!(
+        "selected_dpkg_admindir;path_bytes_hex={};before_dev_ino={};after_dev_ino={}",
+        path_bytes_hex(admindir),
+        pair_text(before),
+        pair_text(after)
+    )
+}
+
+fn path_bytes_hex(path: &Path) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = path.as_os_str().as_bytes();
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
 fn serialize_bounded<T: Serialize>(value: &T, max: usize, label: &str) -> Result<Vec<u8>, String> {
     let mut writer = CappedWriter::new(max);
     serde_json::to_writer(&mut writer, value)
@@ -791,8 +987,10 @@ fn artifact_schema(file_name: &str, bytes: &[u8]) -> Result<(String, u32), Strin
 fn artifact_kind(file_name: &str) -> Result<ArtifactKind, String> {
     match file_name {
         "packages.json" => Ok(ArtifactKind::Packages),
+        "packages-after.json" => Ok(ArtifactKind::PackagesAfter),
         "processes.json" => Ok(ArtifactKind::Processes),
         "startup.json" => Ok(ArtifactKind::Startup),
+        "startup-after.json" => Ok(ArtifactKind::StartupAfter),
         "permissions.json" => Ok(ArtifactKind::Permissions),
         "path-executables.json" => Ok(ArtifactKind::PathExecutables),
         "root-snapshot.json" => Ok(ArtifactKind::SelectedRoot),
@@ -800,6 +998,7 @@ fn artifact_kind(file_name: &str) -> Result<ArtifactKind, String> {
         "run.json" => Ok(ArtifactKind::RuntimeManifest),
         "trace.strace" => Ok(ArtifactKind::RuntimeTrace),
         "software.windows.json" => Ok(ArtifactKind::WindowsSoftware),
+        "software-after.windows.json" => Ok(ArtifactKind::WindowsSoftwareAfter),
         "processes.windows.json" => Ok(ArtifactKind::WindowsProcesses),
         "permissions.windows.json" => Ok(ArtifactKind::WindowsPermissions),
         "startup.windows.json" => Ok(ArtifactKind::WindowsStartup),

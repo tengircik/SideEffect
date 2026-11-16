@@ -483,13 +483,20 @@ fn source_role_name(role: SourceRole) -> &'static str {
 fn artifact_kind_name(kind: crate::audit_session::ArtifactKind) -> &'static str {
     match kind {
         crate::audit_session::ArtifactKind::Packages => "packages",
+        crate::audit_session::ArtifactKind::PackagesAfter => "packages_after",
         crate::audit_session::ArtifactKind::Processes => "processes",
         crate::audit_session::ArtifactKind::Permissions => "permissions",
         crate::audit_session::ArtifactKind::Startup => "startup",
+        crate::audit_session::ArtifactKind::StartupAfter => "startup_after",
         crate::audit_session::ArtifactKind::PathExecutables => "path_executables",
         crate::audit_session::ArtifactKind::SelectedRoot => "selected_root",
         crate::audit_session::ArtifactKind::SelectedRootAfter => "selected_root_after",
+        crate::audit_session::ArtifactKind::WindowsStartupAfter => "windows_startup_after",
         crate::audit_session::ArtifactKind::WindowsSoftware => "windows_software",
+        crate::audit_session::ArtifactKind::WindowsSoftwareAfter => "windows_software_after",
+        crate::audit_session::ArtifactKind::WindowsRootNamespaceIdentity => {
+            "windows_root_namespace_identity"
+        }
         crate::audit_session::ArtifactKind::WindowsMsix => "windows_msix",
         crate::audit_session::ArtifactKind::WindowsAppPaths => "windows_app_paths",
         crate::audit_session::ArtifactKind::WindowsProcesses => "windows_processes",
