@@ -4,6 +4,8 @@ SideEffect collects local software inventories and records what a selected comma
 
 SideEffect is an on-demand audit tool. It does not continuously monitor your computer, run startup entries, upload audit data, or request administrator access automatically.
 
+![SideEffect audit workflow: choose a scope, collect locally, follow evidence, and compare runs](assets/audit-flow.svg)
+
 ## Try a local audit
 
 The examples below use the current source checkout. They collect package and startup snapshots around a short command run, and save a session you can inspect. Pick a new output directory each time. Keep it outside the selected directory being observed.
