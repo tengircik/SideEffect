@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use sideeffect::audit_session::{SourceRole, SourceStatus, parse_manifest};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -973,6 +974,215 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
                 && event["operation"]["result"] == "success"
         }),
         "runtime evidence must retain the observed successful open of the transient file"
+    );
+}
+
+#[test]
+fn audit_v20_preserves_partial_startup_source_evidence_without_poisoning_root_diff() {
+    let directory = TestDirectory::new();
+    let observed_root = directory.0.join("observed-root");
+    let output = directory.0.join("partial-startup.session");
+    let home = directory.0.join("home");
+    let config_home = home.join(".config");
+    let autostart = config_home.join("autostart");
+    let user_units = config_home.join("systemd/user");
+    let config_dirs = directory.0.join("xdg-config-dirs");
+    let data_dirs = directory.0.join("xdg-data-dirs");
+    let runtime_dir = directory.0.join("xdg-runtime");
+    fs::create_dir(&observed_root).unwrap();
+    fs::create_dir_all(&autostart).unwrap();
+    fs::create_dir_all(&user_units).unwrap();
+    fs::create_dir_all(&config_dirs).unwrap();
+    fs::create_dir_all(&data_dirs).unwrap();
+    fs::create_dir(&runtime_dir).unwrap();
+    fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let invalid_entry = autostart.join("invalid-symlink.desktop");
+    symlink("missing-fixture-target", &invalid_entry).unwrap();
+    let unit_path = user_units.join("sideeffect-r5-partial-startup.service");
+    fs::write(
+        &unit_path,
+        "[Unit]\nDescription=Before synthetic startup change\n[Service]\nExecStart=/nonexistent/sideeffect-fixture\n",
+    )
+    .unwrap();
+    let created_file = observed_root.join("created-during-command.txt");
+    let created_startup_entry = autostart.join("created-during-command.desktop");
+    let script = "from pathlib import Path\nimport sys\nPath(sys.argv[1]).write_text('fixture')\nPath(sys.argv[2]).write_text('[Desktop Entry]\\nType=Application\\nName=Synthetic fixture\\nExec=/nonexistent/sideeffect-fixture\\n')\nPath(sys.argv[3]).write_text('[Unit]\\nDescription=After synthetic startup change\\n[Service]\\nExecStart=/nonexistent/sideeffect-fixture\\n')\n";
+    let captured = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&output)
+        .arg("--observe-root")
+        .arg(&observed_root)
+        .arg("--startup")
+        .arg("--runtime-duration-seconds")
+        .arg("10")
+        .arg("--")
+        .arg("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(&created_file)
+        .arg(&created_startup_entry)
+        .arg(&unit_path)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_CONFIG_DIRS", &config_dirs)
+        .env("XDG_DATA_DIRS", &data_dirs)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .output()
+        .expect("launch startup observation with a private XDG fixture");
+    assert_eq!(
+        captured.status.code(),
+        Some(2),
+        "runtime capture is partial by contract: {}",
+        String::from_utf8_lossy(&captured.stderr)
+    );
+    assert!(created_file.is_file());
+    assert!(created_startup_entry.is_file());
+
+    let manifest = parse_manifest(&fs::read(output.join("session.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest.schema_version,
+        sideeffect::audit_session::AUDIT_SESSION_V20_SCHEMA_VERSION
+    );
+    let root_source = manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::SelectedRoot)
+        .expect("selected-root source");
+    assert_eq!(root_source.status, SourceStatus::Complete);
+    let startup_source = manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::Startup)
+        .expect("startup source");
+    assert_eq!(startup_source.status, SourceStatus::Partial);
+    assert!(
+        startup_source
+            .diagnostic_codes
+            .contains(&"file_not_regular".to_owned())
+    );
+    let before_ref = startup_source
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == sideeffect::audit_session::ArtifactKind::Startup)
+        .expect("startup before artifact");
+    let after_ref = startup_source
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == sideeffect::audit_session::ArtifactKind::StartupAfter)
+        .expect("startup after artifact");
+    assert_eq!(before_ref.path, "startup.json");
+    assert_eq!(after_ref.path, "startup-after.json");
+
+    let read_verified_startup = |artifact: &sideeffect::audit_session::SessionArtifactRef| {
+        let bytes = fs::read(output.join(artifact.path.as_str())).unwrap();
+        assert_eq!(artifact.byte_length, bytes.len() as u64);
+        assert_eq!(artifact.sha256, format!("{:x}", Sha256::digest(&bytes)));
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+    let before: serde_json::Value = read_verified_startup(before_ref);
+    let after: serde_json::Value = read_verified_startup(after_ref);
+    for document in [&before, &after] {
+        assert_eq!(document["status"], "partial");
+        assert_eq!(document["xdg_autostart"]["status"], "partial");
+        let directory = document["xdg_autostart"]["directories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|directory| directory["path"] == autostart.display().to_string())
+            .expect("private user autostart source row");
+        assert_eq!(directory["status"], "partial");
+        assert!(
+            directory["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic["code"] == "file_not_regular"
+                        && diagnostic["path"] == invalid_entry.display().to_string()
+                })
+        );
+    }
+    assert_eq!(
+        before["xdg_autostart"]["entries"].as_array().unwrap().len(),
+        0
+    );
+    assert_eq!(
+        after["xdg_autostart"]["entries"].as_array().unwrap().len(),
+        1
+    );
+    let before_unit_index = before["systemd_units"]["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|record| record["source_path"] == unit_path.display().to_string())
+        .expect("before systemd unit fixture evidence");
+    let after_unit_index = after["systemd_units"]["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|record| record["source_path"] == unit_path.display().to_string())
+        .expect("after systemd unit fixture evidence");
+
+    let compared = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("compare-observation")
+        .arg(&output)
+        .output()
+        .expect("compare partial-startup observation artifacts");
+    assert_eq!(compared.status.code(), Some(2));
+    let report: serde_json::Value = serde_json::from_slice(&compared.stdout).unwrap();
+    assert_eq!(report["startup_source_status"], "partial");
+    assert_eq!(report["startup_before_document_status"], "partial");
+    assert_eq!(report["startup_after_document_status"], "partial");
+    assert_eq!(report["startup_comparison_status"], "partial");
+    assert_eq!(report["startup_diff"]["status"], "partial");
+    assert_eq!(report["startup_before_artifact"]["path"], before_ref.path);
+    assert_eq!(report["startup_after_artifact"]["path"], after_ref.path);
+    assert_eq!(
+        report["startup_before_artifact"]["sha256"],
+        before_ref.sha256
+    );
+    assert_eq!(report["startup_after_artifact"]["sha256"], after_ref.sha256);
+    assert!(
+        report["startup_diff"]["counts"]["unmatched_rows_suppressed_for_incomplete_source"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    let startup_deltas = report["startup_diff"]["deltas"].as_array().unwrap();
+    assert!(
+        startup_deltas
+            .iter()
+            .all(|delta| delta["category"] != "xdg_autostart")
+    );
+    let before_unit_reference = format!("/systemd_units/records/{before_unit_index}");
+    let after_unit_reference = format!("/systemd_units/records/{after_unit_index}");
+    let preserved_unit_change = startup_deltas
+        .iter()
+        .find(|delta| {
+            delta["category"] == "systemd_units"
+                && delta["kind"] == "changed"
+                && delta["before"]["references"]
+                    .as_array()
+                    .is_some_and(|refs| refs.iter().any(|value| value == &before_unit_reference))
+                && delta["after"]["references"]
+                    .as_array()
+                    .is_some_and(|refs| refs.iter().any(|value| value == &after_unit_reference))
+        })
+        .expect("unrelated complete systemd source change remains linked");
+    assert!(
+        preserved_unit_change["changed_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "directives")
+    );
+    assert_eq!(report["root_comparison_status"], "complete");
+    assert_eq!(report["root_diff"]["counts"]["additions"], 1);
+    assert_eq!(
+        report["root_diff"]["deltas"][0]["name"],
+        "created-during-command.txt"
     );
 }
 

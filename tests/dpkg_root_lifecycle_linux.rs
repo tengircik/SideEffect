@@ -10,7 +10,7 @@ use sideeffect::model::{SyscallOutcome, TraceRecord, TraceRecordKind};
 use sideeffect::trace::strace::parse_trace_bytes;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1770,4 +1770,153 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
     let log = private_parent.join("dpkg.log");
     assert!(log.starts_with(private_parent));
     assert!(log.is_file());
+}
+
+#[test]
+fn observed_command_replacing_selected_dpkg_admindir_marks_package_pair_partial() {
+    let temporary = TempDirectory::new();
+    let private_parent = &temporary.0;
+    let root = private_parent.join("root");
+    let observed_root = private_parent.join("observed");
+    let output = private_parent.join("admindir-replaced.session");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&observed_root).unwrap();
+
+    let admindir = root.join("var/lib/dpkg");
+    fs::create_dir_all(&admindir).unwrap();
+    fs::write(
+        admindir.join("status"),
+        b"Package: sideeffect-r5-replacement-fixture\nStatus: install ok installed\nPriority: optional\nSection: misc\nInstalled-Size: 1\nMaintainer: SideEffect Test <test@example.invalid>\nArchitecture: all\nVersion: 1.0-1\nDescription: Synthetic installed row for the dpkg replacement test\n",
+    )
+    .unwrap();
+    let parked_admindir = private_parent.join("parked-dpkg-admin");
+    let script = "import os, pathlib, sys\nadmin = pathlib.Path(sys.argv[1])\nparked = pathlib.Path(sys.argv[2])\nos.rename(admin, parked)\nadmin.mkdir()\nstatus = f'''Package: sideeffect-r5-replacement-fixture\\nStatus: install ok installed\\nPriority: optional\\nSection: misc\\nInstalled-Size: 1\\nMaintainer: SideEffect Test <test@example.invalid>\\nArchitecture: all\\nVersion: {sys.argv[3]}\\nDescription: Synthetic installed row for the dpkg replacement test\\n'''\n(admin / 'status').write_text(status)\n";
+    let result = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&output)
+        .arg("--observe-root")
+        .arg(&observed_root)
+        .arg("--packages")
+        .arg("--dpkg-admindir")
+        .arg(&admindir)
+        .arg("--runtime-duration-seconds")
+        .arg("10")
+        .arg("--")
+        .arg("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(&admindir)
+        .arg(&parked_admindir)
+        .arg("2.0-1")
+        .output()
+        .expect("launch observed private-admindir replacement");
+    assert_eq!(
+        result.status.code(),
+        Some(2),
+        "runtime capture is partial by contract: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let before_identity = fs::metadata(&parked_admindir).unwrap();
+    let after_identity = fs::metadata(&admindir).unwrap();
+    assert_eq!(before_identity.dev(), after_identity.dev());
+    assert_ne!(before_identity.ino(), after_identity.ino());
+
+    let manifest = parse_manifest(&fs::read(output.join("session.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest.schema_version,
+        sideeffect::audit_session::AUDIT_SESSION_V20_SCHEMA_VERSION
+    );
+    assert_eq!(
+        manifest.status,
+        sideeffect::audit_session::SessionStatus::Partial
+    );
+    let package_source = manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::Packages)
+        .expect("selected package source");
+    assert_eq!(package_source.status, SourceStatus::Partial);
+    assert!(
+        package_source
+            .diagnostic_codes
+            .contains(&"dpkg_admindir_identity_changed".to_owned())
+    );
+    let before_ref = package_source
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == ArtifactKind::Packages)
+        .expect("before package artifact");
+    let after_ref = package_source
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == ArtifactKind::PackagesAfter)
+        .expect("after package artifact");
+    assert_eq!(before_ref.path, "packages.json");
+    assert_eq!(after_ref.path, "packages-after.json");
+
+    let before_bytes = fs::read(output.join(before_ref.path.as_str())).unwrap();
+    let after_bytes = fs::read(output.join(after_ref.path.as_str())).unwrap();
+    assert_eq!(before_ref.byte_length, before_bytes.len() as u64);
+    assert_eq!(before_ref.sha256, sha256_hex(&before_bytes));
+    assert_eq!(after_ref.byte_length, after_bytes.len() as u64);
+    assert_eq!(after_ref.sha256, sha256_hex(&after_bytes));
+    let before_document: Value = serde_json::from_slice(&before_bytes).unwrap();
+    let after_document: Value = serde_json::from_slice(&after_bytes).unwrap();
+    assert_eq!(before_document["status"], "complete");
+    assert_eq!(after_document["status"], "partial");
+    assert_eq!(before_document["packages"].as_array().unwrap().len(), 1);
+    assert_eq!(after_document["packages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        before_document["packages"][0]["name"],
+        "sideeffect-r5-replacement-fixture"
+    );
+    assert_eq!(before_document["packages"][0]["version"], "1.0-1");
+    assert_eq!(after_document["packages"][0]["version"], "2.0-1");
+    assert!(
+        after_document["sources"][0]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "dpkg_admindir_identity_changed")
+    );
+
+    let expected_scope = format!(
+        "selected_dpkg_admindir;path_bytes_hex={};before_dev_ino={}:{}~{}:{};after_dev_ino={}:{}~{}:{}",
+        path_bytes_hex(&admindir),
+        before_identity.dev(),
+        before_identity.ino(),
+        before_identity.dev(),
+        before_identity.ino(),
+        after_identity.dev(),
+        after_identity.ino(),
+        after_identity.dev(),
+        after_identity.ino()
+    );
+    assert_eq!(package_source.scope, expected_scope);
+
+    let compared = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("compare-observation")
+        .arg(&output)
+        .output()
+        .expect("compare the paired observation artifacts");
+    assert_eq!(compared.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&compared.stdout).unwrap();
+    assert_eq!(report["package_comparison_status"], "partial");
+    assert_eq!(
+        report["package_comparison_diagnostic"],
+        "package_scope_or_selection_mismatch"
+    );
+    assert_eq!(report["package_source_status"], "partial");
+    assert_eq!(report["package_before_artifact"]["path"], before_ref.path);
+    assert_eq!(report["package_after_artifact"]["path"], after_ref.path);
+    assert_eq!(
+        report["package_before_artifact"]["sha256"],
+        before_ref.sha256
+    );
+    assert_eq!(report["package_after_artifact"]["sha256"], after_ref.sha256);
+    assert!(report["package_diff"].is_null());
+    assert_eq!(report["root_comparison_status"], "complete");
+    assert_eq!(report["root_diff"]["counts"]["additions"], 0);
 }
