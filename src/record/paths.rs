@@ -13,10 +13,12 @@ const BUNDLE_TRACE_NAME: &[u8] = b"trace.strace";
 const MANIFEST_NAME: &[u8] = b"run.json";
 const REPORT_NAME: &[u8] = b"report.html";
 const PRIVATE_FILE_NAME: &[u8] = b"private-output";
-const SESSION_ARTIFACT_NAMES: [&[u8]; 9] = [
+const SESSION_ARTIFACT_NAMES: [&[u8]; 11] = [
     b"packages.json",
+    b"packages-after.json",
     b"processes.json",
     b"startup.json",
+    b"startup-after.json",
     b"path-executables.json",
     b"root-snapshot.json",
     b"root-snapshot-after.json",

@@ -43,6 +43,22 @@ pub struct UnitDirectory {
 /// Common vendor and administrator unit search paths. Missing optional paths are
 /// represented as empty; callers should not interpret this list as exhaustive.
 pub fn default_unit_directories(home: Option<&OsStr>) -> Vec<UnitDirectory> {
+    default_unit_directories_with_user_priority(home, false)
+}
+
+/// Observation-window snapshots prioritize the selected user's unit files so
+/// a dense system-wide installation cannot consume the shared parser budget
+/// before those files are reached. The overall record bound is unchanged.
+pub(crate) fn collect_systemd_units_for_observation() -> UnitInventory {
+    let dirs =
+        default_unit_directories_with_user_priority(std::env::var_os("HOME").as_deref(), true);
+    collect_systemd_units_from(&dirs)
+}
+
+fn default_unit_directories_with_user_priority(
+    home: Option<&OsStr>,
+    prioritize_home: bool,
+) -> Vec<UnitDirectory> {
     let mut dirs = vec![
         UnitDirectory {
             scope: "system",
@@ -111,7 +127,7 @@ pub fn default_unit_directories(home: Option<&OsStr>) -> Vec<UnitDirectory> {
     ];
     if let Some(home) = home.filter(|h| !h.is_empty()) {
         let home = PathBuf::from(home);
-        dirs.extend([
+        let user_dirs = [
             UnitDirectory {
                 scope: "user",
                 path: home.join(".config/systemd/user"),
@@ -120,7 +136,12 @@ pub fn default_unit_directories(home: Option<&OsStr>) -> Vec<UnitDirectory> {
                 scope: "user",
                 path: home.join(".local/share/systemd/user"),
             },
-        ]);
+        ];
+        if prioritize_home {
+            dirs.splice(0..0, user_dirs);
+        } else {
+            dirs.extend(user_dirs);
+        }
     }
     if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|p| !p.is_empty()) {
         dirs.extend(user_runtime_unit_directories(&PathBuf::from(runtime_dir)));
@@ -1031,6 +1052,29 @@ mod tests {
     fn default_paths_include_system_and_configured_user_runtime_units() {
         let runtime = std::env::temp_dir().join("sideeffect-xdg-runtime-fixture");
         let dirs = default_unit_directories(Some(OsStr::new("/home/example")));
+        let user_path = Path::new("/home/example/.config/systemd/user");
+        let system_path = Path::new("/etc/systemd/system");
+        let observed_dirs =
+            default_unit_directories_with_user_priority(Some(OsStr::new("/home/example")), true);
+        assert!(
+            dirs.iter()
+                .position(|d| d.path.as_path() == user_path)
+                .unwrap()
+                > dirs
+                    .iter()
+                    .position(|d| d.path.as_path() == system_path)
+                    .unwrap()
+        );
+        assert!(
+            observed_dirs
+                .iter()
+                .position(|d| d.path.as_path() == user_path)
+                .unwrap()
+                < observed_dirs
+                    .iter()
+                    .position(|d| d.path.as_path() == system_path)
+                    .unwrap()
+        );
         for path in [
             "/run/systemd/generator.early",
             "/run/systemd/generator",

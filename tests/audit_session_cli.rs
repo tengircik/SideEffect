@@ -628,6 +628,26 @@ fn audit_cli_rejects_an_empty_source_selection_without_publishing() {
 }
 
 #[test]
+fn alternate_dpkg_database_is_limited_to_observation_sessions() {
+    let directory = TestDirectory::new();
+    let output = directory.0.join("alternate.session");
+    let admindir = directory.0.join("admindir");
+    fs::create_dir(&admindir).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_sideeffect"))
+        .arg("audit")
+        .arg("--output")
+        .arg(&output)
+        .arg("--packages")
+        .arg("--dpkg-admindir")
+        .arg(&admindir)
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("requires --observe-root"));
+    assert!(!output.exists());
+}
+
+#[test]
 fn audit_cli_includes_bounded_runtime_bundle_and_preserves_argument_boundaries() {
     let directory = TestDirectory::new();
     let output = directory.0.join("runtime.session");
@@ -765,7 +785,7 @@ fn audit_observe_root_wraps_real_strace_and_compares_verified_snapshots() {
     let manifest = parse_manifest(&fs::read(output.join("session.json")).unwrap()).unwrap();
     assert_eq!(
         manifest.schema_version,
-        sideeffect::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION
+        sideeffect::audit_session::AUDIT_SESSION_V20_SCHEMA_VERSION
     );
     let root_source = manifest
         .sources

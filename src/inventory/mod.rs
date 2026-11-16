@@ -64,6 +64,7 @@ pub use effective_access_windows::{
 pub use model::{
     INVENTORY_SCHEMA, INVENTORY_SCHEMA_VERSION, InventoryDiagnostic, InventoryDocument,
     InventoryEvidence, InventoryPackage, InventorySource, InventorySourceStatus, InventoryStatus,
+    PackageSourceSelection, SELECTED_DPKG_INVENTORY_SCHEMA_VERSION,
 };
 pub use package_diff::{
     PackageChangeKind, PackageComparisonCounts, PackageComparisonDiagnostic,
@@ -126,7 +127,10 @@ pub use windows_software_diff::{
 pub use debian::collect_debian_packages;
 pub use debian::parse_dpkg_query_output;
 #[cfg(target_os = "linux")]
-pub use packages::collect_packages;
+pub use packages::{
+    MAX_DPKG_ADMINDIR_PATH_BYTES, collect_packages, collect_packages_from_dpkg_admindir,
+    dpkg_admindir_identity, validate_dpkg_admindir,
+};
 #[cfg(windows)]
 pub use packages_windows::{
     WindowsRegistryValue, WindowsSoftwareDiagnostic, WindowsSoftwareInventoryDocument,
@@ -180,6 +184,8 @@ pub use root_snapshot_diff::{
     RootSnapshotSide, compare_observation_root_inventory_json,
     compare_selected_root_inventory_json, is_selected_root_inventory_json,
 };
+#[cfg(target_os = "linux")]
+pub(crate) use startup::collect_startup_for_observation;
 #[cfg(target_os = "linux")]
 pub use startup::{
     Directory as StartupDirectory, Entry as XdgStartupEntry, KeyEvidence as StartupKeyEvidence,

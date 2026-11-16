@@ -18,6 +18,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const PACKAGE_NAME: &str = "sideeffect-r5-synthetic-lifecycle";
 const PACKAGE_DIRECTORY: &str = "usr/lib/sideeffect-r5-synthetic-lifecycle";
+const STARTUP_HOME_DIRECTORY: &str = "home/sideeffect-r5-synthetic";
+const STARTUP_SERVICE_NAME: &str = "sideeffect-r5-synthetic.service";
+const STARTUP_TIMER_NAME: &str = "sideeffect-r5-synthetic.timer";
 const PAYLOAD_NAME: &str = "payload.bin";
 const ANCHOR_NAME: &str = "fixture-owned-anchor.txt";
 const ANCHOR_CONTENT: &[u8] = b"fixture-owned directory anchor\n";
@@ -25,6 +28,50 @@ const DPKG: &str = "/usr/bin/dpkg";
 const DPKG_DEB: &str = "/usr/bin/dpkg-deb";
 const DPKG_QUERY: &str = "/usr/bin/dpkg-query";
 const SAFE_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+
+struct PrivateStartupEnvironment {
+    home: PathBuf,
+    config_home: PathBuf,
+    config_dirs: PathBuf,
+    data_dirs: PathBuf,
+    runtime_dir: PathBuf,
+}
+
+impl PrivateStartupEnvironment {
+    fn new(root: &Path, parent: &Path) -> Self {
+        let home = root.join(STARTUP_HOME_DIRECTORY);
+        let config_home = home.join(".config");
+        let config_dirs = parent.join("xdg-config");
+        let data_dirs = parent.join("xdg-data");
+        let runtime_dir = parent.join("xdg-runtime");
+        fs::create_dir_all(home.join(".config/systemd/user")).unwrap();
+        fs::create_dir_all(config_dirs.join("autostart")).unwrap();
+        fs::create_dir_all(&data_dirs).unwrap();
+        fs::create_dir_all(&runtime_dir).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        Self {
+            home: home.canonicalize().unwrap(),
+            config_home: config_home.canonicalize().unwrap(),
+            config_dirs: config_dirs.canonicalize().unwrap(),
+            data_dirs: data_dirs.canonicalize().unwrap(),
+            runtime_dir: runtime_dir.canonicalize().unwrap(),
+        }
+    }
+
+    fn apply(&self, command: &mut Command) {
+        command
+            .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", &self.config_home)
+            .env("XDG_CONFIG_DIRS", &self.config_dirs)
+            .env("XDG_DATA_DIRS", &self.data_dirs)
+            .env("XDG_RUNTIME_DIR", &self.runtime_dir);
+    }
+
+    fn fixture_unit_dir(&self) -> PathBuf {
+        self.home.join(".config/systemd/user")
+    }
+}
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -132,8 +179,12 @@ fn build_scriptless_deb(parent: &Path, version: &str, payload: &[u8]) -> PathBuf
     let package_tree = parent.join(format!("package-{version}"));
     let control_dir = package_tree.join("DEBIAN");
     let payload_dir = package_tree.join(PACKAGE_DIRECTORY);
+    let user_unit_dir = package_tree
+        .join(STARTUP_HOME_DIRECTORY)
+        .join(".config/systemd/user");
     fs::create_dir_all(&control_dir).unwrap();
     fs::create_dir_all(&payload_dir).unwrap();
+    fs::create_dir_all(&user_unit_dir).unwrap();
     fs::write(
         control_dir.join("control"),
         format!(
@@ -142,6 +193,27 @@ fn build_scriptless_deb(parent: &Path, version: &str, payload: &[u8]) -> PathBuf
     )
     .unwrap();
     fs::write(payload_dir.join(PAYLOAD_NAME), payload).unwrap();
+    let never_run_command = parent.join("fixture-command-never-executed");
+    assert!(
+        !never_run_command.exists(),
+        "private fixture command must remain absent and inert"
+    );
+    let revision = if version == "1.0-1" { "v1" } else { "v2" };
+    fs::write(
+        user_unit_dir.join(STARTUP_SERVICE_NAME),
+        format!(
+            "[Unit]\nDescription=SideEffect private service fixture {revision}\n[Service]\nType=oneshot\nExecStart={}\n",
+            never_run_command.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        user_unit_dir.join(STARTUP_TIMER_NAME),
+        format!(
+            "[Unit]\nDescription=SideEffect private timer fixture {revision}\n[Timer]\nOnBootSec=1h\nUnit={STARTUP_SERVICE_NAME}\n"
+        ),
+    )
+    .unwrap();
     let control_entries: Vec<_> = fs::read_dir(&control_dir)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
@@ -164,7 +236,11 @@ fn build_scriptless_deb(parent: &Path, version: &str, payload: &[u8]) -> PathBuf
     deb
 }
 
-fn isolated_dpkg_command(root: &Path, private_parent: &Path) -> Command {
+fn isolated_dpkg_command(
+    root: &Path,
+    private_parent: &Path,
+    startup_environment: &PrivateStartupEnvironment,
+) -> Command {
     let root = root
         .canonicalize()
         .expect("canonicalize isolated dpkg root");
@@ -196,16 +272,18 @@ fn isolated_dpkg_command(root: &Path, private_parent: &Path) -> Command {
         .arg(format!("--log={}", log.display()))
         .args(["--force-not-root", "--no-triggers"])
         .env("TMPDIR", private_parent);
+    startup_environment.apply(&mut command);
     command
 }
 
 fn dpkg_install_command(
     root: &Path,
     private_parent: &Path,
+    startup_environment: &PrivateStartupEnvironment,
     deb: &Path,
     downgrade: bool,
 ) -> Command {
-    let mut command = isolated_dpkg_command(root, private_parent);
+    let mut command = isolated_dpkg_command(root, private_parent, startup_environment);
     if downgrade {
         command.arg("--force-downgrade");
     }
@@ -213,8 +291,14 @@ fn dpkg_install_command(
     command
 }
 
-fn dpkg_install(root: &Path, private_parent: &Path, deb: &Path, downgrade: bool) {
-    let output = dpkg_install_command(root, private_parent, deb, downgrade)
+fn dpkg_install(
+    root: &Path,
+    private_parent: &Path,
+    startup_environment: &PrivateStartupEnvironment,
+    deb: &Path,
+    downgrade: bool,
+) {
+    let output = dpkg_install_command(root, private_parent, startup_environment, deb, downgrade)
         .output()
         .unwrap();
     assert!(
@@ -227,23 +311,31 @@ fn dpkg_install(root: &Path, private_parent: &Path, deb: &Path, downgrade: bool)
 fn audit_dpkg_install(
     root: &Path,
     private_parent: &Path,
+    startup_environment: &PrivateStartupEnvironment,
     observed_root: &Path,
     deb: &Path,
     session_path: &Path,
 ) {
-    let dpkg = dpkg_install_command(root, private_parent, deb, false);
+    let dpkg = dpkg_install_command(root, private_parent, startup_environment, deb, false);
     audit_dpkg_command(
         root,
         private_parent,
         observed_root,
         session_path,
         dpkg,
+        startup_environment,
         &["--install".to_owned(), deb.to_string_lossy().into_owned()],
     );
 }
 
-fn audit_dpkg_purge(root: &Path, private_parent: &Path, observed_root: &Path, session_path: &Path) {
-    let mut dpkg = isolated_dpkg_command(root, private_parent);
+fn audit_dpkg_purge(
+    root: &Path,
+    private_parent: &Path,
+    startup_environment: &PrivateStartupEnvironment,
+    observed_root: &Path,
+    session_path: &Path,
+) {
+    let mut dpkg = isolated_dpkg_command(root, private_parent, startup_environment);
     dpkg.args(["--purge", PACKAGE_NAME]);
     audit_dpkg_command(
         root,
@@ -251,6 +343,7 @@ fn audit_dpkg_purge(root: &Path, private_parent: &Path, observed_root: &Path, se
         observed_root,
         session_path,
         dpkg,
+        startup_environment,
         &["--purge".to_owned(), PACKAGE_NAME.to_owned()],
     );
 }
@@ -261,6 +354,7 @@ fn audit_dpkg_command(
     observed_root: &Path,
     session_path: &Path,
     dpkg: Command,
+    startup_environment: &PrivateStartupEnvironment,
     operation_arguments: &[String],
 ) {
     let program = dpkg.get_program().to_owned();
@@ -302,8 +396,8 @@ fn audit_dpkg_command(
     assert_eq!(program, DPKG);
     assert_eq!(
         environment.len(),
-        3,
-        "isolated dpkg must retain only its fixed PATH, locale, and private TMPDIR overrides"
+        8,
+        "isolated dpkg must receive only its fixed PATH, locale, private TMPDIR, and private startup/XDG settings"
     );
     assert!(
         environment
@@ -318,6 +412,26 @@ fn audit_dpkg_command(
     assert!(environment.iter().any(|(key, value)| {
         key == "TMPDIR" && value.as_deref() == Some(private_parent.as_os_str())
     }));
+    for (key, expected) in [
+        ("HOME", startup_environment.home.as_os_str()),
+        (
+            "XDG_CONFIG_HOME",
+            startup_environment.config_home.as_os_str(),
+        ),
+        (
+            "XDG_CONFIG_DIRS",
+            startup_environment.config_dirs.as_os_str(),
+        ),
+        ("XDG_DATA_DIRS", startup_environment.data_dirs.as_os_str()),
+        (
+            "XDG_RUNTIME_DIR",
+            startup_environment.runtime_dir.as_os_str(),
+        ),
+    ] {
+        assert!(environment.iter().any(|(actual_key, value)| {
+            actual_key == key && value.as_deref() == Some(expected)
+        }));
+    }
 
     let mut audit = Command::new(env!("CARGO_BIN_EXE_sideeffect"));
     audit
@@ -328,6 +442,10 @@ fn audit_dpkg_command(
         .arg("--observe-root")
         .arg(observed_root)
         .arg("--hash-regular-files")
+        .arg("--startup")
+        .arg("--packages")
+        .arg("--dpkg-admindir")
+        .arg(root.join("var/lib/dpkg"))
         .arg("--runtime-duration-seconds")
         .arg("30")
         .arg("--")
@@ -339,6 +457,7 @@ fn audit_dpkg_command(
             value.expect("the fixture dpkg environment contains only fixed values"),
         );
     }
+    startup_environment.apply(&mut audit);
     let output = audit
         .output()
         .expect("launch observed isolated dpkg transaction");
@@ -525,19 +644,156 @@ fn snapshot_diff(before: &Path, after: &Path) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn path_bytes_hex(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn assert_selected_dpkg_version(document: &Value, admindir: &Path, version: Option<&str>) {
+    assert_eq!(document["schema"], "sideeffect.inventory");
+    assert_eq!(document["schema_version"], 3);
+    assert_eq!(document["scope"], "selected_dpkg_admindir");
+    assert_eq!(document["source_selection"]["kind"], "dpkg_admindir");
+    assert_eq!(
+        document["source_selection"]["path_bytes_hex"],
+        path_bytes_hex(admindir)
+    );
+    let matching = document["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|package| package["name"] == PACKAGE_NAME)
+        .collect::<Vec<_>>();
+    match version {
+        Some(version) => {
+            assert_eq!(matching.len(), 1);
+            assert_eq!(matching[0]["version"], version);
+            assert_eq!(matching[0]["source_id"], "dpkg_query");
+            assert!(matching[0]["evidence"]["line"].as_u64().unwrap() > 0);
+            assert!(matching[0]["evidence"]["byte_length"].as_u64().unwrap() > 0);
+        }
+        None => assert!(matching.is_empty()),
+    }
+}
+
+fn assert_startup_fixture_units(
+    document: &Value,
+    startup_environment: &PrivateStartupEnvironment,
+    version: Option<&str>,
+    never_run_command: &Path,
+) -> Vec<(String, usize)> {
+    assert_eq!(document["schema"], "sideeffect.startup_inventory");
+    assert_eq!(document["schema_version"], 3);
+    assert_eq!(document["platform"], "linux");
+    let revision = version.map(|version| if version == "1.0-1" { "v1" } else { "v2" });
+    let mut result = Vec::new();
+    for (unit_name, description) in [
+        (
+            STARTUP_SERVICE_NAME,
+            revision.map(|revision| format!("SideEffect private service fixture {revision}")),
+        ),
+        (
+            STARTUP_TIMER_NAME,
+            revision.map(|revision| format!("SideEffect private timer fixture {revision}")),
+        ),
+    ] {
+        let path = startup_environment.fixture_unit_dir().join(unit_name);
+        let matches = document["systemd_units"]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                record["scope"] == "user"
+                    && record["record_type"] == "unit_file"
+                    && record["source_path"] == path.to_string_lossy().as_ref()
+            })
+            .collect::<Vec<_>>();
+        match description {
+            Some(description) => {
+                assert_eq!(matches.len(), 1, "expected exact private fixture unit row");
+                let (index, record) = matches[0];
+                assert_eq!(record["source_path_bytes_hex"], path_bytes_hex(&path));
+                assert_eq!(record["startup_state"]["configured"], "present");
+                assert_eq!(record["startup_state"]["effective"]["status"], "unknown");
+                assert_eq!(record["startup_state"]["observed"]["status"], "unknown");
+                let directives = record["directives"].as_array().unwrap();
+                let directive_value = |section: &str, key: &str| {
+                    directives
+                        .iter()
+                        .find(|directive| {
+                            directive["section"] == section && directive["key"] == key
+                        })
+                        .and_then(|directive| directive["value"].as_str())
+                };
+                assert_eq!(
+                    directive_value("Unit", "Description"),
+                    Some(description.as_str()),
+                    "synthetic fixture directives did not preserve Unit/Description: {:?}; fixture file text: {:?}",
+                    directives
+                        .iter()
+                        .map(|directive| (
+                            directive["section"].as_str(),
+                            directive["key"].as_str(),
+                            directive["value"].as_str()
+                        ))
+                        .collect::<Vec<_>>(),
+                    fs::read_to_string(&path).ok()
+                );
+                if unit_name == STARTUP_SERVICE_NAME {
+                    assert_eq!(
+                        directive_value("Service", "ExecStart"),
+                        Some(never_run_command.to_string_lossy().as_ref())
+                    );
+                } else {
+                    assert_eq!(directive_value("Timer", "Unit"), Some(STARTUP_SERVICE_NAME));
+                    assert_eq!(directive_value("Timer", "OnBootSec"), Some("1h"));
+                }
+                result.push((path.to_string_lossy().into_owned(), index));
+            }
+            None => assert!(matches.is_empty(), "unit row unexpectedly present"),
+        }
+    }
+    result
+}
+
+fn source_status_name(status: SourceStatus) -> &'static str {
+    match status {
+        SourceStatus::Complete => "complete",
+        SourceStatus::Partial => "partial",
+        SourceStatus::Unknown => "unknown",
+        SourceStatus::NotChecked => "not_checked",
+        SourceStatus::Unsupported => "unsupported",
+        SourceStatus::NotApplicable => "not_applicable",
+        SourceStatus::Unavailable => "unavailable",
+        SourceStatus::AccessDenied => "access_denied",
+        SourceStatus::Failed => "failed",
+        SourceStatus::TimedOut => "timed_out",
+        SourceStatus::OutputLimitExceeded => "output_limit_exceeded",
+    }
+}
+
 fn assert_observed_dpkg_transition(
     session_path: &Path,
     observed_root: &Path,
+    startup_environment: &PrivateStartupEnvironment,
     payload_before: Option<&[u8]>,
     payload_after: Option<&[u8]>,
+    package_before: Option<&str>,
+    package_after: Option<&str>,
 ) {
     let manifest_path = session_path.join("session.json");
     let manifest_bytes = fs::read(&manifest_path).unwrap();
     let manifest = parse_manifest(&manifest_bytes).expect("validate observation session manifest");
     assert_eq!(
         manifest.schema_version,
-        sideeffect::audit_session::AUDIT_SESSION_V16_SCHEMA_VERSION
+        sideeffect::audit_session::AUDIT_SESSION_V20_SCHEMA_VERSION
     );
+    assert_eq!(manifest.platform, "linux");
     assert_eq!(
         manifest.status,
         sideeffect::audit_session::SessionStatus::Partial,
@@ -562,6 +818,42 @@ fn assert_observed_dpkg_transition(
             .iter()
             .any(|artifact| artifact.kind == ArtifactKind::SelectedRootAfter)
     );
+    let packages = manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::Packages)
+        .expect("selected package source");
+    assert_eq!(packages.artifacts.len(), 2);
+    let package_before_ref = packages
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == ArtifactKind::Packages)
+        .unwrap();
+    let package_after_ref = packages
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == ArtifactKind::PackagesAfter)
+        .unwrap();
+    assert_eq!(package_before_ref.path, "packages.json");
+    assert_eq!(package_after_ref.path, "packages-after.json");
+    let startup = manifest
+        .sources
+        .iter()
+        .find(|source| source.role == SourceRole::Startup)
+        .expect("selected startup source");
+    assert_eq!(startup.artifacts.len(), 2);
+    let startup_before_ref = startup
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == ArtifactKind::Startup)
+        .unwrap();
+    let startup_after_ref = startup
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == ArtifactKind::StartupAfter)
+        .unwrap();
+    assert_eq!(startup_before_ref.path, "startup.json");
+    assert_eq!(startup_after_ref.path, "startup-after.json");
 
     let runtime = manifest
         .sources
@@ -589,7 +881,54 @@ fn assert_observed_dpkg_transition(
 
     assert_session_artifacts_verified(
         session_path,
-        root_source.artifacts.iter().chain(&runtime.artifacts),
+        root_source
+            .artifacts
+            .iter()
+            .chain(&runtime.artifacts)
+            .chain(&packages.artifacts)
+            .chain(&startup.artifacts),
+    );
+
+    let admindir = session_path
+        .parent()
+        .expect("session fixture parent")
+        .join("root/var/lib/dpkg")
+        .canonicalize()
+        .expect("canonical selected dpkg admin directory");
+    let packages_before_document: Value = serde_json::from_slice(
+        &fs::read(session_path.join(package_before_ref.path.as_str())).unwrap(),
+    )
+    .expect("verified package before inventory JSON");
+    let packages_after_document: Value = serde_json::from_slice(
+        &fs::read(session_path.join(package_after_ref.path.as_str())).unwrap(),
+    )
+    .expect("verified package after inventory JSON");
+    assert_selected_dpkg_version(&packages_before_document, &admindir, package_before);
+    assert_selected_dpkg_version(&packages_after_document, &admindir, package_after);
+    let startup_before_document: Value = serde_json::from_slice(
+        &fs::read(session_path.join(startup_before_ref.path.as_str())).unwrap(),
+    )
+    .expect("verified startup before inventory JSON");
+    let startup_after_document: Value = serde_json::from_slice(
+        &fs::read(session_path.join(startup_after_ref.path.as_str())).unwrap(),
+    )
+    .expect("verified startup after inventory JSON");
+    let never_run_command = session_path
+        .parent()
+        .expect("session fixture parent")
+        .join("fixture-command-never-executed");
+    assert!(!never_run_command.exists());
+    let startup_before_rows = assert_startup_fixture_units(
+        &startup_before_document,
+        startup_environment,
+        package_before,
+        &never_run_command,
+    );
+    let startup_after_rows = assert_startup_fixture_units(
+        &startup_after_document,
+        startup_environment,
+        package_after,
+        &never_run_command,
     );
 
     let before_ref = root_source
@@ -698,6 +1037,180 @@ fn assert_observed_dpkg_transition(
     );
     let report: Value = serde_json::from_slice(&compared.stdout).unwrap();
     assert_eq!(report["root_comparison_status"], "complete");
+    assert_eq!(
+        report["package_before_artifact"]["path"],
+        package_before_ref.path
+    );
+    assert_eq!(
+        report["package_after_artifact"]["path"],
+        package_after_ref.path
+    );
+    assert_eq!(
+        report["package_before_artifact"]["sha256"],
+        package_before_ref.sha256
+    );
+    assert_eq!(
+        report["package_after_artifact"]["sha256"],
+        package_after_ref.sha256
+    );
+    assert_eq!(
+        report["package_source_status"],
+        source_status_name(packages.status)
+    );
+    assert_eq!(
+        report["startup_before_artifact"]["path"],
+        startup_before_ref.path
+    );
+    assert_eq!(
+        report["startup_after_artifact"]["path"],
+        startup_after_ref.path
+    );
+    assert_eq!(
+        report["startup_before_artifact"]["sha256"],
+        startup_before_ref.sha256
+    );
+    assert_eq!(
+        report["startup_after_artifact"]["sha256"],
+        startup_after_ref.sha256
+    );
+    assert_eq!(
+        report["startup_source_status"],
+        source_status_name(startup.status)
+    );
+    assert_eq!(
+        report["startup_before_document_status"],
+        startup_before_document["status"]
+    );
+    assert_eq!(
+        report["startup_after_document_status"],
+        startup_after_document["status"]
+    );
+    let package_delta_kind = match (package_before, package_after) {
+        (None, Some(_)) => "added",
+        (Some(_), Some(_)) if package_before != package_after => "changed",
+        (Some(_), None) => "removed",
+        _ => panic!("package transition must change the selected package version"),
+    };
+    if packages.status == SourceStatus::Complete {
+        assert_eq!(report["package_comparison_status"], "complete");
+        let package_diff = &report["package_diff"];
+        assert_eq!(package_diff["status"], "complete");
+        assert_eq!(package_diff["deltas"].as_array().unwrap().len(), 1);
+        let package_delta = &package_diff["deltas"][0];
+        assert_eq!(package_delta["kind"], package_delta_kind);
+        assert_eq!(package_delta["identity"]["source_id"], "dpkg_query");
+        assert_eq!(package_delta["identity"]["name"], PACKAGE_NAME);
+    } else {
+        assert_eq!(report["package_comparison_status"], "partial");
+        assert_eq!(
+            report["package_comparison_diagnostic"],
+            "package_source_incomplete"
+        );
+        assert!(report["package_diff"].is_null());
+    }
+
+    let startup_diff = &report["startup_diff"];
+    assert_eq!(startup_diff["schema"], "sideeffect.startup_inventory_diff");
+    assert_eq!(startup_diff["platform"], "linux");
+    let startup_is_complete = startup.status == SourceStatus::Complete
+        && startup_before_document["status"] == "complete"
+        && startup_after_document["status"] == "complete"
+        && startup_diff["status"] == "complete";
+    assert_eq!(
+        report["startup_comparison_status"],
+        if startup_is_complete {
+            "complete"
+        } else {
+            "partial"
+        }
+    );
+    let startup_deltas = startup_diff["deltas"].as_array().unwrap();
+    match (package_before, package_after) {
+        (Some(_), Some(_)) => {
+            assert_eq!(startup_before_rows.len(), 2);
+            assert_eq!(startup_after_rows.len(), 2);
+            assert_eq!(startup_diff["counts"]["changed"], 2);
+            assert_eq!(startup_deltas.len(), 2);
+            for ((before_path, before_index), (after_path, after_index)) in
+                startup_before_rows.iter().zip(&startup_after_rows)
+            {
+                assert_eq!(before_path, after_path);
+                let before_pointer = format!("/systemd_units/records/{before_index}");
+                let after_pointer = format!("/systemd_units/records/{after_index}");
+                let matching = startup_deltas
+                    .iter()
+                    .filter(|delta| {
+                        delta["category"] == "systemd_units"
+                            && delta["kind"] == "changed"
+                            && delta["before"]["references"]
+                                .as_array()
+                                .is_some_and(|refs| {
+                                    refs.iter().any(|value| value == &before_pointer)
+                                })
+                            && delta["after"]["references"].as_array().is_some_and(|refs| {
+                                refs.iter().any(|value| value == &after_pointer)
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(matching.len(), 1);
+                assert!(
+                    matching[0]["changed_fields"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|field| field == "directives")
+                );
+            }
+        }
+        (None, Some(_)) | (Some(_), None) => {
+            if startup_is_complete {
+                assert_eq!(startup_deltas.len(), 2);
+                let expected_kind = if package_before.is_none() {
+                    "observed_after_only"
+                } else {
+                    "observed_before_only"
+                };
+                assert!(
+                    startup_deltas
+                        .iter()
+                        .all(|delta| delta["kind"] == expected_kind
+                            && delta["category"] == "systemd_units")
+                );
+                let expected_rows = if package_before.is_none() {
+                    &startup_after_rows
+                } else {
+                    &startup_before_rows
+                };
+                for (_, index) in expected_rows {
+                    let pointer = format!("/systemd_units/records/{index}");
+                    assert!(startup_deltas.iter().any(|delta| {
+                        let side = if package_before.is_none() {
+                            &delta["after"]
+                        } else {
+                            &delta["before"]
+                        };
+                        delta["category"] == "systemd_units"
+                            && side["references"]
+                                .as_array()
+                                .is_some_and(|refs| refs.iter().any(|value| value == &pointer))
+                    }));
+                }
+            } else {
+                assert!(
+                    startup_deltas
+                        .iter()
+                        .all(|delta| delta["kind"] == "changed")
+                );
+                assert!(
+                    startup_diff["counts"]["unmatched_rows_suppressed_for_incomplete_source"]
+                        .as_u64()
+                        .unwrap()
+                        >= 2
+                );
+            }
+        }
+        _ => unreachable!("validated package transition"),
+    }
     let expected_delta_kind = match (payload_before.is_some(), payload_after.is_some()) {
         (false, true) => "added",
         (true, true) => "changed",
@@ -1048,6 +1561,10 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
     let private_root = private_parent.join("root");
     fs::create_dir(&private_root).unwrap();
     fs::set_permissions(&private_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let startup_environment = PrivateStartupEnvironment::new(&private_root, private_parent);
+    let admindir = private_root.join("var/lib/dpkg");
+    fs::create_dir_all(&admindir).unwrap();
+    fs::write(admindir.join("status"), b"").unwrap();
     let install_root = private_root.join(PACKAGE_DIRECTORY);
     fs::create_dir_all(&install_root).unwrap();
     fs::write(install_root.join(ANCHOR_NAME), ANCHOR_CONTENT).unwrap();
@@ -1078,11 +1595,20 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
     audit_dpkg_install(
         &private_root,
         private_parent,
+        &startup_environment,
         &install_root,
         &deb_v1,
         &observed_v1_session,
     );
-    assert_observed_dpkg_transition(&observed_v1_session, &install_root, None, Some(payload_v1));
+    assert_observed_dpkg_transition(
+        &observed_v1_session,
+        &install_root,
+        &startup_environment,
+        None,
+        Some(payload_v1),
+        None,
+        Some("1.0-1"),
+    );
     let packages_v1_path = private_parent.join("packages-installed-v1.json");
     let packages_v1 = dpkg_query_inventory(&private_root, private_parent, &packages_v1_path);
     assert_package_version(&packages_v1, Some("1.0-1"));
@@ -1108,6 +1634,7 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
     audit_dpkg_install(
         &private_root,
         private_parent,
+        &startup_environment,
         &install_root,
         &deb_v2,
         &observed_v2_session,
@@ -1115,8 +1642,11 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
     assert_observed_dpkg_transition(
         &observed_v2_session,
         &install_root,
+        &startup_environment,
         Some(payload_v1),
         Some(payload_v2),
+        Some("1.0-1"),
+        Some("2.0-1"),
     );
     let packages_v2_path = private_parent.join("packages-installed-v2.json");
     let packages_v2 = dpkg_query_inventory(&private_root, private_parent, &packages_v2_path);
@@ -1149,7 +1679,13 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
         v2_ordinal
     );
 
-    dpkg_install(&private_root, private_parent, &deb_v1, true);
+    dpkg_install(
+        &private_root,
+        private_parent,
+        &startup_environment,
+        &deb_v1,
+        true,
+    );
     let packages_downgraded_path = private_parent.join("packages-downgraded-v1.json");
     let packages_downgraded =
         dpkg_query_inventory(&private_root, private_parent, &packages_downgraded_path);
@@ -1186,13 +1722,17 @@ fn private_dpkg_install_update_downgrade_purge_has_selected_root_evidence() {
     audit_dpkg_purge(
         &private_root,
         private_parent,
+        &startup_environment,
         &install_root,
         &observed_purge_session,
     );
     assert_observed_dpkg_transition(
         &observed_purge_session,
         &install_root,
+        &startup_environment,
         Some(payload_v1),
+        None,
+        Some("1.0-1"),
         None,
     );
     let packages_purged_path = private_parent.join("packages-purged.json");

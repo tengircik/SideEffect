@@ -102,6 +102,19 @@ pub struct Diagnostic {
 }
 
 pub fn collect_startup() -> StartupInventoryDocument {
+    collect_startup_with_observation_priority(false)
+}
+
+/// Collects paired observation-window startup evidence with the selected
+/// user's systemd unit directories ahead of system-wide directories. This
+/// keeps the before/after collection order stable under the shared line cap.
+pub(crate) fn collect_startup_for_observation() -> StartupInventoryDocument {
+    collect_startup_with_observation_priority(true)
+}
+
+fn collect_startup_with_observation_priority(
+    prioritize_user_units: bool,
+) -> StartupInventoryDocument {
     let started = now_ms();
     let dirs = resolve_xdg_paths(
         std::env::var_os("HOME").as_deref(),
@@ -109,7 +122,11 @@ pub fn collect_startup() -> StartupInventoryDocument {
         std::env::var_os("XDG_CONFIG_DIRS").as_deref(),
     );
     let xdg_autostart = collect_startup_from(&dirs);
-    let systemd_units = super::systemd_units::collect_systemd_units();
+    let systemd_units = if prioritize_user_units {
+        super::systemd_units::collect_systemd_units_for_observation()
+    } else {
+        super::systemd_units::collect_systemd_units()
+    };
     let legacy_sources = super::startup_legacy::collect_legacy_startup();
     let status = if xdg_autostart.status == Status::Complete
         && systemd_units.status == super::systemd_units::Status::Complete

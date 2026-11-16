@@ -1093,6 +1093,14 @@ fn audit_command(arguments: &[OsString]) -> Result<ExitCode, String> {
                 index += 1;
                 continue;
             }
+            if argument == "--dpkg-admindir" {
+                if options.dpkg_admindir.is_some() || index + 1 >= arguments.len() {
+                    return Err("audit requires exactly one --dpkg-admindir DIRECTORY".to_owned());
+                }
+                options.dpkg_admindir = Some(Path::new(&arguments[index + 1]).to_path_buf());
+                index += 2;
+                continue;
+            }
             if argument == "--processes" {
                 if !selected.insert("processes") {
                     return Err("audit source --processes was specified more than once".to_owned());
@@ -2016,7 +2024,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
         "audit" => {
             #[cfg(target_os = "linux")]
             {
-                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages] [--processes] [--startup] [--path-executables] [--root DIRECTORY [--hash-regular-files]] [--observe-root DIRECTORY [--hash-regular-files] --runtime-duration-seconds 1..3600 -- PROGRAM [ARGS...]] [--permission PATH]...\nCollects explicitly selected Linux inventory sources and an optional bounded command capture into one local, private session directory. --root snapshots one selected directory and its direct children; it reads metadata only by default. --observe-root requires a selected root and bounded runtime command and records before/after direct-child snapshots alongside runtime evidence. The output directory must not overlap the observed root. Use compare-observation SESSION_DIR for a verified evidence-linked temporal diff; changes do not establish causation. --hash-regular-files opts into bounded SHA-256 reads of direct-child regular files and requires --root or --observe-root. Hashes are sensitive equality fingerprints, not authenticity evidence. Collection does not recurse. Review root paths and names before sharing a session. --path-executables snapshots current-process PATH metadata heuristically and never runs files or resolves commands through a shell. Linux runtime uses external strace. Runtime command arguments stay separate and are passed without a shell. The session stores the native run manifest and raw trace, which may contain sensitive arguments and paths. Each source has its own interval; the session is not an atomic snapshot. Runtime completeness remains unknown, so runtime sources and sessions containing runtime are partial. Partial and unavailable selected sources are preserved and cause exit status 2."
+                "Usage: sideeffect audit --output NEW_DIRECTORY [--packages [--dpkg-admindir DIRECTORY]] [--processes] [--startup] [--path-executables] [--root DIRECTORY [--hash-regular-files]] [--observe-root DIRECTORY [--hash-regular-files] --runtime-duration-seconds 1..3600 -- PROGRAM [ARGS...]] [--permission PATH]...\nCollects explicitly selected Linux inventory sources and an optional bounded command capture into one local, private session directory. --dpkg-admindir selects exactly one existing dpkg database for --packages; it requires --packages and --observe-root, does not infer from --root, and does not merge host package sources or run package hooks. Its bounded path and directory identity are recorded, and package presence differences are withheld if that selection changes or cannot be verified. Observation sessions use envelope v20 and collect selected packages and startup sources before and after the runtime command. --root snapshots one selected directory and its direct children; it reads metadata only by default. --observe-root requires a selected root and bounded runtime command and records before/after direct-child snapshots alongside runtime evidence. The output directory must not overlap the observed root. Use compare-observation SESSION_DIR for a verified evidence-linked temporal diff; changes do not establish causation. --hash-regular-files opts into bounded SHA-256 reads of direct-child regular files and requires --root or --observe-root. Hashes are sensitive equality fingerprints, not authenticity evidence. Collection does not recurse. Review root paths and names before sharing a session. --path-executables snapshots current-process PATH metadata heuristically and never runs files or resolves commands through a shell. Linux runtime uses external strace. Runtime command arguments stay separate and are passed without a shell. The session stores the native run manifest and raw trace, which may contain sensitive arguments and paths. Each source has its own interval; the session is not an atomic snapshot. Runtime completeness remains unknown, so runtime sources and sessions containing runtime are partial. Partial and unavailable selected sources are preserved and cause exit status 2."
             }
             #[cfg(windows)]
             {
@@ -2064,7 +2072,7 @@ fn command_help(topics: &[OsString]) -> Result<ExitCode, String> {
             "Usage: sideeffect compare-sessions BEFORE_SESSION_DIR AFTER_SESSION_DIR\nVerifies both local audit sessions, reports metadata comparability, and compares bounded item-level inventory and runtime evidence from verified artifacts. Per-source status and evidence references remain visible; missing, partial, unsupported, or incompatible sources do not become empty results. This is not an exhaustive history or coverage claim, and it does not establish causation or event absence. Incomparable or partial results exit with status 2 and include stable reason codes."
         }
         "compare-observation" => {
-            "Usage: sideeffect compare-observation VERIFIED_OBSERVATION_SESSION_DIR\nVerifies one v16-v19 observation session and compares selected-root snapshots; v17/v18 and v19 Windows sessions compare paired startup snapshots when present, v18 compares paired Windows Uninstall-registration snapshots, and v19 compares paired software snapshots when --packages was selected. Windows v19 adds exact NT-device path candidates only when the before/after held-root NT path and nonzero volume/file-index hints are stable; it does not translate DOS, volume-GUID, UNC, verbatim, or other namespaces. Existing DOS matching remains exact and lexical. Linux adds exact-path candidates from the manifest-verified strace trace; Windows matches require raw-cross-checked ETW FileIo name observations. Results cite input artifacts and raw rows. Linux locators bind to trace digest and raw row offsets; Windows locators bind to capture document digest, event-array row, and raw-payload digest. ETW file-name records do not report operation success. Path matches do not prove mutation, process identity, or cause, and do not establish causation. Runtime source and capture completeness remain distinct. Unsupported path namespaces remain unresolved."
+            "Usage: sideeffect compare-observation VERIFIED_OBSERVATION_SESSION_DIR\nVerifies one v16-v20 observation session and compares selected-root snapshots; v17/v18/v19 Windows sessions compare paired startup snapshots when present, v18 compares paired Windows Uninstall-registration snapshots, v19 compares paired Windows software snapshots when --packages was selected, and v20 Linux sessions compare paired package and startup snapshots when selected. Windows v19 adds exact NT-device path candidates only when the before/after held-root NT path and nonzero volume/file-index hints are stable; it does not translate DOS, volume-GUID, UNC, verbatim, or other namespaces. Existing DOS matching remains exact and lexical. Linux adds exact-path candidates from the manifest-verified strace trace; Windows matches require raw-cross-checked ETW FileIo name observations. Results cite input artifacts and raw rows. Linux locators bind to trace digest and raw row offsets; Windows locators bind to capture document digest, event-array row, and raw-payload digest. ETW file-name records do not report operation success. Path matches do not prove mutation, process identity, or cause, and do not establish causation. Runtime source and capture completeness remain distinct. Unsupported path namespaces remain unresolved."
         }
         "baseline" => {
             "Usage: sideeffect baseline preview --label LABEL --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect baseline create --profile NEW_PROFILE.json --label LABEL --confirm-sha256 PREVIEW_SHA256 --session SESSION_DIR [--session SESSION_DIR...]\n       sideeffect baseline compare --profile PROFILE.json --baseline-session SESSION_DIR [--baseline-session SESSION_DIR...] --session CANDIDATE_SESSION_DIR [--session CANDIDATE_SESSION_DIR...]\nPreviews a bounded set of 1..=16 verified audit sessions and prints a deterministic preview digest. Creating a profile requires the exact digest and writes a new current-user-private file without replacing an existing file. Partial, incomplete, or loss-affected inputs are shown with their unknown coverage but cannot be promoted into a profile. A profile records only reviewed observations: software and signer identity are not recorded. Comparison requires the exact approved baseline sessions and matching manifest digests; a missing, replaced, or additional session prevents item comparison and exits with status 2. Candidate item differences are reported against the existing evidence-linked session diff, but the candidate is never absorbed automatically. Removal and absence claims are withheld when either side declares incomplete or unknown coverage. Differences do not establish unsafe behavior, causation, or complete system coverage."
@@ -6760,6 +6768,18 @@ struct ObservationWindowReport<'a> {
     software_comparison_diagnostic: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     software_diff: Option<sideeffect::inventory::WindowsSoftwareInventoryComparison>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package_comparison_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package_source_status: Option<sideeffect::audit_session::SourceStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package_before_artifact: Option<&'a sideeffect::audit_session::SessionArtifactRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package_after_artifact: Option<&'a sideeffect::audit_session::SessionArtifactRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package_comparison_diagnostic: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package_diff: Option<sideeffect::inventory::PackageInventoryComparison>,
     #[cfg(target_os = "linux")]
     root_runtime_association: Option<sideeffect::inventory::RootRuntimeAssociationReport>,
     #[cfg(windows)]
@@ -6774,10 +6794,67 @@ struct ObservationWindowReport<'a> {
     root_nt_runtime_association_diagnostic: Option<&'static str>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[derive(serde::Deserialize)]
 struct InventoryStatusDocument {
     status: String,
+}
+
+#[cfg(target_os = "linux")]
+fn selected_dpkg_artifacts_match_source_scope(scope: &str, before: &[u8], after: &[u8]) -> bool {
+    let mut fields = scope.split(';');
+    if fields.next() != Some("selected_dpkg_admindir") {
+        return false;
+    }
+    let Some(path_field) = fields
+        .next()
+        .and_then(|field| field.strip_prefix("path_bytes_hex="))
+    else {
+        return false;
+    };
+    let Some(before_field) = fields
+        .next()
+        .and_then(|field| field.strip_prefix("before_dev_ino="))
+    else {
+        return false;
+    };
+    let Some(after_field) = fields
+        .next()
+        .and_then(|field| field.strip_prefix("after_dev_ino="))
+    else {
+        return false;
+    };
+    if fields.next().is_some() {
+        return false;
+    }
+    let selected_identity = |bytes: &[u8]| -> Option<(String, String)> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        if value["schema_version"] != 3
+            || value["scope"] != "selected_dpkg_admindir"
+            || value["source_selection"]["kind"] != "dpkg_admindir"
+        {
+            return None;
+        }
+        let path = value["source_selection"]["path_bytes_hex"]
+            .as_str()?
+            .to_owned();
+        let device = value["source_selection"]["directory_device"].as_u64()?;
+        let inode = value["source_selection"]["directory_inode"].as_u64()?;
+        (device != 0 && inode != 0).then(|| (path, format!("{device}:{inode}")))
+    };
+    let Some((before_path, before_identity)) = selected_identity(before) else {
+        return false;
+    };
+    let Some((after_path, after_identity)) = selected_identity(after) else {
+        return false;
+    };
+    fn endpoint(value: &str) -> Option<&str> {
+        value.split_once('~').map(|(_, after)| after)
+    }
+    before_path == path_field
+        && after_path == path_field
+        && endpoint(before_field) == Some(before_identity.as_str())
+        && endpoint(after_field) == Some(after_identity.as_str())
 }
 
 fn compare_observation(session_path: &OsString) -> Result<ExitCode, String> {
@@ -6798,7 +6875,7 @@ fn compare_observation(session_path: &OsString) -> Result<ExitCode, String> {
         .iter()
         .find(|source| source.role == sideeffect::audit_session::SourceRole::Runtime)
         .ok_or_else(|| "observation session has no runtime source".to_owned())?;
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     let startup = manifest
         .sources
         .iter()
@@ -6962,7 +7039,7 @@ fn compare_observation(session_path: &OsString) -> Result<ExitCode, String> {
         }
     };
     let root_comparison_status = root_diff.as_ref().map_or("partial", |diff| diff.status);
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     let (
         startup_comparison_status,
         startup_source_status,
@@ -6976,12 +7053,25 @@ fn compare_observation(session_path: &OsString) -> Result<ExitCode, String> {
         manifest.schema_version >= sideeffect::audit_session::AUDIT_SESSION_V17_SCHEMA_VERSION
     }) {
         Some(source) => {
-            let before = source.artifacts.iter().find(|artifact| {
-                artifact.kind == sideeffect::audit_session::ArtifactKind::WindowsStartup
-            });
-            let after = source.artifacts.iter().find(|artifact| {
-                artifact.kind == sideeffect::audit_session::ArtifactKind::WindowsStartupAfter
-            });
+            let (before_kind, after_kind) = if manifest.platform == "linux" {
+                (
+                    sideeffect::audit_session::ArtifactKind::Startup,
+                    sideeffect::audit_session::ArtifactKind::StartupAfter,
+                )
+            } else {
+                (
+                    sideeffect::audit_session::ArtifactKind::WindowsStartup,
+                    sideeffect::audit_session::ArtifactKind::WindowsStartupAfter,
+                )
+            };
+            let before = source
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.kind == before_kind);
+            let after = source
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.kind == after_kind);
             let mut status = "partial";
             let mut diagnostic = None;
             let mut comparison = None;
@@ -7082,7 +7172,7 @@ fn compare_observation(session_path: &OsString) -> Result<ExitCode, String> {
         }
         None => (None, None, None, None, None, None, None, None),
     };
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     let (
         startup_comparison_status,
         startup_source_status,
@@ -7217,6 +7307,150 @@ fn compare_observation(session_path: &OsString) -> Result<ExitCode, String> {
     } else {
         (None, None, None, None, None, None, None, None)
     };
+    #[cfg(target_os = "linux")]
+    let (
+        package_comparison_status,
+        package_source_status,
+        package_before_artifact,
+        package_after_artifact,
+        package_comparison_diagnostic,
+        package_diff,
+    ) = if manifest.schema_version >= sideeffect::audit_session::AUDIT_SESSION_V20_SCHEMA_VERSION {
+        let source = manifest
+            .sources
+            .iter()
+            .find(|source| source.role == sideeffect::audit_session::SourceRole::Packages);
+        match source {
+            Some(source) => {
+                let before = source.artifacts.iter().find(|artifact| {
+                    artifact.kind == sideeffect::audit_session::ArtifactKind::Packages
+                });
+                let after = source.artifacts.iter().find(|artifact| {
+                    artifact.kind == sideeffect::audit_session::ArtifactKind::PackagesAfter
+                });
+                let mut status = "partial";
+                let mut diagnostic = None;
+                let mut comparison = None;
+                if let (Some(before), Some(after)) = (before, after) {
+                    let lookup = |reference: &sideeffect::audit_session::SessionArtifactRef| {
+                        verified
+                            .artifacts()
+                            .iter()
+                            .find(|artifact| {
+                                artifact.kind() == reference.kind
+                                    && artifact.path() == reference.path
+                            })
+                            .map(|artifact| artifact.bytes())
+                    };
+                    match (lookup(before), lookup(after)) {
+                        (Some(before_bytes), Some(after_bytes)) => {
+                            let package_result = if source
+                                .scope
+                                .starts_with("selected_dpkg_admindir;")
+                                && !selected_dpkg_artifacts_match_source_scope(
+                                    &source.scope,
+                                    before_bytes,
+                                    after_bytes,
+                                ) {
+                                Err(sideeffect::inventory::PackageComparisonError::ScopeMismatch)
+                            } else {
+                                sideeffect::inventory::compare_package_inventory_json(
+                                    before_bytes,
+                                    after_bytes,
+                                )
+                            };
+                            match package_result {
+                                Ok(mut diff) => {
+                                    if source.status
+                                        != sideeffect::audit_session::SourceStatus::Complete
+                                    {
+                                        let suppressed = diff.deltas.len().saturating_sub(
+                                                diff.deltas.iter().filter(|delta| delta.kind == sideeffect::inventory::PackageChangeKind::Changed).count()
+                                            );
+                                        diff.deltas.retain(|delta| delta.kind == sideeffect::inventory::PackageChangeKind::Changed);
+                                        diff.counts.additions = 0;
+                                        diff.counts.removals = 0;
+                                        diff.counts.unmatched_rows_with_incomplete_source = diff
+                                            .counts
+                                            .unmatched_rows_with_incomplete_source
+                                            .saturating_add(suppressed);
+                                        if suppressed > 0 {
+                                            diff.diagnostics.push(sideeffect::inventory::PackageComparisonDiagnostic::SourceIncomplete);
+                                            diff.diagnostics.sort();
+                                            diff.diagnostics.dedup();
+                                        }
+                                        diff.status =
+                                            sideeffect::inventory::PackageComparisonStatus::Partial;
+                                    }
+                                    status = if diff.status
+                                        == sideeffect::inventory::PackageComparisonStatus::Complete
+                                        && source.status
+                                            == sideeffect::audit_session::SourceStatus::Complete
+                                    {
+                                        "complete"
+                                    } else {
+                                        "partial"
+                                    };
+                                    comparison = Some(diff);
+                                }
+                                Err(error) => {
+                                    diagnostic = Some(match error {
+                                            sideeffect::inventory::PackageComparisonError::MalformedInput => "package_snapshot_invalid",
+                                            sideeffect::inventory::PackageComparisonError::InputTooLarge
+                                            | sideeffect::inventory::PackageComparisonError::SourceLimitExceeded
+                                            | sideeffect::inventory::PackageComparisonError::PackageLimitExceeded
+                                            | sideeffect::inventory::PackageComparisonError::FieldLimitExceeded
+                                            | sideeffect::inventory::PackageComparisonError::DocumentTextLimitExceeded
+                                            | sideeffect::inventory::PackageComparisonError::DeltaLimitExceeded => "package_comparison_limit_exceeded",
+                                            sideeffect::inventory::PackageComparisonError::UnsupportedSchema => "package_snapshot_schema_unsupported",
+                                            sideeffect::inventory::PackageComparisonError::PlatformMismatch => "package_platform_mismatch",
+                                            sideeffect::inventory::PackageComparisonError::ScopeMismatch => "package_scope_or_selection_mismatch",
+                                            sideeffect::inventory::PackageComparisonError::UnsupportedSourceId
+                                            | sideeffect::inventory::PackageComparisonError::SchemaMismatch
+                                            | sideeffect::inventory::PackageComparisonError::DuplicateSourceId => "package_snapshot_contract_invalid",
+                                        });
+                                }
+                            }
+                        }
+                        _ => diagnostic = Some("package_artifact_reference_mismatch"),
+                    }
+                } else {
+                    diagnostic = Some(if before.is_none() {
+                        "package_before_artifact_missing"
+                    } else {
+                        "package_after_artifact_missing"
+                    });
+                }
+                (
+                    Some(status),
+                    Some(source.status),
+                    before,
+                    after,
+                    diagnostic,
+                    comparison,
+                )
+            }
+            None => (
+                Some("partial"),
+                None,
+                None,
+                None,
+                Some("package_source_missing"),
+                None,
+            ),
+        }
+    } else {
+        (None, None, None, None, None, None)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (
+        package_comparison_status,
+        package_source_status,
+        package_before_artifact,
+        package_after_artifact,
+        package_comparison_diagnostic,
+        package_diff,
+    ) = (None, None, None, None, None, None);
     #[cfg(not(windows))]
     let (
         software_comparison_status,
@@ -7303,23 +7537,37 @@ fn compare_observation(session_path: &OsString) -> Result<ExitCode, String> {
         && software_comparison_status.is_none_or(|status| status == "complete")
         && software_source_status
             .is_none_or(|status| status == sideeffect::audit_session::SourceStatus::Complete);
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    let complete = root_runtime_complete
+        && startup_comparison_status.is_none_or(|status| status == "complete")
+        && startup_source_status
+            .is_none_or(|status| status == sideeffect::audit_session::SourceStatus::Complete)
+        && package_comparison_status.is_none_or(|status| status == "complete")
+        && package_source_status
+            .is_none_or(|status| status == sideeffect::audit_session::SourceStatus::Complete);
+    #[cfg(not(any(windows, target_os = "linux")))]
     let complete = root_runtime_complete;
-    let scope = match (
-        startup_comparison_status.is_some(),
-        software_comparison_status.is_some(),
-    ) {
-        (false, false) => {
-            "verified_before_after_selected_root_comparison_during_bounded_runtime_capture; temporal differences do not establish causation"
-        }
-        (true, false) => {
-            "verified before/after selected-root and Windows startup comparison during a bounded runtime capture; temporal differences do not establish causation"
-        }
-        (false, true) => {
-            "verified before/after selected-root and Windows Uninstall-registration comparison during a bounded runtime capture; temporal differences do not establish causation"
-        }
-        (true, true) => {
-            "verified before/after selected-root, Windows startup, and Windows Uninstall-registration comparisons during a bounded runtime capture; temporal differences do not establish causation"
+    let scope = if manifest.schema_version
+        >= sideeffect::audit_session::AUDIT_SESSION_V20_SCHEMA_VERSION
+    {
+        "verified before/after selected-root comparison during bounded runtime capture; paired startup, package, or Windows software-registration comparisons are included when available; temporal differences do not establish causation"
+    } else {
+        match (
+            startup_comparison_status.is_some(),
+            software_comparison_status.is_some(),
+        ) {
+            (false, false) => {
+                "verified_before_after_selected_root_comparison_during_bounded_runtime_capture; temporal differences do not establish causation"
+            }
+            (true, false) => {
+                "verified before/after selected-root and Windows startup comparison during a bounded runtime capture; temporal differences do not establish causation"
+            }
+            (false, true) => {
+                "verified before/after selected-root and Windows Uninstall-registration comparison during a bounded runtime capture; temporal differences do not establish causation"
+            }
+            (true, true) => {
+                "verified before/after selected-root, Windows startup, and Windows Uninstall-registration comparisons during a bounded runtime capture; temporal differences do not establish causation"
+            }
         }
     };
     let report = ObservationWindowReport {
@@ -7353,6 +7601,12 @@ fn compare_observation(session_path: &OsString) -> Result<ExitCode, String> {
         software_after_document_status,
         software_comparison_diagnostic,
         software_diff,
+        package_comparison_status,
+        package_source_status,
+        package_before_artifact,
+        package_after_artifact,
+        package_comparison_diagnostic,
+        package_diff,
         #[cfg(target_os = "linux")]
         root_runtime_association,
         #[cfg(windows)]
@@ -11791,6 +12045,40 @@ mod tests {
             Some("runtime_manifest_trace_contract_mismatch")
         );
         assert!(invalid.source_diffs[0].comparison.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selected_dpkg_manifest_scope_must_match_both_endpoint_artifacts() {
+        let artifact = |inode| {
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 3,
+                "scope": "selected_dpkg_admindir",
+                "source_selection": {
+                    "kind": "dpkg_admindir",
+                    "path_bytes_hex": "2f746d702f646270",
+                    "directory_device": 7,
+                    "directory_inode": inode
+                }
+            }))
+            .unwrap()
+        };
+        let before = artifact(11);
+        let after = artifact(12);
+        let scope = "selected_dpkg_admindir;path_bytes_hex=2f746d702f646270;before_dev_ino=7:10~7:11;after_dev_ino=7:11~7:12";
+        assert!(super::selected_dpkg_artifacts_match_source_scope(
+            scope, &before, &after
+        ));
+        let wrong_path = scope.replace("2f746d702f646270", "2f746d702f6f74686572");
+        assert!(!super::selected_dpkg_artifacts_match_source_scope(
+            &wrong_path,
+            &before,
+            &after
+        ));
+        let replaced = artifact(99);
+        assert!(!super::selected_dpkg_artifacts_match_source_scope(
+            scope, &before, &replaced
+        ));
     }
 }
 

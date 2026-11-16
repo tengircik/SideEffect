@@ -6,14 +6,18 @@ use super::debian::{
 };
 use super::model::{
     INVENTORY_SCHEMA, INVENTORY_SCHEMA_VERSION, InventoryDiagnostic, InventoryDocument,
-    InventorySource, InventorySourceStatus, InventoryStatus,
+    InventorySource, InventorySourceStatus, InventoryStatus, PackageSourceSelection,
+    SELECTED_DPKG_INVENTORY_SCHEMA_VERSION,
 };
 use crate::limits::{MAX_INVENTORY_ROWS, MAX_INVENTORY_STDOUT_BYTES};
 use std::io::Read;
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const TOTAL_PACKAGE_SCAN_TIMEOUT: Duration = Duration::from_secs(20);
+pub const MAX_DPKG_ADMINDIR_PATH_BYTES: usize = 1024;
 
 const UNSUPPORTED_ADAPTERS: [(&str, &[&str]); 4] = [
     ("xbps_query", &["/usr/bin/xbps-query", "/bin/xbps-query"]),
@@ -112,11 +116,87 @@ pub fn collect_packages() -> InventoryDocument {
                     stderr_limit: stderr,
                     row_limit: rows,
                     timeout,
+                    dpkg_admindir: None,
                 },
                 captured_at,
             )
         },
     )
+}
+
+/// Resolve and bound an explicitly selected dpkg administrative directory.
+/// This path is never inferred from the selected filesystem root.
+pub fn validate_dpkg_admindir(path: &Path) -> Result<PathBuf, &'static str> {
+    if !path.is_absolute() || path.as_os_str().as_bytes().len() > MAX_DPKG_ADMINDIR_PATH_BYTES {
+        return Err("dpkg_admindir_path_invalid_or_over_limit");
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| "dpkg_admindir_unavailable")?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("dpkg_admindir_not_directory");
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| "dpkg_admindir_unavailable")?;
+    if !canonical.is_absolute()
+        || canonical.as_os_str().as_bytes().len() > MAX_DPKG_ADMINDIR_PATH_BYTES
+    {
+        return Err("dpkg_admindir_path_invalid_or_over_limit");
+    }
+    Ok(canonical)
+}
+
+/// Nonpersistent local directory identity hint for detecting an alternate dpkg
+/// database path replacement between read-only query endpoints.
+pub fn dpkg_admindir_identity(path: &Path) -> Option<(u64, u64)> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    let device = metadata.dev();
+    let inode = metadata.ino();
+    (device != 0 && inode != 0).then_some((device, inode))
+}
+
+/// Read exactly one explicitly selected dpkg database. Other package-manager
+/// inventories are omitted so the selected database is never merged with host state.
+pub fn collect_packages_from_dpkg_admindir(admindir: &Path) -> InventoryDocument {
+    let run = collect_package_source(
+        PackageSourceConfig {
+            id: "dpkg_query",
+            executable: "/usr/bin/dpkg-query",
+            args: &[
+                "-W",
+                "-f",
+                "${binary:Package}\\t${Version}\\t${Architecture}\\t${db:Status-Abbrev}\\n",
+            ],
+            kind: PackageSourceKind::Dpkg,
+            stdout_limit: MAX_INVENTORY_STDOUT_BYTES,
+            stderr_limit: crate::limits::MAX_INVENTORY_STDERR_BYTES,
+            row_limit: MAX_INVENTORY_ROWS,
+            timeout: TOTAL_PACKAGE_SCAN_TIMEOUT,
+            dpkg_admindir: Some(admindir.to_path_buf()),
+        },
+        current_time_unix_ms(),
+    );
+    let mut document = run.document;
+    document.scope = "selected_dpkg_admindir";
+    document.schema_version = SELECTED_DPKG_INVENTORY_SCHEMA_VERSION;
+    let identity = dpkg_admindir_identity(admindir);
+    document.source_selection = Some(PackageSourceSelection {
+        kind: "dpkg_admindir",
+        path_bytes_hex: bytes_to_hex(admindir.as_os_str().as_bytes()),
+        directory_device: identity.map(|(device, _)| device),
+        directory_inode: identity.map(|(_, inode)| inode),
+    });
+    document
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        result.push(char::from(HEX[(byte >> 4) as usize]));
+        result.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+    result
 }
 
 fn collect_packages_with<F>(
@@ -264,6 +344,7 @@ where
         schema_version: INVENTORY_SCHEMA_VERSION,
         platform: "linux",
         scope: "available_package_manager_databases",
+        source_selection: None,
         captured_at_unix_ms,
         status: if available_count > 0 && available_sources_complete && !unsupported_found {
             InventoryStatus::Complete
@@ -632,6 +713,25 @@ mod tests {
             None
         );
         assert_eq!(expected_package_managers(None), None);
+    }
+
+    #[test]
+    fn alternate_dpkg_admindir_must_be_absolute_existing_directory_and_bounded() {
+        let selected = validate_dpkg_admindir(&std::env::temp_dir()).unwrap();
+        assert!(selected.is_absolute());
+        assert_eq!(
+            validate_dpkg_admindir(Path::new("relative-dpkg-state")),
+            Err("dpkg_admindir_path_invalid_or_over_limit")
+        );
+        let too_long = std::env::temp_dir().join("x".repeat(MAX_DPKG_ADMINDIR_PATH_BYTES));
+        assert_eq!(
+            validate_dpkg_admindir(&too_long),
+            Err("dpkg_admindir_path_invalid_or_over_limit")
+        );
+        assert_eq!(
+            validate_dpkg_admindir(&std::env::temp_dir().join("missing-sideeffect-dpkg-state")),
+            Err("dpkg_admindir_unavailable")
+        );
     }
 
     #[test]
